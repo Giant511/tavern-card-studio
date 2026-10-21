@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>TCS 性能粗测</title>
+    <link rel="stylesheet" href="./src/styles.css" />
+    <style>
+      body {
+        display: block;
+        overflow: auto;
+        padding: 24px;
+      }
+      #perf-out {
+        font-family: ui-monospace, Consolas, monospace;
+        font-size: 12px;
+        white-space: pre-wrap;
+        background: #fff;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 12px 14px;
+        max-width: 900px;
+      }
+      #mount {
+        margin-top: 16px;
+        max-width: 900px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <h1 style="font-size: 15px">T6.1 性能粗测（万字段落）</h1>
+    <pre id="perf-out">running…</pre>
+    <div id="mount"></div>
+    <script type="module" src="./src/perf.ts"></script>
+  </body>
+</html>

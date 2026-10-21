@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tavern Card Studio</title>
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">TCS</span>
+        <div class="brand-text">
+          <div id="card-name" class="card-name">加载中…</div>
+          <div id="stats" class="stats"></div>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="btn-open" type="button" class="btn">打开…</button>
+        <button id="btn-save" type="button" class="btn">另存为…</button>
+        <button id="btn-export" type="button" class="btn primary">导出…</button>
+        <button id="btn-preview" type="button" class="btn ghost">渲染预览</button>
+        <button id="btn-rules" type="button" class="btn ghost">规则与预设…</button>
+        <span id="conn-chip" class="conn-chip off" title="服务端连接状态">
+          <span class="conn-dot"></span><span id="conn-text">未连接</span>
+        </span>
+        <button id="btn-settings" type="button" class="btn ghost">设置…</button>
+      </div>
+    </header>
+
+    <div id="sync-bar" class="sync-bar" role="status">
+      <span class="sync-label">同步</span>
+      <button id="btn-upload" type="button" class="btn small" disabled>上传到服务端</button>
+      <button id="btn-history" type="button" class="btn small" disabled>历史版本</button>
+      <button id="btn-rollback" type="button" class="btn small" disabled>回滚</button>
+      <span id="sync-hint" class="sync-hint"></span>
+      <span id="rules-label" class="rules-label">规则加载中…</span>
+    </div>
+
+    <main class="layout">
+      <section class="blocks-wrap" aria-label="板块编辑">
+        <div id="block-list" class="blocks"></div>
+      </section>
+
+      <aside class="issues-panel" aria-label="审计面板">
+        <div class="issues-head">
+          <h2>审计</h2>
+          <span id="issue-summary" class="issue-summary">—</span>
+        </div>
+        <div id="audit-panel" class="audit-panel"></div>
+        <p class="issues-hint">
+          点击问题可定位到对应板块与行；修正后标记会自动消失。
+        </p>
+      </aside>
+    </main>
+
+    <footer id="status" class="status info">初始化…</footer>
+    <script type="module" src="./src/editor/app.ts"></script>
+  </body>
+</html>

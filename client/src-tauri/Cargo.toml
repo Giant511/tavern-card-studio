@@ -1,0 +1,60 @@
+[package]
+name = "tcs-shell"
+version = "0.1.0"
+description = "酒馆角色卡审计编辑工具链 · 桌面客户端壳（Tauri 2）"
+authors = ["Tavern Card Studio"]
+edition = "2021"
+# Tauri 2 要求 1.77+；插件生态的 MSRV 随 tauri 走
+rust-version = "1.77"
+
+[lib]
+name = "tcs_shell_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# build-dependencies 有**独立的特性解析**，上面 [dependencies] 里的 indexmap 管不到它。
+# tauri-build 会打开 schemars/preserve_order，所以这里必须再开一次 std，否则
+# 编译 build script 时 schemars 仍报 E0107。详见 docs/11 §10.2。
+indexmap = { version = "1.9", features = ["std"] }
+
+[dependencies]
+# 核心
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 错误与摘要
+thiserror = "2"
+sha2 = "0.10"
+# 插件（路线 B：官方插件 + 少量自定义命令）
+#   dialog / fs / store / log / opener 会被前端 JS API 调用或有 Rust 侧初始化；
+#   window-state / single-instance 纯 Rust 侧，不暴露给前端。
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-store = "2"
+tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-single-instance = "2"
+
+# ── 仅用于特性合并，代码里不使用 ──────────────────────────────
+# indexmap 1.9.x 的 [features] 里没有 `default = ["std"]`（上游疏漏），
+# 而 tauri-build / tauri-plugin 会打开 `schemars/preserve_order`，
+# 该路径下 schemars 写的是 `IndexMap<K, V>`（两参数），只有在 std 特性开启时
+# `IndexMap<K, V, S = RandomState>` 才有默认参数；否则报
+#   error[E0107]: struct takes 3 generic arguments but 2 generic arguments were supplied
+# 这里不引入任何代码依赖，只借 Cargo 的同版本特性合并把 std 打开。
+# 详见 docs/11 §10.2。删除后必然编译失败。
+indexmap = { version = "1.9", features = ["std"] }
+
+[features]
+# 供 CI 显式开关（默认跟随 tauri 的 custom-protocol 约定）
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+# 体积优先：本项目壳代码量小，LTO 与 strip 的构建代价可接受
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = "s"

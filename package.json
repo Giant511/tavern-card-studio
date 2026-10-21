@@ -1,0 +1,47 @@
+{
+  "name": "tavern-card-studio",
+  "private": true,
+  "version": "0.1.0",
+  "description": "酒馆（SillyTavern）角色卡审计与编辑工具链：服务端（版本控制/审计）+ 客户端（分块编辑器）",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "shared",
+    "server",
+    "client"
+  ],
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "validate:rules": "node scripts/validate-rules.mjs",
+    "typecheck": "tsc -b --pretty false",
+    "build": "tsc -b --pretty false",
+    "build:shared": "tsc -b shared",
+    "build:server": "tsc -b server",
+    "test": "npm run build:shared && npm run build:server && node --test \"test/*.test.mjs\"",
+    "preview:highlight": "node scripts/render-highlight-preview.mjs",
+    "gen:audit-sample": "npm run build:shared && node scripts/gen-audit-sample.mjs",
+    "server": "node server/dist/index.js serve",
+    "server:worker": "node server/dist/index.js worker",
+    "demo:server": "npm run build:server && node scripts/demo-server.mjs",
+    "pack:server": "npm run build:server && node scripts/pack-server.mjs",
+    "gen:wix": "node scripts/gen-wix-fragment.mjs",
+    "typecheck:client": "npm run typecheck --workspace @tcs/client",
+    "build:ui": "npm run build:ui --workspace @tcs/client",
+    "validate:client": "node client/scripts/validate-config.mjs",
+    "check:decisions": "node scripts/check-decision-table.mjs",
+    "enable:hooks": "node scripts/enable-hooks.mjs",
+    "verify:import-atomic": "node scripts/verify-import-atomic.mjs",
+    "verify:export-roundtrip": "node scripts/verify-export-roundtrip.mjs",
+    "verify:sync-live": "node scripts/verify-sync-live.mjs",
+    "validate:examples": "node scripts/validate-examples.mjs",
+    "gen:examples": "node scripts/gen-examples.mjs",
+    "verify:e2e": "node scripts/verify-e2e.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "ajv": "^8.17.1",
+    "typescript": "^5.6.3"
+  }
+}

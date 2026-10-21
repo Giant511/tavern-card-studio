@@ -1,0 +1,26 @@
+{
+  "spec": "chara_card_v2",
+  "spec_version": "2.0",
+  "data": {
+    "name": "空白示例",
+    "description": "【基本信息】\n姓名：{{char}}\n身份：测试用最小卡片",
+    "personality": "沉默寡言。",
+    "scenario": "",
+    "first_mes": "",
+    "mes_example": "",
+    "creator_notes": "",
+    "system_prompt": "",
+    "post_history_instructions": "",
+    "alternate_greetings": [],
+    "tags": [],
+    "creator": "",
+    "character_version": "",
+    "extensions": {}
+  },
+  "name": "空白示例",
+  "description": "【基本信息】\n姓名：{{char}}\n身份：测试用最小卡片",
+  "personality": "沉默寡言。",
+  "scenario": "",
+  "first_mes": "",
+  "mes_example": ""
+}

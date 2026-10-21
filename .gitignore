@@ -1,0 +1,54 @@
+node_modules/
+dist/
+build/
+out/
+release/
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
+server/data/
+client/data/
+*.log
+.env
+.env.local
+
+# 本地构建工具缓存（如 WiX nuget 包），不入库
+.tools/
+
+# installer/build-msi.ps1 的中间产物
+installer/generated/
+installer/obj/
+
+# 客户端（Tauri）
+client/src-tauri/target/
+client/src-tauri/gen/
+# 注意：Cargo.lock 必须入库（应用类项目的可复现构建），不要忽略
+# 注意：client/src-tauri/icons/ 必须入库（bundler 构建期读取）
+# 注意：vendor/winsw/WinSW.NET4.exe 必须入库（服务宿主，构建期需要；
+#       来源与 sha256 见 vendor/winsw/README.md，build-msi.ps1 会校验）
+
+# 构建验证脚本的输出
+.verify/
+
+# ── 安全：运行时生成物（含明文访问令牌），绝不入库 ──────────────────
+# 服务端 config.json（含 auth.token）落在 server/data/ 或 ProgramData，
+# 客户端 client-config.json（含 token）落在 %APPDATA%。
+# 前者已被上面的 server/data/ 覆盖，这里补齐其余可能位置。
+config.json
+config.local.json
+**/client-config.json
+!rules/**/config.json
+
+# 证书与私钥
+*.pem
+*.key
+*.pfx
+*.p12
+id_rsa*
+
+# 证书/密钥目录
+.certs/
+.secrets/
+
+# 冗余压缩包：installer/ 与 vendor/ 已按源文件入库，不再存一份压缩副本
+installer.zip

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>语法高亮渲染预览 · Tavern Card Studio</title>
+<style>
+  body { margin: 0; padding: 32px; background: #f6f6f4; color: #222;
+         font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.lead { margin: 0 0 24px; color: #666; font-size: 13px; }
+  .card { background: #fff; border: 1px solid #e3e3df; border-radius: 8px;
+          padding: 16px 20px; margin-bottom: 20px; }
+  .card h2 { font-size: 15px; margin: 0 0 6px; }
+  .card h2 code { font-size: 12px; color: #8a8a8a; font-weight: normal; }
+  .meta { margin: 2px 0; font-size: 12px; color: #777; }
+  pre.preview { font-family: "Sarasa Mono SC", Consolas, Menlo, monospace; font-size: 14px;
+                line-height: 1.75; padding: 14px 16px; border-radius: 6px; overflow-x: auto;
+                white-space: pre-wrap; margin: 12px 0 0; }
+</style>
+</head>
+<body>
+  <h1>语法高亮渲染预览</h1>
+  <p class="lead">同一段文本，三套内置规则集（default / minimal / dark）。生成命令：<code>npm run preview:highlight</code></p>
+    <section class="card">
+      <header>
+        <h2>默认（纸墨风） <code>default</code> v1.0.0</h2>
+        <p class="meta">继承链 default ｜ scope 11 个 ｜ 规则 14 条 ｜ 启用 14 条</p>
+        <p class="meta">示例文本命中 14 个区间；示例卡片六板块合计命中 16 个区间</p>
+      </header>
+      <pre class="preview" style="color:#2b2b2b;background:#fbf9f4"><div class="tcs-highlight" data-scheme="default" style="color:#2b2b2b;background:#fbf9f4"><span class="tcs-hl tcs-hl-heading" data-rule="block-heading" style="color:#1f4e79;font-weight:600">【基本信息】</span><br>姓名：<span class="tcs-hl tcs-hl-placeholder" data-rule="char-placeholder" style="color:#b0341b;background-color:#fdece7;font-weight:600">{{char}}</span>　<span class="tcs-hl tcs-hl-attribute" data-rule="profile-attribute" style="color:#7a4b16;font-weight:600">年龄</span>：24　<span class="tcs-hl tcs-hl-attribute" data-rule="profile-attribute" style="color:#7a4b16;font-weight:600">身高</span>：168cm<br><br><span class="tcs-hl tcs-hl-heading" data-rule="markdown-heading" style="color:#1f4e79;font-weight:600">## 其他设定</span><br>聊天输出格式：对话使用中文双引号；每次回复不超过 3 段。<br><br><span class="tcs-hl tcs-hl-heading" data-rule="block-heading" style="color:#1f4e79;font-weight:600">【特殊设定】</span><br>书店二楼不对客人开放。若<span class="tcs-hl tcs-hl-placeholder" data-rule="char-placeholder" style="color:#b0341b;background-color:#fdece7;font-weight:600">{{user}}</span>执意上楼，<span class="tcs-hl tcs-hl-placeholder" data-rule="char-placeholder" style="color:#b0341b;background-color:#fdece7;font-weight:600">{{char}}</span>会先沉默三秒，然后说<span class="tcs-hl tcs-hl-dialogue" data-rule="dialogue-cn-quote" style="color:#0f6b6b">「上面只是仓库」</span>。<br><br><span class="tcs-hl tcs-hl-separator" data-rule="hr-line" style="color:#b9b1a3">---</span><br><span class="tcs-hl tcs-hl-list" data-rule="list-item" style="color:#3c5a99"><br>- </span>爱好：旧书、雨声<br><span class="tcs-hl tcs-hl-comment" data-rule="commented-note" style="color:#8b8b8b;font-style:italic">// 备注：这段用来展示注释样式 </span><span class="tcs-hl tcs-hl-placeholder-custom" data-rule="custom-macro" style="color:#8a5a00;background-color:#fdf3e0">&lt;BOT&gt;</span><span class="tcs-hl tcs-hl-comment" data-rule="commented-note" style="color:#8b8b8b;font-style:italic"> 伪标签</span></div></pre>
+    </section>
+    <section class="card">
+      <header>
+        <h2>最小可用 <code>minimal</code> v1.0.0</h2>
+        <p class="meta">继承链 minimal ｜ scope 2 个 ｜ 规则 2 条 ｜ 启用 2 条</p>
+        <p class="meta">示例文本命中 5 个区间；示例卡片六板块合计命中 6 个区间</p>
+      </header>
+      <pre class="preview" style="color:#222222;background:#ffffff"><div class="tcs-highlight" data-scheme="minimal" style="color:#222222;background:#ffffff"><span class="tcs-hl tcs-hl-heading" data-rule="block-heading" style="color:#1f4e79;font-weight:600">【基本信息】</span><br>姓名：<span class="tcs-hl tcs-hl-placeholder" data-rule="char-placeholder" style="color:#b0341b;background-color:#fdece7">{{char}}</span>　年龄：24　身高：168cm<br><br>## 其他设定<br>聊天输出格式：对话使用中文双引号；每次回复不超过 3 段。<br><br><span class="tcs-hl tcs-hl-heading" data-rule="block-heading" style="color:#1f4e79;font-weight:600">【特殊设定】</span><br>书店二楼不对客人开放。若<span class="tcs-hl tcs-hl-placeholder" data-rule="char-placeholder" style="color:#b0341b;background-color:#fdece7">{{user}}</span>执意上楼，<span class="tcs-hl tcs-hl-placeholder" data-rule="char-placeholder" style="color:#b0341b;background-color:#fdece7">{{char}}</span>会先沉默三秒，然后说「上面只是仓库」。<br><br>---<br><br>- 爱好：旧书、雨声<br>// 备注：这段用来展示注释样式 &lt;BOT&gt; 伪标签</div></pre>
+    </section>
+    <section class="card">
+      <header>
+        <h2>深色（继承默认） <code>dark</code> v1.0.0</h2>
+        <p class="meta">继承链 default → dark ｜ scope 11 个 ｜ 规则 15 条 ｜ 启用 15 条</p>
+        <p class="meta">示例文本命中 14 个区间；示例卡片六板块合计命中 16 个区间</p>
+      </header>
+      <pre class="preview" style="color:#d8dee9;background:#1c1f26"><div class="tcs-highlight" data-scheme="dark" style="color:#d8dee9;background:#1c1f26"><span class="tcs-hl tcs-hl-heading" data-rule="block-heading" style="color:#8ec7ff;font-weight:600">【基本信息】</span><br>姓名：<span class="tcs-hl tcs-hl-placeholder" data-rule="char-placeholder" style="color:#ff9f7a;background-color:#3a2a24;font-weight:600">{{char}}</span>　<span class="tcs-hl tcs-hl-attribute" data-rule="profile-attribute" style="color:#7a4b16;font-weight:600">年龄</span>：24　<span class="tcs-hl tcs-hl-attribute" data-rule="profile-attribute" style="color:#7a4b16;font-weight:600">身高</span>：168cm<br><br><span class="tcs-hl tcs-hl-heading" data-rule="markdown-heading" style="color:#8ec7ff;font-weight:600">## 其他设定</span><br>聊天输出格式：对话使用中文双引号；每次回复不超过 3 段。<br><br><span class="tcs-hl tcs-hl-heading" data-rule="block-heading" style="color:#8ec7ff;font-weight:600">【特殊设定】</span><br>书店二楼不对客人开放。若<span class="tcs-hl tcs-hl-placeholder" data-rule="char-placeholder" style="color:#ff9f7a;background-color:#3a2a24;font-weight:600">{{user}}</span>执意上楼，<span class="tcs-hl tcs-hl-placeholder" data-rule="char-placeholder" style="color:#ff9f7a;background-color:#3a2a24;font-weight:600">{{char}}</span>会先沉默三秒，然后说<span class="tcs-hl tcs-hl-dialogue" data-rule="dialogue-cn-quote" style="color:#7fd1c1">「上面只是仓库」</span>。<br><br><span class="tcs-hl tcs-hl-separator" data-rule="hr-line" style="color:#b9b1a3">---</span><br><span class="tcs-hl tcs-hl-list" data-rule="list-item" style="color:#3c5a99"><br>- </span>爱好：旧书、雨声<br><span class="tcs-hl tcs-hl-comment" data-rule="commented-note" style="color:#8b8b8b;font-style:italic">// 备注：这段用来展示注释样式 </span><span class="tcs-hl tcs-hl-placeholder-custom" data-rule="custom-macro" style="color:#8a5a00;background-color:#fdf3e0">&lt;BOT&gt;</span><span class="tcs-hl tcs-hl-comment" data-rule="commented-note" style="color:#8b8b8b;font-style:italic"> 伪标签</span></div></pre>
+    </section>
+</body>
+</html>

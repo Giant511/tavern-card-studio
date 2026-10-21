@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Tavern Card Studio Server — WiX v4/v5 installer source.
+
+  Build with installer\build-msi.ps1:
+    1. npm run pack:server            (stages node.exe + app + runtime deps)
+    2. node scripts/gen-wix-fragment.mjs  (generates installer\generated\AppFiles.wxs)
+    3. wix build installer\Product.wxs installer\generated\AppFiles.wxs ...
+
+  Installed layout:
+    C:\Program Files\Tavern Card Studio Server\
+      node.exe
+      tcs-service-host.exe     WinSW: the SCM-facing process (node.exe cannot be one)
+      tcs-service-host.xml     WinSW config: spawns node.exe, logs to ProgramData
+      app\server\dist\...      API + supervisor
+      app\server\public\...    admin panel
+      app\rules\...            platform / preset / highlight rules
+      app\node_modules\...     runtime dependencies
+    C:\ProgramData\TavernCardStudio\   data root (config.json, store\, logs\)
+
+  The data directory is intentionally NOT removed on uninstall: it holds card
+  blobs, git repositories and audit snapshots.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+
+    Name="Tavern Card Studio Server"
+    Language="1033"
+    Version="$(var.ProductVersion)"
+    Manufacturer="Tavern Card Studio"
+    UpgradeCode="7F1D6F2C-4B7E-4C1A-9F3E-2D6C5A8B1E90"
+    Scope="perMachine"
+    Compressed="yes">
+
+    <SummaryInformation
+      Description="Character card audit and version control server (local deployment)."
+      Manufacturer="Tavern Card Studio" />
+
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of Tavern Card Studio Server is already installed."
+      Schedule="afterInstallInitialize" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPCOMMENTS" Value="Local-first character card audit and version control server. Data lives in C:\ProgramData\TavernCardStudio." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Tavern Card Studio Server" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAFOLDER" Name="TavernCardStudio" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Tavern Card Studio Server" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="ServiceComponent" />
+      <ComponentRef Id="DataFolderComponent" />
+    </Feature>
+  </Package>
+
+  <!-- Data directory: created at install, kept at uninstall. -->
+  <Fragment>
+    <DirectoryRef Id="DATAFOLDER">
+      <Component Id="DataFolderComponent" Guid="2C0B8B6A-6E5F-4B3D-9E44-8A7D1C3F5B21">
+        <CreateFolder />
+        <RegistryValue Root="HKLM" Key="Software\TavernCardStudio" Name="DataDir" Type="string" Value="[DATAFOLDER]" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <!--
+    Service host.
+
+    node.exe is NOT a service host: it never calls StartServiceCtrlDispatcher, so
+    the SCM waits forever for SERVICE_RUNNING and the service stays `Start Pending`.
+    With <ServiceInstall> pointing at node.exe directly, msiexec hangs at
+    "Please wait while Windows configures ..." (reproduced 2026-10-21; the node
+    process was up and listening on 8730/8731 the whole time, which made it look
+    like a hang in the wrong place).
+
+    Fix: WinSW (vendor\winsw\WinSW.NET4.exe, 832 KiB) is the SCM-facing process;
+    it spawns node.exe from tcs-service-host.xml, reports RUNNING, captures
+    stdout/stderr to %ProgramData%\TavernCardStudio\logs, and restarts on failure.
+
+    Component GUID changed on purpose: KeyPath moved from node.exe to the host exe,
+    and a component's resources must stay fixed for a given GUID.
+  -->
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="ServiceComponent" Guid="03336D46-B75F-4A36-8605-B60D664DEF28">
+        <File Id="NodeExe" Source="$(var.StageDir)\node.exe" />
+        <File Id="ServiceHostExe" Source="$(var.WinSwDir)\WinSW.NET4.exe" Name="tcs-service-host.exe" KeyPath="yes" />
+        <File Id="ServiceHostConfig" Source="$(var.ServiceHostConfig)" Name="tcs-service-host.xml" />
+        <ServiceInstall
+          Id="ServerServiceInstaller"
+          Name="TavernCardStudioServer"
+          DisplayName="Tavern Card Studio Server"
+          Description="Tavern Card Studio: character card storage, audit and git-based version control."
+          Type="ownProcess"
+          Start="auto"
+          ErrorControl="normal"
+          Account="LocalSystem" />
+        <!--
+          No Arguments on purpose. WinSW v2 does NOT accept a config path as a
+          command-line argument: it looks for `<exe-name>.xml` next to itself and
+          aborts with "Unable to locate WinSW.NET4.[xml|yml] file within executable
+          directory" otherwise (verified by running the trial config directly).
+          So the pairing is name-based and must stay exact:
+              tcs-service-host.exe  <->  tcs-service-host.xml
+          Renaming only one of them silently breaks the service.
+        -->
+        <ServiceControl
+          Id="ServerServiceControl"
+          Name="TavernCardStudioServer"
+          Start="install"
+          Stop="both"
+          Remove="uninstall"
+          Wait="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WinSW service definition for Tavern Card Studio Server.
+
+  Why this file exists
+  ====================
+  node.exe does NOT implement the Windows service control protocol: it never
+  calls StartServiceCtrlDispatcher, so the Service Control Manager waits forever
+  for SERVICE_RUNNING and the service sits in `Start Pending`. Registering
+  node.exe directly via ServiceInstall makes msiexec hang at
+  "Please wait while Windows configures ..." (observed 2026-10-21).
+
+  WinSW is a real service host: it starts node.exe as a child process, reports
+  RUNNING to the SCM, captures stdout/stderr into a rolling log, and restarts
+  the child on failure.
+
+  Path tokens
+  ===========
+  %BASE% is substituted by WinSW with the directory containing this host exe,
+  i.e. the install folder (C:\Program Files\Tavern Card Studio Server).
+  The data root is fixed by the MSI DATAFOLDER (CommonAppDataFolder plus
+  TavernCardStudio); if that ever changes, update logpath and the config
+  argument here in the same commit as Product.wxs.
+
+  Logs
+  ====
+  The server prints the generated access token exactly once on first start.
+  Under a service there is no console, so that line lands in
+  C:\ProgramData\TavernCardStudio\logs and is the only way to retrieve it.
+
+  KEEP MARKUP OUT OF THIS COMMENT
+  XML forbids two consecutive hyphens inside a comment, and a hyphen may not sit
+  right before the closing marker. A horizontal rule made of dashes therefore
+  makes the whole file malformed. WinSW then reports only
+    "The configuration file cound not be loaded. XML comment cannot contain a
+     double hyphen"
+  exits before initialising its own logging, the SCM reports 7009, and the MSI
+  rolls back with 1920. That is exactly what happened on 2026-10-21. Use the
+  equals signs above instead of dashes.
+-->
+<service>
+  <id>TavernCardStudioServer</id>
+  <name>Tavern Card Studio Server</name>
+  <description>Tavern Card Studio: character card storage, audit and git-based version control.</description>
+
+  <executable>%BASE%\node.exe</executable>
+  <arguments>"%BASE%\app\server\dist\index.js" serve --config "C:\ProgramData\TavernCardStudio\config.json" --rules-dir "%BASE%\app\rules"</arguments>
+  <workingdirectory>%BASE%</workingdirectory>
+
+  <!-- Plain Automatic on purpose: a standalone delayedAutoStart element is not
+       part of the v2 schema, and WinSW aborts on unrecognised elements. The
+       account is left to the MSI ServiceInstall Account attribute so the two
+       definitions cannot drift apart. -->
+  <startmode>Automatic</startmode>
+
+  <logpath>C:\ProgramData\TavernCardStudio\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>4</keepFiles>
+  </log>
+
+  <!-- Restart on crash; reset the failure counter after an hour of uptime. -->
+  <onfailure action="restart" delay="10 sec" />
+  <onfailure action="restart" delay="30 sec" />
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- Give the supervisor time to shut its worker down before the SCM kills it. -->
+  <stoptimeout>20 sec</stoptimeout>
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+</service>

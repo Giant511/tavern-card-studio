@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tavern Card Studio · 管理面板</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="icon" href="/favicon.ico" />
+  </head>
+  <body>
+    <div id="login" class="login" hidden>
+      <form class="login-card" id="login-form" autocomplete="off">
+        <div class="brand brand-lg">
+          <span class="brand-mark">TC</span>
+          <div>
+            <h1>Tavern Card Studio</h1>
+            <p>服务端管理面板</p>
+          </div>
+        </div>
+        <label class="field">
+          <span>访问令牌</span>
+          <input id="login-token" type="password" placeholder="粘贴 data/config.json 里的 auth.token" required />
+        </label>
+        <p class="hint" id="login-hint">令牌保存在本机 localStorage，不会上传到任何地方。</p>
+        <button class="btn btn-primary" type="submit">连接</button>
+      </form>
+    </div>
+
+    <div id="app" class="layout" hidden>
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">TC</span>
+          <div>
+            <strong>Tavern Card Studio</strong>
+            <small>Server Console</small>
+          </div>
+        </div>
+        <nav class="nav">
+          <button class="nav-item is-active" data-view="overview"><span>总览</span></button>
+          <button class="nav-item" data-view="service"><span>服务控制</span></button>
+          <button class="nav-item" data-view="config"><span>参数配置</span></button>
+          <button class="nav-item" data-view="logs"><span>运行日志</span></button>
+          <button class="nav-item" data-view="api"><span>API 与令牌</span></button>
+        </nav>
+        <div class="sidebar-foot">
+          <div class="pill" id="side-state">未连接</div>
+          <button class="link" id="logout">退出</button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h2 id="view-title">总览</h2>
+            <p class="muted" id="view-sub">本地部署 · 数据不出机器</p>
+          </div>
+          <div class="topbar-right">
+            <span class="pill" id="worker-pill">worker —</span>
+            <span class="muted mono" id="clock"></span>
+          </div>
+        </header>
+
+        <section class="view" data-view="overview">
+          <div class="grid cards">
+            <article class="card stat">
+              <span class="stat-label">角色卡</span>
+              <strong id="stat-cards">—</strong>
+              <span class="muted">张（未删除）</span>
+            </article>
+            <article class="card stat">
+              <span class="stat-label">版本</span>
+              <strong id="stat-versions">—</strong>
+              <span class="muted">次提交</span>
+            </article>
+            <article class="card stat">
+              <span class="stat-label">原始字节</span>
+              <strong id="stat-bytes">—</strong>
+              <span class="muted" id="stat-blobs">blob —</span>
+            </article>
+            <article class="card stat">
+              <span class="stat-label">服务运行</span>
+              <strong id="stat-uptime">—</strong>
+              <span class="muted" id="stat-pid">pid —</span>
+            </article>
+          </div>
+
+          <div class="grid two">
+            <article class="card">
+              <h3>服务状态</h3>
+              <dl class="kv">
+                <dt>数据面</dt><dd id="ov-state">—</dd>
+                <dt>API 地址</dt><dd class="mono" id="ov-api">—</dd>
+                <dt>管理面板</dt><dd class="mono" id="ov-panel">—</dd>
+                <dt>数据目录</dt><dd class="mono" id="ov-data">—</dd>
+                <dt>最近退出</dt><dd id="ov-exit">—</dd>
+              </dl>
+              <p class="hint" id="ov-hint"></p>
+            </article>
+            <article class="card">
+              <h3>存储布局</h3>
+              <ul class="bullets">
+                <li><code>blobs/</code>：上传字节按 sha256 原样存放，读取逐字节校验</li>
+                <li><code>repos/&lt;cardId&gt;.git</code>：每个角色卡一个裸仓库，提交里含 <code>card.json</code> 与 <code>audit.json</code></li>
+                <li><code>state.db</code>：SQLite 索引（名称、版本指针、审计摘要、事件）</li>
+                <li><code>logs/</code>：服务日志与 worker 输出</li>
+              </ul>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" data-view="service" hidden>
+          <article class="card">
+            <h3>后台服务</h3>
+            <p class="muted">数据面 worker 独立于本面板运行；停止或重启时面板保持在线。</p>
+            <div class="service-row">
+              <span class="big-state" id="svc-state">—</span>
+              <div class="btn-group">
+                <button class="btn" id="svc-start">启动</button>
+                <button class="btn" id="svc-stop">停止</button>
+                <button class="btn btn-primary" id="svc-restart">重启</button>
+              </div>
+            </div>
+            <dl class="kv">
+              <dt>进程号</dt><dd id="svc-pid">—</dd>
+              <dt>启动时间</dt><dd id="svc-started">—</dd>
+              <dt>自动拉起次数</dt><dd id="svc-restarts">—</dd>
+              <dt>健康检查</dt><dd id="svc-health">—</dd>
+            </dl>
+            <p class="hint">Linux/macOS 可用 systemd/launchd 托管 <code>tcs-server serve</code>；Windows 服务见「部署说明」。</p>
+          </article>
+        </section>
+
+        <section class="view" data-view="config" hidden>
+          <div class="grid two">
+            <article class="card">
+              <h3>网络</h3>
+              <label class="field"><span>API 端口</span><input id="cfg-port" type="number" min="1" max="65535" /></label>
+              <label class="field"><span>管理面板端口</span><input id="cfg-controlPort" type="number" min="1" max="65535" /></label>
+              <label class="field">
+                <span>API 监听地址</span>
+                <input id="cfg-host" type="text" />
+                <small class="hint">客户端连的这个。给局域网用填 <code>0.0.0.0</code>；只本机用保持 <code>127.0.0.1</code>。</small>
+              </label>
+              <label class="field">
+                <span>管理面板监听地址</span>
+                <input id="cfg-controlHost" type="text" />
+                <small class="hint">面板只给本机运维用，默认 <code>127.0.0.1</code>。<strong>与上面的 API 地址相互独立</strong>——改了 API 地址不会连带暴露面板。</small>
+              </label>
+              <label class="field"><span>上传上限（字节）</span><input id="cfg-maxUploadBytes" type="number" min="1024" /></label>
+            </article>
+            <article class="card">
+              <h3>路径与默认规则</h3>
+              <label class="field"><span>数据目录</span><input id="cfg-dataDir" type="text" /></label>
+              <label class="field"><span>规则目录</span><input id="cfg-rulesDir" type="text" /></label>
+              <label class="field"><span>默认平台规则</span><input id="cfg-defaultPlatformRule" type="text" /></label>
+              <label class="field"><span>默认 TXT 预设</span><input id="cfg-defaultPreset" type="text" /></label>
+              <label class="field"><span>日志级别</span>
+                <select id="cfg-logLevel">
+                  <option value="debug">debug</option>
+                  <option value="info">info</option>
+                  <option value="warn">warn</option>
+                  <option value="error">error</option>
+                </select>
+              </label>
+            </article>
+          </div>
+          <article class="card">
+            <h3>服务注册信息</h3>
+            <div class="grid three">
+              <label class="field"><span>托管方式</span>
+                <select id="cfg-serviceMode">
+                  <option value="process">process（本进程托管）</option>
+                  <option value="windows-service">windows-service（SCM）</option>
+                </select>
+              </label>
+              <label class="field"><span>服务名</span><input id="cfg-serviceName" type="text" /></label>
+              <label class="field"><span>显示名</span><input id="cfg-serviceDisplayName" type="text" /></label>
+            </div>
+            <label class="check"><input id="cfg-autoStart" type="checkbox" /> 开机自启（安装服务时写入 start= auto）</label>
+            <label class="check"><input id="cfg-authRequire" type="checkbox" /> 强制令牌鉴权（监听非回环地址时必须开启）</label>
+          </article>
+          <div class="actions">
+            <button class="btn btn-primary" id="cfg-save">保存配置</button>
+            <span class="muted" id="cfg-msg"></span>
+          </div>
+        </section>
+
+        <section class="view" data-view="logs" hidden>
+          <article class="card">
+            <div class="card-head">
+              <h3>worker 输出</h3>
+              <div class="btn-group">
+                <button class="btn btn-small" id="logs-refresh">刷新</button>
+                <label class="check inline"><input id="logs-auto" type="checkbox" checked /> 自动刷新</label>
+              </div>
+            </div>
+            <pre class="log" id="log-box">（暂无日志）</pre>
+            <p class="hint" id="log-path"></p>
+          </article>
+        </section>
+
+        <section class="view" data-view="api" hidden>
+          <div class="grid two">
+            <article class="card">
+              <h3>访问令牌</h3>
+              <p class="muted">客户端（Electron）与服务端使用同一个 Bearer token。</p>
+              <div class="token-row">
+                <input id="token-input" type="text" readonly value="（已隐藏，点击显示）" />
+                <button class="btn btn-small" id="token-show">显示</button>
+                <button class="btn btn-small" id="token-copy">复制</button>
+              </div>
+              <button class="btn btn-danger" id="token-rotate">轮换令牌</button>
+              <p class="hint">轮换后旧令牌立即失效，并自动重启后台服务。</p>
+            </article>
+            <article class="card">
+              <h3>常用接口</h3>
+              <ul class="endpoints">
+                <li><span class="method get">GET</span><code>/api/cards</code></li>
+                <li><span class="method post">POST</span><code>/api/cards</code>（原始字节）</li>
+                <li><span class="method get">GET</span><code>/api/cards/:id/raw?version=latest</code></li>
+                <li><span class="method post">POST</span><code>/api/cards/:id/versions</code></li>
+                <li><span class="method get">GET</span><code>/api/cards/:id/diff?from=1&amp;to=2</code></li>
+                <li><span class="method post">POST</span><code>/api/cards/:id/rollback</code></li>
+                <li><span class="method get">GET</span><code>/api/cards/:id/audit?version=2</code></li>
+                <li><span class="method get">GET</span><code>/api/health</code>（免鉴权）</li>
+              </ul>
+              <p class="hint">完整说明见 <code>docs/08-server-api.md</code>。</p>
+            </article>
+          </div>
+        </section>
+
+        <footer class="footer">
+          <span id="foot-version"></span>
+          <span class="dot">·</span>
+          <span>数据仅存本机</span>
+        </footer>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

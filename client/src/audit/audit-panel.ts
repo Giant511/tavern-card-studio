@@ -1,0 +1,405 @@
+/**
+ * 审计面板（T6.5）。
+ *
+ * 结构：
+ *   ┌ 摘要（等级计数，可点击当筛选器）
+ *   ├ 筛选条（严重度 / 类别 / 板块 / 关键字）
+ *   ├ 字数分布（六板块条形 + 合计）
+ *   └ 问题列表（按板块或类别分组；每条可点击定位）
+ *
+ * 约束：
+ *   · 位置信息**只消费**报告里的 location（blockId/line/column/start/end），
+ *     这里不做任何"从文本反推偏移"的计算；
+ *   · 渲染只走 textContent / createElement，不用 innerHTML（见 validate 第 11 项）；
+ *   · 视图模型（过滤/分组/排序/字数）在 audit-model.ts，本文件只管画。
+ */
+
+import type { AuditIssue, AuditReport, BlockId, IssueCategory, Severity } from '@tcs/shared';
+
+import {
+  CATEGORY_LABELS,
+  EMPTY_FILTER,
+  SEVERITY_LABELS,
+  buildWordBars,
+  countByCategory,
+  countBySeverity,
+  filterIssues,
+  filterSummary,
+  groupIssues,
+  sortIssues,
+  type AuditFilter,
+  type GroupMode,
+} from './audit-model';
+
+function el<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  className?: string,
+  text?: string,
+): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+export interface AuditPanelOptions {
+  /** 点击某条问题（定位到板块内偏移） */
+  onLocate: (issue: AuditIssue) => void;
+  /** 点击板块行（展开并聚焦该板块） */
+  onFocusBlock?: (blockId: BlockId) => void;
+}
+
+const BLOCK_FILTER_OPTIONS: Array<{ value: BlockId | 'all' | null; label: string }> = [
+  { value: 'all', label: '全部板块' },
+  { value: 'basic', label: '基本信息' },
+  { value: 'personality', label: '性格' },
+  { value: 'settings', label: '其他设定' },
+  { value: 'special', label: '特殊设定' },
+  { value: 'user', label: '用户相关设定' },
+  { value: 'worldbook', label: '世界书' },
+  { value: null, label: '仅全文级' },
+];
+
+const CATEGORIES: IssueCategory[] = ['completeness', 'format', 'platform-rule', 'structure'];
+
+export class AuditPanel {
+  private readonly root: HTMLElement;
+  private readonly summaryEl: HTMLElement;
+  private readonly filterBar: HTMLElement;
+  private readonly wordSection: HTMLElement;
+  private readonly listEl: HTMLElement;
+  private readonly countEl: HTMLElement;
+
+  private report: AuditReport | null = null;
+  private filter: AuditFilter = { ...EMPTY_FILTER };
+  private groupMode: GroupMode = 'block';
+  private activeIssueId: string | null = null;
+
+  constructor(
+    private readonly options: AuditPanelOptions,
+    mount: HTMLElement,
+  ) {
+    this.root = mount;
+
+    // 摘要
+    this.summaryEl = el('div', 'audit-summary');
+    // 筛选条
+    this.filterBar = el('div', 'audit-filters');
+    // 字数分布
+    this.wordSection = el('div', 'audit-words');
+    // 计数 + 列表
+    const listHead = el('div', 'audit-list-head');
+    this.countEl = el('span', 'audit-count', '—');
+    listHead.append(this.countEl);
+    this.listEl = el('div', 'audit-list');
+
+    this.root.append(this.summaryEl, this.filterBar, this.wordSection, listHead, this.listEl);
+    this.renderFilters();
+  }
+
+  /** 设置新报告并重绘（编辑后由 app 调用） */
+  setReport(report: AuditReport): void {
+    this.report = report;
+    this.render();
+  }
+
+  /** 外部要求聚焦某条问题（例如从编辑器跳过来） */
+  setActiveIssue(issueId: string | null): void {
+    this.activeIssueId = issueId;
+    this.renderList();
+  }
+
+  getFilter(): AuditFilter {
+    return this.filter;
+  }
+
+  // ── 筛选条 ───────────────────────────────────────────────
+  private renderFilters(): void {
+    this.filterBar.replaceChildren();
+
+    // 严重度：紧凑的分段按钮
+    const severityRow = el('div', 'filter-row');
+    severityRow.append(el('span', 'filter-label', '等级'));
+    for (const severity of ['error', 'warning', 'info'] as Severity[]) {
+      const button = el('button', `chip chip-${severity}`);
+      button.type = 'button';
+      button.dataset['severity'] = severity;
+      const dot = el('span', `dot ${severity}`);
+      const text = el('span', 'chip-text', SEVERITY_LABELS[severity]);
+      const count = el('span', 'chip-count', '0');
+      button.append(dot, text, count);
+      button.addEventListener('click', () => {
+        const next = new Set(this.filter.severities);
+        if (next.has(severity)) next.delete(severity);
+        else next.add(severity);
+        this.filter = { ...this.filter, severities: next };
+        this.render();
+      });
+      severityRow.append(button);
+    }
+    this.filterBar.append(severityRow);
+
+    // 类别
+    const categoryRow = el('div', 'filter-row');
+    categoryRow.append(el('span', 'filter-label', '类别'));
+    for (const category of CATEGORIES) {
+      const button = el('button', 'chip chip-category');
+      button.type = 'button';
+      button.dataset['category'] = category;
+      const text = el('span', 'chip-text', CATEGORY_LABELS[category]);
+      const count = el('span', 'chip-count', '0');
+      button.append(text, count);
+      button.addEventListener('click', () => {
+        const next = new Set(this.filter.categories);
+        if (next.has(category)) next.delete(category);
+        else next.add(category);
+        this.filter = { ...this.filter, categories: next };
+        this.render();
+      });
+      categoryRow.append(button);
+    }
+    this.filterBar.append(categoryRow);
+
+    // 板块 + 分组 + 搜索
+    const controlRow = el('div', 'filter-row');
+
+    const blockSelect = el('select', 'select') as HTMLSelectElement;
+    blockSelect.dataset['role'] = 'block-filter';
+    for (const option of BLOCK_FILTER_OPTIONS) {
+      const node = el('option');
+      node.value = option.value === null ? '__global__' : option.value;
+      node.textContent = option.label;
+      blockSelect.append(node);
+    }
+    blockSelect.value = 'all';
+    blockSelect.addEventListener('change', () => {
+      const raw = blockSelect.value;
+      this.filter = {
+        ...this.filter,
+        blockId: raw === '__global__' ? null : (raw as BlockId | 'all'),
+      };
+      this.render();
+    });
+    controlRow.append(blockSelect);
+
+    const groupSelect = el('select', 'select') as HTMLSelectElement;
+    groupSelect.dataset['role'] = 'group-mode';
+    for (const [value, label] of [
+      ['block', '按板块分组'],
+      ['category', '按类别分组'],
+      ['none', '不分组'],
+    ] as Array<[GroupMode, string]>) {
+      const node = el('option');
+      node.value = value;
+      node.textContent = label;
+      groupSelect.append(node);
+    }
+    groupSelect.value = this.groupMode;
+    groupSelect.addEventListener('change', () => {
+      this.groupMode = groupSelect.value as GroupMode;
+      this.renderList();
+    });
+    controlRow.append(groupSelect);
+
+    this.filterBar.append(controlRow);
+
+    // 搜索
+    const searchRow = el('div', 'filter-row');
+    const search = el('input', 'input search') as HTMLInputElement;
+    search.type = 'search';
+    search.placeholder = '搜索问题内容…';
+    search.dataset['role'] = 'search';
+    search.addEventListener('input', () => {
+      this.filter = { ...this.filter, query: search.value };
+      this.render();
+    });
+    const reset = el('button', 'btn ghost small', '重置');
+    reset.type = 'button';
+    reset.addEventListener('click', () => {
+      this.filter = { ...EMPTY_FILTER };
+      search.value = '';
+      blockSelect.value = 'all';
+      this.render();
+    });
+    searchRow.append(search, reset);
+    this.filterBar.append(searchRow);
+  }
+
+  // ── 渲染主流程 ────────────────────────────────────────────
+  private render(): void {
+    if (!this.report) {
+      this.summaryEl.textContent = '尚未审计';
+      return;
+    }
+
+    this.renderSummary();
+    this.renderFilterCounts();
+    this.renderWords();
+    this.renderList();
+  }
+
+  private renderSummary(): void {
+    const report = this.report!;
+    const { error, warning, info, exportable } = report.summary;
+
+    this.summaryEl.replaceChildren();
+    this.summaryEl.className = `audit-summary ${error > 0 ? 'bad' : warning > 0 ? 'warn' : 'ok'}`;
+
+    const line = el('div', 'summary-line');
+    line.append(
+      el('span', `summary-item ${error > 0 ? 'bad' : ''}`, `错误 ${error}`),
+      el('span', `summary-item ${warning > 0 ? 'warn' : ''}`, `警告 ${warning}`),
+      el('span', 'summary-item', `提示 ${info}`),
+      el('span', `summary-badge ${exportable ? 'ok' : 'bad'}`, exportable ? '可导出' : '不可导出'),
+    );
+    this.summaryEl.append(line);
+    // 只保留字数（等级计数已在上面的 line 里，不再重复一次）
+    this.summaryEl.append(
+      el('div', 'summary-meta', `六板块合计 ${report.wordCount.total.chars} 字符 / ${report.wordCount.total.totalWords} 字`),
+    );
+  }
+
+  private renderFilterCounts(): void {
+    const report = this.report!;
+    const severityCounts = countBySeverity(report.issues);
+    const categoryCounts = countByCategory(report);
+
+    for (const button of this.filterBar.querySelectorAll<HTMLButtonElement>('.chip')) {
+      const severity = button.dataset['severity'] as Severity | undefined;
+      const category = button.dataset['category'] as IssueCategory | undefined;
+      const countNode = button.querySelector('.chip-count');
+      let active = false;
+
+      if (severity) {
+        if (countNode) countNode.textContent = String(severityCounts[severity] ?? 0);
+        active = this.filter.severities.has(severity);
+      } else if (category) {
+        if (countNode) countNode.textContent = String(categoryCounts[category] ?? 0);
+        active = this.filter.categories.has(category);
+      }
+
+      button.classList.toggle('active', active);
+    }
+  }
+
+  private renderWords(): void {
+    const report = this.report!;
+    const bars = buildWordBars(report);
+
+    this.wordSection.replaceChildren();
+    const head = el('div', 'words-head');
+    head.append(
+      el('span', 'words-title', '字数分布'),
+      el(
+        'span',
+        'words-total',
+        `合计 ${report.wordCount.total.chars} 字符 / ${report.wordCount.total.totalWords} 字`,
+      ),
+    );
+    this.wordSection.append(head);
+
+    const chart = el('div', 'words-chart');
+    for (const bar of bars) {
+      const row = el('button', 'word-row');
+      row.type = 'button';
+      row.dataset['blockId'] = bar.blockId;
+      row.title = `点击定位到「${bar.label}」`;
+
+      const label = el('span', 'word-label', bar.label);
+      const track = el('span', 'word-track');
+      const fill = el('span', 'word-fill');
+      fill.style.width = `${bar.percent}%`;
+      track.append(fill);
+      const value = el('span', 'word-value', `${bar.chars}（${bar.share}%）`);
+
+      row.append(label, track, value);
+      row.addEventListener('click', () => this.options.onFocusBlock?.(bar.blockId));
+      chart.append(row);
+    }
+    this.wordSection.append(chart);
+
+    // 落盘字段口径（与平台长度规则同一口径，容易和"六板块合计"混淆，所以单列）
+    const byField = report.wordCount.byField;
+    const fieldRow = el('div', 'words-fields');
+    fieldRow.append(el('span', 'words-fields-title', '落盘字段口径'));
+    fieldRow.append(
+      el('span', 'words-field', `description ${byField.description.totalWords}`),
+      el('span', 'words-field', `personality ${byField.personality.totalWords}`),
+      el('span', 'words-field', `character_book ${byField.character_book.totalWords}`),
+    );
+    this.wordSection.append(fieldRow);
+  }
+
+  private renderList(): void {
+    const report = this.report;
+    if (!report) return;
+
+    const filtered = filterIssues(report.issues, this.filter);
+    const sorted = sortIssues(filtered);
+    this.countEl.textContent = filterSummary(report.issues.length, sorted.length);
+
+    this.listEl.replaceChildren();
+
+    if (sorted.length === 0) {
+      const empty = el(
+        'p',
+        'issue-empty',
+        report.issues.length === 0 ? '当前平台规则下未发现问题' : '没有符合筛选条件的问题',
+      );
+      this.listEl.append(empty);
+      return;
+    }
+
+    for (const group of groupIssues(sorted, this.groupMode)) {
+      const section = el('section', 'audit-group');
+      const head = el('div', `group-head ${group.worstSeverity ?? 'info'}`);
+      head.append(
+        el('span', 'group-title', group.title),
+        el('span', 'group-count', String(group.issues.length)),
+      );
+      section.append(head);
+
+      for (const issue of group.issues) {
+        section.append(this.renderIssue(issue));
+      }
+      this.listEl.append(section);
+    }
+  }
+
+  private renderIssue(issue: AuditIssue): HTMLElement {
+    const item = el('button', `issue ${issue.severity}`);
+    item.type = 'button';
+    item.dataset['issueId'] = issue.id;
+    if (issue.id === this.activeIssueId) item.classList.add('active');
+
+    const head = el('span', 'issue-head');
+    head.append(el('span', `dot ${issue.severity}`));
+    // 位置：行号优先（人能对上），列号补充（便于精确判断）
+    const position: string[] = [];
+    if (issue.location.line !== null) position.push(`第 ${issue.location.line} 行`);
+    if (issue.location.column !== null) position.push(`第 ${issue.location.column} 列`);
+    // 没有任何位置信息（aggregate 或 blockId=null）时也要给一句话，
+    // 否则头部只剩一个圆点，看起来像渲染坏了。
+    if (position.length === 0) position.push(issue.aggregate ? '全文统计' : '全文');
+    head.append(el('span', 'issue-pos', position.join(' ')));
+    head.append(el('span', 'issue-rule', issue.ruleId));
+    item.append(head);
+
+    item.append(el('span', 'issue-msg', issue.message));
+
+    if (issue.hint) item.append(el('span', 'issue-hint', issue.hint));
+
+    if (issue.location.lineText && issue.location.lineText.trim() !== '') {
+      const code = el('code', 'issue-line');
+      code.textContent = issue.location.lineText.trim();
+      item.append(code);
+    }
+
+    item.addEventListener('click', () => {
+      this.setActiveIssue(issue.id);
+      this.options.onLocate(issue);
+    });
+
+    return item;
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "dark",
+  "name": "深色（继承默认）",
+  "version": "1.0.0",
+  "description": "演示 extends 的写法：只覆盖 theme 与三条 scope 的颜色，规则集整体继承 default（本文件额外追加一条 TODO 标记规则）。加载时引擎按 id 合并——同名 scope/rule 覆盖父级，未提及的全部保留。",
+  "extends": "default",
+  "editor": {
+    "fontSize": 15,
+    "lineHeight": 1.8
+  },
+  "theme": {
+    "foreground": "#d8dee9",
+    "background": "#1c1f26",
+    "caret": "#ffcc66",
+    "selectionBackground": "#31405a"
+  },
+  "scopes": [
+    { "id": "heading", "label": "板块/小节标题", "color": "#8ec7ff", "bold": true },
+    { "id": "placeholder", "label": "占位符（{{char}}/{{user}}）", "color": "#ff9f7a", "backgroundColor": "#3a2a24", "bold": true },
+    { "id": "dialogue", "label": "对话引号内容", "color": "#7fd1c1" }
+  ],
+  "rules": [
+    {
+      "id": "todo-marker",
+      "scope": "comment",
+      "priority": 15,
+      "match": { "type": "regex", "pattern": "^\\s*(TODO|FIXME)[:：].*$", "flags": "gm", "wholeLine": true }
+    }
+  ],
+  "metadata": {
+    "author": "Tavern Card Studio",
+    "license": "MIT",
+    "updatedAt": "2026-10-21"
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "../schema/preset.schema.json",
+  "schemaVersion": 1,
+  "id": "markdown",
+  "name": "Markdown · 二级标题",
+  "version": "1.0.0",
+  "description": "## 标题 + 空行分隔，适合直接贴进支持 Markdown 的平台。板块顺序与默认预设一致。",
+  "builtin": true,
+  "blockOrder": ["basic", "personality", "settings", "special", "user", "worldbook"],
+  "headings": {
+    "basic": {
+      "pattern": "## {title}",
+      "aliases": ["基本信息", "基本资料", "基础信息", "角色信息", "角色档案", "档案", "信息"]
+    },
+    "personality": {
+      "pattern": "## {title}",
+      "aliases": ["性格", "性格设定", "个性", "性格特征", "personality"]
+    },
+    "settings": {
+      "pattern": "## {title}",
+      "aliases": ["其他设定", "其它设定", "其他", "其他信息", "输出设定", "行为准则"]
+    },
+    "special": {
+      "pattern": "## {title}",
+      "aliases": ["特殊设定", "特别设定", "特殊", "特殊规则"]
+    },
+    "user": {
+      "pattern": "## {title}",
+      "aliases": ["用户相关设定", "用户设定", "玩家设定", "用户相关", "用户信息", "user"]
+    },
+    "worldbook": {
+      "pattern": "## {title}",
+      "aliases": ["世界书", "世界观", "世界设定", "设定集", "worldbook", "world info"]
+    }
+  },
+  "separator": "\n\n",
+  "worldbook": { "includeHeading": true },
+  "meta": { "author": "Tavern Card Studio", "updatedAt": "2026-10-21" }
+}

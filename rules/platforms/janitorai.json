@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 1,
+  "id": "janitorai",
+  "name": "JanitorAI",
+  "version": "1.0.0",
+  "description": "JanitorAI 适配规则。要点：只认 {{char}} / {{user}} 双花括号占位符（不识别 <BOT>/<USER> 伪标签）；平台不支持内嵌世界书（character_book），世界书需迁到站点 Lorebook；开场白必须存在。具体字数上限以站点当前政策为准，可在本文件 maxLength 中自行调整。",
+  "extends": "ccv2",
+  "target": {
+    "spec": "v2",
+    "specVersion": "2.0"
+  },
+  "placeholders": {
+    "char": ["{{char}}"],
+    "user": ["{{user}}"]
+  },
+  "fields": [
+    {
+      "path": "meta.name",
+      "label": "角色名",
+      "required": true,
+      "minLength": 1,
+      "maxLength": 50,
+      "severity": "error",
+      "message": "JanitorAI 角色名不能为空，且建议不超过 50 字符"
+    },
+    {
+      "path": "description",
+      "label": "角色描述",
+      "required": true,
+      "minLength": 20,
+      "severity": "error",
+      "message": "JanitorAI 要求角色描述有效内容（至少 20 字）"
+    },
+    {
+      "path": "first_mes",
+      "label": "开场白",
+      "required": true,
+      "minLength": 1,
+      "severity": "error",
+      "message": "JanitorAI 要求必须有开场白（first message）"
+    },
+    {
+      "path": "meta.tags",
+      "label": "标签",
+      "required": false,
+      "severity": "info",
+      "message": "建议至少填写 1 个标签，便于站点检索"
+    }
+  ],
+  "rules": [
+    {
+      "id": "char-placeholder-required",
+      "type": "placeholder-min-count",
+      "token": "char",
+      "min": 1,
+      "aggregate": true,
+      "scope": ["block:basic", "block:settings", "block:special"],
+      "severity": "error",
+      "message": "必须在正文中使用 {{char}} 指代角色，JanitorAI 不会替换写死的角色名",
+      "hint": "把「角色名」替换为 {{char}}。"
+    },
+    {
+      "id": "user-placeholder-required",
+      "type": "placeholder-min-count",
+      "token": "user",
+      "min": 1,
+      "scope": "block:user",
+      "severity": "warning",
+      "message": "「用户相关设定」未使用 {{user}} 指代玩家",
+      "hint": "把「你」「玩家」等替换为 {{user}}。"
+    },
+    {
+      "id": "forbid-angle-tags",
+      "type": "pattern-forbid",
+      "pattern": "<\\s*(BOT|CHAR|USER|PERSONA)\\s*>",
+      "scope": "*",
+      "severity": "error",
+      "message": "JanitorAI 不识别 <BOT>/<USER> 形式伪标签，导入后会原样显示",
+      "hint": "改为 {{char}} / {{user}}。"
+    },
+    {
+      "id": "forbid-square-tags",
+      "type": "pattern-forbid",
+      "pattern": "\\[(BOT|CHAR|USER)\\]",
+      "scope": "*",
+      "severity": "warning",
+      "message": "出现 [BOT]/[USER] 形式标记，JanitorAI 不会替换",
+      "hint": "改为 {{char}} / {{user}}。"
+    },
+    {
+      "id": "worldbook-not-supported",
+      "type": "length",
+      "max": 0,
+      "scope": "field:character_book",
+      "severity": "warning",
+      "message": "JanitorAI 不支持内嵌世界书，导出后世界书内容会丢失",
+      "hint": "请先在站点创建 Lorebook，或切回 SillyTavern/Chub 规则导出。"
+    },
+    {
+      "id": "no-html-tags",
+      "type": "pattern-forbid",
+      "pattern": "</?(div|span|p|br|b|i|u)\\b[^>]*>",
+      "scope": "*",
+      "severity": "info",
+      "message": "正文包含 HTML 标签，JanitorAI 会以纯文本显示"
+    }
+  ],
+  "autoFix": [
+    {
+      "type": "replace-regex",
+      "pattern": "<\\s*(?:BOT|CHAR)\\s*>",
+      "flags": "gi",
+      "replacement": "{{char}}"
+    },
+    {
+      "type": "replace-regex",
+      "pattern": "<\\s*(?:USER|PERSONA)\\s*>",
+      "flags": "gi",
+      "replacement": "{{user}}"
+    },
+    { "type": "replace-regex", "pattern": "\\[(?:BOT|CHAR)\\]", "flags": "gi", "replacement": "{{char}}" },
+    { "type": "replace-regex", "pattern": "\\[(?:USER|PERSONA)\\]", "flags": "gi", "replacement": "{{user}}" }
+  ],
+  "metadata": {
+    "author": "Tavern Card Studio",
+    "license": "MIT",
+    "updatedAt": "2026-10-21"
+  }
+}

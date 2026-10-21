@@ -1,0 +1,22 @@
+@@ENTRY 0
+name: 书店位置
+keys: 拾光, 书店
+secondary_keys:
+enabled: true
+insertion_order: 100
+position: before_char
+priority: 10
+case_sensitive: false
+@@CONTENT
+「拾光」书店位于旧城区青石巷 17 号，两层砖木结构，一楼营业，二楼仓库。
+@@END 0
+
+@@ENTRY 1
+name: 银耳钉
+keys: 银耳钉, 耳钉
+enabled: true
+insertion_order: 110
+case_sensitive: false
+@@CONTENT
+银耳钉是{{char}}母亲留下的唯一物件，从不摘下。
+@@END 1

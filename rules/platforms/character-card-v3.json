@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "id": "ccv3",
+  "name": "Character Card V3",
+  "version": "1.0.0",
+  "description": "Character Card V3（spec=chara_card_v3, spec_version=3.0）。在 V2 基础上新增 nickname、group_only_greetings、creator_notes_multilingual、assets、creation/modification_date；本规则在 V2 之上追加 V3 相关约定。",
+  "extends": "ccv2",
+  "target": {
+    "spec": "v3",
+    "specVersion": "3.0"
+  },
+  "placeholders": {
+    "char": ["{{char}}"],
+    "user": ["{{user}}"]
+  },
+  "fields": [
+    {
+      "path": "meta.name",
+      "label": "角色名",
+      "required": true,
+      "minLength": 1,
+      "maxLength": 64,
+      "severity": "error",
+      "message": "V3 规范要求 data.name 非空"
+    },
+    {
+      "path": "description",
+      "label": "角色描述",
+      "required": true,
+      "minLength": 1,
+      "severity": "error",
+      "message": "V3 规范要求 data.description 非空"
+    },
+    {
+      "path": "first_mes",
+      "label": "开场白",
+      "required": true,
+      "minLength": 1,
+      "severity": "warning",
+      "message": "V3 规范建议 data.first_mes 非空"
+    },
+    {
+      "path": "group_only_greetings",
+      "label": "群聊专用开场白",
+      "required": false,
+      "severity": "info"
+    }
+  ],
+  "rules": [
+    {
+      "id": "example-uses-start-marker",
+      "type": "pattern-required",
+      "pattern": "<START>",
+      "scope": "field:mes_example",
+      "severity": "warning",
+      "message": "对话示例（mes_example）未使用 <START> 分隔对话轮次",
+      "hint": "ST/CCV3 生态约定用 <START> 标记示例对话的开始。"
+    },
+    {
+      "id": "char-placeholder-required-v3",
+      "type": "placeholder-min-count",
+      "token": "char",
+      "min": 1,
+      "aggregate": true,
+      "scope": ["block:basic", "block:settings"],
+      "severity": "warning",
+      "message": "未使用 {{char}} 指代角色（V3 生态约定）"
+    }
+  ],
+  "autoFix": [],
+  "metadata": {
+    "author": "Tavern Card Studio",
+    "license": "MIT",
+    "updatedAt": "2026-10-21"
+  }
+}
