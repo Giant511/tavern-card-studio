@@ -1,0 +1,21 @@
+{
+  "name": "@tcs/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "角色卡统一内部模型、格式转换、规则引擎、审计的共享核心库（客户端与服务端共用）",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  }
+}

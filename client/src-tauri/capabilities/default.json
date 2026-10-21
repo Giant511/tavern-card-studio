@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口最小权限：只允许单文件对话框、自身配置读写；刻意不授予任意路径 fs 访问与目录选择",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+
+    "dialog:allow-open",
+    "dialog:allow-save",
+
+    "store:default",
+    "log:default",
+    "opener:default",
+
+    "fs:default"
+  ]
+}

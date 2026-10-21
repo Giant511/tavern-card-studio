@@ -1,0 +1,268 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://tavern-card-studio.local/schema/platform-rule.schema.json",
+  "title": "平台规则文件（Platform Rule）",
+  "description": "描述某一平台（SillyTavern / CCV2 / CCV3 / JanitorAI / Chub / 自定义）对角色卡内容层的写法要求。文件格式本身固定，规则只约束内容，不改变角色卡 JSON 结构。",
+  "type": "object",
+  "required": ["schemaVersion", "id", "name", "version", "target", "placeholders", "fields", "rules"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "规则文件格式版本。当前固定为 1，用于未来兼容升级。"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$",
+      "description": "规则唯一标识，小写字母/数字/点/下划线/连字符。自定义规则不得与内置规则重名。"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "界面显示名称，例如「JanitorAI」。"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "规则语义化版本，规则内容变更时递增。"
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 2000,
+      "description": "规则说明：该平台的内容风格、常见限制、来源依据。"
+    },
+    "extends": {
+      "type": ["string", "null"],
+      "description": "继承的父规则 id。子规则会先应用父规则，再用自身同名 id 的规则覆盖；null 表示不继承。",
+      "default": null
+    },
+    "target": {
+      "type": "object",
+      "description": "导出目标规范，决定保存/导出时写哪一版 SillyTavern JSON。",
+      "required": ["spec"],
+      "additionalProperties": false,
+      "properties": {
+        "spec": {
+          "type": "string",
+          "enum": ["v1", "v2", "v3", "any"],
+          "description": "v1=平铺字段；v2=chara_card_v2；v3=chara_card_v3；any=沿用卡片原有版本。"
+        },
+        "specVersion": {
+          "type": "string",
+          "description": "写入 spec_version 的值，例如 \"2.0\"、\"3.0\"。spec=any 时忽略。"
+        }
+      }
+    },
+    "placeholders": {
+      "type": "object",
+      "description": "占位符词表。规则中的 token 引用这里的键；第一个写法为主写法，平台间切换时用于自动替换。",
+      "required": ["char", "user"],
+      "additionalProperties": false,
+      "properties": {
+        "char": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": { "type": "string", "minLength": 1, "maxLength": 32 },
+          "description": "角色占位符的所有合法写法，按优先级排序，如 [\"{{char}}\", \"<BOT>\"]。"
+        },
+        "user": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": { "type": "string", "minLength": 1, "maxLength": 32 },
+          "description": "用户占位符的所有合法写法，如 [\"{{user}}\", \"<USER>\"]。"
+        },
+        "custom": {
+          "type": "object",
+          "description": "其他占位符，键为自定义名（在规则中以 custom:键名 引用），值为写法数组。",
+          "propertyNames": { "pattern": "^[a-zA-Z][a-zA-Z0-9_]{0,31}$" },
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1, "maxLength": 32 }
+          }
+        }
+      }
+    },
+    "fields": {
+      "type": "array",
+      "description": "字段完整性要求：必填、长度、正则约束。path 使用 ST 原生字段名或模型路径。",
+      "items": { "$ref": "#/definitions/fieldRequirement" },
+      "default": []
+    },
+    "rules": {
+      "type": "array",
+      "description": "内容层规则：占位符、正则、长度、禁用词等。",
+      "items": { "$ref": "#/definitions/contentRule" },
+      "default": []
+    },
+    "autoFix": {
+      "type": "array",
+      "description": "切换平台时的自动适配操作（需用户确认后执行），例如把 <BOT> 替换为 {{char}}。",
+      "items": { "$ref": "#/definitions/autoFixOp" },
+      "default": []
+    },
+    "metadata": {
+      "type": "object",
+      "description": "作者、来源等元信息，不影响规则执行。",
+      "additionalProperties": false,
+      "properties": {
+        "author": { "type": "string", "maxLength": 64 },
+        "homepage": { "type": "string", "maxLength": 256 },
+        "license": { "type": "string", "maxLength": 64 },
+        "updatedAt": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}" }
+      }
+    }
+  },
+  "definitions": {
+    "severity": {
+      "type": "string",
+      "enum": ["error", "warning", "info"],
+      "description": "error=阻断导出（需确认）；warning=提醒；info=提示。"
+    },
+    "selector": {
+      "type": "string",
+      "description": "\"*\" 全部文本板块；\"block:<id>\" 指定板块（basic/personality/settings/special/user/worldbook）；\"field:<ST字段名>\" 指定原生字段。",
+      "pattern": "^(\\*|block:(basic|personality|settings|special|user|worldbook)|field:[a-z_]+)$"
+    },
+    "selectorList": {
+      "oneOf": [
+        { "$ref": "#/definitions/selector" },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/selector" }
+        }
+      ]
+    },
+    "placeholderKey": {
+      "type": "string",
+      "description": "char / user / custom:<名称>",
+      "pattern": "^(char|user|custom:[a-zA-Z][a-zA-Z0-9_]{0,31})$"
+    },
+    "fieldRequirement": {
+      "type": "object",
+      "required": ["path", "label", "required"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "ST 原生字段名（name/description/personality/scenario/first_mes/mes_example/creator_notes/system_prompt/post_history_instructions/alternate_greetings/character_book）或模型路径（meta.name/meta.creator/meta.tags/meta.creatorNotes/meta.characterVersion）。",
+          "pattern": "^(meta\\.[a-zA-Z]+|[a-z_]+)$"
+        },
+        "label": { "type": "string", "minLength": 1, "maxLength": 64, "description": "展示名称，如「角色名」。" },
+        "required": { "type": "boolean", "description": "是否必填。" },
+        "minLength": { "type": "integer", "minimum": 0, "description": "最小字符数（不含空白）。" },
+        "maxLength": { "type": "integer", "minimum": 1, "description": "最大字符数（不含空白）。" },
+        "pattern": { "type": "string", "description": "必须命中的正则（ECMAScript 语法）。" },
+        "flags": { "type": "string", "pattern": "^[gimsuy]*$", "description": "正则标志，如 \"i\"。注意：校验时自动忽略 g/y。" },
+        "severity": { "$ref": "#/definitions/severity" },
+        "message": { "type": "string", "maxLength": 300, "description": "自定义问题文案，缺省使用内置模板。" },
+        "stDefault": {
+          "type": "boolean",
+          "default": false,
+          "description": "该字段在目标规范里有缺省值（如世界书条目的 constant / insertion_order）。true 时「未写出」只报 info，不报 error；false（缺省）时按 severity 报。详见 docs/02 §T4.2。"
+        }
+      }
+    },
+    "contentRule": {
+      "type": "object",
+      "required": ["id", "type", "message", "scope", "severity"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$", "description": "规则 id，在同一文件内唯一；继承时同名覆盖。" },
+        "type": {
+          "type": "string",
+          "enum": [
+            "placeholder-min-count",
+            "placeholder-forbid",
+            "pattern-forbid",
+            "pattern-required",
+            "length",
+            "non-empty",
+            "forbidden-words"
+          ],
+          "description": "规则类型，决定其余字段的语义。"
+        },
+        "message": { "type": "string", "minLength": 1, "maxLength": 300, "description": "问题描述文案，展示在问题列表。" },
+        "hint": { "type": "string", "maxLength": 300, "description": "修复建议。" },
+        "scope": { "$ref": "#/definitions/selectorList" },
+        "severity": { "$ref": "#/definitions/severity" },
+        "enabled": { "type": "boolean", "default": true, "description": "false 时该规则不参与校验，便于用户临时关闭。" },
+        "token": { "$ref": "#/definitions/placeholderKey" },
+        "min": { "type": "integer", "minimum": 0, "description": "最小出现次数 / 最小长度 / 最少匹配数（随 type 变化）。" },
+        "max": { "type": "integer", "minimum": 0, "description": "最大出现次数 / 最大长度（随 type 变化）。" },
+        "pattern": { "type": "string", "description": "type 为 pattern-forbid / pattern-required 时的正则。" },
+        "flags": { "type": "string", "pattern": "^[gimsuy]*$", "description": "正则标志。" },
+        "unit": { "type": "string", "enum": ["char", "word"], "default": "char", "description": "length 规则的计数单位。" },
+        "words": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "description": "forbidden-words 规则的词表。"
+        },
+        "caseSensitive": { "type": "boolean", "default": false, "description": "forbidden-words 是否区分大小写。" },
+        "aggregate": {
+          "type": "boolean",
+          "default": false,
+          "description": "仅用于 placeholder-min-count / pattern-required：true 表示把所有 scope 文本合并统计（全卡至少 N 次），false 表示对每个 scope 文本分别统计（每个板块都至少 N 次）。"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "placeholder-min-count" } }, "required": ["type"] },
+          "then": { "required": ["token", "min"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "placeholder-forbid" } }, "required": ["type"] },
+          "then": { "required": ["token"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "pattern-forbid" } }, "required": ["type"] },
+          "then": { "required": ["pattern"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "pattern-required" } }, "required": ["type"] },
+          "then": { "required": ["pattern"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "forbidden-words" } }, "required": ["type"] },
+          "then": { "required": ["words"] }
+        }
+      ]
+    },
+    "autoFixOp": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["replace-text", "replace-regex", "trim"],
+          "description": "替换字面量 / 正则替换 / 去除首尾空白。"
+        },
+        "ruleId": { "type": "string", "description": "关联的规则 id，仅当该规则报错时才执行该修复。" },
+        "scope": { "$ref": "#/definitions/selectorList" },
+        "from": { "type": "string", "minLength": 1, "description": "replace-text 的查找文本（字面量）。" },
+        "to": { "type": "string", "description": "replace-text 的替换文本。" },
+        "caseSensitive": { "type": "boolean", "default": true, "description": "replace-text 是否区分大小写。" },
+        "pattern": { "type": "string", "description": "replace-regex 的查找正则。" },
+        "flags": { "type": "string", "pattern": "^[gimsuy]*$", "description": "replace-regex 的正则标志。" },
+        "replacement": { "type": "string", "description": "replace-regex 的替换文本，支持 $1 等捕获组引用。" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "replace-text" } }, "required": ["type"] },
+          "then": { "required": ["from", "to"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "replace-regex" } }, "required": ["type"] },
+          "then": { "required": ["pattern", "replacement"] }
+        }
+      ]
+    }
+  }
+}

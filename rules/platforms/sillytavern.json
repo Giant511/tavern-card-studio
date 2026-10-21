@@ -1,0 +1,106 @@
+{
+  "schemaVersion": 1,
+  "id": "sillytavern",
+  "name": "SillyTavern（原生）",
+  "version": "1.0.0",
+  "description": "SillyTavern 原生规则。官方对内容写法基本不设限，因此本规则以「结构完整 + 占位符规范」为主：字段缺失为 error，占位符问题只做 info/warning 提示，不阻断导出。",
+  "extends": null,
+  "target": {
+    "spec": "any"
+  },
+  "placeholders": {
+    "char": ["{{char}}"],
+    "user": ["{{user}}"],
+    "custom": {
+      "persona": ["{{persona}}"],
+      "original": ["{{original}}"]
+    }
+  },
+  "fields": [
+    {
+      "path": "meta.name",
+      "label": "角色名",
+      "required": true,
+      "minLength": 1,
+      "maxLength": 64,
+      "severity": "error",
+      "message": "角色名（name）不能为空"
+    },
+    {
+      "path": "description",
+      "label": "角色描述",
+      "required": true,
+      "minLength": 1,
+      "severity": "error",
+      "message": "角色描述（description）不能为空"
+    },
+    {
+      "path": "first_mes",
+      "label": "开场白",
+      "required": true,
+      "minLength": 1,
+      "severity": "warning",
+      "message": "开场白（first_mes）为空，聊天将没有默认开场"
+    },
+    {
+      "path": "meta.creator",
+      "label": "作者",
+      "required": false,
+      "maxLength": 128,
+      "severity": "info"
+    }
+  ],
+  "rules": [
+    {
+      "id": "char-placeholder-suggested",
+      "type": "placeholder-min-count",
+      "token": "char",
+      "min": 1,
+      "scope": ["block:basic", "block:settings"],
+      "severity": "info",
+      "message": "正文中未出现 {{char}} 占位符，角色名硬编码后换卡易失效",
+      "hint": "建议用 {{char}} 代替角色名，SillyTavern 会自动替换。"
+    },
+    {
+      "id": "user-placeholder-suggested",
+      "type": "placeholder-min-count",
+      "token": "user",
+      "min": 1,
+      "scope": "block:user",
+      "severity": "info",
+      "message": "「用户相关设定」板块未出现 {{user}} 占位符",
+      "hint": "建议用 {{user}} 指代玩家角色，避免硬编码「你」。"
+    },
+    {
+      "id": "placeholder-inner-spacing",
+      "type": "pattern-forbid",
+      "pattern": "\\{\\{\\s+(char|user)\\s+\\}\\}",
+      "scope": "*",
+      "severity": "warning",
+      "message": "占位符内含多余空格，部分前端无法识别",
+      "hint": "请写成 {{char}} / {{user}}。"
+    },
+    {
+      "id": "unknown-double-brace",
+      "type": "pattern-forbid",
+      "pattern": "\\{\\{(?!(char|user|persona|original)\\}\\})",
+      "scope": "*",
+      "severity": "info",
+      "message": "出现非标准 {{...}} 表达，可能被 SillyTavern 当作未知宏",
+      "hint": "仅 {{char}}、{{user}}、{{persona}}、{{original}} 会被替换。"
+    },
+    {
+      "id": "basic-block-not-empty",
+      "type": "non-empty",
+      "scope": "block:basic",
+      "severity": "warning",
+      "message": "「基本信息」板块为空，角色外貌/身份缺失会影响扮演质量"
+    }
+  ],
+  "autoFix": [],
+  "metadata": {
+    "author": "Tavern Card Studio",
+    "license": "MIT",
+    "updatedAt": "2026-10-21"
+  }
+}

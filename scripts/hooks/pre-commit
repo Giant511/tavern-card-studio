@@ -1,0 +1,28 @@
+#!/bin/sh
+# pre-commit：改 README 时自动校验决策表序号连续性。
+#
+# 为什么只在 README.md 进暂存区时才检查：
+#   钩子必须快（<0.5s），否则会被 `--no-verify` 绕过而形同虚设。
+#   这条检查只读一个文件、只跑 node，代价极低。
+#
+# 为什么需要它：决策表追加条目时容易把相邻行一起吃进替换范围，
+# 导致条目被静默删除（2026-10-21 一天内发生两次）。编号跳号就是丢条目的信号。
+#
+# 启用方式（每个克隆执行一次）：
+#   git config core.hooksPath scripts/hooks
+# 或在 Windows 上：
+#   powershell -File scripts/enable-hooks.ps1
+
+set -e
+
+if git diff --cached --name-only --diff-filter=ACM | grep -qx 'README\.md'; then
+  echo "[pre-commit] 检测到 README.md 变更，校验决策表序号…"
+  if ! node scripts/check-decision-table.mjs; then
+    echo ""
+    echo "[pre-commit] 提交被拦截：决策表序号不连续，多半是追加条目时吃掉了相邻行。"
+    echo "             修好 README.md 后重新 git add。"
+    exit 1
+  fi
+fi
+
+exit 0

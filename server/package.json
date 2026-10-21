@@ -1,0 +1,20 @@
+{
+  "name": "@tcs/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "角色卡审计与版本控制服务端（CRUD / Git 版本控制 / 审计 API / Web 管理面板）",
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "node --watch dist/index.js",
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@tcs/shared": "*",
+    "better-sqlite3": "^11.10.0",
+    "isomorphic-git": "^1.44.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13"
+  }
+}
