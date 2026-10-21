@@ -1,0 +1,105 @@
+{
+  "schemaVersion": 1,
+  "id": "chub",
+  "name": "Chub",
+  "version": "1.0.0",
+  "description": "Chub.ai 适配规则。要点：支持内嵌世界书（character_book）；卡片需填写作者与标签以便站点展示与检索；支持 {{char}} / {{user}} 占位符，也兼容 <BOT>/<USER>（会自动转换，但统一写法更稳）；对话示例建议使用 <START> 分隔。",
+  "extends": "ccv2",
+  "target": {
+    "spec": "v2",
+    "specVersion": "2.0"
+  },
+  "placeholders": {
+    "char": ["{{char}}", "<BOT>"],
+    "user": ["{{user}}", "<USER>"]
+  },
+  "fields": [
+    {
+      "path": "meta.name",
+      "label": "角色名",
+      "required": true,
+      "minLength": 1,
+      "maxLength": 64,
+      "severity": "error",
+      "message": "Chub 要求角色名非空"
+    },
+    {
+      "path": "description",
+      "label": "角色描述",
+      "required": true,
+      "minLength": 1,
+      "severity": "error",
+      "message": "Chub 要求角色描述非空"
+    },
+    {
+      "path": "first_mes",
+      "label": "开场白",
+      "required": true,
+      "minLength": 1,
+      "severity": "warning",
+      "message": "建议填写开场白，否则站点预览为空白"
+    },
+    {
+      "path": "meta.creator",
+      "label": "作者",
+      "required": true,
+      "minLength": 1,
+      "maxLength": 128,
+      "severity": "warning",
+      "message": "Chub 页面会展示作者名，建议填写"
+    },
+    {
+      "path": "meta.tags",
+      "label": "标签",
+      "required": true,
+      "severity": "warning",
+      "message": "Chub 依赖标签做检索，至少填写 1 个"
+    }
+  ],
+  "rules": [
+    {
+      "id": "canonical-char-placeholder",
+      "type": "pattern-required",
+      "pattern": "\\{\\{char\\}\\}",
+      "aggregate": true,
+      "scope": ["block:basic", "block:settings"],
+      "severity": "warning",
+      "message": "建议统一使用 {{char}} 写法，<BOT> 虽可导入但部分客户端不识别",
+      "hint": "可用「平台切换自动适配」把 <BOT> 替换为 {{char}}。"
+    },
+    {
+      "id": "canonical-user-placeholder",
+      "type": "pattern-required",
+      "pattern": "\\{\\{user\\}\\}",
+      "aggregate": true,
+      "scope": "block:user",
+      "severity": "warning",
+      "message": "建议统一使用 {{user}} 写法",
+      "hint": "可用「平台切换自动适配」把 <USER> 替换为 {{user}}。"
+    },
+    {
+      "id": "example-uses-start-marker",
+      "type": "pattern-required",
+      "pattern": "<START>",
+      "scope": "field:mes_example",
+      "severity": "warning",
+      "message": "对话示例（mes_example）未使用 <START> 分隔"
+    },
+    {
+      "id": "no-empty-greeting",
+      "type": "non-empty",
+      "scope": "field:first_mes",
+      "severity": "warning",
+      "message": "开场白为空，Chub 预览页会显示空白"
+    }
+  ],
+  "autoFix": [
+    { "type": "replace-regex", "pattern": "<BOT>", "flags": "gi", "replacement": "{{char}}" },
+    { "type": "replace-regex", "pattern": "<USER>", "flags": "gi", "replacement": "{{user}}" }
+  ],
+  "metadata": {
+    "author": "Tavern Card Studio",
+    "license": "MIT",
+    "updatedAt": "2026-10-21"
+  }
+}

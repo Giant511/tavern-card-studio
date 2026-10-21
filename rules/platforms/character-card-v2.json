@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "id": "ccv2",
+  "name": "Character Card V2",
+  "version": "1.0.0",
+  "description": "Character Card V2 规范（spec=chara_card_v2, spec_version=2.0）。要求卡片使用 spec/data 结构，data 段七个文本字段必须存在（可为空串），alternate_greetings 必须为字符串数组。",
+  "extends": "sillytavern",
+  "target": {
+    "spec": "v2",
+    "specVersion": "2.0"
+  },
+  "placeholders": {
+    "char": ["{{char}}"],
+    "user": ["{{user}}"]
+  },
+  "fields": [
+    {
+      "path": "meta.name",
+      "label": "角色名",
+      "required": true,
+      "minLength": 1,
+      "maxLength": 64,
+      "severity": "error",
+      "message": "V2 规范要求 data.name 非空"
+    },
+    {
+      "path": "description",
+      "label": "角色描述",
+      "required": true,
+      "minLength": 1,
+      "severity": "error",
+      "message": "V2 规范要求 data.description 非空"
+    },
+    {
+      "path": "first_mes",
+      "label": "开场白",
+      "required": true,
+      "minLength": 1,
+      "severity": "warning",
+      "message": "V2 规范建议 data.first_mes 非空"
+    },
+    {
+      "path": "alternate_greetings",
+      "label": "备选开场白",
+      "required": false,
+      "severity": "info"
+    },
+    {
+      "path": "meta.characterVersion",
+      "label": "角色版本",
+      "required": false,
+      "maxLength": 32,
+      "severity": "info",
+      "message": "建议填写 character_version（如 1.0），便于服务端版本对照"
+    }
+  ],
+  "rules": [
+    {
+      "id": "char-placeholder-required",
+      "type": "placeholder-min-count",
+      "token": "char",
+      "min": 1,
+      "aggregate": true,
+      "scope": ["block:basic", "block:settings", "field:first_mes"],
+      "severity": "warning",
+      "message": "未使用 {{char}} 指代角色（V2 生态约定）",
+      "hint": "用 {{char}} 替换写死的角色名。"
+    },
+    {
+      "id": "bbcode-fake-tag",
+      "type": "pattern-forbid",
+      "pattern": "<(BOT|USER|CHAR|PERSONA)>",
+      "scope": "*",
+      "severity": "error",
+      "message": "出现 <BOT>/<USER> 等伪标签，V2 规范不支持",
+      "hint": "改为 {{char}} / {{user}}。"
+    }
+  ],
+  "autoFix": [
+    { "type": "replace-regex", "pattern": "<(?:BOT|CHAR)>", "flags": "gi", "replacement": "{{char}}" },
+    { "type": "replace-regex", "pattern": "<(?:USER|PERSONA)>", "flags": "gi", "replacement": "{{user}}" }
+  ],
+  "metadata": {
+    "author": "Tavern Card Studio",
+    "license": "MIT",
+    "updatedAt": "2026-10-21"
+  }
+}

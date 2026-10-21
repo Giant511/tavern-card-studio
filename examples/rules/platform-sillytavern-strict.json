@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "id": "sillytavern-strict",
+  "name": "SillyTavern（严格示例）",
+  "version": "1.0.0",
+  "description": "示例：继承原生规则并追加两条自定义检查，用于演示\"自定义规则导入\"。",
+  "extends": "sillytavern",
+  "target": {
+    "spec": "any"
+  },
+  "placeholders": {
+    "char": [
+      "{{char}}"
+    ],
+    "user": [
+      "{{user}}"
+    ],
+    "custom": {
+      "persona": [
+        "{{persona}}"
+      ],
+      "original": [
+        "{{original}}"
+      ]
+    }
+  },
+  "fields": [
+    {
+      "path": "meta.name",
+      "label": "角色名",
+      "required": true,
+      "minLength": 1,
+      "maxLength": 64,
+      "severity": "error",
+      "message": "角色名（name）不能为空"
+    },
+    {
+      "path": "description",
+      "label": "角色描述",
+      "required": true,
+      "minLength": 1,
+      "severity": "error",
+      "message": "角色描述（description）不能为空"
+    },
+    {
+      "path": "first_mes",
+      "label": "开场白",
+      "required": true,
+      "minLength": 1,
+      "severity": "warning",
+      "message": "开场白（first_mes）为空，聊天将没有默认开场"
+    },
+    {
+      "path": "meta.creator",
+      "label": "作者",
+      "required": false,
+      "maxLength": 128,
+      "severity": "info"
+    }
+  ],
+  "rules": [
+    {
+      "id": "no-halfwidth-brackets",
+      "type": "pattern-forbid",
+      "pattern": "\\[[^\\]]{1,20}\\]",
+      "scope": "*",
+      "severity": "warning",
+      "message": "正文里出现了半角方括号 [ ]，容易与模板占位符混淆",
+      "hint": "改用全角【】或删掉括号"
+    },
+    {
+      "id": "require-age",
+      "type": "pattern-required",
+      "pattern": "年龄",
+      "scope": [
+        "block:basic"
+      ],
+      "severity": "info",
+      "message": "基本信息里没有写年龄",
+      "hint": "补一行「年龄：xx」更完整"
+    }
+  ],
+  "autoFix": [],
+  "metadata": {
+    "author": "Tavern Card Studio",
+    "license": "MIT",
+    "updatedAt": "2026-10-21"
+  }
+}

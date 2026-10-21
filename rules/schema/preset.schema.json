@@ -1,0 +1,97 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ebyte.local/tcs/preset.schema.json",
+  "title": "TXT 分块预设格式（preset.json）",
+  "description": "定义标题样式、板块顺序与板块分隔符。blockOrder 必须是六个板块的完整排列；解析始终按标题位置，导出不重排，只有「应用预设」才按 blockOrder 排序。",
+  "type": "object",
+  "required": ["schemaVersion", "id", "name", "version", "blockOrder", "headings", "separator"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": 1 },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$",
+      "description": "唯一标识，用户自定义预设不得与内置预设冲突。"
+    },
+    "name": { "type": "string", "minLength": 1, "description": "界面上显示的名称。" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "description": { "type": "string" },
+    "builtin": {
+      "type": "boolean",
+      "default": true,
+      "description": "true 表示随程序内置（只读，不可删除）；用户自定义预设应为 false。"
+    },
+    "blockOrder": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "uniqueItems": true,
+      "description": "六个板块的排列。默认预设为 基本信息→性格→其他设定→特殊设定→用户相关设定→世界书。worldbook 不参与 description 拼装，但必须在排列中出现，保证顺序概念完整。",
+      "items": { "$ref": "#/definitions/blockId" }
+    },
+    "headings": {
+      "type": "object",
+      "description": "六个板块的标题模板与别名。别名必须覆盖全部六个板块，且不同板块之间不得共用同一条别名（否则解析二义）。",
+      "required": ["basic", "personality", "settings", "special", "user", "worldbook"],
+      "additionalProperties": false,
+      "properties": {
+        "basic": { "$ref": "#/definitions/heading" },
+        "personality": { "$ref": "#/definitions/heading" },
+        "settings": { "$ref": "#/definitions/heading" },
+        "special": { "$ref": "#/definitions/heading" },
+        "user": { "$ref": "#/definitions/heading" },
+        "worldbook": { "$ref": "#/definitions/heading" }
+      }
+    },
+    "separator": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\n",
+      "description": "板块之间的分隔符，必须含换行。常用的三种：\"\\n\\n\"（空行）、\"\\n\\n---\\n\\n\"（分隔线）。若分隔符只有一行文字（如 ---），解析时会把它从板块正文末尾剔除。",
+      "examples": ["\n\n", "\n\n---\n\n"]
+    },
+    "worldbook": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "世界书段落的输出选项；条目内部格式见 docs/04-worldbook-txt-spec.md。",
+      "properties": {
+        "includeHeading": {
+          "type": "boolean",
+          "default": true,
+          "description": "TXT 导出时是否为世界书单独输出一个板块标题。"
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "author": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      }
+    }
+  },
+  "definitions": {
+    "blockId": {
+      "enum": ["basic", "personality", "settings", "special", "user", "worldbook"]
+    },
+    "heading": {
+      "type": "object",
+      "required": ["pattern", "aliases"],
+      "additionalProperties": false,
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "pattern": "\\{title\\}",
+          "description": "标题行模板，必须含 {title}。如 \"【{title}】\"、\"## {title}\"、\"[{title}]\"、\"**{title}**\"。"
+        },
+        "aliases": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "该板块可识别的标题文案，第一项为默认文案。比对时忽略空白、大小写与结尾冒号。"
+        }
+      }
+    }
+  }
+}

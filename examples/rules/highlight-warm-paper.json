@@ -1,0 +1,253 @@
+{
+  "schemaVersion": 1,
+  "id": "warm-paper",
+  "name": "暖纸（示例）",
+  "version": "1.0.0",
+  "description": "示例：继承默认方案，仅调整主题色与占位符配色。",
+  "extends": "default",
+  "editor": {
+    "fontFamily": "Sarasa Mono SC, Consolas, Menlo, monospace",
+    "fontSize": 14,
+    "lineHeight": 1.75,
+    "tabSize": 2
+  },
+  "theme": {
+    "foreground": "#3a2f28",
+    "background": "#fdf8f0",
+    "caret": "#c2410c",
+    "selectionBackground": "#f7e0c8"
+  },
+  "scopes": [
+    {
+      "id": "heading",
+      "label": "板块/小节标题",
+      "color": "#1f4e79",
+      "bold": true
+    },
+    {
+      "id": "subheading",
+      "label": "小标题",
+      "color": "#2e6b4f",
+      "bold": true
+    },
+    {
+      "id": "placeholder",
+      "label": "占位符（{{char}}/{{user}}）",
+      "color": "#0f766e",
+      "backgroundColor": "#ccfbf1",
+      "bold": true
+    },
+    {
+      "id": "placeholder-custom",
+      "label": "其他宏/占位符",
+      "color": "#8a5a00",
+      "backgroundColor": "#fdf3e0"
+    },
+    {
+      "id": "dialogue",
+      "label": "对话引号内容",
+      "color": "#0f6b6b"
+    },
+    {
+      "id": "action",
+      "label": "动作/旁白括号",
+      "color": "#6b4c9a",
+      "italic": true
+    },
+    {
+      "id": "emphasis",
+      "label": "强调（**...**）",
+      "color": "#a3246b",
+      "bold": true
+    },
+    {
+      "id": "attribute",
+      "label": "档案字段名",
+      "color": "#7a4b16",
+      "bold": true
+    },
+    {
+      "id": "list",
+      "label": "列表项",
+      "color": "#3c5a99"
+    },
+    {
+      "id": "separator",
+      "label": "分隔线",
+      "color": "#b9b1a3"
+    },
+    {
+      "id": "comment",
+      "label": "注释/括注",
+      "color": "#8b8b8b",
+      "italic": true
+    }
+  ],
+  "rules": [
+    {
+      "id": "block-heading",
+      "scope": "heading",
+      "priority": 100,
+      "match": {
+        "type": "regex",
+        "pattern": "^【[^】\\n]{1,30}】\\s*$",
+        "flags": "gm",
+        "wholeLine": true
+      }
+    },
+    {
+      "id": "markdown-heading",
+      "scope": "heading",
+      "priority": 100,
+      "match": {
+        "type": "regex",
+        "pattern": "^#{1,6}\\s+.*$",
+        "flags": "gm",
+        "wholeLine": true
+      }
+    },
+    {
+      "id": "bracket-heading",
+      "scope": "heading",
+      "priority": 95,
+      "match": {
+        "type": "regex",
+        "pattern": "^\\[[^\\]\\n]{1,30}\\]\\s*$",
+        "flags": "gm",
+        "wholeLine": true
+      }
+    },
+    {
+      "id": "char-placeholder",
+      "scope": "placeholder",
+      "priority": 90,
+      "match": {
+        "type": "delimiter-block",
+        "open": "{{",
+        "close": "}}"
+      }
+    },
+    {
+      "id": "custom-macro",
+      "scope": "placeholder-custom",
+      "priority": 60,
+      "match": {
+        "type": "regex",
+        "pattern": "<[A-Za-z_][A-Za-z0-9_]{0,20}>",
+        "flags": "g"
+      }
+    },
+    {
+      "id": "dialogue-double-quote",
+      "scope": "dialogue",
+      "priority": 50,
+      "match": {
+        "type": "regex",
+        "pattern": "\"[^\"\\n]{1,400}\"",
+        "flags": "g"
+      }
+    },
+    {
+      "id": "dialogue-cn-quote",
+      "scope": "dialogue",
+      "priority": 50,
+      "match": {
+        "type": "regex",
+        "pattern": "[「『][^」』\\n]{1,400}[」』]",
+        "flags": "g"
+      }
+    },
+    {
+      "id": "action-cn-paren",
+      "scope": "action",
+      "priority": 40,
+      "match": {
+        "type": "regex",
+        "pattern": "（[^）\\n]{1,400}）",
+        "flags": "g"
+      }
+    },
+    {
+      "id": "action-ascii-paren",
+      "scope": "action",
+      "priority": 40,
+      "match": {
+        "type": "regex",
+        "pattern": "\\([^)\\n]{1,400}\\)",
+        "flags": "g"
+      }
+    },
+    {
+      "id": "bold-emphasis",
+      "scope": "emphasis",
+      "priority": 70,
+      "match": {
+        "type": "regex",
+        "pattern": "\\*\\*[^*\\n]{1,200}\\*\\*",
+        "flags": "g"
+      }
+    },
+    {
+      "id": "profile-attribute",
+      "scope": "attribute",
+      "priority": 30,
+      "match": {
+        "type": "word-list",
+        "words": [
+          "身高",
+          "体重",
+          "年龄",
+          "生日",
+          "身份",
+          "性别",
+          "外貌",
+          "穿搭",
+          "发色",
+          "瞳色",
+          "职业",
+          "称呼",
+          "关系"
+        ],
+        "caseSensitive": false,
+        "wholeWord": false
+      }
+    },
+    {
+      "id": "list-item",
+      "scope": "list",
+      "priority": 20,
+      "match": {
+        "type": "regex",
+        "pattern": "^\\s*(?:[-*+·]|\\d+[.、)])\\s+",
+        "flags": "gm"
+      }
+    },
+    {
+      "id": "hr-line",
+      "scope": "separator",
+      "priority": 80,
+      "match": {
+        "type": "regex",
+        "pattern": "^\\s*(?:[-=_*]\\s*){3,}$",
+        "flags": "gm",
+        "wholeLine": true
+      }
+    },
+    {
+      "id": "commented-note",
+      "scope": "comment",
+      "priority": 10,
+      "match": {
+        "type": "regex",
+        "pattern": "^//.*$",
+        "flags": "gm",
+        "wholeLine": true
+      }
+    }
+  ],
+  "metadata": {
+    "author": "Tavern Card Studio",
+    "license": "MIT",
+    "updatedAt": "2026-10-21"
+  }
+}

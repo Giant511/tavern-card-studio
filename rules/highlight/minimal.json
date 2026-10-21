@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "minimal",
+  "name": "最小可用",
+  "version": "1.0.0",
+  "description": "最小可加载范例：只有 2 个样式 + 2 条规则。用于说明必填字段与两种最常用匹配方式（regex 整行标题、delimiter-block 占位符），可直接复制改写。",
+  "extends": null,
+  "theme": {
+    "foreground": "#222222",
+    "background": "#ffffff"
+  },
+  "scopes": [
+    { "id": "heading", "label": "板块标题", "color": "#1f4e79", "bold": true },
+    { "id": "placeholder", "label": "占位符", "color": "#b0341b", "backgroundColor": "#fdece7" }
+  ],
+  "rules": [
+    {
+      "id": "block-heading",
+      "scope": "heading",
+      "priority": 100,
+      "match": { "type": "regex", "pattern": "^【[^】\\n]{1,30}】\\s*$", "flags": "gm", "wholeLine": true }
+    },
+    {
+      "id": "char-placeholder",
+      "scope": "placeholder",
+      "priority": 90,
+      "match": { "type": "delimiter-block", "open": "{{", "close": "}}" }
+    }
+  ],
+  "metadata": {
+    "author": "Tavern Card Studio",
+    "license": "MIT",
+    "updatedAt": "2026-10-21"
+  }
+}

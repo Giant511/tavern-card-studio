@@ -1,0 +1,33 @@
+{
+  "name": "@tcs/client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "酒馆角色卡审计编辑工具链 · 桌面客户端（Tauri 2 壳 + Web 渲染层）",
+  "scripts": {
+    "dev": "tauri dev",
+    "dev:ui": "vite",
+    "build": "tauri build",
+    "build:ui": "vite build",
+    "typecheck": "tsc -p tsconfig.json",
+    "tauri": "tauri",
+    "icons": "node scripts/gen-icons.mjs"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.11.1",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.15",
+    "@tauri-apps/api": "2.12.4",
+    "@tauri-apps/plugin-dialog": "2.8.3",
+    "@tauri-apps/plugin-fs": "2.7.1",
+    "@tauri-apps/plugin-log": "2.10.1",
+    "@tauri-apps/plugin-opener": "2.7.2",
+    "@tauri-apps/plugin-store": "2.5.0",
+    "@tcs/shared": "*"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.3",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.0"
+  }
+}

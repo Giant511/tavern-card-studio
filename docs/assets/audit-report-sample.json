@@ -1,0 +1,315 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-10-21T04:00:00.000Z",
+  "card": {
+    "name": "",
+    "spec": "v2",
+    "specVersion": "2.0",
+    "source": ""
+  },
+  "platformRule": {
+    "id": "janitorai",
+    "name": "JanitorAI",
+    "version": "1.0.0",
+    "lineage": [
+      "sillytavern",
+      "ccv2",
+      "janitorai"
+    ]
+  },
+  "presetId": "default",
+  "wordCount": {
+    "blocks": [
+      {
+        "blockId": "basic",
+        "label": "基本信息",
+        "chars": 23,
+        "charsNoSpace": 21,
+        "cjk": 11,
+        "words": 2,
+        "totalWords": 13,
+        "empty": false,
+        "missing": false
+      },
+      {
+        "blockId": "personality",
+        "label": "性格",
+        "chars": 14,
+        "charsNoSpace": 14,
+        "cjk": 12,
+        "words": 0,
+        "totalWords": 12,
+        "empty": false,
+        "missing": false
+      },
+      {
+        "blockId": "settings",
+        "label": "其他设定",
+        "chars": 16,
+        "charsNoSpace": 15,
+        "cjk": 8,
+        "words": 1,
+        "totalWords": 9,
+        "empty": false,
+        "missing": false
+      },
+      {
+        "blockId": "special",
+        "label": "特殊设定",
+        "chars": 7,
+        "charsNoSpace": 7,
+        "cjk": 6,
+        "words": 0,
+        "totalWords": 6,
+        "empty": false,
+        "missing": false
+      },
+      {
+        "blockId": "user",
+        "label": "用户相关设定",
+        "chars": 25,
+        "charsNoSpace": 24,
+        "cjk": 14,
+        "words": 1,
+        "totalWords": 15,
+        "empty": false,
+        "missing": false
+      },
+      {
+        "blockId": "worldbook",
+        "label": "世界书",
+        "chars": 38,
+        "charsNoSpace": 36,
+        "cjk": 33,
+        "words": 0,
+        "totalWords": 33,
+        "empty": false,
+        "missing": false
+      }
+    ],
+    "total": {
+      "chars": 123,
+      "charsNoSpace": 117,
+      "cjk": 84,
+      "words": 4,
+      "totalWords": 88
+    },
+    "byField": {
+      "description": {
+        "chars": 71,
+        "charsNoSpace": 67,
+        "cjk": 39,
+        "words": 4,
+        "totalWords": 43
+      },
+      "personality": {
+        "chars": 14,
+        "charsNoSpace": 14,
+        "cjk": 12,
+        "words": 0,
+        "totalWords": 12
+      },
+      "character_book": {
+        "chars": 38,
+        "charsNoSpace": 36,
+        "cjk": 33,
+        "words": 0,
+        "totalWords": 33
+      }
+    }
+  },
+  "issues": [
+    {
+      "id": "char-placeholder-suggested|basic|0",
+      "ruleId": "char-placeholder-suggested",
+      "category": "platform-rule",
+      "severity": "info",
+      "message": "正文中未出现 {{char}} 占位符，角色名硬编码后换卡易失效",
+      "location": {
+        "blockId": "basic",
+        "field": "description",
+        "start": 0,
+        "end": 23,
+        "line": 1,
+        "column": 1,
+        "lineText": "年龄 24，身高 168cm，咖啡馆夜班店员。",
+        "excerpt": "年龄 24，身高 168cm，咖啡馆夜班店员。"
+      },
+      "hint": "建议用 {{char}} 代替角色名，SillyTavern 会自动替换。",
+      "selector": "block:basic"
+    },
+    {
+      "id": "bbcode-fake-tag|settings|0",
+      "ruleId": "bbcode-fake-tag",
+      "category": "platform-rule",
+      "severity": "error",
+      "message": "出现 <BOT>/<USER> 等伪标签，V2 规范不支持",
+      "location": {
+        "blockId": "settings",
+        "field": "description",
+        "start": 0,
+        "end": 5,
+        "line": 1,
+        "column": 1,
+        "lineText": "<BOT> 说话简短，不爱解释。",
+        "excerpt": "<BOT>"
+      },
+      "hint": "改为 {{char}} / {{user}}。",
+      "selector": "*"
+    },
+    {
+      "id": "forbid-angle-tags|settings|0",
+      "ruleId": "forbid-angle-tags",
+      "category": "platform-rule",
+      "severity": "error",
+      "message": "JanitorAI 不识别 <BOT>/<USER> 形式伪标签，导入后会原样显示",
+      "location": {
+        "blockId": "settings",
+        "field": "description",
+        "start": 0,
+        "end": 5,
+        "line": 1,
+        "column": 1,
+        "lineText": "<BOT> 说话简短，不爱解释。",
+        "excerpt": "<BOT>"
+      },
+      "hint": "改为 {{char}} / {{user}}。",
+      "selector": "*"
+    },
+    {
+      "id": "char-placeholder-suggested|settings|0",
+      "ruleId": "char-placeholder-suggested",
+      "category": "platform-rule",
+      "severity": "info",
+      "message": "正文中未出现 {{char}} 占位符，角色名硬编码后换卡易失效",
+      "location": {
+        "blockId": "settings",
+        "field": "description",
+        "start": 0,
+        "end": 16,
+        "line": 1,
+        "column": 1,
+        "lineText": "<BOT> 说话简短，不爱解释。",
+        "excerpt": "<BOT> 说话简短，不爱解释。"
+      },
+      "hint": "建议用 {{char}} 代替角色名，SillyTavern 会自动替换。",
+      "selector": "block:settings"
+    },
+    {
+      "id": "builtin:preset-heading-decorator|user|0",
+      "ruleId": "builtin:preset-heading-decorator",
+      "category": "format",
+      "severity": "info",
+      "message": "标题写法与预设不一致：当前「## 用户相关设定」，预设「【用户相关设定】」",
+      "location": {
+        "blockId": "user",
+        "field": "description",
+        "start": 0,
+        "end": 0,
+        "line": 1,
+        "column": 1,
+        "lineText": "{{user}} 是常来的邻居，两人只在深夜聊天。"
+      },
+      "hint": "解析不受影响；点「应用预设」可统一装饰符。若换了预设，记得同步调整高亮方案的标题正则"
+    },
+    {
+      "id": "builtin:worldbook-duplicate-id|worldbook|57",
+      "ruleId": "builtin:worldbook-duplicate-id",
+      "category": "format",
+      "severity": "error",
+      "message": "条目 id 0 重复（首次出现于上文，第 7 行再次声明）；禁止静默合并，请改为唯一 id",
+      "location": {
+        "blockId": "worldbook",
+        "field": "character_book",
+        "start": 57,
+        "end": 66,
+        "line": 7,
+        "column": 1,
+        "lineText": "@@ENTRY 0",
+        "excerpt": "@@ENTRY 0",
+        "entryId": 0
+      },
+      "hint": "重复 id 不会静默合并，请先修正再保存"
+    },
+    {
+      "id": "worldbook-not-supported|worldbook|0",
+      "ruleId": "worldbook-not-supported",
+      "category": "platform-rule",
+      "severity": "warning",
+      "message": "JanitorAI 不支持内嵌世界书，导出后世界书内容会丢失（当前 92，上限 0）",
+      "location": {
+        "blockId": "worldbook",
+        "field": "character_book",
+        "start": 0,
+        "end": 40,
+        "line": 1,
+        "column": 1,
+        "lineText": "@@ENTRY 0",
+        "excerpt": "@@ENTRY 0\nkeys: 咖啡馆\n@@CONTENT\n咖啡馆位于银座四丁目"
+      },
+      "hint": "请先在站点创建 Lorebook，或切回 SillyTavern/Chub 规则导出。",
+      "selector": "field:character_book"
+    },
+    {
+      "id": "char-placeholder-required|-|-1",
+      "ruleId": "char-placeholder-required",
+      "category": "platform-rule",
+      "severity": "error",
+      "message": "必须在正文中使用 {{char}} 指代角色，JanitorAI 不会替换写死的角色名（全文合计 0 次，至少 1 次）",
+      "location": {
+        "blockId": null,
+        "field": null,
+        "start": null,
+        "end": null,
+        "line": null,
+        "column": null
+      },
+      "hint": "把「角色名」替换为 {{char}}。",
+      "aggregate": true
+    },
+    {
+      "id": "builtin:field-required:meta.name|name|0",
+      "ruleId": "builtin:field-required:meta.name",
+      "category": "completeness",
+      "severity": "error",
+      "message": "JanitorAI 角色名不能为空，且建议不超过 50 字符",
+      "location": {
+        "blockId": null,
+        "field": "name",
+        "start": 0,
+        "end": 0,
+        "line": 1,
+        "column": 1,
+        "lineText": ""
+      }
+    },
+    {
+      "id": "builtin:st-defaults-omitted|file|-1",
+      "ruleId": "builtin:st-defaults-omitted",
+      "category": "format",
+      "severity": "info",
+      "message": "14 个字段未写出，导出时由目标平台按缺省值处理：话痨程度（talkativeness）、收藏标记（fav）、扫描深度（scan_depth）、令牌预算（token_budget）、递归扫描（recursive_scanning）、扩展字段（extensions）、常驻（constant ×2）、选择性触发（selective ×2）、插入顺序（insertion_order ×2）、启用（enabled ×2）、插入位置（position ×2）、大小写敏感（case_sensitive ×2）、优先级（priority ×2）、扩展字段（extensions ×2）",
+      "location": {
+        "blockId": null,
+        "field": "file",
+        "start": null,
+        "end": null,
+        "line": null,
+        "column": null
+      },
+      "hint": "这是预期行为：工具不注入缺省值，避免版本 diff 噪声"
+    }
+  ],
+  "summary": {
+    "error": 5,
+    "warning": 1,
+    "info": 4,
+    "exportable": false
+  },
+  "byCategory": {
+    "completeness": 1,
+    "format": 3,
+    "platform-rule": 6,
+    "structure": 0
+  }
+}
