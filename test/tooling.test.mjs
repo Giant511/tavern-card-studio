@@ -1,7 +1,7 @@
 /**
  * 静态校验工具的测试：决策表序号解析 + git config ini 写入。
  *
- * 这两个工具都直接动项目文件（README 决策表、.git/config），
+ * 这两个工具都直接动项目文件（PLAN.md 决策表、.git/config），
  * 出错代价高且不易察觉，所以必须有单测——不依赖真实仓库状态。
  */
 
@@ -36,14 +36,14 @@ function makeTable(rows) {
 // ── 决策表序号 ──────────────────────────────────────────────
 
 test('决策表：连续序号通过', () => {
-  const file = writeTemp('README.md', makeTable([1, 2, 3]));
+  const file = writeTemp('table.md', makeTable([1, 2, 3]));
   const result = checkDecisionTable(file);
   assert.equal(result.ok, true);
   assert.deepEqual(result.numbers, [1, 2, 3]);
 });
 
 test('决策表：缺号被捕获（模拟误删相邻行）', () => {
-  const file = writeTemp('README.md', makeTable([1, 2, 4, 5]));
+  const file = writeTemp('table.md', makeTable([1, 2, 4, 5]));
   const result = checkDecisionTable(file);
   assert.equal(result.ok, false);
   assert.match(result.problems.join(), /#2 之后跳到 #4（缺 1 条）/);
@@ -60,14 +60,14 @@ test('决策表：重复与倒序都被捕获', () => {
 });
 
 test('决策表：首条不是 #1 被捕获', () => {
-  const result = checkDecisionTable(writeTemp('README.md', makeTable([2, 3])));
+  const result = checkDecisionTable(writeTemp('table.md', makeTable([2, 3])));
   assert.equal(result.ok, false);
   assert.match(result.problems.join(), /首条不是 #1/);
 });
 
 test('决策表：CRLF 文件同样正确解析（本机 autocrlf=true）', () => {
   const crlf = makeTable([1, 2, 3]).replace(/\n/g, '\r\n');
-  const result = checkDecisionTable(writeTemp('README.md', crlf));
+  const result = checkDecisionTable(writeTemp('table.md', crlf));
   assert.equal(result.ok, true);
   assert.deepEqual(result.numbers, [1, 2, 3]);
 });
@@ -93,7 +93,7 @@ test('决策表：只统计第一张表，不会串到后面的表格', () => {
     '|---|---|',
     '| 99 | 不该被读进来 |',
   ].join('\n');
-  const result = checkDecisionTable(writeTemp('README.md', content));
+  const result = checkDecisionTable(writeTemp('table.md', content));
   assert.equal(result.ok, true);
   assert.deepEqual(result.numbers, [1, 2]);
 });

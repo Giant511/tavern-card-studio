@@ -31,6 +31,8 @@
     "build:ui": "npm run build:ui --workspace @tcs/client",
     "validate:client": "node client/scripts/validate-config.mjs",
     "check:decisions": "node scripts/check-decision-table.mjs",
+    "check:readme": "node scripts/check-readme.mjs",
+    "scan:entropy": "node scripts/scan-entropy.mjs",
     "enable:hooks": "node scripts/enable-hooks.mjs",
     "verify:import-atomic": "node scripts/verify-import-atomic.mjs",
     "verify:export-roundtrip": "node scripts/verify-export-roundtrip.mjs",

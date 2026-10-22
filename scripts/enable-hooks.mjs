@@ -1,5 +1,5 @@
 /**
- * 启用仓库内的 git 钩子（pre-commit 校验 README 决策表序号）。
+ * 启用仓库内的 git 钩子（pre-commit 校验 PLAN.md 决策表序号）。
  *
  * 实现方式：**直接改 `.git/config`**，不 spawn git。
  *
@@ -112,9 +112,9 @@ function main() {
 
   console.log(`${changed ? '✔ 已写入' : '✔ 已是目标值'}：${configPath}`);
   console.log(`  [core] hooksPath = ${HOOKS_PATH}`);
-  console.log('  生效的钩子：pre-commit（改 README.md 时校验决策表序号）');
+  console.log('  生效的钩子：pre-commit（改 PLAN.md 时校验决策表序号）');
   console.log('');
-  console.log('验证方式：修改 README.md 决策表后 git add && git commit，');
+  console.log('验证方式：修改 PLAN.md 决策表后 git add && git commit，');
   console.log('应看到 [pre-commit] 输出"决策表序号连续"。');
 }
 
