@@ -1,4 +1,4 @@
-﻿# 启用仓库内的 git 钩子（pre-commit 校验 README 决策表序号）
+﻿# 启用仓库内的 git 钩子（pre-commit 校验 PLAN.md 决策表序号）
 #
 # 为什么用 core.hooksPath 而不是往 .git/hooks 里拷文件：
 #   .git/hooks 不入库，换台机器就丢了；钩子放 scripts/hooks 可审查、可版本化。
