@@ -44,7 +44,7 @@ if ([string]::IsNullOrEmpty($scriptDir)) {
   $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
 if ([string]::IsNullOrEmpty($Msi)) {
-  $Msi = Join-Path (Split-Path -Parent $scriptDir) 'release\TavernCardStudioServer-0.1.0.msi'
+  $Msi = Join-Path (Split-Path -Parent $scriptDir) 'release\TavernCardStudioServer-0.1.1.msi'
 }
 if (-not (Test-Path -LiteralPath $Msi)) { throw "MSI not found: $Msi" }
 
