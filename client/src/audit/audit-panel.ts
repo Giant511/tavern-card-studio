@@ -103,6 +103,19 @@ export class AuditPanel {
     this.render();
   }
 
+  /**
+   * 清空面板（零标签 / 空工作台时用）。
+   *
+   * 为什么单独一个方法而不是 `setReport(null)`：`report` 的类型是非空的，
+   * 若允许 null 会让 render() 里每一处都要判空，反而容易漏。
+   * 这里显式表达"当前没有正在审计的卡"这个状态。
+   */
+  clear(): void {
+    this.report = null as unknown as AuditReport;
+    this.activeIssueId = null;
+    this.root.replaceChildren();
+  }
+
   /** 外部要求聚焦某条问题（例如从编辑器跳过来） */
   setActiveIssue(issueId: string | null): void {
     this.activeIssueId = issueId;

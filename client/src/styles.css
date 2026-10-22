@@ -37,8 +37,15 @@ body {
   color: var(--tcs-fg);
   font: 13px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   display: grid;
-  /* header / 同步条 / 主区 / 状态栏 */
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  /*
+   * 五个直接子元素，必须给五行 —— 少给一行的话，多出来的子元素会落到"隐式行"，
+   * 而 `minmax(0, 1fr)` 那一行会被**前面的元素**占掉。
+   * 2026-10-22 就是这样坏的：T9.2 插入标签栏后仍是四行，
+   * 于是 `1fr` 落到同步条上（同步条被撑到几百像素高，主区挤成 auto 高度），
+   * 表现是顶部一大片空白 + 内容溢出到视口外。
+   * 顺序：header / 标签栏 / 同步条 / 主区 / 状态栏。
+   */
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   overflow: hidden;
 }
 
@@ -77,12 +84,68 @@ body {
   min-width: 0;
 }
 
+/* F10：角色名就地编辑。
+ * 元素是 <button>（可聚焦、有原生激活语义），所以要把按钮外观完全压掉，
+ * 看起来仍是纯文本。hover 时给一点提示，让用户知道"这里能点"。
+ */
 .card-name {
   font-size: 14px;
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* 覆盖 button 的默认外观 */
+  display: block;
+  max-width: 100%;
+  margin: 0;
+  padding: 1px 4px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: text;
+}
+
+.card-name[hidden] {
+  display: none;
+}
+
+.card-name:hover {
+  border-color: var(--border);
+  background: #fff;
+}
+
+.card-name:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 编辑态输入框：与按钮视觉宽度对齐，避免切换时跳动。
+ *
+ * ⚠️ `[hidden]` 必须显式处理：HTML 的 hidden 属性只由 UA 样式表的
+ * `[hidden] { display: none }` 生效，而下面这条 `display: block` 选择器
+ * 特异性更高，会把它覆盖掉 —— 结果就是"隐藏"的输入框照样显示出来
+ * （2026-10-22 截图里角色名和输入框同时出现在左上角，就是这么来的）。
+ */
+.card-name-input[hidden] {
+  display: none;
+}
+
+.card-name-input {
+  display: block;
+  width: 100%;
+  max-width: 320px;
+  margin: 0;
+  padding: 1px 4px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  font-family: inherit;
+  color: var(--text);
+  background: #fff;
 }
 
 .stats {
@@ -726,6 +789,56 @@ body {
 .probe-status.bad {
   background: var(--danger-bg);
   color: var(--danger);
+}
+
+/* ── 一键连接的分步说明（F6.1）────────────────────────
+ * 失败时要让用户看到「哪一步错了 + 下一步做什么」，所以用有序列表而不是一段话。
+ * 这是支持成本最高的一块，排版必须能扫读。
+ */
+.local-steps {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border-left: 3px solid var(--border-strong);
+  background: #fbfcfd;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.local-steps.ok {
+  border-left-color: var(--ok);
+  background: #f4fdf8;
+}
+
+.local-steps.warn {
+  border-left-color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.local-steps.bad {
+  border-left-color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.local-steps-title {
+  margin: 0 0 6px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.local-steps-list {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--text-2);
+}
+
+.local-steps-list li {
+  margin: 4px 0;
+}
+
+.local-steps-list li strong {
+  color: var(--text);
+  font-weight: 600;
 }
 
 .sync-note {
@@ -1408,6 +1521,25 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
+/* 状态行 + 「连接本机服务端」快捷入口（F6.1）：
+ * 用户在同步面板才发现连不上，就近给入口，不必先记住"去设置页" */
+.sync-status-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px 0 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.sync-status-row .sync-status {
+  flex: 1;
+  border-bottom: none;
+}
+
+.sync-status-row .btn {
+  flex: none;
+}
+
 .sync-status.ok {
   color: var(--ok);
   background: #f6fef9;
@@ -1514,4 +1646,273 @@ body {
   background: #eff4ff;
   color: var(--accent);
   font-size: 12px;
+}
+
+/* ── 新建角色卡对话框（F11）──────────────────────────── */
+.new-card-modal {
+  width: min(520px, 92vw);
+}
+
+/* 角色卡 ID 是机器可读的标识，用等宽字体便于核对字符是否一致 */
+.input.mono {
+  font-family: ui-monospace, Consolas, "Courier New", monospace;
+  font-size: 13px;
+  letter-spacing: 0.01em;
+}
+
+/* 字段级错误：贴在对应输入框下方，而不是统一堆在底部 ——
+ * 用户改哪个字段就看哪一行提示，不用在两处之间来回找。 */
+.field-hint.bad {
+  color: var(--danger);
+}
+
+/* ── 标签栏（T9.2）────────────────────────────────────── */
+.tabbar {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  background: #f7f9fb;
+  /* 高度固定：标签栏出现/消失时不要让整个编辑区跳一下 */
+  min-height: 36px;
+}
+
+/* 横向滚动容器。
+ * 用 overflow-x:auto 而不是 flex-wrap: wrap —— 换行会让"第几个标签"失去意义，
+ * 也会把编辑区往下推。滚动条隐藏但保留滚动能力（鼠标滚轮/触控板可横滚）。 */
+.tabbar-scroll {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 2px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  padding: 4px 4px 0;
+}
+.tabbar-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  max-width: 220px;
+  padding: 5px 8px 5px 10px;
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  background: #eef1f5;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  /* 出现/消失时不要抖动 */
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.tab:hover {
+  background: #e6eaf0;
+  color: var(--text);
+}
+
+/* 活动标签与下方编辑区连成一体（去掉底边），视觉上"这张卡是当前的" */
+.tab.is-active {
+  background: var(--bg);
+  color: var(--text);
+  font-weight: 600;
+  border-color: var(--border-strong);
+  box-shadow: 0 -1px 0 var(--accent) inset;
+}
+
+/* 未落盘：左侧虚线标记，与"已保存到磁盘"区分开（F1 的未落盘状态） */
+.tab.is-unpersisted {
+  border-left: 3px dashed var(--warn);
+}
+
+.tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-close {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  line-height: 14px;
+  text-align: center;
+  border-radius: 3px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.tab-close:hover {
+  background: #d9dee5;
+  color: var(--danger);
+}
+
+/* 「+」固定在滚动容器外面：标签多到要滚动时，
+ * 若它也在滚动区里，用户得先滚到底才能新建 —— 很常见的体验缺陷。 */
+.tab-new {
+  flex: 0 0 auto;
+  width: 36px;
+  border: none;
+  border-left: 1px solid var(--border);
+  background: none;
+  color: var(--text-2);
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.tab-new:hover {
+  background: #e6eaf0;
+  color: var(--accent);
+}
+
+/* ── 空工作台（F3）────────────────────────────────────
+ * 「启动时无卡」与「关闭最后一个标签」共用这一套渲染，
+ * 所以两处的视觉必然一致，不会各自演化成两个样子。 */
+.empty-workspace {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 46vh;
+  padding: 40px 20px;
+  text-align: center;
+}
+
+.empty-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.empty-hint {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.empty-actions {
+  display: flex;
+  gap: 10px;
+}
+
+/* ── 关闭确认（T9.4 三选）──────────────────────────── */
+.confirm-close-modal {
+  width: min(440px, 92vw);
+}
+
+.confirm-text {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.65;
+  color: var(--text);
+}
+
+/* ── 同步面板：上传目标与分叉警告（T9.7 / F11）──────────── */
+
+/* 上传目标行：角色名 + 角色卡 ID。
+ * 用 flex 而不是纯文本，是因为 ID 要用等宽字体、名字要能被省略号截断，
+ * 两者排版规则不同。 */
+.sync-target {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.sync-target.empty {
+  color: var(--text-2);
+  font-style: italic;
+}
+
+.sync-target-name {
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sync-target-id {
+  flex: 0 1 auto;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: #eef1f5;
+  color: var(--text-2);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* "基线 v3" / "尚未与远端对齐"：告诉用户服务端拿什么做分叉比较 */
+.sync-target-base {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* 分叉警告条：常驻，不用 toast。
+ * 分叉是持续存在的事实（两条历史已经分开），一次性提示划过去就没了。 */
+.sync-warning {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid #f0c36d;
+  border-left: 3px solid var(--warn);
+  border-radius: 4px;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.sync-warning[hidden] {
+  display: none;
+}
+
+.sync-warning-title {
+  display: block;
+  margin-bottom: 2px;
+}
+
+.sync-warning-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+/* 历史标题行：标题与"看哪张卡"下拉并排 */
+.form-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.form-title-row .form-title {
+  margin: 0;
+}
+
+.select.small {
+  width: auto;
+  max-width: 320px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+/* 警告条里的补充说明：字号更小，与"问题本身"分层 */
+.sync-warning-note {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--warn);
+  opacity: 0.9;
 }

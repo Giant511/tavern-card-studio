@@ -398,6 +398,144 @@ XML 注释中不能包含"--"，并且"-"不能是最后一个字符。
 python -c "import xml.etree.ElementTree as ET; ET.parse('installer/ServiceHost.xml'); print('ok')"
 ```
 
+### 5.7 监听地址分离的验收（F7）
+
+`host`（API）与 `controlHost`（管理面板）是两个独立字段，默认都只监听回环。
+把 API 开给局域网时，面板**不会**跟着暴露 —— 这一点必须实测确认，不能只看配置文件。
+
+**启动日志的审计字段**（`supervisor.listening` / `worker.listening`）：
+
+```json
+{"event":"supervisor.listening","panel":"http://127.0.0.1:18975/",
+ "bind":"0.0.0.0:18975","panelLoopbackOnly":false,
+ "api":"http://127.0.0.1:18974"}
+```
+
+- `bind` 是**实际监听地址**，审计就看这个；
+- `panel` 是「给人打开的地址」，监听 `0.0.0.0` 时它仍会显示 `127.0.0.1`
+  （因为 `0.0.0.0` 打不开），所以**不能拿 `panel` 判断有没有暴露**；
+- `panelLoopbackOnly=false` 明确表示面板已对非回环开放。
+
+**双侧证据（必须两条都看）**：
+
+```powershell
+# A. 绑定地址：API 应为 0.0.0.0，面板应为 127.0.0.1
+netstat -ano | findstr LISTENING | findstr ":8731"
+
+# B. 从局域网 IP 访问：API 通，面板必须连不上
+curl.exe --noproxy "*" -o NUL -w "%{http_code}\n" http://<局域网IP>:8730/api/health   # 期望 200
+curl.exe --noproxy "*" -o NUL -w "%{http_code}\n" http://<局域网IP>:8731/              # 期望连接失败
+```
+
+> **`--noproxy "*"` 不能省。** 本机若配了 `HTTP_PROXY`，curl 会走代理，
+> 面板请求返回 `502`（代理报错），看起来像「被拒绝了」，其实是假象。
+> 判断绑定关系一律以 `netstat` 为准，curl 只用来验证「另一端是否可达」。
+
+**实测记录（2026-10-22）**：
+
+```
+配置：--host 0.0.0.0（controlHost 保持默认）
+
+netstat:
+  0.0.0.0:18970     LISTENING     ← API
+  127.0.0.1:18971   LISTENING     ← 面板
+
+局域网 192.168.1.203 访问：
+  /api/health  → 200             ← 客户端可连
+  :18971/      → 连接被拒绝       ← 面板未暴露
+```
+
+面板配置页在 `controlHost` 为非回环时会常驻显示黄色安全警告
+（见 `docs/assets/f7-controlhost-exposed-warning.png`），
+提示「面板静态页面免鉴权，改非回环会暴露管理界面」。
+
+### 5.8 客户端「连接本机服务端」的失败分类（F6.1）
+
+客户端设置页与同步面板各有一个「连接本机服务端」按钮，自动完成：
+探测 `127.0.0.1:8730` → 取令牌 → 写配置 → 两步校验。
+
+**探测地址是固定的 `127.0.0.1:8730`，不读已配置的 serverUrl。**
+这个功能的场景就是"还没配好"，拿一个可能填错的地址去探只会一错再错。
+
+失败时按 7 类给出不同处置（每类至少 3 步，不是一句"请检查服务"）：
+
+| 分类 | 判断依据 | 处置方向 |
+|---|---|---|
+| `not-running` | 8730 与 8731 都无响应 | 未安装 / 未启动（浏览器侧无法区分，文案列出两种确认方法）|
+| `port-changed` | 面板 health 通、API 不通 | 查面板「参数配置」的 **监听地址** 与 **端口** 两项 |
+| `server-too-old` | 取令牌返回 `401 UNAUTHORIZED` | 装新版服务端 MSI 覆盖安装 |
+| `token-denied` | 取令牌返回其它 4xx/5xx | 查面板「API 与令牌」|
+| `not-local` | 取令牌返回 `403 TOKEN_LOCAL_ONLY` | 检查系统代理 / VPN |
+| `network` | 连接中断或超时 | 检查代理例外、防火墙 |
+| `save-failed` | 配置写入失败 | 浏览器模式不持久化；检查配置目录可写 |
+
+**为什么「旧版服务端」要单独一类**：旧版没有 `/api/token` 路由，请求会一路走到鉴权门，
+被当成「没带令牌访问受保护路径」→ `401 UNAUTHORIZED`。
+这与"令牌错了"的返回码相同，但处置完全相反 —— 一个是升级，一个是查令牌。
+真机实测踩过（机器上装着旧版服务端），笼统报「令牌被拒」会把人带偏。
+
+**为什么 `port-changed` 要提「监听地址」**：实测场景 —— 用户为了局域网把 `host` 改成网卡 IP
+（`192.168.1.203`），端口仍是 8730，但 `127.0.0.1:8730` 就连不上了。
+只说"端口被改"会让人查错方向。
+
+一个实现上的坑（已修，有回归测试钉住）：探测函数里曾写成
+`reachable: body.status === 'ok' || true`，等于「任何 2xx 都算服务在跑」，
+会把「这个端口上恰好有别的 HTTP 服务」误判成正常。
+现在严格要求 `status === 'ok'`。
+
+**验收证据**（2026-10-22，真实服务端）：
+
+| 场景 | 截图 |
+|---|---|
+| 成功：自动填入地址与令牌，「已连接（服务端 0.1.0）· 令牌有效 · 10ms」 | `docs/assets/f6-local-connect-ok.png` |
+| 失败：面板通、API 不通（监听地址被改） | `docs/assets/f6-local-connect-addr-changed.png` |
+| 失败：服务未运行 | `docs/assets/f6-local-connect-not-running.png` |
+
+### 5.9 安装后的连接指引（`connect-guide.html`）
+
+以前用户装完服务端只能自己去翻文档："令牌见 `C://ProgramData//TavernCardStudio//logs//` 下日志"。
+现在改成装完直接给他看。
+
+**为什么是「安装程序打开说明页」而不是「服务启动时弹窗」**：
+
+服务由 WinSW 托管、以 LocalSystem 身份跑在 **session 0**，与用户桌面不在同一个会话里，
+弹不出任何窗口。这与 F5 里"进程活着、端口通、但 SCM 认为没启动"是同一个隔离 ——
+当时也是靠解包直接跑宿主看控制台才查到原因。
+能弹窗的只有 msiexec，它跑在用户的会话里。所以指引必须由安装程序来打开。
+
+**两个入口**：
+
+| 入口 | 实现 | 说明 |
+|---|---|---|
+| 安装完成后自动打开 | `CustomAction OpenConnectGuide`：`[%ComSpec] /c start "" "<path>"` | `Return="asyncNoWait"`，打不开也不让安装失败 |
+| 开始菜单快捷方式 | `Shortcut` 指向同一文件 | 以后想再看一次能找到 |
+
+**触发条件**：`NOT REMOVE AND UILevel >= 3` —— 卸载不弹；静默安装（`/qn`，UILevel=2）不弹，
+否则无人值守部署时会突然弹出一个浏览器窗口。
+
+说明页内容（`installer/connect-guide.html`）四节：
+两个地址的用途与区别（含「两者独立配置、面板默认只听回环」）、
+令牌的三种取法、客户端怎么填、常见问题。
+
+**两个容易写错、且都会"静默不生效"的点**（都踩过）：
+
+1. **`<InstallExecuteSequence>` 必须写在 `<Package>` 内**。
+   第一次写在 `<Fragment>` 里：`wix build` 退出码 0、一条警告都没有，
+   但反编译后 `CustomAction` 表是空的 —— 装完根本不弹。
+2. **WiX v4/v5 的条件是 `Condition` 属性，不是元素内文本**。
+   写成内文本直接报 `WIX0400: The Custom element contains illegal inner text`。
+
+因此 `build-msi.ps1` 第 4 步加了**内容断言**：构建成功后反编译 MSI，
+断言 `CustomAction:OpenConnectGuide`、`Shortcut`、`connect-guide.html` 三者都在，缺一即失败。
+这类"构建成功但装完没反应"的问题，只有解包反编译才发现得了。
+
+> **注意 `wix msi decompile` 默认只输出 File/Directory/Component/Feature/Property，
+> 不输出 CustomAction / InstallExecuteSequence / ServiceInstall 等「逻辑表」。**
+> 用它做断言只能验证「文件在不在」，验证不了「安装时会不会执行动作」。
+> 要验证后者，得看 `CustomAction` 表本身 —— 本次是通过反编译产物里
+> `-match 'OpenConnectGuide'` 确认的（若默认不输出，该断言会失败并提示，
+> 不会假通过）。
+
 ---
 
 ## 6. 构建 MSI

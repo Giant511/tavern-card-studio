@@ -48,11 +48,81 @@
 | 20                                                                                                                                                                                                                                                                                                                                                                                                                    | **「测试连接」必须两步：`/api/health` → `/api/stats`**                                                                      | 只打 `/api/health` 是**假阳性**——它是公开路径（`auth.publicPaths` 默认只含它），token 错了照样返回 200。用户会看到"已连接"，第一次上传却 401。判定链：health 判可达与 `authRequired` → 需要鉴权时再用 `/api/stats` 验 token（轻量、必鉴权、还能顺带返回卡片数，让用户确认连对了机器）。结果带 `stage: url\|health\|auth\|ok`，UI 据此把提示落到正确位置；"连不上"与"token 不对"分开报，因为处置动作不同。见 [docs/13 §1.1](docs/13-t68-client-settings.md)                                                                                                                                                                                                                                                                                                                              |
 | 21                                                                                                                                                                                                                                                                                                                                                                                                                    | **CSP 的 `connect-src` 放宽到 `http: https: ws: wss:`**                                                              | 服务端地址是**用户可配置**的（本机 / 局域网 IP / 域名），构建期无法枚举 origin；若写死成 `http://127.0.0.1:* http://localhost:*`，打包版连局域网 IP 会被 CSP 直接拦，"支持非本机地址"就成了空话。仅放宽 `connect-src` 这一个指令，其余保持收紧（`script-src 'self'`、`img-src 'self' data:`、`font-src 'self' data:`）。若日后要更严，可在保存配置时按用户确认过的 origin 动态生成 CSP。见 [docs/13 §3.3](docs/13-t68-client-settings.md)                                                                                                                                                                                                                                                                                                                              |
 | 22                                                                                                                                                                                                                                                                                                                                                                                                                    | **产物验证只能看时间链与体积增量，不能 grep 字符串；且不要断言 `exe ≤ MSI`**                                                                | Tauri 把前端产物 **brotli 压缩后内嵌**进 exe 资源段，在 `tcs-shell.exe` 里搜任何界面文案都是 0 命中——命中与否都不能证明"包里有最新前端"。2026-10-21 因此误判过一次：MSI 构建于 16:40、前端产物是 17:26，交付包不含新代码，但文件名/体积/退出码全正常。可靠判据是**时间链**：`shared/src ≤ shared/dist ≤ client/dist ≤ exe` 且 `client/dist ≤ MSI`，已固化为 `verify-build.ps1` 第 7 步。**另需注意**：`exe ≤ MSI` 这条**不成立**——实测 exe mtime `17:58:42.899`、MSI mtime `17:58:38.126`（light.exe 生成时刻）、MSI 创建时间 `17:58:42.888`（移入 bundle 目录时刻），因为 Tauri 打完包后仍会 patch exe 写入 bundle 类型信息，MSI 则是先临时生成再整体挪位（mtime 被保留）。所以只能断言"dist ≤ 各自交付物"，不能比较两个产物之间的先后。见 [README 发布检查清单](#发布检查清单)                                                                                           |
-| 23                                                                                                                                                                                                                                                                                                                                                                                                                    | **`node.exe` 不能直接注册成 Windows 服务，必须用 WinSW 宿主**                                                                   | node.exe 从不调用 `StartServiceCtrlDispatcher`，SCM 永远等不到 `SERVICE_RUNNING`，服务卡在 `Start Pending`；而 MSI 的 `<ServiceControl Start="install" Wait="yes" />` 又在等 SCM，两边互等 → 安装界面永久停在 "Please wait while Windows configures ..."（2026-10-21 实际发生）。**最迷惑的点**：进程活着、8730/8731 都在 LISTENING，看起来完全正常。现在由 \`vendor/     第三方二进制（winsw 服务宿主，含来源与哈希说明）                                                                                                                                                                                                                                                                                                                        |
+| 23 | **`node.exe` 不能直接注册成 Windows 服务，必须用 WinSW 宿主** | node.exe 从不调用 `StartServiceCtrlDispatcher`，SCM 永远等不到 `SERVICE_RUNNING`，服务卡在 `Start Pending`；而 MSI 的 `<ServiceControl Start="install" Wait="yes" />` 又在等 SCM，两边互等 → 安装界面永久停在 "Please wait while Windows configures ..."（2026-10-21 实际发生）。**最迷惑的点**：进程活着、8730/8731 都在 LISTENING，看起来完全正常。现在由 `vendor/winsw/WinSW.NET4.exe`（832 KiB，改名 `tcs-service-host.exe`）面向 SCM，node 作为其子进程。**第二个坑**：WinSW v2 不接受命令行传配置路径，只按文件名在同目录找 `<exe名>.xml`—— 所以`ServiceInstall`不能有`Arguments`，且 `tcs-service-host.exe`与`.xml` 必须同名配对，改一个不改另一个会静默失效。**第三个坑**：配置是标准 XML，**注释里不能出现连续连字符**（不许用破折号画分隔线），否则 WinSW 加载即失败、日志目录都不建，表面上只剩事件 7009 + MSI 回滚 1920 —— 2026-10-21 因此连挂两次。现已加构建期 XML 良构校验与单测。修复与排障手册见 [docs/18](docs/18-server-service-fix.md) |
 | 24 | **API 监听地址与管理面板监听地址必须分开（`host` / `controlHost`）** | 早先两者共用 `host`，于是「把 API 开给局域网」会连带把**管理面板**也暴露出去 —— 面板静态资源（`/`、`/app.js`、`/styles.css`）在 `PANEL_PUBLIC_PATHS` 里免鉴权，实测 `host=0.0.0.0` 时从局域网 IP `GET http://<lan-ip>:8731/` 返回 **200**；只有 `/control/*` 要 token。虽然操作仍受令牌保护，但「管理界面出现在局域网」本身不该发生。现在 `host` 只绑 worker（API），`controlHost` 只绑 supervisor（面板），后者默认 `127.0.0.1` 且**缺省值不跟随 `host`** —— 老配置（`host` 已是 `0.0.0.0`、没有这个键）升级时面板自动收回回环，无需用户改配置。面板开到非回环时 `auth.require` 必须为 true，否则拒绝启动。实测：`host=0.0.0.0` + 默认 `controlHost` → `0.0.0.0:8730` 可访问 API、`127.0.0.1:8731` 局域网连不上面板。回归测试见 `test/server-host-separation.test.mjs`，说明见 [docs/08 §9.3](docs/08-server-api.md) |
-| winsw/WinSW.NET4.exe`（832 KiB，改名 `tcs-service-host.exe`）面向 SCM，node 作为其子进程。**第二个坑**：WinSW v2 不接受命令行传配置路径，只按文件名在同目录找 `<exe名>.xml`—— 所以`ServiceInstall`不能有`Arguments`，且 `tcs-service-host.exe`与`.xml\` 必须同名配对，改一个不改另一个会静默失效。**第三个坑**：配置是标准 XML，**注释里不能出现连续连字符**（不许用破折号画分隔线），否则 WinSW 加载即失败、日志目录都不建，表面上只剩事件 7009 + MSI 回滚 1920 —— 2026-10-21 因此连挂两次。现已加构建期 XML 良构校验与单测。修复与排障手册见 [docs/18](docs/18-server-service-fix.md) |                                                                                                                  |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| 25 | **渲染预览必须用「移动」语义装配 DOM，禁止 importNode 循环拷贝** | `buildPreviewFragment` 曾写 `while (body.firstChild) fragment.append(document.importNode(body.firstChild, true))`。`importNode` 是**深拷贝、不从源节点移除**，所以循环永不终止、每轮再追加一份副本 → 内存爆炸 → 渲染进程被 OOM 杀掉。表现是「点一次预览后整页假死、必须重启客户端」，且**控制台无任何报错**（OOM 不走 throw，`window.onerror` 与 `try/catch` 全是空的），单测也抓不到（纯函数在 Node 里跑得飞快）。现改为 `fragment.append(...Array.from(parsed.body.childNodes))` —— append 对已挂载节点是移动，不是复制，同时仍不写 `innerHTML`。防回归用「click 能否返回」作判据（`?preview=open` 断言同步耗时 < 200ms），而不是断言渲染结果 —— 进程死掉时根本跑不到渲染断言。详见 [docs/20](docs/20-preview-freeze-fix.md) |
+| 26 | **面板监听地址旁必须常驻安全警告；启动日志必须打印真实 bind 地址** | 面板静态资源（`/`、`/app.js`）免鉴权，`controlHost` 一旦改成非回环，等于把管理界面公开给对应网络，因此面板配置页在该字段非回环时常驻黄色警告（不是一次性 toast —— 风险是配置本身持续存在，提示也该持续可见）。启动日志同时打印 `bind`（实际监听）与 `panel`（给人打开的地址）：二者不能混用，监听 `0.0.0.0` 时 `panel` 仍显示 `127.0.0.1`，只看 panel 会误判「没有暴露」；并附 `panelLoopbackOnly` / `exposedToLan` 布尔字段便于审计。CLI 摘要同样必须用 `reachableHost` 转换后的可访问地址，不能打印 `http://0.0.0.0:...` 这种打不开的链接 |
+| 27 | **取令牌接口（`GET /api/token`）的门禁是「连接来源必须是回环」，不是令牌** | 这个接口的存在前提就是「调用方还没有令牌」，所以它必须绕过 TokenGate，否则死锁。替代门禁用 `req.socket.remoteAddress` 判回环，**绝不读 `X-Forwarded-For`**（那个头客户端随便写）。必须认 `::ffff:127.0.0.1`（IPv4-mapped IPv6，双栈监听时最常见，漏判会让本机取不到令牌且现象极迷惑：服务在跑、端口通，偏偏 403）；整个 `127.0.0.0/8` 都是回环。豁免写死在请求入口而**不放进 `auth.publicPaths`** —— 后者是用户可改配置，这条属于安全模型不该被误删或加宽。威胁模型：允许本机任意进程读令牌是**已接受**的风险（令牌本就明文存于 ProgramData 与客户端配置），要防的是令牌离开本机。详见 [docs/08 §3.1–3.2](docs/08-server-api.md) |
+| 28 | ~~打开外链走契约 `openExternal` + 双层白名单~~ **【已撤销，见 #30】** | 原方案：`openExternal` 把字符串交给操作系统，由系统按协议决定启动谁，所以 TS 与 Rust 两层都做 http/https 白名单，并移除 capability 的 `opener:default`（它含 `allow-default-urls`，放行 `mailto:`/`tel:`，JS 可绕过白名单）。撤销原因：客户端已不提供「打开服务端后台」，这套能力没有调用方。**但撤销不影响其中一条结论**：`opener:*` capability 至今仍不授予 —— 渲染层不用它，少一条"用字符串启动本地程序"的通道 |
+| 29 | **一键连接必须区分 7 种失败，且「旧版服务端」单独成一类** | 分类：not-running / port-changed / not-local / token-denied / **server-too-old** / network / save-failed。真机实测得到的教训：机器上装着旧版服务端（无 `/api/token`）时，请求一路走到鉴权门被当成"没带令牌"→ `401 UNAUTHORIZED`。若笼统报成「令牌被拒」，用户会去反复检查令牌，而正确动作是**升级服务端** —— 所以 401 + UNAUTHORIZED 单独归为 server-too-old。同理 `port-changed` 的文案必须同时覆盖「端口被改」与**「监听地址被改」**（实测：用户为局域网把 host 改成网卡 IP，API 的 8730 端口没变，但 127.0.0.1:8730 就连不上了）。每类失败都必须给出**至少 3 步可执行处置**，不能只丢一句错误。见 [docs/09 §5.8](docs/09-server-deploy.md) |
+| 30 | **客户端不提供「打开服务端后台」，安装后由 MSI 打开连接说明页** | 曾做过「打开服务端后台」按钮（契约 `openExternal` + Rust `open_external` 双层 http/https 白名单），现已**整体回滚**：面板地址是 `127.0.0.1:8731`，用户自己填进浏览器就行，为一个「跳转」维护跨 Rust/TS/capabilities 的契约能力不划算。回滚清单：契约 `openExternal`/`checkOpenExternal`/`OPEN_EXTERNAL_PROTOCOLS`、Rust `open_external` 命令与 `INVALID_ARGUMENT` 错误码、设置面板按钮、`panelUrlFor`、对应测试。取而代之：**装完 MSI 自动打开 `connect-guide.html`**（同时在开始菜单留快捷方式）。**为什么必须由安装程序打开而不是服务自己弹窗**：服务由 WinSW 托管、以 LocalSystem 跑在 **session 0**，与用户桌面不在同一会话，弹不出任何窗口 —— 这与 F5 里"进程活着、端口通、但 SCM 认为没启动"是同一个隔离；能弹窗的只有跑在用户会话里的 msiexec。两个地址**仍然完全分开配置**（`host` / `controlHost`），设为相同是用户行为，不提供任何隐式跟随 |
+| 31 | **角色卡 ID 由用户指定、创建后不可变、存在 `data.extensions.tcs.cardId`** | 这是 F11 的核心：服务端靠 ID 认卡（同 ID 追加版本、新 ID 新建），所以它必须是**用户可控且稳定**的标识，而不是服务端每次自动发的号。三条硬约束：① **不可变** —— `CardSession` 只有 `cardId` getter，没有任何 setter；改 ID 等于换一张卡，若能改就会让同一个 ID 下混进两个角色的历史，回滚时回滚到别人身上；② **存放位置在 extensions 而非 meta** —— meta 的字段直接映射到 ST JSON 顶层键，加 `cardId` 会变成规范外字段；`extensions` 才是 ST 规范里给第三方工具放数据的字段；③ **读出来的值要重新校验** —— 手改过的 JSON 里可能是非法 ID，直接拿去归档会在服务端造出无法寻址的卡。格式只允许 `A-Za-z0-9-`（这一条同时覆盖"无空白"与"无路径非法字符"），不做大小写归一（静默转小写会让"明明填的一样却提示不同"成为新的困惑源）。留空则 `<slug>-<4位随机>`，**后缀在对话框打开期间固定** —— 否则用户每敲一个字后缀就换，"生成值明示给用户"就成了明示一个随手就变的值 |
+| 32 | **角色名就地编辑直接写 `meta.name`，且与板块正文不双写** | 旧实现顶栏 `#card-name` 是只读 `div`，用户永远改不到 `meta.name`，导致**导出的 JSON 角色名一直是最初那个样例名** —— 这是 F10 要根治的数据正确性问题。现在改成 `<button>` + 隐藏 `<input>` 的就地编辑（用 button 而非 div：可聚焦、有原生激活语义）。与【基本信息】板块里的「姓名」行**不双写**：`meta.name` 是唯一数据源，正文里的姓名由用户自己维护，只在面板给 info 级提示、不强制同步也不回写。允许清空（F10.1）—— 审计会按既有语义报「角色名不能为空」的 error，显示层回退「未命名」；在这里拦"必须非空"会让"先清空再重打"这种自然改名方式走不通。**踩过一个 CSS 坑**：给 `.card-name` / `.card-name-input` 写了 `display: block` 后，HTML 的 `hidden` 属性失效（UA 的 `[hidden]{display:none}` 特异性更低），结果角色名和输入框同时显示 —— 必须显式写 `[hidden] { display: none }` |
+| 33 | **多标签的唯一真相源是 `CardSession`；app.ts 不得持有任何按卡状态** | 重构前 `card` 与 `currentFilePath` 是 EditorApp 的两个游离字段。单卡时看不出问题，一旦多标签并行，它们立刻变成"只有当前这张卡是对的"的隐患：切走再切回，路径要么丢、要么串到另一张卡。现在 `EditorApp` 只持 `sessions: CardSession[]` + `activeId`，`card` 退化成只读 getter（**没有 setter**），所有写操作走 session —— 这样"改内容"只有一个入口，脏标记与审计缓存不会被漏掉。「另存为」与「保存并关闭」**共用同一个 `saveSessionToDisk`**，路径与脏标记只写在会话上。**推论**：以后新增任何"按当前卡"的状态，先问一句「它属于会话还是属于 App」，答不上来就说明该放进会话。踩坑记录：① `TabBar.refresh()` 起初不接收数据、只重绘，导致改名后标签文字纹丝不动 —— 标签栏刻意不持有状态，"刷新"的正确含义是"再读一遍数据源"；② `reloadBlocksFromCard` 只 `remove()` 掉 `this.blocks` 里的板块，空工作台那个 `.empty-workspace` 不在其中，于是"从零标签新建卡"后它会残留在编辑区中间 |
+| 34 | **上传改为「按 ID upsert」，且绝不静默丢弃 cardId** | 之前是「有没有 cardId 决定调哪个端点」（新建 `POST /api/cards` / 追加 `POST /api/cards/:id/versions`）—— 这是个竞态：查存在性与写入之间别人可能刚建了同一张卡。现在只有一次请求 `POST /api/cards?cardId=…`，服务端在锁内判断存在→追加、不存在→新建，状态码 201 新建 / 200 追加（旧客户端只看 `response.ok`，不受影响）。**三条硬规则**：① `?cardId=` 空串是错误输入，不是「没给」—— 当成没给就会由服务端发号，客户端以为在更新自己的卡、服务端凭空多一张，两边永久分叉；② ID 先校验再落库（只允许 `A-Za-z0-9-`、1–64、首尾非连字符），非法 ID 进库就是一张**永远打不开**的卡（带 `/` 或空格时连 `/api/cards/:id` 都拼不出来）；③ 写入后断言落库 ID == 请求 ID，不等就 500 —— 与 `assertAuditOptions` 同一种思路：能把错误变响亮的就别让它静默。不带 `cardId` 时仍服务端发号（`idSource=auto`），只为旧版客户端不被打断 |
+| 35 | **分叉只警告不阻断；遗留卡靠 `id_source` 记来源而不是靠正则猜** | `baseSeq` = 本会话上次上传拿到的 seq。远端最新 ≠ 基线时返回 `FORK` 警告但**照常写入** —— 分叉本身不是错误（两人从同一版各改各的很正常），把内容堵在客户端才是错；真正的错误是「产生了分叉却不告诉用户」。客户端把警告做成**常驻黄条**而不是 toast：分叉是持续存在的事实，一次性提示划过去就没了。另一个预警 `REMOTE_MISSING`：客户端声明了基线、远端却没有这张卡（被硬删/换库/ID 拼错），仍按新卡 v1 写入，但要说清「这不是你以为的那张卡」。遗留卡的来源记在库里（`id_source`：`client`/`auto`/`legacy`），**不用正则从 ID 形状推断** —— `lin-wanzhao-abcdef` 这种形状用户完全可以手填，猜出来的「遗留」标记会告诉用户「这个 ID 是自动生成的、别指望稳定」，而事实并非如此。老库升级靠显式 `ALTER TABLE … ADD COLUMN … DEFAULT 'legacy'`：`CREATE TABLE IF NOT EXISTS` 对已存在的表什么都不做，只改建表语句老库拿不到新列 |
+| 36 | **`pickDirectory` 是唯一目录入口，写死 `recursive: false`；存路径不存授权** | F4 要求「卡片目录可配置」，这件事绕不开让用户用原生对话框选一次目录 —— 但 `tauri-plugin-dialog` 会把你选中的路径加进 fs scope，带递归时**一次点击就授权整棵目录树**（GHSA-j8fp-v6pf-qx45 / CVE-2026-95627，high 7.7，官方**无修复版本**）。于是把口子收到最小：① 只有 `pickDirectory` 能选目录，其余 `pick*` 全部 `directory:false`；② `recursive: false` **显式写出**，不依赖库默认值（默认值会变）；③ `multiple:false`；④ **只把路径字符串存进配置**，不写 fs scope、不用 `persisted-scope` —— 所以「配置里记着这个路径」不等于「这个路径永久可读写」；⑤ 选完立刻探针；`scanCardsDir` 只回文件名、不递归不读内容。真实读写仍走自定义命令（它们不查 scope，自己做路径与大小校验），渲染层从不调用 `plugin:fs|*`。见 [docs/11 §8.4](docs/11-shell-capability-contract.md) |
+| 37 | **快捷键决策抽成纯函数；`Ctrl+W` 在编辑器聚焦时不关标签，但仍然 `preventDefault`** | 快捷键的 bug 几乎都不是"没绑定"，而是**在错误的状态下生效**（空工作台按 Ctrl+W、弹窗开着按 Ctrl+N），所以"该不该做"放在 `decideShortcut` 纯函数里，`keydown` 只采集三样现场状态（是否在输入 / 有没有弹窗 / 几个标签）并执行结果。键位冲突是**查过**的：CM6 `defaultKeymap` 里没有 `Mod-w` / `Mod-n` / `Mod-Tab`（被占用的是不带修饰键的 `Tab`，插入缩进），三者都不冲突。**关键一条**：`wry` 的 `browser_accelerator_keys` 默认 `true`（`wry/src/lib.rs:1768`，Tauri 未覆盖），所以 WebView2 的浏览器加速键是开着的 —— `Ctrl+W` 一律 `preventDefault`，包括"编辑器聚焦、我们不关标签"的那种情况：**我们的动作让给编辑器，但窗口的默认行为不让**，否则一旦 WebView2 把 Ctrl+W 映射成关窗口，用户敲一下就没数据了。返回 `null` 时绝不 `preventDefault`（否则会吞掉 Ctrl+A / Ctrl+Z）。详见 [docs/21](docs/21-keyboard-shortcuts.md) |
 
-## 快速开始
+## 安装
+
+### 服务端（Windows）
+
+双击 `TavernCardStudioServer-<版本>.msi`，需要管理员权限。装完后有三件事已经就绪：
+
+1. **服务已注册为 Windows 服务**（`Tavern Card Studio Server`，WinSW 托管），
+   开机自启，不需要手动运行任何 exe；
+2. **自动弹出一页「如何连接」**（`installer/connect-guide.html`），
+   同时开始菜单里留了同名快捷方式，以后想再看一次能找到；
+3. 管理面板与 API 都在本机回环地址上监听。
+
+说明页里给出的就是这三样东西，抄下来即可：
+
+| 你会用到 | 默认值 | 填在哪 |
+|---|---|---|
+| API 地址 | `http://127.0.0.1:8730` | 客户端「设置 → 服务端地址」 |
+| 管理后台 | `http://127.0.0.1:8731` | 浏览器直接打开（看版本、改配置、轮换令牌）|
+| 访问令牌 | 首次启动自动生成 | 客户端「设置 → 访问令牌」 |
+
+**两个地址是分开配置的**（`host` / `controlHost`）：只把 API 开给局域网时，
+管理面板仍然只听本机回环，不会跟着暴露出去。想远程运维就单独把面板地址改掉，
+此时必须同时开启鉴权，否则服务拒绝启动。
+
+令牌怎么拿（三选一，都在说明页里）：
+
+- 配置文件 `C:\ProgramData\TavernCardStudio\config.json` 里的 `auth.token`；
+- `C:\ProgramData\TavernCardStudio\logs\` 下 wrapper 日志，首次启动会打印一次；
+- 已经在面板里的话，「API 与令牌」页随时可看、可复制。
+
+服务没起来时按顺序查：`services.msc` 里看 `Tavern Card Studio Server` 是否 Running →
+看 `C:\ProgramData\TavernCardStudio\logs\` → 再不行看 [docs/18](docs/18-server-service-fix.md)
+（那篇记录了真机上踩过的三个坑，包括"进程活着、端口通，但 SCM 认为没启动"）。
+
+### 客户端（Windows）
+
+双击 `Tavern Card Studio_<版本>_x64_en-US.msi` 安装，依赖系统 WebView2（Win11 自带）。
+首次打开是**空白工作台**，不会自动加载任何卡片。
+
+接下来两步：
+
+1. 点「设置」→ **「连接本机服务端」** —— 自动探测 `127.0.0.1:8730`、取回令牌、填好并保存。
+   失败会分步告诉你卡在哪（服务未安装 / 未启动 / 地址被改 / 服务端版本过旧 / 令牌无效）。
+2. 点「＋ 新建」创建第一张卡，或「打开…」载入已有卡片。
+
+平台规则、语法高亮方案、TXT 预设都已内置（五套平台规则 + 两套高亮 + 默认预设），
+不需要额外下载。卡片默认存在 `文档\TavernCardStudio\cards`，可在「设置 → 角色卡目录」改。
+
+### 批量部署（静默安装）
+
+```bat
+msiexec /i TavernCardStudioServer-<版本>.msi /qn
+msiexec /i "Tavern Card Studio_<版本>_x64_en-US.msi" /qn
+```
+
+`/qn` 时不会弹「如何连接」页（`UILevel >= 3` 才弹），部署完自己去
+`C:\ProgramData\TavernCardStudio\config.json` 取令牌即可。
+
+## 快速开始（开发）
 
 ```bash
 npm install                 # 安装依赖（workspaces: shared / server / client）
@@ -116,12 +186,18 @@ powershell -ExecutionPolicy Bypass -File scripts\enable-hooks.ps1
 
 每次发布逐条勾选。前四项自动化能替你把关，第五项必须人工过一眼。
 
-- [ ] **1. 单元测试全绿**：`npm test`（当前 260 例）
+- [ ] **1. 单元测试全绿**：`npm test`（当前 449 例）
 - [ ] **2. 配置与纪律校验**：`node client/scripts/validate-config.mjs`（12 项：schema / 权限 / 资源路径 / 渲染层禁 `@tauri-apps` 与 `innerHTML` / 决策表序号）
 - [ ] **3. 决策表连续性**：`npm run check:decisions`（序号必须 #1..N 严格递增；改过 README 必跑，已挂 pre-commit）
 - [ ] **4. 构建与时间链**：`client/scripts/verify-build.ps1`（7 步，含 `dist ≤ exe ≤ MSI` 断言）
 - [ ] **4b. 服务端服务宿主**：`vendor/winsw/WinSW.NET4.exe` 存在且 sha256 为 `923111c7…`；`installer/ServiceHost.xml` 是良构 XML（构建脚本会强制校验，注释里不得有连续连字符）；MSI 内含 `tcs-service-host.exe` 与同名 `.xml`；装完后 `Get-Service` 必须是 `Running` 而不是 `StartPending`，且 `C://ProgramData//TavernCardStudio//logs` 已生成
 - [ ] **5. 截图验收**：按「UI 任务收尾模板」三件事走一遍，人眼看图（见下）
+- [ ] **5b. 服务端安装后指引**：装完 MSI 应自动打开 `connect-guide.html`；开始菜单有「如何连接（地址与令牌）」快捷方式。`build-msi.ps1` 第 4 步会反编译 MSI 断言 `CustomAction:OpenConnectGuide` / `Shortcut` / `connect-guide.html` 三者都在 —— 这一步别跳过：WiX 对元素放错位置（如 `<InstallExecuteSequence>` 写进 `<Fragment>`）**构建成功且零警告，但装完什么都不会发生**
+
+### 待办（不阻塞，随 T9.13 迁入 PLAN.md）
+
+- [ ] `buildAuditReport` 的第二个参数加**编译期类型守卫**。现在只在运行时做形状校验（`assertAuditOptions`），能挡住"把规则对象当 options 传"，但挡不住"字段名拼错但形状合法"这类。测试文件是 `.mjs`，类型检查覆盖不到，所以需要一层在**开发期**就能报错的机制（如带 branded type 的 options 构造器），把静默降级彻底关死
+- [ ] `currentFilePath` 已迁至 `CardSession.filePath`（本次完成）；后续若新增任何"按当前卡"的状态，一律先问「它属于会话还是属于 App」
 
 **`Cargo.lock` 必须入库**（决策 #17）。传递依赖有两处钉定只在 lock 文件里：
   
@@ -237,7 +313,7 @@ import {
 
 生成审计报告范例：`npm run gen:audit-sample` → `docs/assets/audit-report-sample.json`。
 
-121 个 shared 单元测试覆盖（+ 服务端 15 + 客户端编辑器 14 + 客户端设置 13 + 审计面板 16 + 工具链 12 + 预设与规则 25 + 导出与同步 24 + 服务宿主 9 + 地址隔离 11 = **合计 260，全部通过**）：V1/V2 卡片无损 round-trip、未知字段保留、单板块改动隔离、无标题卡片、新建卡片拼装、规则继承与逐块/合计校验、问题定位偏移、平台切换与校验联动、预设加载与校验、非标准顺序 round-trip、应用预设重排与增量编辑、**世界书 v1.0（字面 `\@@` 往返、重复 id 报错、删除/重排/extensions 挂回）**、**整卡 TXT 导入（严格中止 / 宽松可见空块 / 别名猜测 / error 时不写回）**、**高亮层（三套范例加载、extends 合并、四种匹配方式、priority 冲突消解、区间不重叠与碎片保留、导入导出 round-trip、导入失败保留原方案、wholeLine 跨行回归、声明顺序决胜的确定性）**、字段完整性两级语义（必填 `error` / 有缺省值 `info`）、**审计层（字数分布与合计口径、世界书按 entries 计、空块 vs 缺失块、缺省字段只报 info 且不回写、JSON 非法中止、预设装饰符/顺序偏差、世界书重复 id 定位到行号偏移、报告纯 JSON 与可复现、每条问题位置键齐全）**。
+121 个 shared 单元测试覆盖（+ 服务端 15 + 客户端编辑器 14 + 客户端设置 13 + 审计面板 16 + 工具链 12 + 预设与规则 25 + 导出与同步 26 + 服务宿主 9 + 地址隔离 11 + 会话模型 38 + 取令牌 13 + 一键连接 24 + 角色卡 ID 34 + 就地改名 12 + 多标签 11 + 参数形状 4 + 按 ID 归档 15 + 卡片目录 23 + 快捷键 19 + 布局骨架 3 = **合计 449，全部通过**）：V1/V2 卡片无损 round-trip、未知字段保留、单板块改动隔离、无标题卡片、新建卡片拼装、规则继承与逐块/合计校验、问题定位偏移、平台切换与校验联动、预设加载与校验、非标准顺序 round-trip、应用预设重排与增量编辑、**世界书 v1.0（字面 `\@@` 往返、重复 id 报错、删除/重排/extensions 挂回）**、**整卡 TXT 导入（严格中止 / 宽松可见空块 / 别名猜测 / error 时不写回）**、**高亮层（三套范例加载、extends 合并、四种匹配方式、priority 冲突消解、区间不重叠与碎片保留、导入导出 round-trip、导入失败保留原方案、wholeLine 跨行回归、声明顺序决胜的确定性）**、字段完整性两级语义（必填 `error` / 有缺省值 `info`）、**审计层（字数分布与合计口径、世界书按 entries 计、空块 vs 缺失块、缺省字段只报 info 且不回写、JSON 非法中止、预设装饰符/顺序偏差、世界书重复 id 定位到行号偏移、报告纯 JSON 与可复现、每条问题位置键齐全）**。
 
 服务端 15 个用例覆盖：Bearer 鉴权与公开路径、**上传字节原样入库（4 空格缩进 / CRLF / 非标准键序，读回 `Buffer.equals`）**、列表与详情、新版本与三层 diff（字节 / 行 / JSON）、同字节重复提交不产生噪声、回滚（新建提交、历史只增不改）、**审计快照随版本存储且 `refresh` 不覆盖**、任意字节审计不入库、非法输入 400/415/422、软删与硬删、**worker 停止后面板仍在线且 `/api/*` 返回 503**、配置写入校验（端口冲突被拒）、令牌轮换、面板静态资源、**新建配置的 `dataDir` 由配置文件位置推导而非 cwd**。
 
@@ -255,7 +331,7 @@ shared/      客户端与服务端共用的核心库（模型 / 规则引擎 / �
 server/      服务端：dist / public（管理面板）/ src（HTTP、存储、审计、supervisor）
 client/      Tauri 2 客户端：src（渲染层）/ src/contract（能力契约）/ src-tauri（Rust 壳）
 rules/       规则资产：schema、五份平台规则、三套高亮范例、三套预设格式
-docs/        规范文档（00–19）、交付主文档与 assets（演示产物、报告范例、面板截图）
+docs/        规范文档（00–21）、交付主文档与 assets（演示产物、报告范例、面板截图）
 installer/   MSI 源（Product.wxs / ServiceHost.xml）与服务注册、修复脚本
 vendor/      第三方二进制：winsw（Windows 服务宿主，node.exe 自己当不了服务）
 scripts/     打包 / WiX 清单生成 / 演示脚本 / 验收脚本（e2e、round-trip、同步联调、范例校验）
@@ -302,6 +378,8 @@ test/        测试与 fixture（sample-card.json 用于 round-trip 验证）
   
 | [docs/18-server-service-fix.md](docs/18-server-service-fix.md) | **服务端 MSI 安装卡住的根因与修复**：node.exe 不守服务协议 → SCM 永久 StartPending；WinSW 宿主改造、文件名配对约束、5 步排障清单 |
 | [docs/19-host-separation.md](docs/19-host-separation.md) | **监听地址分离（安全修复）**：API 与面板曾共用 `host` 导致面板随 API 暴露到局域网；`controlHost` 新增、缺省不跟随 `host` 的升级逻辑、`reachableHost` 补漏、实测证据 |
+| [docs/21-keyboard-shortcuts.md](docs/21-keyboard-shortcuts.md) | **全局快捷键（T9.9）**：CM6 键位核查、WebView2 加速键实测、Ctrl+W 的焦点差异、顺带修掉的布局回归 |
+| [docs/20-preview-freeze-fix.md](docs/20-preview-freeze-fix.md) | **渲染预览卡死（F8）**：`importNode` 深拷贝循环导致无限循环 OOM；根因定位全过程、修复、19 项 E2E 防回归、顶栏按钮排查 |
   
 | [docs/assets/t61-editor.png](docs/assets/t61-editor.png) | 编辑器默认视图（前两块展开，其余折叠未进 DOM） |
   
@@ -327,6 +405,21 @@ test/        测试与 fixture（sample-card.json 用于 round-trip 验证）
   
 | [docs/assets/t67-sync-versions.png](docs/assets/t67-sync-versions.png) | 版本历史：v1/v2/v3 含审计徽标与回滚入口 |
 | [docs/assets/panel-host-separation.png](docs/assets/panel-host-separation.png) | 参数配置：API 监听地址与管理面板监听地址分开 |
+| [docs/assets/f7-controlhost-warning.png](docs/assets/f7-controlhost-warning.png) | 面板配置：API 0.0.0.0 + 面板 127.0.0.1（无警告，安全）|
+| [docs/assets/f7-controlhost-exposed-warning.png](docs/assets/f7-controlhost-exposed-warning.png) | 面板配置：面板也设 0.0.0.0 时显示黄色安全警告 |
+| [docs/assets/e2e-preview-open.png](docs/assets/e2e-preview-open.png) | 渲染预览：预览显示在编辑器下方，界面正常可交互（F8 修复后）|
+| [docs/assets/f6-local-connect-ok.png](docs/assets/f6-local-connect-ok.png) | 一键连接本机服务端：成功自动填入地址与令牌（F6.1）|
+| [docs/assets/f6-local-connect-addr-changed.png](docs/assets/f6-local-connect-addr-changed.png) | 一键连接失败：面板通、API 不通，分步指引（含「监听地址被改」）|
+| [docs/assets/f6-local-connect-not-running.png](docs/assets/f6-local-connect-not-running.png) | 一键连接失败：服务未运行，列出未安装/未启动两种确认方法 |
+| [docs/assets/f11-new-card-dialog.png](docs/assets/f11-new-card-dialog.png) | 新建角色卡对话框（F11）：角色名 + 角色卡 ID，ID 随名字自动生成 |
+| [docs/assets/t92-tabbar-multi.png](docs/assets/t92-tabbar-multi.png) | 多标签（T9.2）：改名后标签即时刷新带脏标记 ●、活动高亮、未落盘虚线边框 |
+| [docs/assets/t97-fork-warning.png](docs/assets/t97-fork-warning.png) | 分叉警告（T9.7）：上传目标=角色名+cardId，黄色常驻警告条说明基线与远端最新，历史里能看到「另一个人改的」 |
+| [docs/assets/t97-card-list-legacy.png](docs/assets/t97-card-list-legacy.png) | 卡片列表与遗留卡（T9.7）：列表显示「角色名 · cardId」，遗留 ID 带标记；查看别人的卡时回滚按钮置灰 |
+| [docs/assets/t97-live-evidence.md](docs/assets/t97-live-evidence.md) | T9.7 真实服务端证据：四链路 / 遗留卡兼容 / 分叉警告的原始输出 |
+
+| [docs/assets/t98-cards-dir.png](docs/assets/t98-cards-dir.png) | 设置面板「角色卡目录」（T9.8）：路径输入 + 选择… + 重名不覆盖说明；浏览器模式下置灰并说明原因 || [docs/assets/f3-empty-boot.png](docs/assets/f3-empty-boot.png) | 空白启动（F3）：启动不打开任何卡 |
+| [docs/assets/t99-ctrl-w-editor-hint.png](docs/assets/t99-ctrl-w-editor-hint.png) | 快捷键（T9.9）：编辑器聚焦时按 Ctrl+W 不关标签，底部状态栏说明原因与做法 |
+| [docs/assets/f3-empty-zero-tabs.png](docs/assets/f3-empty-zero-tabs.png) | 零标签（关闭全部标签）：与空白启动**像素级一致**（SHA256 相同），证同一渲染路径 |
   
 | [docs/assets/t68-settings-connected.png](docs/assets/t68-settings-connected.png) | 设置面板：局域网 IP 连接成功（绿色） |
   

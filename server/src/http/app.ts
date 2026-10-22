@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import { AppError } from '../errors.js';
+import { isLoopbackAddress } from '../config.js';
 import { API_VERSION, SERVER_VERSION, configSummary, type ServerContext } from '../context.js';
 import { readRawBody, parseJsonBody } from './body.js';
 import { TokenGate } from './auth.js';
@@ -35,6 +36,64 @@ function queryBool(query: URLSearchParams, key: string): boolean {
 function optional(query: URLSearchParams, key: string): string | undefined {
   const raw = query.get(key);
   return raw === null || raw.trim() === '' ? undefined : raw.trim();
+}
+
+/**
+ * 解析上传请求里的角色卡 ID（T9.7）。
+ *
+ * 支持 `?cardId=` 与 `X-TCS-Card-Id` 两种写法：query 便于 curl 随手试，
+ * header 便于客户端把 ID 与"纯字节 body"分干净。两处都给了且不一致 → 400，
+ * 不去猜哪个是用户的本意。
+ *
+ * **空串不算"没给"。** `?cardId=` 是一个明确的、错误的输入：用户/客户端
+ * 想表达"我要用这个 ID"，只是值忘了填。若把它当成"没给"而退回服务端发号，
+ * 就会造出一张 ID 不是用户以为的那张卡 —— 这正是需求里禁止的"静默丢弃 cardId"。
+ * 返回 `null` 只有一种含义：请求里确实没有这个参数（旧版客户端）。
+ */
+function resolveUploadCardId(ctx: RouteContext): string | null {
+  const rawQuery = ctx.query.get('cardId');
+  const rawHeader = ctx.req.headers['x-tcs-card-id'];
+  const fromHeader = typeof rawHeader === 'string' ? rawHeader : Array.isArray(rawHeader) ? rawHeader[0] : undefined;
+
+  // 注意 `URLSearchParams.get()` 缺参数时返回的是 **null**，不是 undefined。
+  // 只判 undefined 会把 null 放进 candidates，下一行 `.trim()` 直接抛 500 ——
+  // 而这个分支恰恰是"旧版客户端不带 cardId"的**最常见**路径。
+  const candidates = [rawQuery, fromHeader].filter(
+    (value): value is string => value !== undefined && value !== null,
+  );
+  if (candidates.length === 0) return null;
+
+  const trimmed = candidates.map((value) => value.trim());
+  if (new Set(trimmed).size > 1) {
+    throw new AppError(400, 'BAD_CARD_ID', 'cardId 在 query 与 X-TCS-Card-Id 头里不一致', {
+      query: rawQuery ?? null,
+      header: fromHeader ?? null,
+    });
+  }
+  const value = trimmed[0]!;
+  if (value === '') {
+    throw new AppError(400, 'BAD_CARD_ID', 'cardId 参数为空：要么给出有效 ID，要么完全不传（不传才会由服务端发号）', {
+      hint: '不传 cardId 意味着"新建一张服务端发号的卡"，只在旧版客户端里出现',
+    });
+  }
+  return value;
+}
+
+/**
+ * 解析 `baseSeq`（本次上传所基于的远端版本号）。
+ *
+ * 只在客户端**确实知道自己上次上传的是哪一版**时才该传。传 0 与不传不同：
+ * 0 表示"我知道远端应该是空的"，不传表示"我不知道基线"。二者都不触发分叉警告，
+ * 但语义不同，所以这里保留原值、不做归一。
+ */
+function parseBaseSeq(query: URLSearchParams): number | null {
+  const raw = query.get('baseSeq');
+  if (raw === null || raw.trim() === '') return null;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new AppError(400, 'BAD_REQUEST', 'baseSeq 必须是非负整数');
+  }
+  return value;
 }
 
 function requireCardBody(ctx: RouteContext): Buffer {
@@ -101,6 +160,51 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     });
   });
 
+  /**
+   * F6.2 取令牌接口。
+   *
+   * 定位：这是「客户端首次连接本机服务端」的引导接口 —— 用户装了服务端，
+   * 不想去翻日志找令牌，点一下按钮自动填好。
+   *
+   * **它必须在 TokenGate 之前处理**（见 handle() 里的提前返回），
+   * 因为调用方此刻手里还没有令牌 —— 这正是它存在的理由。
+   * 取而代之的门禁是**回环来源检查**。
+   */
+  router.get('/api/token', (_ctx) => {
+    // 双重判断：连接来源必须是回环。
+    // 这里刻意不读 X-Forwarded-For —— 那个头由客户端随便写，拿它做门禁等于没有门禁。
+    const remote = _ctx.req.socket.remoteAddress;
+    if (!isLoopbackAddress(remote)) {
+      throw new AppError(
+        403,
+        'TOKEN_LOCAL_ONLY',
+        '取令牌接口只接受来自本机的请求（令牌不得出本机）',
+        { hint: '请在服务端所在的这台机器上运行客户端；远程使用请手动复制令牌' },
+      );
+    }
+    if (ctx.config.auth.token === '') {
+      // 防御性分支：正常配置流程下**走不到这里**。
+      // `normalizeConfig` 用 `generateToken()` 兜底，所以服务端永远有令牌；
+      // `auth.require=false` 只是「不校验」，不代表「没有令牌」。
+      // 保留这个分支是为了挡住一种可能：有人绕过 normalizeConfig 直接构造配置
+      // （测试替身、未来新增的入口）。此时返回空串会让客户端把
+      // 「无鉴权」误当成「令牌是空字符串」，所以宁可明确报错。
+      throw new AppError(
+        409,
+        'TOKEN_NOT_CONFIGURED',
+        '服务端未配置访问令牌（配置被绕过规范化构造），无法取令牌',
+        { hint: '删除配置文件让服务端重新生成，或运行 `tcs-server token rotate`' },
+      );
+    }
+    sendJson(_ctx.res, 200, {
+      token: ctx.config.auth.token,
+      // 让客户端知道服务端是否真的在校验令牌：false 时令牌填不填都能连，
+      // 界面上可以据此提示，而不是让用户以为「必须填对」。
+      authRequired: ctx.config.auth.require,
+      server: { version: SERVER_VERSION, apiVersion: API_VERSION },
+    });
+  });
+
   router.get('/api/auth/verify', (_ctx) => {
     sendJson(_ctx.res, 200, {
       ok: true,
@@ -157,12 +261,31 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     sendJson(_ctx.res, 200, { total: result.total, limit, offset, items: result.items });
   });
 
+  /**
+   * 上传（T9.7 按 ID 归档）。
+   *
+   *   · 带 `cardId` → **upsert**：存在则追加版本，不存在则按该 ID 新建；
+   *   · 不带 `cardId` → 服务端发号（旧版客户端兼容路径，`idSource='auto'`）。
+   *
+   * 状态码：新建 201、追加 200。旧客户端不看状态码只看 `response.ok`，
+   * 所以这个区分不会打断它们。
+   *
+   * 响应里的 `warnings` 是**不阻断**的提示：目前是分叉（FORK）与
+   * "远端没有这张卡"（REMOTE_MISSING）。两者都照常写入 ——
+   * 内容不能因为"可能有冲突"就丢掉，但用户必须知道。
+   */
   router.post('/api/cards', async (_ctx) => {
     const bytes = requireCardBody(_ctx);
-    const result = await ctx.cards.create(bytes, writeOptionsFrom(_ctx.query, ctx));
-    sendJson(_ctx.res, 201, result, {
-      Location: `/api/cards/${result.card.id}`,
-      'X-TCS-Card-Id': result.card.id,
+    const cardId = resolveUploadCardId(_ctx);
+    const result = await ctx.cards.upload(cardId, bytes, {
+      ...writeOptionsFrom(_ctx.query, ctx),
+      baseSeq: parseBaseSeq(_ctx.query),
+    });
+    sendJson(_ctx.res, result.created ? 201 : 200, result, {
+      Location: `/api/cards/${encodeURIComponent(result.cardId)}`,
+      'X-TCS-Card-Id': result.cardId,
+      'X-TCS-Card-Seq': String(result.seq),
+      'X-TCS-Card-Created': result.created ? '1' : '0',
     });
   });
 
@@ -315,7 +438,16 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
         return;
       }
 
-      gate.check(req, pathname);
+      // `/api/token` 是引导接口：调用方此时**必然没有令牌**，所以不能过 TokenGate。
+      // 它的门禁是路由内部的回环来源检查（见路由定义）。
+      //
+      // 为什么不在 auth.publicPaths 里加这一条：publicPaths 是用户可改的配置项，
+      // 而这条豁免是安全模型的一部分，不该被误删或误加宽。把它写死在这里，
+      // 并让「来源必须是回环」成为唯一条件，审计时一眼能看清。
+      const isTokenBootstrap = method === 'GET' && pathname === '/api/token';
+      if (!isTokenBootstrap) {
+        gate.check(req, pathname);
+      }
 
       const match = router.match(method, pathname);
       if (!match) {

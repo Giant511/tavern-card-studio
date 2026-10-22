@@ -210,6 +210,14 @@ Write-Host '[3/4] Building MSI...'
 $stageResolved = (Resolve-Path -LiteralPath $StageDir).Path
 $winSwResolved = (Resolve-Path -LiteralPath $winSwDir).Path
 $serviceHostResolved = (Resolve-Path -LiteralPath $serviceHostConfig).Path
+
+# 连接说明页（装机后自动打开、并在开始菜单留快捷方式）。
+# 缺了它 MSI 会构建失败 —— 这是有意的：指引是交付物的一部分，不该被静默跳过。
+$connectGuide = Join-Path $scriptDir 'connect-guide.html'
+if (-not (Test-Path -LiteralPath $connectGuide)) {
+  throw "Missing connect guide: $connectGuide"
+}
+$connectGuideResolved = (Resolve-Path -LiteralPath $connectGuide).Path
 $wixArgs = @(
   'build'
   (Join-Path $scriptDir 'Product.wxs')
@@ -218,6 +226,7 @@ $wixArgs = @(
   '-d', "StageDir=$stageResolved"
   '-d', "WinSwDir=$winSwResolved"
   '-d', "ServiceHostConfig=$serviceHostResolved"
+  '-d', "ConnectGuide=$connectGuideResolved"
   '-d', "ProductVersion=$Version"
   '-o', $msi
 )
@@ -227,9 +236,40 @@ $wixArgs = @(
 if ($LASTEXITCODE -ne 0) { throw "wix build failed with exit code $LASTEXITCODE" }
 if (-not (Test-Path -LiteralPath $msi)) { throw "wix build reported success but $msi is missing" }
 
-# ---------------------------------------------------- 4. 结果与后续操作提示
+# ------------------------------------------- 4. MSI 内容断言（防静默不生效）
+#
+# 为什么需要这一步：WiX 对「元素放错位置」有时**不报错也不警告**，只是不写进表。
+# 2026-10-22 实测：把 <InstallExecuteSequence> 写在 <Fragment> 里，
+# wix build 退出码 0、日志一条警告都没有，但反编译后 CustomAction 表是空的 ——
+# 装完根本不会弹连接说明。这类问题只有"解包反编译"才能发现。
+#
+# 断言三件事，缺一即失败：
+#   · CustomAction 表有 OpenConnectGuide（安装后打开说明页）；
+#   · Shortcut 表有快捷方式（开始菜单能再次打开）；
+#   · File 表有 connect-guide.html（说明页本身在包里）。
+Write-Host '[4/5] Verifying MSI content (decompile)...'
+$decompDir = Join-Path $OutDir '.decompile'
+if (Test-Path -LiteralPath $decompDir) { Remove-Item -LiteralPath $decompDir -Recurse -Force }
+New-Item -ItemType Directory -Path $decompDir -Force | Out-Null
+$decompFile = Join-Path $decompDir 'decompiled.wxs'
+$null = & $wix msi decompile $msi -o $decompFile 2>&1
+if (-not (Test-Path -LiteralPath $decompFile)) {
+  throw "MSI decompile failed; cannot verify installer content."
+}
+$decompiled = Get-Content -LiteralPath $decompFile -Raw
+$missing = @()
+if ($decompiled -notmatch '<CustomAction[^>]*OpenConnectGuide') { $missing += 'CustomAction:OpenConnectGuide' }
+if ($decompiled -notmatch '<Shortcut') { $missing += 'Shortcut' }
+if ($decompiled -notmatch 'connect-guide\.html') { $missing += 'File:connect-guide.html' }
+if ($missing.Count -gt 0) {
+  throw ("MSI is missing expected entries: {0}. The build succeeded but the installer will not behave as expected." -f ($missing -join ', '))
+}
+Remove-Item -LiteralPath $decompDir -Recurse -Force
+Write-Host '  CustomAction / Shortcut / connect-guide.html all present'
+
+# ---------------------------------------------------- 5. 结果与后续操作提示
 $size = (Get-Item -LiteralPath $msi).Length / 1MB
-Write-Host '[4/4] Done.'
+Write-Host '[5/5] Done.'
 Write-Host ''
 Write-Host ("MSI:      {0} ({1:N1} MB)" -f $msi, $size)
 Write-Host ("Version:  {0}" -f $Version)

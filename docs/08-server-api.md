@@ -89,6 +89,53 @@ HTTP/1.1 200 OK
 }
 ```
 
+### 3.1 取令牌（引导接口，免鉴权）
+
+```http
+GET /api/token
+
+HTTP/1.1 200 OK
+{
+  "token": "<32 字符 base64url>",
+  "authRequired": true,
+  "server": { "version": "0.1.0", "apiVersion": "v1" }
+}
+```
+
+**这是唯一一个「不需要令牌却能拿到令牌」的接口**，所以它的门禁不是令牌，而是**连接来源**：
+
+| 来源 | 结果 |
+|---|---|
+| `127.0.0.1` / `::1` / `::ffff:127.0.0.1` / `127.0.0.0/8` | `200` + 令牌 |
+| 任何非回环来源 | `403` `TOKEN_LOCAL_ONLY` |
+
+判定用的是 `req.socket.remoteAddress`，**绝不读 `X-Forwarded-For`** ——
+那个头由客户端随便写，拿它做门禁等于没有门禁。
+
+几个易错的实现点，都踩过：
+
+- **`::ffff:127.0.0.1`（IPv4-mapped IPv6）必须认**。双栈监听（`::`）时最常见，
+  漏判会让本机客户端拿不到令牌，而现象很迷惑：服务在跑、端口通，偏偏 403。
+- **整个 `127.0.0.0/8` 都是回环**，不只是 `127.0.0.1`。
+- 这个豁免**写死在请求入口**，不放进 `auth.publicPaths`。后者是用户可改的配置项，
+  而这条豁免属于安全模型的一部分，不该被误删或误加宽。
+
+**为什么它必须绕过 TokenGate**：调用方此刻手里必然还没有令牌 —— 这正是它存在的理由。
+若它也要求令牌，就是死锁。
+
+**未启用鉴权时**（`auth.require=false`）仍返回令牌，但 `authRequired=false`。
+注意 `normalizeConfig` 用 `generateToken()` 兜底，所以服务端**永远**有令牌，
+`require` 只决定要不要校验它 —— 这也是为什么不存在"没有令牌"的正常状态。
+
+### 3.2 威胁模型
+
+`GET /api/token` 让「本机任意进程」能读到令牌。这是**已接受**的风险，理由：
+
+1. 令牌本来就明文存放在 `ProgramData\TavernCardStudio\config.json` 与客户端配置里，
+   任何能执行代码的本机进程本来就能读到 —— 加这个接口没有扩大本机攻击面；
+2. 真正要防的是**令牌离开本机**，所以限制是"来源必须是回环"，不是"要另一个凭证"；
+3. 若未来引入多用户或远程管理，这个接口必须重新设计（那时"本机 = 可信"不再成立）。
+
 ---
 
 ## 4. 通用约定
@@ -129,12 +176,13 @@ HTTP/1.1 200 OK
 |---|---|---|---|---|
 | 1 | `GET` | `/api/health` | 健康检查（免鉴权） | worker |
 | 2 | `GET` | `/api/auth/verify` | 验证令牌 | worker |
+| 2b | `GET` | `/api/token` | 取令牌（**免鉴权，仅限回环来源**） | worker |
 | 3 | `GET` | `/api/stats` | 卡片/版本/字节/blob 统计 | worker |
 | 4 | `GET` | `/api/events` | 最近操作事件 | worker |
 | 5 | `GET` | `/api/platforms` | 平台规则列表 | worker |
 | 6 | `GET` | `/api/presets` | TXT 预设列表 | worker |
 | 7 | `GET` | `/api/cards` | 卡片列表（`q` 搜索、分页） | worker |
-| 8 | `POST` | `/api/cards` | 上传新卡（原始字节） | worker |
+| 8 | `POST` | `/api/cards` | 上传（**按 ID upsert**：带 `cardId` 则存在追加/不存在新建；不带则服务端发号） | worker |
 | 9 | `GET` | `/api/cards/:id` | 卡片详情 | worker |
 | 10 | `DELETE` | `/api/cards/:id` | 删除（默认软删，`?hard=true` 彻底删） | worker |
 | 11 | `GET` | `/api/cards/:id/raw` | 下载原始字节 | worker |
@@ -159,64 +207,148 @@ HTTP/1.1 200 OK
 
 ## 6. 卡片 CRUD（T5.1）
 
-### 6.1 上传 `POST /api/cards`
+### 6.1 上传 `POST /api/cards`（按 ID 归档）
 
-请求体是**文件原始字节**，元数据全部在 query：
+请求体是**文件原始字节**，元数据全部在 query（或 header）：
 
 | query | 说明 |
 |---|---|
-| `message` | 版本消息，默认「初始版本」 |
+| `cardId` | **角色卡 ID**（T9.7 / F11）。给了就按它归档：已存在→追加版本，不存在→按该 ID 新建。也可用 `X-TCS-Card-Id` 头，两处不一致直接 400 |
+| `baseSeq` | 客户端声明的基线（本会话上次上传拿到的 `seq`）。用于判断分叉，见下 |
+| `message` | 版本消息，默认「初始版本」/「更新 vN」 |
 | `author` | 版本作者，默认 `Tavern Card Studio` |
 | `filename` | 原始文件名（只做记录） |
 | `platform` / `preset` | 审计所用规则，缺省用服务端配置 |
 | `includeStDefaults` | `false` 可关闭「ST 缺省字段」info 提示 |
 
 ```http
-POST /api/cards?message=导入初版&author=演示脚本&filename=sample-card.json
+POST /api/cards?cardId=lin-wanzhao-0001&message=导入初版&filename=lin.json
 Content-Type: application/json
 Authorization: Bearer <token>
 
-<sample-card.json 的原始字节>
+<角色卡 JSON 的原始字节>
 ```
 
 ```http
 HTTP/1.1 201 Created
-Location: /api/cards/card-23a4e7
-X-TCS-Card-Id: card-23a4e7
+Location: /api/cards/lin-wanzhao-0001
+X-TCS-Card-Id: lin-wanzhao-0001
+X-TCS-Card-Seq: 1
+X-TCS-Card-Created: 1
 
 {
+  "cardId": "lin-wanzhao-0001",
+  "seq": 1,
+  "created": true,
+  "warnings": [],
   "card": {
-    "id": "card-23a4e7",
+    "cardId": "lin-wanzhao-0001",
+    "id": "lin-wanzhao-0001",
+    "idSource": "client",
     "name": "林晚照",
     "spec": "v2",
     "specVersion": "2.0",
     "tags": ["日常", "治愈", "书店"],
-    "createdAt": "2026-10-21T05:41:50.812Z",
+    "createdAt": "2026-10-22T06:11:02.114Z",
     "versionCount": 1,
-    "latest": {
-      "seq": 1,
-      "commit": "cd5997673005df8473cd610f99756965d00f8110",
-      "sha256": "c3e85b1571b207d741fa55b80cc3d354a33bcb1cb1ee23e71aef26023d663b68",
-      "size": 3922,
-      "message": "导入初版",
-      "createdAt": "2026-10-21T05:41:50.812Z"
-    },
+    "latestSeq": 1,
+    "latest": { "seq": 1, "commit": "cd5997…", "sha256": "c3e85b…", "size": 3922, "message": "导入初版", "createdAt": "…" },
     "audit": { "sha256": "7acd…", "generatedAt": "…", "error": 0, "warning": 0, "info": 2, "exportable": true }
   },
   "version": { "seq": 1, "kind": "upload", "…": "同 latest" }
 }
 ```
 
-失败情形：
+**`cardId` 与 `seq` 在顶层**（而不是只在 `card.id` / `version.seq` 里）：
+调用方要的是"我这次传到了哪张卡的哪一版"，从嵌套结构里挖字段容易漏，
+漏了就会静默变成默认值 —— `latestSeq` 曾经因为字段名对不上而恒为 0，就是这么来的。
+
+状态码：**新建 201 / 追加 200**。旧版客户端只看 `response.ok`，不受影响。
 
 | 状态 | code | 触发条件 |
 |---|---|---|
-| `400` | `BAD_REQUEST` | 请求体为空、`message` 超长等 |
+| `201` | — | 按该 ID 新建了卡片（v1） |
+| `200` | — | 该 ID 已存在，追加了一个版本 |
+| `400` | `BAD_CARD_ID` | `cardId` 为空串 / 含非法字符 / 超过 64 字符 / 首尾连字符 / query 与 header 不一致 |
+| `409` | `CARD_DELETED` | 该 ID 被一张**软删**的卡片占着（复用 ID 会把旧历史连带复活） |
+| `400` | `BAD_REQUEST` | 请求体为空、`baseSeq` 非整数 |
 | `413` | `PAYLOAD_TOO_LARGE` | 超过 `maxUploadBytes`（默认 32 MiB） |
 | `415` | `UNSUPPORTED_MEDIA_TYPE` | `multipart/form-data`（见 §2.1） |
 | `422` | `CARD_PARSE_FAILED` | 非 UTF-8、JSON 非法、不是角色卡、结构错误；`details` 带行列 |
 
-> 422 时**不落任何数据**：不会产生卡片、blob 或 git 提交。
+> 422 / 400 / 409 时**不落任何数据**：不会产生卡片、blob 或 git 提交。
+
+#### 6.1.1 `cardId` 的三条硬规则
+
+**① 带了一定用它，绝不退回发号。**
+`?cardId=`（空值）是错误输入，不是"没给"。若把它当成"没给"而由服务端发号，
+客户端以为在更新自己的卡，实际在服务端凭空多出一张，两边永久分叉。
+所以：空串 → 400；非法字符 → 400；写入后再断言落库 ID 等于请求 ID，不等就 500。
+这是 `assertAuditOptions` 的同一种思路 —— **能把错误变成响亮的，就别让它静默。**
+
+**② 校验先于落库。**
+只允许 `A-Z a-z 0-9 -`、1–64 字符、首尾非连字符、至少一个字母或数字
+（与客户端 `validateCardId` 同构）。非法 ID 一旦进库就是一张**永远打不开**的卡：
+ID 里带 `/` 或空格时连 `/api/cards/:id` 都拼不出来。
+
+**③ 不带 `cardId` 时服务端发号，但会标记出来。**
+这是**旧版客户端兼容路径**，行为与 v0.1.0 相同：`<slug>-<6 位 hex>`，`idSource: "auto"`。
+新客户端一律带 ID，这条路径只为"服务端升级了、桌面上还跑着旧客户端"时不被打断。
+
+#### 6.1.2 分叉警告（不阻断写入）
+
+`baseSeq` = 本会话上次上传拿到的 `seq`。服务端比对远端最新版本：
+
+| 情形 | `warnings` |
+|---|---|
+| `baseSeq` 与远端最新一致 | 空 |
+| `baseSeq` ≠ 远端最新 | `FORK` |
+| `baseSeq ≥ 1` 但远端**没有这张卡** | `REMOTE_MISSING` |
+| 未传 `baseSeq` | 空（客户端没声明基线，无从比较） |
+
+```json
+{
+  "cardId": "lin-wanzhao-0001",
+  "seq": 5,
+  "created": false,
+  "warnings": [
+    {
+      "code": "FORK",
+      "message": "远端已有他人修改（最新 v4，你的基线是 v2），本次上传将产生分叉历史",
+      "baseSeq": 2,
+      "remoteLatestSeq": 4,
+      "remoteLatestSha256": "ff31…"
+    }
+  ]
+}
+```
+
+**为什么警告而不拒绝**：分叉本身不是错误 —— 两个人从同一版各改各的很正常，
+拒绝上传会把内容堵在客户端。真正的错误是"产生了分叉却不告诉用户"。
+客户端把 `warnings[].message` 直接上屏（文案由服务端统一给，避免两端各写一套）。
+
+`REMOTE_MISSING` 同理：远端历史不在这台服务器上（被硬删 / 换了库 / ID 拼错），
+内容仍按新卡 v1 写入，但必须说清楚"这不是你以为的那张卡"。
+
+#### 6.1.3 遗留卡片（v0.1.1 之前入库）
+
+v0.1.0 的卡片 ID 是服务端自动发的（`card-xxxxxx`、`<slug>-<6hex>`），
+**不是用户指定的**。库里用 `id_source` 区分来源：
+
+| `idSource` | 含义 |
+|---|---|
+| `client` | 用户/客户端指定（v0.1.1 起唯一的新增方式） |
+| `auto` | 服务端发号（旧版客户端上传时） |
+| `legacy` | v0.1.1 之前入库，老库升级时由列默认值补上 |
+
+**遗留卡只读兼容、读写可用**：能列、能取详情、能看历史、能取原文、**能回滚**，
+也能用同一个 ID 继续追加版本。它们不需要迁移或改 ID ——
+`/api/cards/:id` 的语义本来就是"按 ID 寻址"，新旧 ID 在这一点上没有区别。
+
+为什么不靠正则猜：`lin-wanzhao-abcdef` 这种形状用户完全可以手填，
+猜出来的"遗留"标记会告诉用户"这个 ID 是自动生成的、别指望它稳定"，而事实并非如此。
+**来源是事实，就该记在库里**（`ALTER TABLE cards ADD COLUMN id_source TEXT NOT NULL DEFAULT 'legacy'`，
+`CREATE TABLE IF NOT EXISTS` 对已存在的表不生效，所以这一步是显式的迁移）。
 
 ### 6.2 列表 `GET /api/cards`
 
@@ -231,11 +363,14 @@ HTTP/1.1 200 OK
   "offset": 0,
   "items": [
     {
-      "id": "card-23a4e7",
+      "cardId": "lin-wanzhao-0001",
+      "id": "lin-wanzhao-0001",
+      "idSource": "client",
       "name": "林晚照",
       "spec": "v2",
       "versionCount": 3,
-      "updatedAt": "2026-10-21T05:41:51.402Z",
+      "latestSeq": 3,
+      "updatedAt": "2026-10-22T06:41:51.402Z",
       "latest": { "seq": 3, "sha256": "c3e8…", "message": "回滚到初版（演示）" },
       "audit": { "error": 0, "warning": 0, "info": 2, "exportable": true, "generatedAt": "…", "sha256": "…" },
       "deletedAt": null
@@ -245,6 +380,17 @@ HTTP/1.1 200 OK
 ```
 
 `q` 同时匹配名称与 id；`includeDeleted=true` 可看到软删卡片。
+
+| 字段 | 用途 |
+|---|---|
+| `cardId` | **寻址键**（与 `id` 同值）。历史/回滚/取原文都用它 |
+| `id` | 同一值的旧字段名，保留给尚未改名的调用方 |
+| `name` | **最新版本的 `meta.name`**（角色名）。客户端列表显示「角色名 + cardId」 |
+| `idSource` | `client` / `auto` / `legacy`，见 §6.1.3 |
+| `latestSeq` | 顶层版本号；`null` 表示还没有任何版本。`latest.seq` 仍然保留 |
+
+> `latestSeq` 与 `latest.seq` 两个都给，是因为客户端曾按前者读、服务端只给后者，
+> 于是那一列永远是 0 —— 字段名对不上就静默取默认值，是这类 API 最容易踩的坑。
 
 ### 6.3 原始字节 `GET /api/cards/:id/raw`
 
@@ -277,7 +423,14 @@ X-TCS-Size: 3922
 
 ## 7. 版本控制（T5.2）
 
+**本节的 `:id` 一律是 `cardId`**（T9.7 起 ID 由用户指定、创建后不可变）。
+历史、取原文、diff、回滚全部按它寻址；遗留卡（§6.1.3）用的是同一套路径，无需特殊处理。
+
 ### 7.1 提交新版本 `POST /api/cards/:id/versions`
+
+> 客户端上传走的是 §6.1 的 upsert 端点（一次请求完成"存在则追加/不存在则新建"），
+> 这个端点保留给"确定卡片已存在"的调用方与旧版客户端。
+> 两者写的是同一份 `addVersion` 实现，版本语义不会有分歧。
 
 请求体同样是原始字节，query 同上传。返回 `201` + 版本对象（`kind: "update"`）。
 

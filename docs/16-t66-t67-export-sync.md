@@ -106,11 +106,21 @@ if (!isSyncReady(this.connection)) { 置灰 + 提示 }   // 同一函数
 
 ### 3.2 三个功能
 
+> **T9.7 起改为按 ID 归档**：上传不再是"新建 or 追加"两个端点，
+> 而是同一个 `POST /api/cards?cardId=…`（存在则追加、不存在则新建）。
+> 上传目标恒为**活动会话的 cardId**，不再由下拉框选择 ——
+> 让用户选"传到哪张卡"等于给了个把 A 卡内容写进 B 卡 ID 的开关。
+> 详见 [docs/08 §6.1](08-server-api.md)。
+
 | 功能 | API | 要点 |
 |---|---|---|
-| 上传 | `POST /api/cards`（新建）/ `POST /api/cards/:id/versions`（追加） | body 是**原文本身**，不是 JSON 信封——服务端按原始字节入库 |
-| 历史 | `GET /api/cards/:id/versions` | 显示 seq / kind / sha256 / 字节数 / 时间 / 审计徽标 |
-| 回滚 | `POST /api/cards/:id/rollback` | 服务端**新建提交**，历史只增不改 |
+| 上传 | `POST /api/cards?cardId=<会话 ID>&baseSeq=<上次 seq>` | body 是**原文本身**；`baseSeq` 用于判断分叉；响应回 `cardId` / `seq` / `warnings` |
+| 历史 | `GET /api/cards/:cardId/versions` | 显示 seq / kind / sha256 / 字节数 / 时间 / 审计徽标 |
+| 回滚 | `POST /api/cards/:cardId/rollback` | 服务端**新建提交**，历史只增不改 |
+
+**回滚只能发生在自己这张卡上**：历史面板可以切去看别的卡片（含遗留卡），
+但那种查看是只读的 —— 「回滚到此版本」按钮直接置灰并给出 title 说明，
+而不是等用户点了再报错。
 
 上传内容与「导出 JSON」**同一份**（都走 `buildExportAsync`），保证服务端字节与本地可复现。
 

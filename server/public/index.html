@@ -145,6 +145,11 @@
                 <span>管理面板监听地址</span>
                 <input id="cfg-controlHost" type="text" />
                 <small class="hint">面板只给本机运维用，默认 <code>127.0.0.1</code>。<strong>与上面的 API 地址相互独立</strong>——改了 API 地址不会连带暴露面板。</small>
+                <small class="hint warn-strong" id="cfg-controlHost-warn" hidden>
+                  ⚠ 改为非回环地址会把<strong>无鉴权</strong>的后台暴露给对应网络：面板静态页面
+                  （<code>/</code>、<code>/app.js</code>）本身不需要令牌，任何人都能看到管理界面，
+                  只有控制接口受令牌保护。仅在明确需要远程运维时修改，并建议配合防火墙或反向代理加 TLS。
+                </small>
               </label>
               <label class="field"><span>上传上限（字节）</span><input id="cfg-maxUploadBytes" type="number" min="1024" /></label>
             </article>

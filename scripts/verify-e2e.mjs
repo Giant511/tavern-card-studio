@@ -175,9 +175,122 @@ async function main() {
     check(false, '上传与回滚', '缺少 .verify/sync-live.txt（先跑 npm run verify:sync-live）');
   }
 
-  // ── 8. 截图归档 ────────────────────────────────────
-  console.log('\n8. 截图归档');
-  for (const name of ['e2e-editor.png', 'e2e-all-blocks.png', 'e2e-export-gate.png', 'e2e-rules.png']) {
+  // ── 8. 渲染预览（F8 回归）───────────────────────────
+  //
+  // 这一组断言的来历：点「渲染预览」后整页假死，必须重启客户端。
+  // 根因是 buildPreviewFragment 里 `while (body.firstChild) importNode(...)` ——
+  // importNode 是深拷贝、不从源节点移除，循环永不结束，内存吃死渲染进程。
+  // 单元测试抓不到（纯函数在 Node 里跑得飞快），所以必须在这里用真实浏览器点一次。
+  //
+  // 判据的选择：故障形态是"同步不返回"，所以「click 能返回」本身就是要断言的事实。
+  // 若回归重现，抓取阶段 Chrome 会被超时杀掉、dump 缺失，这里会因为读不到快照而失败。
+  console.log('\n8. 渲染预览（F8 回归）');
+  const previewOpen = dumpDom('preview-open');
+  const bodyAttrs = (html) => {
+    const match = /<body([^>]*)>/.exec(html);
+    return match ? match[1] : '';
+  };
+  const attr = (html, name) => {
+    const match = new RegExp(`data-${name}="([^"]*)"`).exec(html);
+    return match ? match[1] : '';
+  };
+
+  {
+    const attrs = bodyAttrs(previewOpen);
+    check(attrs !== '', '预览场景快照可读（点击未卡死）');
+    check(attr(previewOpen, 'preview-expanded') === '2', '启动默认展开 2 个板块', attr(previewOpen, 'preview-expanded'));
+    const ms = Number(attr(previewOpen, 'preview-ms'));
+    check(Number.isFinite(ms) && ms < 200, '点击预览同步返回（<200ms）', `${ms}ms`);
+    check(attr(previewOpen, 'preview-visible') === '2', '两个已展开板块显示预览', attr(previewOpen, 'preview-visible'));
+    check(Number(attr(previewOpen, 'preview-nodes')) >= 2, '预览内已填充节点', `${attr(previewOpen, 'preview-nodes')} 个`);
+  }
+
+  {
+    const cycle = dumpDom('preview-cycle10');
+    check(attr(cycle, 'preview-cycles') === '10', '打开/关闭重复 10 次');
+    check(attr(cycle, 'preview-visible-after-close') === '0', '重复 10 次后无残留可见预览',
+      attr(cycle, 'preview-visible-after-close'));
+    check(attr(cycle, 'preview-nodes-after-close') === '0', '关闭后预览节点已清空（无累积泄漏）',
+      attr(cycle, 'preview-nodes-after-close'));
+    check(attr(cycle, 'preview-overlays') === '0', '无残留遮罩层（只计可见）', attr(cycle, 'preview-overlays'));
+  }
+
+  {
+    const typing = dumpDom('preview-typing');
+    check(attr(typing, 'preview-visible') === '2', '输入测试时预览处于打开状态',
+      attr(typing, 'preview-visible'));
+    check(attr(typing, 'typing-result') === 'changed', '预览打开期间编辑器仍可输入',
+      attr(typing, 'typing-result'));
+    check(attr(typing, 'typing-content-editable') === 'true', '编辑区仍为 contenteditable',
+      attr(typing, 'typing-content-editable'));
+    check(attr(typing, 'typing-topmost') === 'editor', '编辑区未被遮罩覆盖（最上层是编辑器）',
+      attr(typing, 'typing-topmost'));
+  }
+
+  // T9.18：顶栏其余按钮的同类状态机问题扫描
+  {
+    const sweep = dumpDom('preview-sweep');
+    const raw = attr(sweep, 'sweep-results');
+    check(raw !== '', '按钮扫描结果存在');
+    const entries = raw.split(' | ').map((item) => item.split(':'));
+    const hung = entries.filter((parts) => parts[1] && parts[1] !== 'disabled' && Number.parseFloat(parts[1]) > 500);
+    check(hung.length === 0, '所有按钮点击均未阻塞（无 >500ms）',
+      hung.map((parts) => `${parts[0]}=${parts[1]}`).join(',') || '全部及时返回');
+    const threw = entries.filter((parts) => parts[2] && parts[2].startsWith('threw'));
+    check(threw.length === 0, '按钮点击均未抛异常', threw.map((parts) => parts[0]).join(',') || '');
+    check(attr(sweep, 'sweep-visible-overlays') === '0', '扫完后无残留遮罩', attr(sweep, 'sweep-visible-overlays'));
+    check(attr(sweep, 'sweep-visible-preview') === '0', '预览被正确复位（不污染后续操作）',
+      attr(sweep, 'sweep-visible-preview'));
+  }
+
+  // ── 9. 一键连接本机服务端（F6.1 / F6.3）───────────────
+  //
+  // 这个场景点的是**真实按钮**，对面是 127.0.0.1:8730 上真实运行的服务端。
+  // 所以它同时验证了：按钮绑定、编排顺序、令牌接口、同步状态刷新。
+  //
+  // 注意：成功态要求那台机器上跑着**本版本**服务端。若跑的是旧版（无 /api/token），
+  // 会得到 fail:server-too-old —— 那本身也是正确行为，所以下面按"结果自洽"断言，
+  // 而不是硬性要求 ok。
+  console.log('\n9. 一键连接本机服务端（F6）');
+  {
+    const local = dumpDom('settings-local');
+    const state = attr(local, 'local-connect');
+    check(state !== '', '本地连接场景已执行', state || '未执行（快照缺失或页面未加载）');
+
+    if (state === 'ok') {
+      check(attr(local, 'local-token-length') === '32', '自动取到 32 字符令牌',
+        attr(local, 'local-token-length'));
+      check(attr(local, 'local-auth-required') === 'true', '标注服务端要求鉴权',
+        attr(local, 'local-auth-required'));
+      check(attr(local, 'local-server-version') !== '', '回填了服务端版本',
+        attr(local, 'local-server-version'));
+      // 浏览器模式下不该谎报已持久化
+      check(attr(local, 'local-persisted') === 'false', '浏览器模式如实标注未持久化',
+        attr(local, 'local-persisted'));
+    } else if (state.startsWith('fail:')) {
+      const kind = state.slice('fail:'.length);
+      // 每种失败都必须给出分步处置，不能只丢一句错误
+      check(Number(attr(local, 'local-steps')) >= 3, `失败分类 ${kind} 给出分步处置`,
+        `${attr(local, 'local-steps')} 步`);
+      check(
+        ['not-running', 'port-changed', 'not-local', 'token-denied', 'server-too-old', 'network', 'save-failed']
+          .includes(kind),
+        `失败分类可识别：${kind}`,
+      );
+    }
+  }
+
+  // ── 10. 截图归档 ────────────────────────────────────
+  console.log('\n10. 截图归档');
+  for (const name of [
+    'e2e-editor.png',
+    'e2e-all-blocks.png',
+    'e2e-export-gate.png',
+    'e2e-rules.png',
+    'e2e-preview-open.png',
+    'f6-local-connect-ok.png',
+    'f6-local-connect-addr-changed.png',
+  ]) {
     const shot = screenshot(name);
     check(shot !== null, `截图 ${name}`, shot === null ? '缺失（先跑 capture-e2e-dumps.sh）' : '');
   }

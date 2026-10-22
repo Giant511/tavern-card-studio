@@ -6,7 +6,8 @@
  *      `@tauri-apps/api` / `@tauri-apps/plugin-*`。
  *   2. 这里只暴露**语义化能力**（读卡片、写导出、扫规则、存取配置、选文件），
  *      不暴露通用的「给我一个路径，我随便读写」。
- *   3. 不提供目录选择。见下方 pick* 的注释。
+ *   3. 目录选择**只有一个入口** `pickDirectory`，且固定 `recursive: false`
+ *      （非递归、不持久化授权）。见下方「文件对话框」与 docs/11 §8。
  *   4. 所有错误统一抛 `ShellError`，调用方按 `code` 分支，不解析文案。
  */
 
@@ -17,7 +18,9 @@ import { load, type Store } from '@tauri-apps/plugin-store';
 import { ShellError, toShellError } from './errors.js';
 import {
   DEFAULT_CLIENT_CONFIG,
+  type CardsDirScan,
   type ClientConfig,
+  type DirProbe,
   type RuleDirScan,
   type RuleKind,
   type ShellInfo,
@@ -98,36 +101,91 @@ export function readRuleText(kind: RuleKind, name: string, maxBytes?: number): P
 // ─────────────────────────────────────────────────────────────
 //
 // 安全约束（项目决策，勿擅自放宽）：
-//   · 一律 `multiple: false`、`directory: false`；
-//   · 不传任何递归选项。
-// 原由：`tauri-plugin-dialog` 会把你选中的路径加入 fs scope；若允许选目录且
-// 带递归，一次点击可能把整棵目录树的读写权授给 webview（GHSA-j8fp-v6pf-qx45 /
-// CVE-2026-95627，high / 7.7，该公告目前**没有修复版本**）。
-// 我们的做法是「根本不给前端选目录的能力」，而不是指望升级修好。
+//   · 选文件一律 `multiple: false`、`directory: false`；
+//   · **选目录只有 pickDirectory 一个入口**，固定 `multiple: false`、
+//     `directory: true`、`recursive: false`。
+//
+// 原由：`tauri-plugin-dialog` 会把你选中的路径加入 fs scope。若选目录时带
+// 递归，一次点击可能把**整棵目录树**的读写权授给 webview
+// （GHSA-j8fp-v6pf-qx45 / CVE-2026-95627，high / 7.7，该公告**没有修复版本**）。
+//
+// T9.8 为什么要开这个口子：F4 要求「卡片存放目录可配置」，而这必须让用户
+// 用原生对话框选一次 —— 让他手打绝对路径既容易错，也绕不过"选目录"这件事。
+// 于是把风险收紧到最小：
+//   · `recursive: false` —— scope 只加该目录本身，**不下潜子目录**，
+//     所以即便 webview 被劫持，也拿不到目录里任何文件的授权；
+//   · `multiple: false` —— 一次只加一个目录，不能批量圈地；
+//   · **不持久化**：我们只把路径字符串存进配置（plugin-store），
+//     从不把它写进 fs 的 scope/allowlist。重启后 dialog 给的运行时授权自然消失。
+//     所以"配置里记着这个路径"不等于"这个路径永久可读写"。
+// 详见 docs/11 §8。
 
 const CARD_FILTERS = [{ name: '角色卡 JSON', extensions: ['json'] }];
 const TEXT_FILTERS = [{ name: '文本文件', extensions: ['txt', 'md'] }];
 
-/** 选一张角色卡 JSON；取消返回 null */
-export async function pickCardFile(): Promise<string | null> {
+/**
+ * 选一张角色卡 JSON；取消返回 null。
+ *
+ * `defaultDir` 是对话框的默认落点（T9.8：接入 cardsDir）。
+ * 传目录而不是"目录+文件名"，由 dialog 自己在该目录下打开；
+ * 目录不存在时 dialog 会退到父目录，不会报错。
+ */
+export async function pickCardFile(defaultDir?: string | null): Promise<string | null> {
   const selected = await open({
     multiple: false,
     directory: false,
     filters: CARD_FILTERS,
+    ...(defaultDir ? { defaultPath: defaultDir } : {}),
   });
   return typeof selected === 'string' ? selected : null;
 }
 
-/** 选一个导出目标路径；取消返回 null */
+/**
+ * 选一个保存目标路径；取消返回 null。
+ *
+ * `defaultDir` 与上面的含义一致：这里要拼成**完整路径**（目录 + 建议文件名），
+ * 因为 save 对话框把 `defaultPath` 当作"文件名输入框的初值"：
+ * 只给目录时，用户会看到一个停在目录上的文件名框，而不是预填好的名字。
+ */
 export async function pickSavePath(
   suggestedName: string,
   format: 'json' | 'txt',
+  defaultDir?: string | null,
 ): Promise<string | null> {
   const selected = await save({
-    defaultPath: suggestedName,
+    defaultPath: defaultDir ? joinPath(defaultDir, suggestedName) : suggestedName,
     filters: format === 'json' ? CARD_FILTERS : TEXT_FILTERS,
   });
   return selected ?? null;
+}
+
+/**
+ * 拼接目录与文件名（实现见 `session/cards-path.ts`）。
+ *
+ * 放在纯逻辑模块里而不是这里：契约层依赖 `@tauri-apps/*`，Node 里跑不了，
+ * 而拼接规则需要单测。这里转发一次，调用方仍然只从契约层取能力。
+ */
+import { joinPath } from '../session/cards-path.js';
+
+export { joinPath };
+
+/**
+ * 选一个目录（T9.8 / F4）。取消返回 null。
+ *
+ * 唯一允许选目录的入口，固定 `recursive: false`。调用方拿到路径后
+ * **必须**再走 `probeCardsDir`：对话框只保证"用户选了这个目录"，
+ * 不保证它存在、可写。
+ */
+export async function pickDirectory(defaultPath?: string | null): Promise<string | null> {
+  const selected = await open({
+    multiple: false,
+    directory: true,
+    // 关键：非递归。缺省也是 false，但这里显式写出来 ——
+    // 这是安全边界，不该依赖库的默认值（默认值可能变）。
+    recursive: false,
+    ...(defaultPath ? { defaultPath } : {}),
+  });
+  return typeof selected === 'string' ? selected : null;
 }
 
 /** 选一个用户自定义规则文件（单文件，不含目录） */
@@ -191,6 +249,39 @@ export async function configReset(): Promise<void> {
   const store = await getStore();
   await store.clear();
   await store.save();
+}
+
+// ─────────────────────────────────────────────────────────────
+// 卡片目录（T9.8 / F4）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 默认卡片目录：`<Documents>/TavernCardStudio/cards`。
+ *
+ * 由壳解析（`document_dir()`），不在 TS 里拼 `%USERPROFILE%\\Documents` ——
+ * Windows 上文档目录可能被重定向到 OneDrive，手拼的路径未必存在。
+ */
+export function defaultCardsDir(): Promise<string> {
+  return call<string>('default_cards_dir');
+}
+
+/**
+ * 探测目录：存在？可写？（可选创建）
+ *
+ * 可写性是**真实写一个探针文件再删掉**，不是看属性位。返回结构把
+ * 「不存在 / 创建失败 / 不可写」分开，调用方才能分别处置（见 types.ts 的 DirProbe）。
+ */
+export function probeCardsDir(path: string, options: { create?: boolean } = {}): Promise<DirProbe> {
+  return call<DirProbe>('probe_cards_dir', { path, create: options.create ?? false });
+}
+
+/**
+ * 列出目录下的 `.json` 文件名（不递归、不读内容）。
+ *
+ * 用途只有一个：保存前看看有没有同名文件，好自动追加序号而不是静默覆盖。
+ */
+export function scanCardsDir(path: string, limit?: number): Promise<CardsDirScan> {
+  return call<CardsDirScan>('scan_cards_dir', { path, limit: limit ?? null });
 }
 
 // ─────────────────────────────────────────────────────────────

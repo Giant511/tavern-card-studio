@@ -173,6 +173,16 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
   background: #eef1f5; color: var(--text-2);
   font-family: ui-monospace, Consolas, monospace; font-size: 10px;
 }
+/* 安全警告：F7.3 要求「面板 host 旁常驻黄色提示」，非回环时显示 */
+.field > small.hint.warn-strong {
+  color: #8a5a00;
+  background: #fff6e0;
+  border-left: 3px solid #e0a020;
+  padding: 6px 8px;
+  border-radius: 0 4px 4px 0;
+}
+.field > small.hint.warn-strong strong { color: #7a4d00; }
+.field > small.hint.warn-strong code { background: #f6ead0; }
 .field input, .field select, .token-row input {
   width: 100%;
   padding: 8px 10px;

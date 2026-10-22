@@ -70,6 +70,12 @@ import { buildExportAsync } from '../export/export-card';
 import { SyncDialog } from '../sync/sync-dialog';
 import type { SyncConfig } from '../sync/server-sync';
 import { SettingsDialog } from '../settings/settings-dialog';
+import { NewCardDialog } from '../session/new-card-dialog';
+import { decideShortcut } from './shortcuts';
+import { CardSession } from '../session/card-session';
+import { effectiveCardsDir, suggestCardFileName } from '../session/cards-dir';
+import { TabBar, type TabItem } from '../session/tab-bar';
+import { generateCardId, readCardIdFromCard, withCardId } from '../session/card-id';
 
 import sampleCardJson from '../../../test/fixtures/sample-card.json';
 
@@ -104,7 +110,25 @@ interface BlockRuntime {
 }
 
 class EditorApp {
-  private card: UnifiedCard;
+  /**
+   * 当前编辑会话。**所有卡片状态（卡数据、文件路径、脏标记、规则选择）都从这里读**，
+   * 不再散落在 EditorApp 的字段上。
+   *
+   * 为什么必须收拢（2026-10-22 重构）：之前 `card` 与 `currentFilePath` 是 app.ts 的
+   * 两个游离字段，一旦多标签并行编辑，它们就会变成"只有当前卡是对的"的隐患 ——
+   * 切走再切回来，路径和脏标记要么丢、要么串到另一张卡上。
+   * 现在 `CardSession` 是唯一真相源，切换标签只需换 session 引用。
+   */
+  /**
+   * 所有已打开的编辑会话（T9.2）。
+   *
+   * 顺序即标签栏顺序，**不排序** —— 用户记住的是"第几个标签"，
+   * 自动排序会让位置跳来跳去。
+   */
+  private sessions: CardSession[] = [];
+  /** 活动会话 id；null 表示零标签（空工作台） */
+  private activeId: string | null = null;
+  private tabs: TabBar | null = null;
   private rules: Ruleset | null = null;
   private blocks: BlockRuntime[] = [];
   private issues: readonly AuditIssue[] = [];
@@ -113,8 +137,9 @@ class EditorApp {
   private rulesDialog: RulesDialog | null = null;
   private exportDialog: ExportDialog | null = null;
   private syncDialog: SyncDialog | null = null;
-  /** 已关联的服务端卡片 id（上传/版本/回滚都针对它） */
-  private syncCardId: string | null = null;
+  // 注意：这里**没有** syncCardId 字段了（T9.7）。
+  // 远端关联属于卡片状态，已归 CardSession.syncCardId / lastUploadedSeq ——
+  // 多标签下"当前是哪张卡"由 activeId 决定，app.ts 再留一份必然串卡。
   /** 设置里保存的 token（同步请求要用；probeServer 的 url 不含 token） */
   private settingsToken = '';
   private validateTimer: number | null = null;
@@ -125,12 +150,49 @@ class EditorApp {
   private readonly issueSummary = byId('issue-summary');
   private readonly statusBar = byId('status');
   private settings: SettingsDialog | null = null;
+  private newCardDialog: NewCardDialog | null = null;
   private connection: ProbeResult | null = null;
   /** 最近一次审计的等级计数（切规则后要给用户一句话结论） */
   private lastSummary = { error: 0, warning: 0, info: 0 };
 
-  constructor(card: UnifiedCard) {
-    this.card = card;
+  constructor(card: UnifiedCard | null) {
+    // 传入 null = 空白启动（F3）：启动时不打开任何卡，工作台是空的。
+    if (card !== null) {
+      const session = new CardSession({ card, cardId: readCardIdFromCard(card) ?? undefined });
+      this.sessions.push(session);
+      this.activeId = session.id;
+    }
+  }
+
+  /**
+   * 当前卡数据（只读视图）。
+   *
+   * 保留 `this.card` 这个读法是为了让一百多处读取点不用改；
+   * 但**没有 setter** —— 写操作一律走 session（见 onBlockChange / replaceCard / applyCardName），
+   * 这样"改内容"只有一个入口，脏标记与审计缓存不会被漏掉。
+   */
+  private get card(): UnifiedCard {
+    return this.session.card;
+  }
+
+  /**
+   * 活动会话。
+   *
+   * 零标签时没有活动会话 —— 这种情况**必然**发生在启动（F3 空白启动）与
+   * 关闭最后一个标签之后。所有因为"需要一张卡"而取 card 的地方都得先确认有会话，
+   * 否则会在空工作台上炸。这里用抛错把问题暴露在开发期，而不是返回一个假卡。
+   */
+  private get session(): CardSession {
+    const active = this.sessions.find((item) => item.id === this.activeId);
+    if (!active) {
+      throw new Error('当前没有活动会话：请先在零标签判断之后调用（见 hasSession）');
+    }
+    return active;
+  }
+
+  /** 是否有活动会话（零标签时 false） */
+  private get hasSession(): boolean {
+    return this.sessions.some((item) => item.id === this.activeId);
   }
 
   async start(): Promise<void> {
@@ -147,15 +209,12 @@ class EditorApp {
       );
     }
 
-    this.blocks = collectBlocks(this.card).map((snapshot) => this.createBlock(snapshot));
-    // 默认只展开前两块，其余折叠（懒渲染）。`?expand=all` 是给截图/联调用的调试开关。
-    const expandAll = new URLSearchParams(location.search).get('expand') === 'all';
-    for (const [index, runtime] of this.blocks.entries()) {
-      if (expandAll || index < 2) this.expand(runtime, true);
-    }
+    // 右上角「规则」标签要在这里刷一次。
+    // 之前只在"切换规则/预设"时刷，于是启动后它一直停在 HTML 里的初始文案
+    // 「规则加载中…」—— 明明已经加载完了（2026-10-22 截图核对时发现）。
+    this.refreshRulesLabel();
 
-    this.refreshStats();
-    // T6.5：审计面板在首次校验前就位，否则第一次报告会无处渲染
+    // T6.5：审计面板要在首次校验前就位，否则第一次报告会无处渲染
     this.auditPanel = new AuditPanel(
       {
         onLocate: (issue) => this.locateIssue(issue),
@@ -166,11 +225,26 @@ class EditorApp {
       },
       byId('audit-panel'),
     );
+
+    // 标签栏要在挂载会话之前建好，否则首屏的 refreshTabs() 无处可去
+    this.tabs = new TabBar(byId('tabbar-host'), {
+      onActivate: (id) => this.activateSession(id),
+      onClose: (id) => void this.closeSession(id),
+      onNew: () => void this.newCard(),
+    });
+
     this.wireToolbar();
+    this.wireNameEditor();
+    this.wireShortcuts();
     this.wireSettings();
     this.wireRules();
     this.wireExportAndSync();
-    this.scheduleValidate(0);
+
+    // 首屏：有会话就挂载，没有就走空工作台（F3 空白启动）。
+    // **这两条路径共用 mountActiveSession**，所以"启动界面"与"零标签界面"
+    // 不可能长得不一样。
+    this.mountActiveSession();
+    this.refreshTabs();
   }
 
   // ── 规则与预设（T6.2 / T6.3）─────────────────────────────
@@ -250,13 +324,24 @@ class EditorApp {
         const preset = this.rules?.preset ?? null;
         return buildExportAsync(this.card, preset, 'json').then((artifact) => artifact.text);
       },
-      getCurrentCardId: () => this.syncCardId,
-      setCurrentCardId: (id) => {
-        this.syncCardId = id;
+      // 上传目标 = 活动会话（F11）：cardId 创建时定死，baseSeq 是上次对齐的版本
+      getUploadTarget: () => {
+        if (!this.hasSession) return null;
+        const session = this.session;
+        return { cardId: session.cardId, name: session.card.meta.name, baseSeq: session.lastUploadedSeq };
       },
-      onRollbackApplied: (text, version) => {
-        this.applyRemoteText(text, version.seq);
+      // cardId 与 seq 必须一起记回会话：分叉判定要的正是"上次上传到哪一版"
+      onUploaded: (cardId, seq) => {
+        if (!this.hasSession) return;
+        this.session.noteRemoteVersion(cardId, seq);
       },
+      onRemoteTextApplied: (text, version, remoteSeq) => {
+        this.applyRemoteText(text, version.seq, remoteSeq);
+      },
+      // 同步面板里一键连接成功后，把结论交回 App：
+      // 顶栏指示与三个同步入口的启用状态都读 this.connection，必须同步更新，
+      // 否则面板里显示"已连接"、顶栏还写着"未就绪"。
+      onConnectionReady: (result) => this.applyConnection(result),
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
     });
 
@@ -279,11 +364,19 @@ class EditorApp {
    * 走 `parseStCard` 而不是直接替换文本：必须经过同一套解析，
    * 否则 anchor / worldbook 结构会与本地不一致，后续编辑就会写错位置。
    */
-  private applyRemoteText(text: string, seq: number): void {
+  /**
+   * 把远端版本内容载入编辑器，并把**远端最新 seq** 记成会话基线。
+   *
+   * `displaySeq` 是给用户看的"这是第几版"，`remoteSeq` 是"现在远端最新是第几版"。
+   * 回滚时两者不同（回滚新建了一个版本）：基线必须记后者，否则下一次上传
+   * 服务端会拿"我上次传的是 v2"去比"远端最新是 v4"，凭空报一个分叉。
+   */
+  private applyRemoteText(text: string, displaySeq: number, remoteSeq: number = displaySeq): void {
     try {
       const parsed = parseStCard(JSON.parse(text) as unknown);
       this.replaceCard(parsed.card);
-      this.setStatus(`已载入服务端 v${seq} 的内容（原文件未自动保存，建议另存）`, 'warn');
+      this.session.noteRemoteVersion(this.session.cardId, remoteSeq);
+      this.setStatus(`已载入服务端 v${displaySeq} 的内容（原文件未自动保存，建议另存）`, 'warn');
     } catch (error) {
       this.setStatus(
         `载入服务端版本失败：${error instanceof Error ? error.message : String(error)}`,
@@ -468,13 +561,18 @@ class EditorApp {
       this.collapse(runtime);
       runtime.section.remove();
     }
+    // 清掉空工作台留下的占位块。
+    // 只删 this.blocks 里的板块是不够的 —— 空工作台那个 .empty-workspace 不在
+    // this.blocks 里，于是"从零标签新建一张卡"之后它会残留在编辑区中间
+    // （2026-10-22 截图里同时出现空占位与六个板块，就是这个原因）。
+    this.blockList.replaceChildren();
     this.blocks = collectBlocks(this.card).map((snapshot) => this.createBlock(snapshot));
     const expandAll = new URLSearchParams(location.search).get('expand') === 'all';
     for (const [index, runtime] of this.blocks.entries()) {
       if (expandAll || index < 2) this.expand(runtime, true);
     }
     this.refreshStats();
-    byId('card-name').textContent = this.card.meta.name || '(未命名)';
+    this.renderCardName();
   }
 
   // ── 设置与同步可用性（T6.8）──────────────────────────────
@@ -496,12 +594,21 @@ class EditorApp {
 
     // 调试/截图入口：?settings=1 自动打开；配合 &serverUrl=…&token=… 会执行一次真实探测。
     // 只影响"打开面板"这一步，探测逻辑与手动点击完全一致（不伪造状态）。
+    //
+    // `&localConnect=1` 再往前走一步：点一次「连接本机服务端」按钮。
+    // 这是 F6 的端到端断言入口 —— 必须真的点按钮，而不是直接调编排函数，
+    // 否则测不到按钮绑定、busy 状态、分步说明渲染这些 UI 环节。
     const params = new URLSearchParams(location.search);
     if (params.get('settings') === '1') {
       const serverUrl = params.get('serverUrl') ?? undefined;
       const token = params.get('token') ?? undefined;
+      const wantLocalConnect = params.get('localConnect') === '1';
       void (async () => {
         await this.settings?.open({ serverUrl, token });
+        if (wantLocalConnect) {
+          await this.settings?.clickConnectLocal();
+          return;
+        }
         if (params.get('probe') === '1') {
           await this.settings?.runProbe();
         }
@@ -519,8 +626,163 @@ class EditorApp {
       });
     }
 
+    // 调试/截图入口：?preview=<mode> 驱动「渲染预览」，把结果写进 body.dataset
+    // 供端到端断言读取（scripts/verify-e2e.mjs）。
+    // F8 回归：该按钮曾因 buildPreviewFragment 的无限循环让整页假死，
+    // 表现为「点了没反应、必须重启客户端」，且控制台无任何报错。
+    const previewMode = params.get('preview');
+    if (previewMode) void this.runPreviewScenario(previewMode);
+
     this.applyConnection(null);
     void this.autoProbe();
+  }
+
+  /**
+   * 预览场景驱动（仅测试/截图用，正常启动不触发）。
+   *
+   * 为什么需要它：F8 的故障形态是「同步不返回」，单元测试（Node 里跑纯函数）
+   * 抓不到这类问题 —— 必须真的在浏览器里点一次、并确认点击能返回。
+   * 这里只做「点按钮 + 读 DOM」，不伪造任何业务状态。
+   */
+  private async runPreviewScenario(mode: string): Promise<void> {
+    const button = byId<HTMLButtonElement>('btn-preview');
+    const visibleCount = (): number =>
+      [...document.querySelectorAll<HTMLElement>('.preview')].filter((node) => !node.hidden).length;
+    const nodeCount = (): number =>
+      [...document.querySelectorAll<HTMLElement>('.preview')].reduce((sum, node) => sum + node.childNodes.length, 0);
+    const mark = (key: string, value: string): void => {
+      document.body.dataset[key] = value;
+    };
+
+    // 默认启动会展开前两个板块，预览只对已展开的块生效
+    const expanded = this.blocks.filter((runtime) => runtime.expanded).length;
+    mark('previewExpanded', String(expanded));
+
+    if (mode === 'open') {
+      const started = performance.now();
+      button.click();
+      mark('previewMs', (performance.now() - started).toFixed(1));
+      mark('previewVisible', String(visibleCount()));
+      mark('previewNodes', String(nodeCount()));
+      return;
+    }
+
+    if (mode === 'cycle10') {
+      // 需求 F8.2：重复打开关闭 10 次，不泄漏、不累积遮罩
+      let worstVisibleAfterClose = 0;
+      let worstNodesAfterClose = 0;
+      for (let round = 0; round < 10; round += 1) {
+        button.click();
+        button.click();
+        worstVisibleAfterClose = Math.max(worstVisibleAfterClose, visibleCount());
+        worstNodesAfterClose = Math.max(worstNodesAfterClose, nodeCount());
+      }
+      mark('previewCycles', '10');
+      mark('previewVisibleAfterClose', String(worstVisibleAfterClose));
+      mark('previewNodesAfterClose', String(worstNodesAfterClose));
+      // 只统计**可见**的遮罩层。页面里本来就有设置/规则对话框的 .modal-overlay，
+      // 它们带 hidden 属性常驻 DOM；把它们算进来会得到一个永远非零的假告警。
+      const visibleOverlays = [...document.querySelectorAll<HTMLElement>(
+        '[class*=overlay],[class*=mask],[class*=backdrop]',
+      )].filter((node) => !node.hidden && node.getClientRects().length > 0).length;
+      mark('previewOverlays', String(visibleOverlays));
+      return;
+    }
+
+    if (mode === 'typing') {
+      // 需求 F8.2：预览打开期间编辑器仍可输入（预览不应独占）
+      button.click();
+      mark('previewVisible', String(visibleCount()));
+      const content = document.querySelector<HTMLElement>('.cm-content');
+      if (!content) {
+        mark('typingResult', 'no-editor');
+        return;
+      }
+      const before = content.textContent ?? '';
+      content.focus();
+      // execCommand 会产生真实的 beforeinput/input 事件，CM6 按正常路径接收
+      document.execCommand('insertText', false, '预览期间输入');
+      const after = content.textContent ?? '';
+      mark('typingResult', after !== before ? 'changed' : 'unchanged');
+      mark('typingContentEditable', content.getAttribute('contenteditable') ?? 'null');
+      // 中心点最上层元素必须仍在编辑器内，说明没有被全屏遮罩挡住
+      const rect = content.getBoundingClientRect();
+      const top = document.elementFromPoint(
+        Math.round(rect.left + rect.width / 2),
+        Math.round(rect.top + Math.min(rect.height / 2, 20)),
+      );
+      mark('typingTopmost', top && content.contains(top) ? 'editor' : (top?.className || top?.tagName || 'null'));
+      return;
+    }
+
+    if (mode === 'sweep') {
+      // T9.18：顶栏其余按钮逐个点一遍，确认没有「点了不返回」的同类状态机问题。
+      // 判据是 click 的同步耗时 —— F8 那种故障会让 click 永不返回，
+      // 这里因此拿不到 dump（进程被杀），本身就是失败信号。
+      const ids = [
+        'btn-open',
+        'btn-save',
+        'btn-preview',
+        'btn-export',
+        'btn-rules',
+        'btn-settings',
+        'btn-upload',
+        'btn-history',
+        'btn-rollback',
+      ];
+      const parts: string[] = [];
+      for (const id of ids) {
+        const node = document.getElementById(id) as HTMLButtonElement | null;
+        if (!node) {
+          parts.push(`${id}:missing`);
+          continue;
+        }
+        if (node.disabled) {
+          // 「打开/另存为」在浏览器模式下不可用（依赖 Tauri 契约），保持跳过；
+          // 同步三键在未配置服务端时是 disabled，但它们内部只是「置一条提示后返回」，
+          // 强制启用一次才能真正覆盖到处理函数，否则这一格等于没测。
+          if (id.startsWith('btn-') && !['btn-open', 'btn-save'].includes(id)) {
+            node.disabled = false;
+            const startedForce = performance.now();
+            let forcedState = 'ok';
+            try {
+              node.click();
+            } catch (error) {
+              forcedState = `threw(${(error as Error).message.slice(0, 30)})`;
+            }
+            parts.push(`${id}:${(performance.now() - startedForce).toFixed(1)}ms:${forcedState}(forced)`);
+            node.disabled = true;
+          } else {
+            parts.push(`${id}:disabled`);
+          }
+          continue;
+        }
+        const started = performance.now();
+        let state = 'ok';
+        try {
+          node.click();
+        } catch (error) {
+          state = `threw(${(error as Error).message.slice(0, 30)})`;
+        }
+        const elapsed = performance.now() - started;
+        parts.push(`${id}:${elapsed.toFixed(1)}ms:${state}`);
+        // 关掉可能弹出的对话框，否则会挡住后续点击
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        for (const close of document.querySelectorAll<HTMLElement>('.modal-close,[data-close]')) {
+          if (close.getClientRects().length > 0) close.click();
+        }
+        // 预览是开关，点成打开后要再点回来，避免状态污染后续按钮
+        if (id === 'btn-preview' && visibleCount() > 0) node.click();
+      }
+      // 全部点完再看一次：可见遮罩应为 0，页面仍可响应
+      const leftover = [...document.querySelectorAll<HTMLElement>(
+        '[class*=overlay],[class*=mask],[class*=backdrop]',
+      )].filter((node) => !node.hidden && node.getClientRects().length > 0).length;
+      mark('sweepResults', parts.join(' | '));
+      mark('sweepVisibleOverlays', String(leftover));
+      mark('sweepVisiblePreview', String(visibleCount()));
+      return;
+    }
   }
 
   /** 启动时探测一次已保存的配置；失败静默（不打扰编辑） */
@@ -660,10 +922,11 @@ class EditorApp {
 
   // ── 编辑 → 校验 ──────────────────────────────────────────
   private onBlockChange(runtime: BlockRuntime, text: string): void {
-    const result = setBlockText(this.card, runtime.snapshot.id, text);
+    // 走 session：它内部会置脏并让审计缓存失效。
+    // 直接 `this.card = result.card` 会绕过这两件事 —— 那正是脏标记不可靠的老原因。
+    const result = this.session.setBlockText(runtime.snapshot.id, text);
     if (!result.changed) return;
 
-    this.card = result.card;
     runtime.snapshot = {
       ...runtime.snapshot,
       text,
@@ -798,6 +1061,186 @@ class EditorApp {
   }
 
 
+  // ── 角色名就地编辑（F10）──────────────────────────────────
+  //
+  // 为什么必须改 meta.name 而不是只改显示文本：导出 JSON 的角色名取自 meta.name。
+  // 之前顶栏只是个只读 div，用户永远改不到 meta.name，导出的 JSON 里角色名
+  // 就一直是最初那个样例名 —— 这是 F10 要根治的问题。
+  //
+  // 与【基本信息】板块里的「姓名」行不双写：meta.name 是唯一数据源，
+  // 正文里的姓名由用户自己维护（面板会给 info 级提示，但不强制同步，也不回写）。
+  private wireNameEditor(): void {
+    const display = byId<HTMLButtonElement>('card-name');
+    const input = byId<HTMLInputElement>('card-name-input');
+    /** 进入编辑时记住原值，Esc 要能退回去 */
+    let original = '';
+
+    const begin = (): void => {
+      original = this.card.meta.name;
+      input.value = original;
+      display.hidden = true;
+      input.hidden = false;
+      input.focus();
+      // 全选：改名通常是想整个换掉，而不是在中间插字
+      input.select();
+    };
+
+    const commit = (): void => {
+      if (input.hidden) return;
+      input.hidden = true;
+      display.hidden = false;
+      const next = input.value.trim();
+      if (next === original) {
+        // 没改就什么都不做 —— 免得把「点了一下又点走」记成一次内容变更
+        this.renderCardName();
+        return;
+      }
+      this.applyCardName(next);
+    };
+
+    const cancel = (): void => {
+      if (input.hidden) return;
+      input.hidden = true;
+      display.hidden = false;
+      this.renderCardName();
+    };
+
+    display.addEventListener('click', begin);
+    // 失焦即确认：这是这类就地编辑的通行行为，用户点别处就是不打算改了
+    input.addEventListener('blur', commit);
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        commit();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        cancel();
+      }
+    });
+  }
+
+  /**
+   * 全局快捷键（T9.9）：Ctrl+N 新建 / Ctrl+W 关标签 / Ctrl+Tab 切换。
+   *
+   * **决策在 `editor/shortcuts.ts` 的纯函数里**（`decideShortcut`），这里只负责
+   * 采集三样现场状态（是否在输入、有没有弹窗、有几个标签）并执行结果。
+   * 这样"空工作台按 Ctrl+W 会不会有反应""编辑器里按 Ctrl+W 关不关标签"
+   * 都能被单测钉住，而不是靠手点。
+   *
+   * 为什么挂在 `window` 的**捕获阶段**：CodeMirror 6 会自己处理大量按键，
+   * 冒泡到 document 时可能已经被它消费。捕获阶段能抢在它之前判断，
+   * 而我们只对三个组合生效，其余键一律放行 —— 不拦用户正常输入。
+   *
+   * 键位冲突（已核实，见 `shortcuts.ts` 文件头）：
+   *   · CM6 `defaultKeymap` 里没有 `Mod-w` / `Mod-n` / `Mod-Tab`，三者都不冲突；
+   *   · 被 CM6 占用的是**不带修饰键**的 `Tab`（插入缩进），与 Ctrl+Tab 是两回事；
+   *   · wry 的 `browser_accelerator_keys` 默认 `true`（Tauri 未覆盖），
+   *     所以 WebView2 的加速键是开着的 —— Ctrl+W 一律 `preventDefault`，
+   *     不让它有机会走浏览器的默认行为。
+   */
+  private wireShortcuts(): void {
+    window.addEventListener(
+      'keydown',
+      (event) => {
+        const intent = decideShortcut({
+          key: event.key,
+          ctrlKey: event.ctrlKey,
+          metaKey: event.metaKey,
+          altKey: event.altKey,
+          shiftKey: event.shiftKey,
+          editing: this.isEditingText(),
+          modalOpen: this.isModalOpen(),
+          tabCount: this.sessions.length,
+        });
+
+        // null = 与我们无关，绝不 preventDefault（否则会吞掉 Ctrl+A 这类通用键）
+        if (intent === null) return;
+        if (intent.preventDefault) event.preventDefault();
+
+        switch (intent.type) {
+          case 'new-card':
+            void this.newCard();
+            return;
+          case 'close-tab':
+            if (this.activeId) void this.closeSession(this.activeId);
+            return;
+          case 'switch-tab':
+            this.cycleSession(intent.delta);
+            return;
+          case 'editor-took-key':
+            // 不关标签，只解释为什么没反应 —— 静默无响应会让人以为快捷键坏了
+            this.setStatus(intent.hint, 'info');
+            return;
+        }
+      },
+      // capture：抢在 CodeMirror 的处理器之前
+      true,
+    );
+  }
+
+  /**
+   * 当前焦点是否在"打字的地方"：编辑器、就地改名输入框、或任何输入控件。
+   *
+   * 判 `closest('.cm-editor')` 而不是 `editor.hasFocus()`：后者只认 CM6 自己的
+   * 焦点，判不到"就地改名"那个 input，而那里同样是打字场景。
+   */
+  private isEditingText(): boolean {
+    const active = document.activeElement;
+    if (!active || !(active instanceof HTMLElement)) return false;
+    if (active.closest('.cm-editor')) return true;
+    if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return true;
+    return active.isContentEditable;
+  }
+
+  /**
+   * 是否有打开着的模态框。
+   *
+   * 判 `.modal-overlay:not([hidden])` 而不是记一个布尔量：弹窗的开关散落在
+   * 五六个组件里（设置 / 新建 / 同步 / 导出 / 规则 / 关闭确认），
+   * 各自维护标志位迟早漏一个，而从 DOM 读是唯一不会失真的来源。
+   */
+  private isModalOpen(): boolean {
+    return document.querySelector('.modal-overlay:not([hidden])') !== null;
+  }
+
+  /** 按 delta 切换标签，到边界回绕（Ctrl+Tab 从最后一个跳到第一个） */
+  private cycleSession(delta: 1 | -1): void {
+    if (this.sessions.length < 2) return;
+    const index = this.sessions.findIndex((item) => item.id === this.activeId);
+    if (index === -1) return;
+    const next = (index + delta + this.sessions.length) % this.sessions.length;
+    this.activateSession(this.sessions[next]!.id);
+  }
+
+  /** 把当前 meta.name 渲染到顶栏（空值显示「未命名」） */
+  private renderCardName(): void {
+    // 用 textContent 而不是 innerHTML：角色名来自用户/导入文件，是纯文本
+    byId('card-name').textContent = this.card.meta.name || '(未命名)';
+  }
+
+  /**
+   * 写入角色名并联动。
+   *
+   * 允许空值（F10.1）：清空后审计会按既有语义报「角色名不能为空」，
+   * 显示层回退「未命名」。这里不做"必须非空"的拦截 —— 那会让
+   * "先清空再重打" 这种很自然的改名方式走不通。
+   */
+  private applyCardName(name: string): void {
+    if (this.card.meta.name === name) {
+      this.renderCardName();
+      return;
+    }
+    this.session.setName(name);
+    this.renderCardName();
+    // 标签栏文字联动（F10 + T9.2）：改名后活动标签即时刷新。
+    // 注意走 refreshTabs 而不是 tabs.refresh —— 后者需要传入重读的数据，
+    // 写错会变成「调了刷新但文字没变」。
+    this.refreshTabs();
+    // 审计要立刻重算：name 是多数平台的必填项，改完必须马上反映到面板上。
+    // 用 0 延迟而不是走防抖，因为这是"一次确定的操作"，不是连续输入。
+    this.scheduleValidate(0);
+  }
+
   // ── 工具条：打开 / 另存 / 预览 ────────────────────────────
   private wireToolbar(): void {
     const openButton = byId<HTMLButtonElement>('btn-open');
@@ -812,38 +1255,357 @@ class EditorApp {
       saveButton.title = '浏览器模式：请在桌面客户端内使用';
     }
 
+    const newButton = byId<HTMLButtonElement>('btn-new');
+    newButton.addEventListener('click', () => void this.newCard());
     openButton.addEventListener('click', () => void this.openCard());
     saveButton.addEventListener('click', () => void this.saveCard());
     previewButton.addEventListener('click', () => this.togglePreview());
   }
 
-  private async openCard(): Promise<void> {
-    try {
-      const path = await pickCardFile();
-      if (!path) return;
-      const file = await readTextExact(path);
-      const parsed = parseStCard(file.text);
-      this.replaceCard(parsed.card);
-      this.setStatus(`已打开：${file.pathDisplay ?? '(非 UTF-8 路径)'}（${file.bytesLen} 字节）`);
-    } catch (error) {
-      this.setStatus(`打开失败：${describe(error)}`, 'bad');
+  /**
+   * 新建角色卡（F1 + F11）。
+   *
+   * 流程：F11 对话框拿「角色名 + 角色卡 ID」→ 按当前预设装配空卡 →
+   * 把 ID 写进卡数据 → 载入编辑器。
+   *
+   * 空卡也要写入 ID：否则这张卡在保存/上传时会被当成"没有 ID 的外部卡"
+   * 又生成一个新的，用户在对话框里看到的 ID 就白显示了。
+   */
+  // ── 多标签：切换 / 关闭 / 空工作台（T9.2–T9.4）──────────────
+
+  /** 把会话集合投影成标签数据。标签栏不持有状态，每次重绘都重读一遍。 */
+  private tabItems(): TabItem[] {
+    return this.sessions.map((session) => ({
+      id: session.id,
+      label: session.label,
+      displayName: session.displayName,
+      cardId: session.cardId,
+      persisted: session.persisted,
+    }));
+  }
+
+  /**
+   * 重读会话集合并刷新标签栏。
+   *
+   * 走 `render` 而不是 `refresh`：这里的调用点**既可能是集合变化**（新建/关闭）
+   * **也可能只是内容变化**（改名/置脏）。`render` 会按 id 比对，多余的删、缺的补、
+   * 现有的就地更新 —— 两种场景都覆盖，而 `refresh` 只处理后者。
+   * 统一走一条路径，避免"某个调用点用错了刷新方法"这类只在特定操作后复现的 bug。
+   */
+  private refreshTabs(): void {
+    if (!this.tabs) return;
+    this.tabs.render(this.tabItems(), this.activeId);
+  }
+
+  /**
+   * 切换活动会话。
+   *
+   * 关键：**内容在 CardSession 里，UI 只是它的投影**。所以切换时不需要
+   * "把编辑器内容存回会话再载入另一张" —— 会话里本来就是最新的。
+   * 只需把当前 UI 拆掉、按新会话重建，这也正是 T6.1 的懒渲染原则。
+   */
+  private activateSession(id: string): void {
+    if (id === this.activeId) return;
+    if (!this.sessions.some((item) => item.id === id)) return;
+
+    // 先把当前 UI 的编辑器全部销毁（折叠即销毁），再换会话重建
+    for (const runtime of this.blocks) {
+      this.collapse(runtime);
+      runtime.section.remove();
+    }
+    this.blocks = [];
+    this.activeIssueId = null;
+
+    this.activeId = id;
+    this.mountActiveSession();
+    this.refreshTabs();
+  }
+
+  /**
+   * 按活动会话重建编辑器与面板。
+   *
+   * 零标签走 `renderEmptyWorkspace()` —— F3 要求「空工作台」与「零标签」
+   * 是同一套渲染，所以这里只有一条分支，不存在两套界面。
+   */
+  private mountActiveSession(): void {
+    const has = this.hasSession;
+    // 零标签时把所有"需要一张卡"的入口禁用。
+    // 不做这件事的话，点「导出」会在 this.session 上抛错（它明确要求有活动会话）。
+    // 「打开」「新建」永远可用 —— 它们正是从零标签里出来的路。
+    this.setCardActionEnabled(has);
+
+    if (!has) {
+      this.renderEmptyWorkspace();
+      return;
+    }
+    document.body.dataset['workspace'] = 'card';
+    this.reloadBlocksFromCard();
+    this.renderCardName();
+    // 每个会话有自己的规则选择，切换后要把规则/预设下拉同步过来
+    this.syncRulesUiToSession();
+    this.scheduleValidate(0);
+  }
+
+  /**
+   * 启用/禁用「需要一张卡」的顶栏与同步按钮。
+   *
+   * 同步三个按钮本来由连接状态控制，这里只处理"零标签"这一维：
+   * 有卡时把控制权交回 applyConnection，无卡时统一禁用。
+   */
+  private setCardActionEnabled(enabled: boolean): void {
+    for (const id of ['btn-save', 'btn-preview', 'btn-export', 'btn-rules']) {
+      const node = document.getElementById(id) as HTMLButtonElement | null;
+      if (node && !node.dataset['browserDisabled']) node.disabled = !enabled;
+    }
+    if (!enabled) {
+      for (const id of ['btn-upload', 'btn-history', 'btn-rollback']) {
+        const node = document.getElementById(id) as HTMLButtonElement | null;
+        if (node) node.disabled = true;
+      }
+    } else {
+      // 有卡了，让连接状态重新决定同步三键的可用性
+      this.applyConnection(this.connection);
     }
   }
 
-  private async saveCard(): Promise<void> {
+  /**
+   * 空工作台（F3）。
+   *
+   * 与「零标签」是**同一个渲染路径**：启动时不打开任何卡、关闭最后一个标签后，
+   * 都走到这里。这样就不存在"启动界面"和"零标签界面"两套东西各自演化、
+   * 最后长得不一样的问题。
+   */
+  private renderEmptyWorkspace(): void {
+    document.body.dataset['workspace'] = 'empty';
+    this.blockList.replaceChildren();
+
+    const empty = el('div', 'empty-workspace');
+    const title = el('p', 'empty-title', '还没有打开任何角色卡');
+    const hint = el('p', 'empty-hint', '新建一张空白卡，或从磁盘打开已有卡片。');
+
+    const actions = el('div', 'empty-actions');
+    const newBtn = el('button', 'btn primary', '新建角色卡');
+    newBtn.type = 'button';
+    newBtn.addEventListener('click', () => void this.newCard());
+    const openBtn = el('button', 'btn', '打开角色卡…');
+    openBtn.type = 'button';
+    openBtn.addEventListener('click', () => void this.openCard());
+    actions.append(newBtn, openBtn);
+
+    empty.append(title, hint, actions);
+    this.blockList.append(empty);
+
+    // 顶栏与统计清空，避免残留上一张卡的信息
+    byId('card-name').textContent = '未打开角色卡';
+    byId('stats').textContent = '';
+    this.issueSummary.replaceChildren();
+    this.auditPanel?.clear();
+    this.setStatus('空白工作台：新建或打开一张角色卡开始', 'info');
+  }
+
+  /**
+   * 关闭标签（T9.4 的三选确认在 T9.4 里补，这里先处理无脏标记的主路径）。
+   *
+   * 关闭后的活动标签选择规则：优先右侧相邻，没有则左侧 ——
+   * 这是浏览器标签的通行行为，用户不需要重新找位置。
+   */
+  private async closeSession(id: string): Promise<void> {
+    const index = this.sessions.findIndex((item) => item.id === id);
+    if (index === -1) return;
+    const session = this.sessions[index]!;
+
+    // 有未落盘修改时先问用户（三选：保存并关闭 / 不保存关闭 / 取消）
+    if (session.dirty) {
+      const decision = await this.confirmClose(session);
+      if (decision === 'cancel') return;
+      if (decision === 'save') {
+        const saved = await this.saveSessionToDisk(session);
+        if (!saved) return; // 保存失败或用户取消保存对话框 → 中止关闭
+      }
+    }
+
+    this.sessions.splice(index, 1);
+
+    if (this.activeId === id) {
+      const next = this.sessions[index] ?? this.sessions[index - 1] ?? null;
+      this.activeId = next?.id ?? null;
+      // 先清掉旧 UI，再按新会话（或空工作台）重建
+      for (const runtime of this.blocks) {
+        this.collapse(runtime);
+        runtime.section.remove();
+      }
+      this.blocks = [];
+      this.mountActiveSession();
+    }
+
+    this.refreshTabs();
+  }
+
+  /** 三选确认：保存并关闭 / 不保存关闭 / 取消 */
+  private confirmClose(session: CardSession): Promise<'save' | 'discard' | 'cancel'> {
+    return new Promise((resolve) => {
+      const overlay = el('div', 'modal-overlay');
+      const panel = el('div', 'modal confirm-close-modal');
+      const head = el('div', 'modal-head');
+      head.append(el('h2', 'modal-title', '有未保存的修改'));
+      const body = el('div', 'modal-body');
+      body.append(
+        el(
+          'p',
+          'confirm-text',
+          `「${session.displayName}」有尚未保存到磁盘的修改。关闭前要保存吗？`,
+        ),
+      );
+      const foot = el('div', 'modal-foot');
+      const cancel = el('button', 'btn', '取消');
+      cancel.type = 'button';
+      const discard = el('button', 'btn', '不保存关闭');
+      discard.type = 'button';
+      const save = el('button', 'btn primary', '保存并关闭');
+      save.type = 'button';
+      foot.append(cancel, discard, save);
+      panel.append(head, body, foot);
+      overlay.append(panel);
+      document.body.append(overlay);
+
+      const finish = (value: 'save' | 'discard' | 'cancel'): void => {
+        overlay.remove();
+        resolve(value);
+      };
+      cancel.addEventListener('click', () => finish('cancel'));
+      discard.addEventListener('click', () => finish('discard'));
+      save.addEventListener('click', () => finish('save'));
+      overlay.addEventListener('click', (event) => {
+        if (event.target === overlay) finish('cancel');
+      });
+      document.addEventListener(
+        'keydown',
+        (event) => {
+          if (event.key === 'Escape' && overlay.isConnected) {
+            event.preventDefault();
+            finish('cancel');
+          }
+        },
+        { once: true },
+      );
+      save.focus();
+    });
+  }
+
+  /**
+   * 保存指定会话到磁盘（另存为语义）。
+   *
+   * **只改会话状态**：路径与脏标记都写在 session 上，app.ts 不再有游离字段。
+   * 这是 T9.2 一并要求的「另存为只改会话状态」。
+   */
+  private async saveSessionToDisk(session: CardSession): Promise<boolean> {
     try {
-      const target = await pickSavePath(`${this.card.meta.name || 'card'}.json`, 'json');
-      if (!target) return;
-      const text = serializeCard(this.card);
+      // 默认落点 = cardsDir（F4）；文件名取角色名，重名自动追加序号
+      const dir = await effectiveCardsDir();
+      const suggested = await suggestCardFileName(session.card.meta.name, dir);
+      const target = await pickSavePath(suggested, 'json', dir === '' ? undefined : dir);
+      if (!target) return false;
+
+      const text = serializeCard(session.card);
       const receipt = await writeFileAtomic(target, text);
+      session.markSaved(target);
+      this.refreshTabs();
+      this.renderCardName();
       this.setStatus(
         `已保存：${receipt.pathDisplay ?? '(非 UTF-8 路径)'} · ${receipt.bytesWritten} 字节 · ` +
           `sha256 ${receipt.sha256.slice(0, 12)}… · 回读${receipt.verified ? '一致' : '不一致！'}`,
         receipt.verified ? 'ok' : 'bad',
       );
+      return true;
     } catch (error) {
       this.setStatus(`保存失败：${describe(error)}`, 'bad');
+      return false;
     }
+  }
+
+  /** 把会话的规则选择同步到界面（切换标签后调用） */
+  private syncRulesUiToSession(): void {
+    // 规则面板从 session 读当前选择，这里只需让它重绘
+    this.rulesDialog?.refresh();
+  }
+
+  private async newCard(): Promise<void> {
+    if (!this.newCardDialog) this.newCardDialog = new NewCardDialog();
+
+    // 已占用的 ID 全都要传进去，不只是当前这张 —— 重复 ID 提示是对整个标签栏而言的
+    const openIds = this.sessions.map((item) => item.cardId);
+    const request = await this.newCardDialog.open({ openIds });
+    if (!request) return;
+
+    const preset = this.rules?.preset ?? null;
+    // createEmptyCard 给出六板块骨架；预设决定导出时的标题与顺序（docs/15 §1），
+    // 但空卡阶段没有正文，所以这里只需要把骨架建出来。
+    const blank = createEmptyCard(request.name);
+    const withId = withCardId(blank, request.cardId);
+
+    // 新建 = 追加一个会话（而不是替换当前卡）。这是 F1 与 F2 的结合点：
+    // 用户点「+」是想再开一张，不是想把手上这张扔掉。
+    const session = new CardSession({
+      card: withId,
+      cardId: request.cardId,
+      platformId: this.rules?.platformId,
+      highlightId: this.rules?.highlightId,
+      presetId: preset?.id ?? null,
+      filePath: null,
+    });
+    this.sessions.push(session);
+    this.activeId = session.id;
+
+    // 切换过去：把旧 UI 拆掉、按新会话重建
+    for (const runtime of this.blocks) {
+      this.collapse(runtime);
+      runtime.section.remove();
+    }
+    this.blocks = [];
+    this.mountActiveSession();
+    this.refreshTabs();
+    this.setStatus(
+      `已新建「${request.name || '未命名'}」· ID ${request.cardId}（尚未保存到磁盘）`,
+      'ok',
+    );
+  }
+
+  /** 当前卡的角色卡 ID：优先读卡数据里已存的，没有就按角色名生成 */
+  private currentCardId(): string {
+    return readCardIdFromCard(this.card) ?? generateCardId(this.card.meta.name);
+  }
+
+  private async openCard(): Promise<void> {
+    try {
+      const dir = await effectiveCardsDir();
+      const path = await pickCardFile(dir === '' ? undefined : dir);
+      if (!path) return;
+      const file = await readTextExact(path);
+      const parsed = parseStCard(file.text);
+      this.replaceCard(parsed.card);
+      // 打开的文件不在 cardsDir 里时说一句：用户会以为"打开过的卡都在那个目录"
+      const outside = dir !== '' && !path.toLowerCase().startsWith(dir.toLowerCase());
+      this.setStatus(
+        `已打开：${file.pathDisplay ?? '(非 UTF-8 路径)'}（${file.bytesLen} 字节）` +
+          (outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${dir}` : ''),
+        outside ? 'warn' : 'info',
+      );
+    } catch (error) {
+      this.setStatus(`打开失败：${describe(error)}`, 'bad');
+    }
+  }
+
+  /**
+   * 「另存为…」按钮。
+   *
+   * 与 closeSession 的「保存并关闭」**共用同一个实现**（saveSessionToDisk）：
+   * 两处各写一遍的话，路径/脏标记的更新迟早会有一边漏掉。
+   * 注意它改的只是**会话状态**（session.filePath / dirty），
+   * app.ts 里没有任何文件路径字段。
+   */
+  private async saveCard(): Promise<void> {
+    if (!this.hasSession) return;
+    await this.saveSessionToDisk(this.session);
   }
 
   private togglePreview(): void {
@@ -867,7 +1629,10 @@ class EditorApp {
   }
 
   private replaceCard(card: UnifiedCard): void {
-    this.card = card;
+    // 走 session：它会深拷贝，避免调用方后续改动这份卡数据时渗透进会话。
+    // 但"打开文件/导入"应当重置脏标记 —— 刚载入的内容相对磁盘是干净的。
+    this.session.replaceCard(card);
+    this.session.markSaved(this.session.filePath);
     this.reloadBlocksFromCard();
     this.scheduleValidate(0);
   }
@@ -906,7 +1671,9 @@ class EditorApp {
     if (this.rules) {
       this.rules = { ...this.rules, preset };
     }
-    this.card = applyPresetPlan(this.card, plan);
+    // 换预设要置脏：预设决定导出时的标题与顺序，属于产出的一部分（见 CardSession 注释）
+    this.session.replaceCard(applyPresetPlan(this.card, plan));
+    this.session.markDirty();
     this.reloadBlocksFromCard();
     this.rulesDialog?.refresh();
     // 重排后按新预设口径立即重检（分隔符/顺序类问题应当消失）
@@ -966,7 +1733,7 @@ class EditorApp {
 
   /** 调试/截图：预选服务端卡片并加载其版本历史 */
   preselectSyncCardForDemo(cardId: string): void {
-    this.syncCardId = cardId;
+    // 只改"看哪张卡的历史"，不改上传目标 —— 上传目标恒为活动会话
     this.syncDialog?.selectCard(cardId);
   }
 
@@ -1034,21 +1801,34 @@ function describe(error: unknown): string {
 
 // ── 启动 ────────────────────────────────────────────────────
 async function boot(): Promise<void> {
-  let card: UnifiedCard;
-  try {
-    card = parseStCard(sampleCardJson as unknown).card;
-  } catch {
-    card = createEmptyCard('未命名');
+  const params = new URLSearchParams(location.search);
+
+  /**
+   * 启动时是否载入样例卡。
+   *
+   * **默认不载入** —— F3 要求「启动后不自动打开任何角色卡，显示空工作台」。
+   * 之前无条件加载 test/fixtures 里的样例卡，那是开发期图方便，
+   * 真实用户打开客户端会莫名其妙看到别人的角色卡。
+   *
+   * `?sample=1` 保留给端到端测试与截图：那些场景需要一张有内容的卡作为起点。
+   * 这里不写"生产环境禁用"的判断 —— 它是调试入口，和 ?rules=1 等一致。
+   */
+  let card: UnifiedCard | null = null;
+  if (params.get('sample') === '1') {
+    try {
+      card = parseStCard(sampleCardJson as unknown).card;
+    } catch {
+      card = null; // 样例卡坏了也不该让启动失败，退化成空工作台
+    }
   }
 
-  byId('card-name').textContent = card.meta.name || '(未命名)';
+  byId('card-name-input').hidden = true;
 
   const app = new EditorApp(card);
   await app.start();
 
   // 调试/截图入口：?demo=lenient 用「只有基本信息」的 TXT 走一次**真实的宽松导入**，
   // 用于验证/展示「原文缺失」标记。走的是 shared 的 applyCardText，不伪造状态。
-  const params = new URLSearchParams(location.search);
   if (params.get('demo') === 'lenient') {
     app.applyDemoLenientText();
   }

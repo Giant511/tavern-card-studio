@@ -40,6 +40,10 @@ export async function startWorker(loaded: LoadedConfig): Promise<RunningWorker> 
   const url = `http://${loaded.config.host === '0.0.0.0' ? '127.0.0.1' : loaded.config.host}:${loaded.config.port}`;
   context.logger.info('worker.listening', {
     url,
+    // 实际监听地址（审计用）：0.0.0.0 表示对局域网开放。
+    // url 是「可访问地址」，两者不能混为一谈 —— 只打 url 看不出是否暴露到局域网。
+    bind: `${loaded.config.host}:${loaded.config.port}`,
+    exposedToLan: loaded.config.host === '0.0.0.0' || loaded.config.host === '::',
     pid: process.pid,
     dataDir: loaded.config.dataDir,
     authRequired: loaded.config.auth.require,

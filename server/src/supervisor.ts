@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 import {
   assertSafeConfig,
   generateToken,
+  isLoopbackHost,
   normalizeConfig,
   reachableHost,
   writeConfig,
@@ -570,7 +571,14 @@ export async function startSupervisor(loaded: LoadedConfig, options: SupervisorO
   });
 
   logger.info('supervisor.listening', {
+    // panel 是「给人在浏览器里打开的地址」，bind 才是「实际监听的地址」。
+    // F7.4 要求日志能用于审计，所以两者都要打：
+    //   bind=127.0.0.1 说明面板只在本机，局域网连不上；
+    //   bind=0.0.0.0   说明面板对局域网开放（面板静态资源免鉴权，需要警惕）。
+    // 只打 panel 会被误读 —— 监听得是 0.0.0.0 时 panel 仍显示 127.0.0.1。
     panel: `http://${reachableHost(config.controlHost)}:${config.controlPort}/`,
+    bind: `${config.controlHost}:${config.controlPort}`,
+    panelLoopbackOnly: isLoopbackHost(config.controlHost),
     api: controller.url,
     pid: process.pid,
   });

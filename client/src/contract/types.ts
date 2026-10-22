@@ -71,6 +71,45 @@ export interface ShellInfo {
   mode: 'debug' | 'release';
 }
 
+/**
+ * 目录探测结果（T9.8）。
+ *
+ * 「存在 / 已创建 / 可写」三件事分开报，而不是一个 `ok` 布尔 ——
+ * 因为它们的处置完全不同：
+ *   · 不存在且创建失败 → **拒绝保存**（用户填了个建不出来的路径，存了也用不了）；
+ *   · 存在但不可写     → **允许保存 + 黄色警告**（可能是权限临时问题，
+ *     或者是只读盘/网络盘；拦下来会让人连"先记下来待会修"都做不到）。
+ */
+export interface DirProbe {
+  /** 原样回传的绝对路径 */
+  path: string;
+  /** 展示用路径；非 UTF-8 时为 null */
+  pathDisplay: string | null;
+  /** 探测时是否已存在 */
+  exists: boolean;
+  /** 本次是否为调用方新建（exists=false 且创建成功时为 true） */
+  created: boolean;
+  /** 是否可写（实际写入一个探针文件再删掉，不是只看属性位） */
+  writable: boolean;
+  /** 不可写 / 创建失败的原因，面向用户的一句话；正常时为 null */
+  reason: string | null;
+}
+
+/**
+ * 卡片目录扫描结果。
+ *
+ * **只有文件名，没有路径、没有内容、不递归** —— 这个能力存在的唯一目的是
+ * 「保存时别把同名文件覆盖掉」，所以它不该有能力看到子目录或读文件。
+ */
+export interface CardsDirScan {
+  /** 展示用目录路径；非 UTF-8 时为 null */
+  pathDisplay: string | null;
+  /** 目录下 `.json` 文件名（不含路径） */
+  names: string[];
+  /** 条目过多被截断（只影响"重名检测"的完备性，不影响保存本身） */
+  truncated: boolean;
+}
+
 /** 客户端持久化配置（T6.8） */
 export interface ClientConfig {
   /** 服务端 API 根地址，如 http://127.0.0.1:8730 */
@@ -83,6 +122,14 @@ export interface ClientConfig {
   presetId: string | null;
   /** 当前高亮方案 id */
   highlightSchemeId: string | null;
+  /**
+   * 角色卡目录（T9.8 / F4）。`null` = 未设置，使用壳给出的默认值
+   * （`%USERPROFILE%\Documents\TavernCardStudio\cards`）。
+   *
+   * 存的是**路径字符串**，不是文件系统授权 —— 授权由每次的原生对话框现给，
+   * 重启即失效。这一点见 docs/11 §8。
+   */
+  cardsDir: string | null;
 }
 
 export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
@@ -91,4 +138,5 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
   platformRuleId: null,
   presetId: null,
   highlightSchemeId: null,
+  cardsDir: null,
 };

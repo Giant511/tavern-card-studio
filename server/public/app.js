@@ -228,12 +228,24 @@
   $('svc-restart').addEventListener('click', () => serviceAction('restart'));
 
   // ── 配置 ─────────────────────────────────────────────
+  // F7.3：面板监听地址旁的安全提示。非回环时常驻显示（不是一次性 toast），
+  // 因为风险是"配置本身持续存在"，提示也该持续可见。
+  const LOOPBACK = ['127.0.0.1', 'localhost', '::1'];
+  function updateControlHostWarning() {
+    const input = $('cfg-controlHost');
+    const warn = $('cfg-controlHost-warn');
+    if (!input || !warn) return;
+    const value = input.value.trim();
+    warn.hidden = LOOPBACK.includes(value);
+  }
+
   function fillConfigForm(config) {
     $('cfg-port').value = config.port;
     $('cfg-controlPort').value = config.controlPort;
     $('cfg-host').value = config.host;
     // 老服务端可能还没有这个字段；没有就显示默认回环，而不是留空。
     $('cfg-controlHost').value = config.controlHost || '127.0.0.1';
+    updateControlHostWarning();
     $('cfg-maxUploadBytes').value = config.maxUploadBytes;
     $('cfg-dataDir').value = config.dataDir;
     $('cfg-rulesDir').value = config.rulesDir;
@@ -255,6 +267,8 @@
       /* 状态接口里也有配置，忽略 */
     }
   }
+
+  $('cfg-controlHost').addEventListener('input', updateControlHostWarning);
 
   $('cfg-save').addEventListener('click', async () => {
     const payload = {

@@ -122,6 +122,40 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 /**
+ * 判断一条**连接来源地址**是否来自本机回环（`GET /api/token` 的门禁）。
+ *
+ * 与 `isLoopbackHost` 的区别很重要，别混用：
+ *   · `isLoopbackHost` 判的是**配置里的监听地址**（决定 bind 到哪）；
+ *   · 本函数判的是**这次请求的对端地址**（决定要不要给令牌）。
+ *
+ * `socket.remoteAddress` 的形态不止一种，都得认：
+ *   · `127.0.0.1`            —— 普通 IPv4 回环
+ *   · `::1`                  —— 普通 IPv6 回环
+ *   · `::ffff:127.0.0.1`     —— **IPv4-mapped IPv6**。双栈监听（`::`）时最常见，
+ *                               漏判这一种会让本机客户端拿不到令牌，且现象很迷惑：
+ *                               看起来"服务在跑、端口通"，偏偏取令牌 403。
+ *   · `127.x.y.z`            —— 整个 127.0.0.0/8 都是回环，不只是 127.0.0.1。
+ *
+ * **绝不看 `X-Forwarded-For` 之类的请求头**：那个由客户端随便写，
+ * 拿它做门禁等于没有门禁。只有内核给出的 socket 地址可信。
+ */
+export function isLoopbackAddress(remoteAddress: string | undefined): boolean {
+  if (!remoteAddress) return false;
+  const address = remoteAddress.trim().toLowerCase();
+
+  // IPv4-mapped IPv6：先剥掉前缀再按 IPv4 判
+  const mapped = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address;
+  if (mapped === '::1' || mapped === '0:0:0:0:0:0:0:1') return true;
+
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(mapped);
+  if (v4) {
+    // 127.0.0.0/8 整段都是回环
+    return v4[1] === '127';
+  }
+  return false;
+}
+
+/**
  * 把「监听地址」换成「人能在浏览器里打开的地址」。
  *
  * 监听地址和访问地址不是一回事：`0.0.0.0` 表示「监听所有网卡」，但它本身不是一个
