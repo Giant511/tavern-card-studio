@@ -179,13 +179,16 @@ check(
   violationHtml.length ? `越界：${violationHtml.join(', ')}` : '',
 );
 
-// ── 6. README 决策表序号连续性 ────────────────────────────
+// ── 6. PLAN.md 决策表序号连续性 ───────────────────────────
 //
 // 逻辑放在 scripts/check-decision-table.mjs，那里同时被 git pre-commit 钩子使用，
 // 避免两处实现漂移。这里只负责把结果并进统一的校验汇总。
-const decisionResult = checkDecisionTable(join(REPO, 'README.md'));
+//
+// T9.13 起决策表已从 README.md 迁到 PLAN.md（README 转为纯用户文档，
+// 不含决策表）；PLAN.md 本地保留、不入库，所以本项在干净 clone 上会报"找不到文件"。
+const decisionResult = checkDecisionTable(join(REPO, 'PLAN.md'));
 check(
-  'README 决策表序号严格递增且无缺号',
+  'PLAN.md 决策表序号严格递增且无缺号',
   decisionResult.ok,
   decisionResult.detail,
 );
