@@ -1,6 +1,6 @@
 [package]
 name = "tcs-shell"
-version = "0.1.0"
+version = "0.1.1"
 description = "酒馆角色卡审计编辑工具链 · 桌面客户端壳（Tauri 2）"
 authors = ["Tavern Card Studio"]
 edition = "2021"

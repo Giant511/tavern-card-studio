@@ -76,6 +76,7 @@ import { CardSession } from '../session/card-session';
 import { effectiveCardsDir, suggestCardFileName } from '../session/cards-dir';
 import { TabBar, type TabItem } from '../session/tab-bar';
 import { generateCardId, readCardIdFromCard, withCardId } from '../session/card-id';
+import { collectDirtyNames, installUnloadGuard } from '../session/unload-guard';
 
 import sampleCardJson from '../../../test/fixtures/sample-card.json';
 
@@ -239,6 +240,13 @@ class EditorApp {
     this.wireSettings();
     this.wireRules();
     this.wireExportAndSync();
+
+    // 未落盘会话的离开拦截（T9.14）。
+    // WebView2 认 F5 / Ctrl+R，误按一次就把整个 webview 重载、所有标签的
+    // 未保存内容一起消失——比逐个关标签严重得多。这里只在有脏会话时拦，
+    // 全部保存过就放行（详见 unload-guard.ts 里与「三选」的语义对应）。
+    // 每次事件现取会话状态，不维护镜像：镜像状态最容易在保存后忘记清。
+    installUnloadGuard(window, () => collectDirtyNames(this.sessions));
 
     // 首屏：有会话就挂载，没有就走空工作台（F3 空白启动）。
     // **这两条路径共用 mountActiveSession**，所以"启动界面"与"零标签界面"
@@ -924,6 +932,9 @@ class EditorApp {
   private onBlockChange(runtime: BlockRuntime, text: string): void {
     // 走 session：它内部会置脏并让审计缓存失效。
     // 直接 `this.card = result.card` 会绕过这两件事 —— 那正是脏标记不可靠的老原因。
+    // 记下改之前是否已脏：脏标记只在「首次变脏」时才会改变标签文字，
+    // 每敲一个字都重绘整个标签栏是白费（TabBar.render 会重建 DOM）。
+    const wasDirty = this.session.dirty;
     const result = this.session.setBlockText(runtime.snapshot.id, text);
     if (!result.changed) return;
 
@@ -933,6 +944,10 @@ class EditorApp {
       length: [...text].length,
       empty: text.trim() === '',
     };
+    // 标签上的 ● 必须跟着第一次改动立刻出现。
+    // 之前这里只刷了统计与校验，于是「改完内容后标签看不出有未保存修改」，
+    // 要等切标签/新建才补上（2026-10-22 T9.14 端到端抓到的缺陷）。
+    if (!wasDirty && this.session.dirty) this.refreshTabs();
     this.refreshStats();
     this.scheduleValidate(260);
   }
