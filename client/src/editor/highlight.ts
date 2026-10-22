@@ -58,6 +58,21 @@ export function toDecorationSet(
  * 只读预览：把 renderInlineHtml 的结果变成可插入的真实 DOM 节点。
  * 用 DOMParser 而不是 innerHTML —— 内容虽已转义，但保留「永不写 innerHTML」的约定，
  * 让静态检查（grep innerHTML）始终为 0。
+ *
+ * ⚠️ 这里的循环形状是有讲究的，别改回 `while (body.firstChild) importNode(...)`。
+ *
+ * `document.importNode(node, true)` 是**深拷贝**：它把节点复制到当前文档，
+ * 但**不会**从源文档里移除。所以如果只 append 不删除，`body.firstChild` 永远非空，
+ * 循环会无限增长直到渲染进程 OOM 崩溃。
+ *
+ * 这正是 F8「点渲染预览后整个界面卡死」的根因（2026-10-22 定位）：
+ * 界面在本机表现为「卡死、必须重启客户端」，在 headless Chrome 里表现为
+ * `Abnormal renderer termination`，且崩溃前没有任何 JS 报错——因为进程是被内存吃死的，
+ * try/catch 根本接不住。
+ *
+ * 现在改用**移动**语义：`fragment.append(...body.childNodes)` 会把节点从 body 中
+ * 摘走放进 fragment（先展开成静态数组，避免边遍历边修改活集合）。
+ * 既不写 innerHTML，也不会重复拷贝。
  */
 export function buildPreviewFragment(
   text: string,
@@ -67,10 +82,9 @@ export function buildPreviewFragment(
   const html = renderInlineHtml(text, compiled, context, { breakLines: true });
   const parsed = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
   const fragment = document.createDocumentFragment();
-  const body = parsed.body;
-  while (body.firstChild) {
-    fragment.append(document.importNode(body.firstChild, true));
-  }
+  // 展开成数组再 append：childNodes 是活集合，直接遍历会被 append 影响；
+  // append 对已在文档中的节点执行的是“移动”，不是复制。
+  fragment.append(...Array.from(parsed.body.childNodes));
   return fragment;
 }
 

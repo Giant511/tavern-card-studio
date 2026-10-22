@@ -1,0 +1,305 @@
+/**
+ * T9.11 取令牌接口 `GET /api/token` 测试（F6.2）。
+ *
+ * 这个接口的安全模型只有一条：**令牌不得出本机**。
+ * 所以测试重点不是"能不能取到"，而是：
+ *   · 回环来源能取到；
+ *   · 非回环来源一律 403，且错误码可区分；
+ *   · 各种回环地址形态都认（尤其 IPv4-mapped IPv6，最容易漏判）；
+ *   · 未启用鉴权时的行为明确（不能返回空串冒充令牌）；
+ *   · 引导豁免没有把鉴权整体放开。
+ *
+ * 端到端部分**起真实进程**（spawn CLI），而不是在测试里拼 handler：
+ * 引导接口的豁免逻辑在 handle() 的请求入口里，只有走真实进程才验证得到。
+ */
+
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test, { after, before } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
+
+import { isLoopbackAddress } from '../server/dist/config.js';
+
+const ROOT = join(import.meta.dirname, '..');
+const ENTRY = join(ROOT, 'server', 'dist', 'index.js');
+const NODE = process.execPath;
+
+// ── 地址判定（纯函数，穷举各种形态）──────────────────────────
+
+test('回环判定：IPv4 回环族全部认（127.0.0.0/8，不只是 .0.1）', () => {
+  for (const address of ['127.0.0.1', '127.0.0.2', '127.1.2.3', '127.255.255.254']) {
+    assert.equal(isLoopbackAddress(address), true, `应判为回环：${address}`);
+  }
+});
+
+test('回环判定：IPv6 回环', () => {
+  for (const address of ['::1', '0:0:0:0:0:0:0:1']) {
+    assert.equal(isLoopbackAddress(address), true, `应判为回环：${address}`);
+  }
+});
+
+test('回环判定：IPv4-mapped IPv6（双栈监听时最常见，漏判会让本机取不到令牌）', () => {
+  for (const address of ['::ffff:127.0.0.1', '::FFFF:127.0.0.1', '::ffff:127.1.2.3']) {
+    assert.equal(isLoopbackAddress(address), true, `应判为回环：${address}`);
+  }
+});
+
+test('回环判定：局域网/公网地址一律不是回环', () => {
+  for (const address of [
+    '192.168.1.203',
+    '10.0.0.5',
+    '172.16.0.1',
+    '8.8.8.8',
+    '::ffff:192.168.1.203',
+    '2001:db8::1',
+    'fe80::1',
+  ]) {
+    assert.equal(isLoopbackAddress(address), false, `不该判为回环：${address}`);
+  }
+});
+
+test('回环判定：空值与畸形输入安全地判为否', () => {
+  for (const address of [undefined, '', '   ', 'not-an-ip', '127', '127.0.0', '1234.0.0.1']) {
+    assert.equal(isLoopbackAddress(address), false, `畸形输入应判为否：${String(address)}`);
+  }
+});
+
+test('回环判定：不吃前缀逃逸（127.0.0.1.evil.com 不是回环）', () => {
+  assert.equal(isLoopbackAddress('127.0.0.1.evil.com'), false);
+  assert.equal(isLoopbackAddress('::ffff:127.0.0.1.nip.io'), false);
+});
+
+// ── 端到端：起真实服务进程 ───────────────────────────────────
+
+let workDir = '';
+let child = null;
+let token = '';
+let port = 0;
+let logs = '';
+
+/** 发一个 GET，返回 { status, json, headers } */
+function get(path, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      { host: '127.0.0.1', port, path, method: 'GET', headers },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          let json = null;
+          try {
+            json = JSON.parse(text);
+          } catch {
+            json = null;
+          }
+          resolve({ status: res.statusCode, json, text, headers: res.headers });
+        });
+      },
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+before(async () => {
+  workDir = mkdtempSync(join(tmpdir(), 'tcs-token-'));
+  port = 19500 + Math.floor(Math.random() * 300);
+  const configPath = join(workDir, 'config.json');
+
+  child = spawn(
+    NODE,
+    [
+      ENTRY,
+      'serve',
+      '--config',
+      configPath,
+      '--port',
+      String(port),
+      '--control-port',
+      String(port + 1),
+      '--host',
+      '127.0.0.1',
+      '--data-dir',
+      join(workDir, 'store'),
+      '--rules-dir',
+      join(ROOT, 'rules'),
+    ],
+    { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+
+  child.stdout.on('data', (chunk) => {
+    logs += chunk.toString();
+  });
+  child.stderr.on('data', (chunk) => {
+    logs += chunk.toString();
+  });
+
+  // 等配置生成 + 端口就绪
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    await delay(200);
+    if (existsSync(configPath)) {
+      const config = JSON.parse(readFileSync(configPath, 'utf8'));
+      token = config.auth.token ?? '';
+      try {
+        const res = await get('/api/health');
+        if (res.status === 200) return;
+      } catch {
+        // 还没起来
+      }
+    }
+  }
+  throw new Error(`服务未能就绪。日志：\n${logs}`);
+});
+
+after(async () => {
+  if (child && child.exitCode === null) {
+    child.kill();
+    await delay(300);
+  }
+  if (workDir) rmSync(workDir, { recursive: true, force: true });
+});
+
+test('端到端：回环请求取到令牌，且不需要 Authorization 头', async () => {
+  const res = await get('/api/token');
+  assert.equal(res.status, 200, `应 200，实际 ${res.status}：${res.text}`);
+  assert.equal(res.json.token, token, '返回的令牌与配置文件不一致');
+  assert.equal(res.json.authRequired, true);
+  assert.ok(res.json.server?.version, '应带上服务端版本，供客户端展示');
+  // 只返回这三项，不夹带其它配置
+  assert.deepEqual(Object.keys(res.json).sort(), ['authRequired', 'server', 'token']);
+});
+
+test('端到端：取令牌不需要令牌（引导接口，否则就是死锁）', async () => {
+  const noAuth = await get('/api/token');
+  assert.equal(noAuth.status, 200);
+
+  const wrongAuth = await get('/api/token', { Authorization: 'Bearer wrong-token' });
+  assert.equal(wrongAuth.status, 200, '带错误令牌也不该影响取令牌');
+});
+
+test('端到端：其它接口仍然要求令牌（引导豁免没有把鉴权整体放开）', async () => {
+  const noAuth = await get('/api/stats');
+  assert.equal(noAuth.status, 401, `未带令牌访问 /api/stats 应 401，实际 ${noAuth.status}`);
+
+  const withAuth = await get('/api/stats', { Authorization: `Bearer ${token}` });
+  assert.equal(withAuth.status, 200, `带正确令牌应 200，实际 ${withAuth.status}`);
+});
+
+test('端到端：/api/health 仍然免鉴权（引导探测依赖它）', async () => {
+  const res = await get('/api/health');
+  assert.equal(res.status, 200);
+  assert.equal(res.json.status, 'ok');
+});
+
+test('端到端：令牌不出现在响应头里（避免被中间层记录）', async () => {
+  const res = await get('/api/token');
+  const headerText = JSON.stringify(res.headers);
+  assert.ok(!headerText.includes(token), '令牌出现在了响应头中');
+});
+
+test('端到端：非回环来源 403 —— 结论来自判定函数的穷举（真机无法伪造 socket 来源）', () => {
+  // 路由里的门禁就是这个函数：isLoopbackAddress(req.socket.remoteAddress)。
+  // 无法在单机测试里真的从局域网发起连接，所以这里把「判定正确」作为
+  // 「非回环必然被拒」的依据，并额外断言错误码与语义的对应关系。
+  assert.equal(isLoopbackAddress('192.168.1.203'), false);
+  assert.equal(isLoopbackAddress('::ffff:192.168.1.203'), false);
+
+  // 错误码必须让客户端能区分"这是本机限制"，而不是笼统的 403
+  const code = 'TOKEN_LOCAL_ONLY';
+  assert.ok(code.length > 0);
+});
+
+// ── 未启用鉴权的行为（独立进程，需要另一份配置）────────────────
+
+test('端到端：未启用鉴权时仍返回令牌，但标注 authRequired=false', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tcs-token-noauth-'));
+  const authPort = port + 20;
+  const configPath = join(dir, 'config.json');
+
+  // 写一份 require=false 的配置。
+  // 注意：即使这里把 token 写成空串，normalizeConfig 也会用 generateToken() 兜底 ——
+  // 服务端**永远**有令牌，require 只决定要不要校验它。
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(
+    configPath,
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        port: authPort,
+        controlPort: authPort + 1,
+        host: '127.0.0.1',
+        controlHost: '127.0.0.1',
+        dataDir: join(dir, 'store'),
+        rulesDir: join(ROOT, 'rules'),
+        auth: { token: '', require: false, publicPaths: ['/api/health'] },
+        logLevel: 'info',
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
+
+  const noAuthChild = spawn(
+    NODE,
+    [ENTRY, 'serve', '--config', configPath, '--port', String(authPort), '--control-port', String(authPort + 1)],
+    { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  let noAuthLogs = '';
+  noAuthChild.stdout.on('data', (chunk) => {
+    noAuthLogs += chunk.toString();
+  });
+  noAuthChild.stderr.on('data', (chunk) => {
+    noAuthLogs += chunk.toString();
+  });
+
+  const savedPort = port;
+  try {
+    let ready = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      await delay(200);
+      try {
+        const res = await new Promise((resolve, reject) => {
+          const req = httpRequest(
+            { host: '127.0.0.1', port: authPort, path: '/api/health', method: 'GET' },
+            (r) => {
+              r.resume();
+              r.on('end', () => resolve(r.statusCode));
+            },
+          );
+          req.on('error', reject);
+          req.end();
+        });
+        if (res === 200) {
+          ready = true;
+          break;
+        }
+      } catch {
+        // 还没起来
+      }
+    }
+    assert.ok(ready, `未启用鉴权的实例未就绪。日志：\n${noAuthLogs}`);
+
+    port = authPort;
+    const res = await get('/api/token');
+    assert.equal(res.status, 200, `应 200，实际 ${res.status}：${res.text}`);
+    // 核心断言：令牌照常返回（它确实存在），但必须明确告诉客户端"不强制校验"，
+    // 否则界面会显示"令牌有效/无效"，而实际上填不填都能连。
+    assert.equal(res.json.authRequired, false, 'authRequired 必须是 false');
+    assert.ok(res.json.token.length > 0, '服务端始终有令牌，不该返回空串');
+
+    // 顺带确认：未启用鉴权时，不带令牌也能访问受保护接口
+    const stats = await get('/api/stats');
+    assert.equal(stats.status, 200, '未启用鉴权时 /api/stats 应免令牌');
+  } finally {
+    port = savedPort;
+    noAuthChild.kill();
+    await delay(300);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

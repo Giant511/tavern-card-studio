@@ -43,7 +43,7 @@
 
 ## 2. 能力清单
 
-契约共 5 类能力 + 1 个自检，对应 5 个 Rust 命令和 3 个插件 API。
+契约共 7 类能力 + 1 个自检，对应 8 个 Rust 命令和 3 个插件 API。
 
 | # | 能力 | 实现 | 入参 | 出参 | 关键约束 |
 |---|---|---|---|---|---|
@@ -52,7 +52,9 @@
 | C3 | 扫规则目录 | `scan_rule_dir` | `kind`（**不是路径**） | `RuleDirScan` | 目录由 Rust 解析，前端无权指定 |
 | C4 | 读规则文件 | `read_rule_text` | `kind`, `name` | `TextFile` | 拒绝 `..`/分隔符/NUL，canonicalize 后必须在根内 |
 | C5 | 配置存取 | `configGet/configSet/configPatch/configReset` | 键值 | `ClientConfig` | plugin-store，落在应用配置目录 |
-| C6 | 文件对话框 | `pickCardFile/pickSavePath/pickRuleFile` | — | `string \| null` | **只选单文件**；不传 `directory`、不传递归 |
+| C6 | 文件对话框 | `pickCardFile/pickSavePath/pickRuleFile` | `defaultDir?` | `string \| null` | **只选单文件**；`directory: false`、不传递归；`defaultDir` 只影响对话框落点 |
+| C6b | 目录对话框 | `pickDirectory` | `defaultPath?` | `string \| null` | **唯一能选目录的入口**，写死 `recursive: false`（T9.8，见 §8.2）|
+| C7 | 卡片目录 | `default_cards_dir` / `probe_cards_dir` / `scan_cards_dir` | `path`, `create?`, `limit?` | `string` / `DirProbe` / `CardsDirScan` | 探针写文件验可写；扫描**不递归、不读内容**，只回文件名 |
 | D1 | 自检 | `shell_info` | — | `ShellInfo` | 版本 / 规则根 / debug\|release |
 
 ### 2.1 Rust 命令注册（`src-tauri/src/lib.rs`）
@@ -64,6 +66,9 @@
     commands::write_file_atomic,
     commands::scan_rule_dir,
     commands::read_rule_text,
+    commands::default_cards_dir,
+    commands::probe_cards_dir,
+    commands::scan_cards_dir,
 ])
 ```
 
@@ -75,9 +80,9 @@
 | `window-state` | 记住窗口大小/位置 | Rust |
 | `log` | 结构化日志落盘 | Rust |
 | `store` | 客户端配置持久化 | JS（经契约层） |
-| `dialog` | 打开/保存对话框 | JS（经契约层） |
+| `dialog` | 打开/保存对话框 + **单个目录**选择（T9.8，非递归） | JS（经契约层 `pick*`） |
 | `fs` | 预留（规则导入等） | **渲染层当前不使用**，仅授予 `fs:default` |
-| `opener` | 外链交系统浏览器 | JS（后续） |
+| `opener` | **不使用**（曾用于「打开服务端后台」，已回滚） | 无。capability **不授予** `opener:*`，渲染层也不 import 它 |
 
 `fs` 的存在与"最小权限"的关系见 §7。
 
@@ -94,6 +99,8 @@ Rust 侧所有结构体都是 `#[serde(rename_all = "camelCase")]`，因此字�
 | `RuleFileEntry` | `struct RuleFileEntry` | `name` / `size` / `mtimeMs` |
 | `RuleDirScan` | `struct RuleDirScan` | `kind` / `root` / `signature` / `entries` / `skipped` |
 | `ShellInfo` | `struct ShellInfo` | `version` / `rulesRoot` / `mode` |
+| `DirProbe` | `struct DirProbe` | `path` / `pathDisplay` / `exists` / `created` / `writable` / `reason` |
+| `CardsDirScan` | `struct CardsDirScan` | `pathDisplay` / `names` / `truncated` |
 | `RuleKind` | `kind: String` + `paths::rule_subdir` 校验 | `'platforms' \| 'presets' \| 'highlight'` |
 
 **`pathDisplay` 允许为 `null`**，这是刻意的：路径不是合法 UTF-8 时返回 `null`，
@@ -111,7 +118,7 @@ Rust 侧所有结构体都是 `#[serde(rename_all = "camelCase")]`，因此字�
 | I3 | **写后自证**：回读并重算 sha256 | `write_file_atomic` 的 `verified` | 无法证明"写进去的就是我以为的" |
 | I4 | **写前断言**：`expectedSha256` 不符则一个字节都不写 | `DigestMismatch` 前置检查 | 覆盖掉编辑期间被外部改动的文件 |
 | I5 | **路径不越界**：规则文件只能来自规则目录 | `ensure_plain_file_name` + `canonicalize().starts_with(root)` | 任意文件读取（符号链接穿越） |
-| I6 | **无目录选择**：前端拿不到"指定目录"的能力 | 三个 `pick*` 全部 `directory: false`；`scan_rule_dir` 无路径参数 | 见 §8 的 CVE |
+| I6 | **目录选择只有一个入口，且不可递归**：除 `pickDirectory` 外没有任何地方能选目录 | `pickDirectory` 写死 `directory:true`/`recursive:false`/`multiple:false`；其余 `pick*` 全部 `directory:false`；`scan_rule_dir` 无路径参数 | 一次点击授权整棵目录树（§8 的 CVE）|
 | I7 | **错误可分支**：`code` 是封闭集合，UI 不解析文案 | `error.rs::code()` ↔ `errors.ts::ShellErrorCode` | UI 靠字符串匹配，改文案即崩 |
 
 > I1 的前提是**卡片必须是 UTF-8**。这与服务端审计的 fatal 解码一致
@@ -192,7 +199,7 @@ format!("{}:{}:{};", entry.name, entry.size, entry.mtime_ms)
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口最小权限：只允许单文件对话框、自身配置读写；刻意不授予任意路径 fs 访问与目录选择",
+  "description": "主窗口最小权限：只允许单文件对话框与单个目录对话框（T9.8，非递归）、自身配置读写；刻意不授予任意路径 fs 访问与 opener 插件",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -200,7 +207,6 @@ format!("{}:{}:{};", entry.name, entry.size, entry.mtime_ms)
     "dialog:allow-save",
     "store:default",
     "log:default",
-    "opener:default",
     "fs:default"
   ]
 }
@@ -212,10 +218,29 @@ format!("{}:{}:{};", entry.name, entry.size, entry.mtime_ms)
   渲染层不需要直接读写任意路径——所有文件 IO 走自定义命令，命令自己做校验。
 - `fs:default` 只覆盖应用自身目录（`$APPCONFIG`/`$APPDATA`/`$APPLOCALDATA` 等）的读与创建，
   **不含任意路径写**。授予它是为将来"把导入的规则存进应用目录"留口，当前渲染层并未调用。
-- **不使用 `persisted-scope`**：因为它持久化的是"对话框授予的目录"，而我们**根本不选目录**（§8）。
+- **不使用 `persisted-scope`**：它持久化的是"对话框授予的目录"。
+  T9.8 起我们确实会选一次目录（`pickDirectory`），但**只把路径字符串存进配置**，
+  从不写进 fs 的 scope/allowlist —— 重启后对话框给的运行时授权自然消失。
   少一个持久化授权面，就少一类"上次点过的目录一直有权限"的隐患。
+  这条与 §8.4 的 `recursive: false` 是一对：不递归 + 不持久化，才让"选一次目录"
+  不至于变成"永久开放的整棵树"。
 - 自定义命令默认对所有窗口开放；如需收紧，用 `build.rs` 的 `AppManifest::commands(&[...])`
   再按窗口授权。本期只有一个窗口，暂不引入该复杂度。
+- **刻意不授予 `opener:*`**（2026-10-22 起）。`opener:default` 包含
+  `allow-open-url` 与 `allow-default-urls`，后者放行 `mailto:` / `tel:`，
+  于是 JS 可以直接 `invoke('plugin:opener|open_url', ...)` 或走插件 JS API，
+  **绕过我们自己的协议白名单**。本项目渲染层从不使用该插件，打开外链一律经
+  `contract.openExternal` → `commands::open_external`（Rust 侧仍有第二道白名单），
+  所以移除它不损失任何功能，只是把那条绕过路径关上。
+
+**当前不存在"打开外链"能力。** 曾做过（契约 `openExternal` + Rust `open_external` + 双层协议白名单），
+2026-10-22 按需求回滚：客户端不再提供「打开服务端后台」，这套能力没有调用方。
+面板地址 `127.0.0.1:8731` 由用户自己填进浏览器即可，为一次跳转维护跨 Rust/TS/capabilities 的能力不划算。
+
+**但「不授予 `opener:*`」这条保留**：渲染层不用它，
+少一条"用别人的字符串启动本地程序"的通道。将来若真需要打开外链，
+重新引入时必须同时恢复双层白名单，不要退回 `opener:default`
+（它含 `allow-default-urls`，放行 `mailto:`/`tel:`）。
 
 ---
 
@@ -243,10 +268,32 @@ vulnerabilities: []   ← 没有已发布修复版本
 
 | 缓解 | 落地 |
 |---|---|
-| 前端没有"选目录"能力 | `pickCardFile/pickSavePath/pickRuleFile` 全部 `directory: false`、`multiple: false` |
-| 前端无法请求递归授权 | 三个 `pick*` 不接受任何选项参数，选项在契约层写死 |
+| 选文件时不带目录选项 | `pickCardFile/pickSavePath/pickRuleFile` 全部 `directory: false`、`multiple: false` |
+| 选目录**只有一处**且不可递归 | `pickDirectory` 写死 `directory: true` + `recursive: false` + `multiple: false`（T9.8，见 §8.4）|
+| 前端无法请求递归授权 | 所有 `pick*` 都不接受 `recursive` / `multiple` 之类选项，选项在契约层写死 |
 | 规则目录遍历只在 Rust 侧 | `scan_rule_dir(kind)` 无路径参数；`read_rule_text(kind, name)` 做穿越校验 |
-| 不持久化任何授权 | 不用 `persisted-scope` |
+| 卡片目录只回文件名 | `scan_cards_dir` **不递归、不读内容**，只返回 `.json` 文件名（用途仅是重名检测）|
+| 不持久化任何授权 | 不用 `persisted-scope`；配置里存的只是路径字符串 |
+
+### 8.4 T9.8 的例外：为什么允许选一次目录，以及怎么把口子收紧
+
+F4 要求「卡片存放目录可配置」。这件事绕不开让用户用原生对话框选一次目录 ——
+让他手打绝对路径既容易错，也没解决"路径从哪来"。
+
+于是保留一个**唯一**的目录入口，并把风险压到最小：
+
+| 约束 | 落地 | 防的是什么 |
+|---|---|---|
+| 非递归 | `recursive: false`，**显式写出**不依赖库默认值 | 一次点击授权整棵目录树（正是 CVE 的场景）|
+| 单选 | `multiple: false` | 批量圈地 |
+| 单一入口 | 只有 `pickDirectory` 能选目录，其余 `pick*` 都 `directory: false` | 能力扩散 |
+| 不持久化 | 只存路径字符串，不写 fs scope，不用 `persisted-scope` | "点过一次就永久有权限" |
+| 用途受限 | 选完立刻 `probeCardsDir`（写探针文件）；`scanCardsDir` 只回文件名、不递归 | 选完就当"已授权可任意读写" |
+
+**注意：真正的文件读写走的是自定义命令**（`read_text_exact` / `write_file_atomic`），
+它们不查 fs scope，而是自己做路径与大小校验。所以这条 CVE 的影响面在这里被进一步缩小到
+"dialog 给 webview 的 fs scope"——而渲染层根本不调用 `plugin:fs|*`，只有
+`fs:default` 那道没有路径扩展的默认授权。
 
 ### 8.3 本项目自身的 XSS 面
 

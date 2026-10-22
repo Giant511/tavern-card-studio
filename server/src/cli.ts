@@ -20,6 +20,7 @@ import {
   assertSafeConfig,
   generateToken,
   loadConfig,
+  reachableHost,
   writeConfig,
   type ConfigOverrides,
   type LoadedConfig,
@@ -305,7 +306,9 @@ export async function main(argv: readonly string[]): Promise<number> {
     process.stdout.write(
       `Tavern Card Studio Server ${SERVER_VERSION}\n` +
         `管理面板：${running.url}\n` +
-        `API：http://${loaded.config.host}:${loaded.config.port}/api\n` +
+        // 这里给人看，必须用可访问地址；监听 0.0.0.0 时打印 http://0.0.0.0:… 是打不开的。
+        // 实际监听地址由日志的 bind 字段给出（见 supervisor.listening）。
+        `API：http://${reachableHost(loaded.config.host)}:${loaded.config.port}/api\n` +
         `数据目录：${loaded.config.dataDir}\n`,
     );
     return 0;
