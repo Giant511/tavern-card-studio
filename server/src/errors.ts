@@ -20,6 +20,18 @@ export type ErrorCode =
   | 'UNKNOWN_PRESET'
   | 'BLOB_CORRUPTED'
   | 'SERVICE_UNAVAILABLE'
+  // F6.2 取令牌接口的两个专用码：
+  //   TOKEN_LOCAL_ONLY     —— 来源不是回环（令牌不得出本机）
+  //   TOKEN_NOT_CONFIGURED —— 服务端根本没配令牌（未启用鉴权）
+  // 分开而不是都塞给 FORBIDDEN/CONFLICT，是为了让客户端能给出准确的处置建议：
+  // 前者要用户去那台机器上操作，后者要用户去开鉴权（或干脆留空令牌）。
+  | 'TOKEN_LOCAL_ONLY'
+  | 'TOKEN_NOT_CONFIGURED'
+  // T9.7 按 ID 归档的两个专用码：
+  //   BAD_CARD_ID  —— 客户端给的 ID 不合法（不是"没找到"，重试也一样，必须改 ID）
+  //   CARD_DELETED —— 该 ID 已被一张已软删的卡片占用（复用 ID 会把旧历史一起复活）
+  | 'BAD_CARD_ID'
+  | 'CARD_DELETED'
   | 'INTERNAL';
 
 export class AppError extends Error {

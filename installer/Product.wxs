@@ -57,7 +57,26 @@
       <ComponentGroupRef Id="AppFiles" />
       <ComponentRef Id="ServiceComponent" />
       <ComponentRef Id="DataFolderComponent" />
+      <ComponentRef Id="ConnectGuideComponent" />
+      <ComponentRef Id="StartMenuShortcutComponent" />
     </Feature>
+
+    <!--
+      安装完成后打开连接说明。
+
+      **必须在 Package 内**，不能放在 Fragment 里 —— 放在 Fragment 里 WiX 会静默忽略整段，
+      构建照样成功、MSI 里却没有这条动作（2026-10-22 实测：反编译后 CustomAction 表为空，
+      而构建日志一条警告都没有）。这类"静默不生效"只能靠解包反编译发现。
+
+      条件：
+        · NOT REMOVE —— 卸载时不弹；
+        · UILevel >= 3 —— 静默安装（/qn，UILevel=2）时不弹，
+          否则在无人值守部署里会突然弹出一个浏览器窗口。
+    -->
+    <InstallExecuteSequence>
+      <Custom Action="OpenConnectGuide" After="InstallFinalize"
+              Condition="NOT REMOVE AND UILevel &gt;= 3" />
+    </InstallExecuteSequence>
   </Package>
 
   <!-- Data directory: created at install, kept at uninstall. -->
@@ -121,4 +140,67 @@
       </Component>
     </DirectoryRef>
   </Fragment>
+
+  <!--
+    Connect guide.
+
+    装完服务端后，用户最需要知道的两件事是「面板地址」和「令牌在哪」。
+    以前这两条只写在 docs/09 里（"令牌见 ProgramData\\...\\logs 下日志"），
+    用户得自己去找 —— 现在改成装完直接给他看。
+
+    为什么用 HTML + 安装完成后打开，而不是服务启动时弹窗：
+    服务由 WinSW 托管、以 LocalSystem 跑在 **session 0**，
+    与用户桌面不在同一个会话里，弹不出任何窗口（这正是 F5 里
+    "进程活着、端口通、但 SCM 认为没启动" 那段排查时踩到的同一个隔离）。
+    能弹窗的只有 msiexec —— 它跑在用户的会话里。所以指引必须由安装程序来打开。
+
+    两个入口都保留：
+      · 安装完成后自动打开（CustomAction，异步且不等待，失败不影响安装结果）；
+      · 开始菜单快捷方式，用户以后想再看一次也能找到。
+  -->
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="ConnectGuideComponent" Guid="8E4A1C72-93B5-4D68-A1F7-6C2D9B4E7053">
+        <File Id="ConnectGuideHtml" Source="$(var.ConnectGuide)" Name="connect-guide.html" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuFolder" Name="Tavern Card Studio Server" />
+    </StandardDirectory>
+
+    <DirectoryRef Id="AppMenuFolder">
+      <Component Id="StartMenuShortcutComponent" Guid="B3F72D91-5A86-4E3C-8D27-1F4B6A9C2E58">
+        <Shortcut
+          Id="ConnectGuideShortcut"
+          Name="如何连接（地址与令牌）"
+          Description="打开连接说明：管理面板地址、API 地址、访问令牌的获取方式"
+          Target="[INSTALLFOLDER]connect-guide.html" />
+        <RemoveFolder Id="RemoveAppMenuFolder" On="uninstall" />
+        <!-- 快捷方式需要一个 KeyPath；用注册表值作为锚点，避免依赖文件是否存在 -->
+        <RegistryValue Root="HKLM" Key="Software\TavernCardStudio" Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <!--
+    安装完成后打开说明页。
+
+    用 `[%ComSpec] /c start "" "<file>"`：靠 shell 关联调起默认浏览器。
+    直接写文件路径不行 —— CustomAction 的 ExeCommand 只能执行程序，不能"打开文档"。
+
+    `Return="asyncNoWait"` 是有意的：说明页打不开（例如默认浏览器被策略限制）
+    绝不能连带把安装判成失败。装好了就是装好了。
+  -->
+  <Fragment>
+    <CustomAction
+      Id="OpenConnectGuide"
+      Directory="INSTALLFOLDER"
+      ExeCommand="[%ComSpec] /c start &quot;&quot; &quot;[INSTALLFOLDER]connect-guide.html&quot;"
+      Execute="immediate"
+      Impersonate="yes"
+      Return="asyncNoWait" />
+
+  </Fragment>
+
 </Wix>

@@ -11,11 +11,19 @@
       <div class="brand">
         <span class="logo" aria-hidden="true">TCS</span>
         <div class="brand-text">
-          <div id="card-name" class="card-name">加载中…</div>
+          <!--
+            F10：角色名就地编辑。
+            button 而不是 div：#card-name 现在可点、可聚焦，用 div 会让键盘用户无法到达，
+            也会丢掉回车/空格的默认激活行为。样式里把 button 的外观压成纯文本。
+          -->
+          <button id="card-name" class="card-name" type="button" title="点击修改角色名">加载中…</button>
+          <input id="card-name-input" class="card-name-input" type="text" hidden
+                 maxlength="120" aria-label="角色名" />
           <div id="stats" class="stats"></div>
         </div>
       </div>
       <div class="actions">
+        <button id="btn-new" type="button" class="btn" title="新建角色卡（Ctrl+N）">＋ 新建</button>
         <button id="btn-open" type="button" class="btn">打开…</button>
         <button id="btn-save" type="button" class="btn">另存为…</button>
         <button id="btn-export" type="button" class="btn primary">导出…</button>
@@ -27,6 +35,9 @@
         <button id="btn-settings" type="button" class="btn ghost">设置…</button>
       </div>
     </header>
+
+    <!-- 标签栏容器：TabBar 组件把自己挂到这里（T9.2） -->
+    <div id="tabbar-host"></div>
 
     <div id="sync-bar" class="sync-bar" role="status">
       <span class="sync-label">同步</span>

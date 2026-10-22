@@ -9,6 +9,7 @@
  */
 
 import { isSyncReady, type ProbeResult } from '../net/server-probe';
+import { connectLocalService, describeLocalSuccess } from '../net/local-connect';
 import {
   SyncError,
   fetchVersionText,
@@ -40,23 +41,49 @@ export interface SyncDialogCallbacks {
   getConfig: () => SyncConfig | null;
   /** 当前待上传的 JSON 文本（与导出同一份，保证字节一致） */
   getPayload: () => Promise<string>;
-  /** 当前是否已关联某张服务端卡 */
-  getCurrentCardId: () => string | null;
-  setCurrentCardId: (id: string | null) => void;
-  /** 回滚时把版本内容应用回编辑器 */
-  onRollbackApplied: (text: string, version: VersionSummary) => void;
+  /**
+   * 上传目标 —— 来自**活动会话**，不是下拉选择。
+   *
+   * `cardId` 是用户创建时指定、之后不可变的那个 ID（F11）。服务端按它归档：
+   * 已存在则追加版本、不存在则新建。返回 null 表示当前没有会话（零标签），不能上传。
+   *
+   * `baseSeq` 是本会话上次与远端对齐的版本号，交给服务端判断是否分叉。
+   */
+  getUploadTarget: () => { cardId: string; name: string; baseSeq: number | null } | null;
+  /** 上传成功后把 cardId 与 seq 一起记回会话（分叉判定要这两个一起才有意义） */
+  onUploaded: (cardId: string, seq: number) => void;
+  /**
+   * 把远端版本内容应用回编辑器。
+   *
+   * `remoteSeq` 是**应用后远端最新的序号**：回滚会新建一个版本，它不等于目标版本的 seq。
+   * 会话基线要记的是前者 —— 记错了下次上传会被误报成分叉。
+   */
+  onRemoteTextApplied: (text: string, version: VersionSummary, remoteSeq: number) => void;
+  /** 一键连接成功后把探测结果交回 App（顶栏指示与同步开关据此刷新） */
+  onConnectionReady?: (result: ProbeResult) => void;
   notify: (message: string, kind?: 'ok' | 'warn' | 'bad' | 'info') => void;
 }
 
 export class SyncDialog {
   private readonly overlay: HTMLDivElement;
   private readonly statusLine: HTMLElement;
-  private readonly cardSelect: HTMLSelectElement;
+  /** 上传目标（只读展示：角色名 + cardId） */
+  private readonly targetLine: HTMLElement;
+  /** 历史面板正在看哪张卡（默认 = 会话自己的 cardId） */
+  private readonly historySelect: HTMLSelectElement;
   private readonly versionList: HTMLElement;
   private readonly uploadButton: HTMLButtonElement;
   private readonly refreshButton: HTMLButtonElement;
   private readonly busyBox: HTMLElement;
+  /** 分叉等不阻断警告的展示位（F11：黄色警告条） */
+  private readonly warningBar: HTMLElement;
+  /** F6.1：同步面板的「连接本机服务端」入口（设置面板为主入口，这里给个快捷方式） */
+  private readonly connectButton: HTMLButtonElement;
   private versions: VersionSummary[] = [];
+  /** 防止「连接本机服务端」被连点（重入会让两次探测结果互相覆盖） */
+  private busy = false;
+  /** 当前历史面板展示的卡片 ID；null 时回落到会话自己的 cardId */
+  private historyCardId: string | null = null;
 
   constructor(private readonly callbacks: SyncDialogCallbacks) {
     this.overlay = el('div', 'modal-overlay');
@@ -76,18 +103,23 @@ export class SyncDialog {
 
     // 状态
     this.statusLine = el('p', 'sync-status', '检查连接…');
+    // 未就绪时把「连接本机服务端」直接放在状态行旁边 ——
+    // 用户在这里发现连不上，就地解决，不用先记住"去设置页"再找回来。
+    this.connectButton = el('button', 'btn small', '连接本机服务端');
+    this.connectButton.type = 'button';
+    this.connectButton.addEventListener('click', () => void this.connectLocal());
+    const statusRow = el('div', 'sync-status-row');
+    statusRow.append(this.statusLine, this.connectButton);
 
-    // 目标卡选择 + 上传
+    // 上传目标（只读）+ 上传
     const uploadSection = el('section', 'form-section');
     uploadSection.append(el('h3', 'form-title', '上传'));
 
-    const cardRow = el('div', 'field-row');
-    this.cardSelect = el('select', 'select') as HTMLSelectElement;
-    this.cardSelect.dataset['role'] = 'sync-card';
-    const newOption = el('option');
-    newOption.value = '__new__';
-    newOption.textContent = '＋ 作为新卡片上传';
-    this.cardSelect.append(newOption);
+    // 这里**不再是下拉选择**：目标由活动会话决定。
+    // 让别人选"上传到哪张卡"等于给了个把 A 卡内容写进 B 卡 ID 的开关，
+    // 而 ID 一旦是稳定身份，写错就是污染别人的历史。
+    this.targetLine = el('div', 'sync-target');
+    this.targetLine.dataset['role'] = 'sync-target';
 
     this.uploadButton = el('button', 'btn primary', '上传当前内容') as HTMLButtonElement;
     this.uploadButton.type = 'button';
@@ -97,21 +129,40 @@ export class SyncDialog {
     this.refreshButton.type = 'button';
     this.refreshButton.addEventListener('click', () => void this.reload());
 
-    cardRow.append(this.cardSelect, this.uploadButton, this.refreshButton);
-    uploadSection.append(cardRow);
+    const targetRow = el('div', 'field-row');
+    targetRow.append(this.targetLine, this.uploadButton, this.refreshButton);
+    uploadSection.append(targetRow);
     uploadSection.append(
       el(
         'p',
         'field-hint',
-        '上传内容与「导出 JSON」完全一致（同样 2 空格缩进 + 结尾换行），保证服务端字节与本地可复现。',
+        '服务端按「角色卡 ID」归档：该 ID 已存在则追加新版本，不存在则新建。上传内容与「导出 JSON」完全一致（同样 2 空格缩进 + 结尾换行）。',
       ),
     );
 
+    // 分叉警告条：默认隐藏，仅在服务端返回 warnings 时出现。
+    // 用**常驻条**而不是一次性 toast —— 分叉是持续存在的事实（两条历史已经分开），
+    // 一次性的提示划过去就没了，用户下次再改还是不知道自己站在哪个分支上。
+    this.warningBar = el('div', 'sync-warning');
+    this.warningBar.hidden = true;
+    this.warningBar.setAttribute('role', 'alert');
+    uploadSection.append(this.warningBar);
+
     // 版本历史
     const historySection = el('section', 'form-section');
-    historySection.append(el('h3', 'form-title', '版本历史'));
+    const historyHead = el('div', 'form-title-row');
+    historyHead.append(el('h3', 'form-title', '版本历史'));
+    this.historySelect = el('select', 'select small') as HTMLSelectElement;
+    this.historySelect.dataset['role'] = 'sync-card';
+    this.historySelect.title = '查看其他卡片的历史（只读）';
+    this.historySelect.addEventListener('change', () => {
+      this.historyCardId = this.historySelect.value === '__session__' ? null : this.historySelect.value;
+      const target = this.effectiveHistoryCardId();
+      if (target) void this.loadVersions(target);
+    });
+    historyHead.append(this.historySelect);
     this.versionList = el('div', 'version-list');
-    historySection.append(this.versionList);
+    historySection.append(historyHead, this.versionList);
 
     // 忙碌提示
     this.busyBox = el('p', 'sync-busy');
@@ -123,7 +174,7 @@ export class SyncDialog {
     done.addEventListener('click', () => this.close());
     foot.append(el('span', 'foot-note', ''), done);
 
-    panel.append(head, this.statusLine, uploadSection, historySection, this.busyBox, foot);
+    panel.append(head, statusRow, uploadSection, historySection, this.busyBox, foot);
     this.overlay.append(panel);
 
     this.overlay.addEventListener('click', (event) => {
@@ -138,6 +189,11 @@ export class SyncDialog {
 
   open(): void {
     this.overlay.hidden = false;
+    // 每次打开都把"看哪张卡的历史"复位到会话自己的卡 ——
+    // 上次留下的选择属于上一次的任务，留着会让用户对着别人的历史回滚。
+    this.historyCardId = null;
+    this.clearWarning();
+    this.renderTarget();
     void this.reload();
   }
 
@@ -145,17 +201,67 @@ export class SyncDialog {
     this.overlay.hidden = true;
   }
 
-  /** 外部预选卡片并加载版本（截图/联调用） */
+  /** 外部指定要查看的历史卡片（截图/联调；不影响上传目标） */
   selectCard(cardId: string): void {
-    if (![...this.cardSelect.options].some((option) => option.value === cardId)) {
+    this.historyCardId = cardId;
+    if (![...this.historySelect.options].some((option) => option.value === cardId)) {
       const option = el('option');
       option.value = cardId;
       option.textContent = cardId;
-      this.cardSelect.append(option);
+      this.historySelect.append(option);
     }
-    this.cardSelect.value = cardId;
-    this.callbacks.setCurrentCardId(cardId);
+    this.historySelect.value = cardId;
     void this.loadVersions(cardId);
+  }
+
+  /** 会话自己的 cardId；没有会话时 null */
+  private sessionCardId(): string | null {
+    return this.callbacks.getUploadTarget()?.cardId ?? null;
+  }
+
+  /** 历史面板实际展示的卡片：用户选的，没选就是会话自己的 */
+  private effectiveHistoryCardId(): string | null {
+    return this.historyCardId ?? this.sessionCardId();
+  }
+
+  /**
+   * 同步面板里的「连接本机服务端」。
+   *
+   * 与设置面板走**同一个** `connectLocalService`，不另写一套 ——
+   * 两个入口如果各有一套判断，迟早出现"设置页能连、同步页连不上"的分歧。
+   *
+   * 连接成功后要通知外部刷新连接状态（顶栏指示、同步入口的启用开关都依赖它），
+   * 因此走 `callbacks.notify` 让 App 重新探测一次，而不是在这里自说自话地标记成功。
+   */
+  private async connectLocal(): Promise<void> {
+    if (this.busy) return;
+    this.busy = true;
+    this.connectButton.disabled = true;
+    this.statusLine.textContent = '正在探测本机服务端…';
+    this.statusLine.className = 'sync-status';
+    try {
+      const result = await connectLocalService();
+      if (!result.ok) {
+        // 失败原因 + 第一条处置建议放在状态行（面板空间有限，完整步骤在设置页）
+        this.statusLine.textContent = result.message;
+        this.statusLine.className = 'sync-status bad';
+        this.callbacks.notify(result.steps[0] ?? result.message, 'warn');
+        return;
+      }
+      this.statusLine.textContent = describeLocalSuccess(result);
+      this.statusLine.className = 'sync-status ok';
+      // 让 App 重新探测并广播，其它面板据此启用/禁用
+      this.callbacks.notify(
+        result.persisted ? '已连接本机服务端' : '已连接（浏览器模式不持久化）',
+        'ok',
+      );
+      this.callbacks.onConnectionReady?.(result.probe);
+      this.renderStatus();
+      await this.reload();
+    } finally {
+      this.busy = false;
+      this.connectButton.disabled = false;
+    }
   }
 
   private setBusy(text: string | null): void {
@@ -182,8 +288,71 @@ export class SyncDialog {
 
     this.uploadButton.disabled = !ready;
     this.refreshButton.disabled = !ready;
-    this.cardSelect.disabled = !ready;
+    this.historySelect.disabled = !ready;
+    this.connectButton.hidden = ready;
+    this.renderTarget();
     return ready;
+  }
+
+  /**
+   * 渲染上传目标：当前会话的「角色名 + 角色卡 ID」。
+   *
+   * 这两项必须同时显示：ID 是服务端认卡的依据，名字只是给人看的。
+   * 只显示名字的话，用户没法确认"我这次真的传到那张卡上了吗"。
+   */
+  private renderTarget(): void {
+    const target = this.callbacks.getUploadTarget();
+    this.targetLine.replaceChildren();
+
+    if (!target) {
+      this.targetLine.className = 'sync-target empty';
+      this.targetLine.textContent = '没有打开的角色卡：先新建或打开一张卡再上传。';
+      this.uploadButton.disabled = true;
+      return;
+    }
+
+    this.targetLine.className = 'sync-target';
+    this.targetLine.append(
+      el('span', 'sync-target-name', target.name || '(未命名)'),
+      el('code', 'sync-target-id', target.cardId),
+    );
+    if (target.baseSeq !== null) {
+      this.targetLine.append(el('span', 'sync-target-base', `基线 v${target.baseSeq}`));
+    } else {
+      // 没有基线时明确说出来：此时服务端无法判断分叉，用户得知道这个前提。
+      this.targetLine.append(el('span', 'sync-target-base', '尚未与远端对齐'));
+    }
+    // 端到端断言用：不靠读文案判断目标
+    document.body.dataset['syncTargetCardId'] = target.cardId;
+    document.body.dataset['syncTargetBase'] = target.baseSeq === null ? '' : String(target.baseSeq);
+  }
+
+  /**
+   * 显示分叉等警告（常驻条，不是 toast）。
+   *
+   * `note` 用来解释"警告里的基线"和"目标行现在显示的基线"为什么不是一个数：
+   * 上传成功后会话基线会前进，而警告说的是**这次上传出发时**的基线。
+   * 不解释的话，同一屏里两个不同的 v 号会让人以为哪边算错了。
+   */
+  private showWarning(messages: string[], code: string, note?: string): void {
+    this.warningBar.replaceChildren();
+    if (messages.length === 0) {
+      this.warningBar.hidden = true;
+      delete document.body.dataset['syncWarning'];
+      return;
+    }
+    this.warningBar.append(el('strong', 'sync-warning-title', '⚠ 注意'));
+    const list = el('ul', 'sync-warning-list');
+    for (const message of messages) list.append(el('li', '', message));
+    this.warningBar.append(list);
+    if (note) this.warningBar.append(el('p', 'sync-warning-note', note));
+    this.warningBar.hidden = false;
+    this.warningBar.dataset['code'] = code;
+    document.body.dataset['syncWarning'] = code;
+  }
+
+  private clearWarning(): void {
+    this.showWarning([], '');
   }
 
   private async reload(): Promise<void> {
@@ -199,10 +368,10 @@ export class SyncDialog {
     this.setBusy('加载卡片列表…');
     try {
       const cards = await listCards(config, { limit: 50 });
-      this.renderCards(cards);
+      this.renderHistoryOptions(cards);
 
-      const currentId = this.callbacks.getCurrentCardId();
-      if (currentId) await this.loadVersions(currentId);
+      const historyId = this.effectiveHistoryCardId();
+      if (historyId) await this.loadVersions(historyId);
       else this.versionList.replaceChildren(el('p', 'issue-empty', '选择一张卡片后显示版本历史'));
     } catch (error) {
       this.reportError('加载失败', error);
@@ -211,34 +380,45 @@ export class SyncDialog {
     }
   }
 
-  private renderCards(cards: CardSummary[]): void {
-    const keep = this.cardSelect.value;
-    this.cardSelect.replaceChildren();
+  /**
+   * 渲染历史选择器（服务端卡片列表）。
+   *
+   * 文案是「角色名 · cardId」—— 这是需求要求的列表形态，也是唯一能让用户
+   * 对上"列表里的这张"和"我手里这张"的写法：只给名字时重名卡分不开，
+   * 只给 ID 时看不出是哪张。
+   *
+   * 第一项固定是「本次会话」，因为绝大多数时候用户只关心手上这张卡的历史。
+   */
+  private renderHistoryOptions(cards: CardSummary[]): void {
+    const keep = this.historySelect.value;
+    this.historySelect.replaceChildren();
 
-    const newOption = el('option');
-    newOption.value = '__new__';
-    newOption.textContent = '＋ 作为新卡片上传';
-    this.cardSelect.append(newOption);
+    const sessionId = this.sessionCardId();
+    const sessionOption = el('option');
+    sessionOption.value = '__session__';
+    sessionOption.textContent = sessionId
+      ? `本次会话 · ${sessionId}`
+      : '本次会话（未打开卡片）';
+    this.historySelect.append(sessionOption);
 
     for (const card of cards) {
+      // 会话自己的卡已经在第一项里了，不重复列
+      if (card.cardId === sessionId) continue;
       const option = el('option');
-      option.value = card.id;
-      option.textContent = `${card.name || '(未命名)'} · ${card.id.slice(0, 8)} · 最新 v${card.latestSeq}`;
-      this.cardSelect.append(option);
+      option.value = card.cardId;
+      // 遗留卡标注出来：它们的 ID 是服务端当年自动发的，不是用户选的
+      const legacyTag = card.idSource === 'legacy' || card.idSource === 'auto' ? '（遗留 ID）' : '';
+      option.textContent = `${card.name || '(未命名)'} · ${card.cardId}${legacyTag} · v${card.latestSeq}`;
+      this.historySelect.append(option);
     }
 
-    const currentId = this.callbacks.getCurrentCardId();
-    this.cardSelect.value = currentId && cards.some((c) => c.id === currentId) ? currentId : keep === '__new__' || keep === '' ? '__new__' : keep;
-    if (![...this.cardSelect.options].some((o) => o.value === this.cardSelect.value)) {
-      this.cardSelect.value = '__new__';
-    }
-
-    this.cardSelect.onchange = () => {
-      const value = this.cardSelect.value;
-      this.callbacks.setCurrentCardId(value === '__new__' ? null : value);
-      if (value !== '__new__') void this.loadVersions(value);
-      else this.versionList.replaceChildren(el('p', 'issue-empty', '作为新卡片上传后会生成 v1'));
-    };
+    const desired = this.historyCardId ?? '__session__';
+    this.historySelect.value = [...this.historySelect.options].some((o) => o.value === desired)
+      ? desired
+      : keep !== '' && [...this.historySelect.options].some((o) => o.value === keep)
+        ? keep
+        : '__session__';
+    this.historyCardId = this.historySelect.value === '__session__' ? null : this.historySelect.value;
   }
 
   private async loadVersions(cardId: string): Promise<void> {
@@ -250,6 +430,16 @@ export class SyncDialog {
       this.versions = await listVersions(config, cardId, { limit: 50 });
       this.renderVersions();
     } catch (error) {
+      // 404 不是失败：这张卡还没上传过，是新建卡打开同步面板的**正常**状态。
+      // 早先这里直接报「角色卡不存在」，用户会以为同步坏了 —— 而实际上
+      // 他要做的只是点一下「上传当前内容」。
+      if (error instanceof SyncError && error.code === 'NOT_FOUND') {
+        this.versions = [];
+        this.versionList.replaceChildren(
+          el('p', 'issue-empty', '该角色卡 ID 在服务端还没有记录：点「上传当前内容」会新建 v1。'),
+        );
+        return;
+      }
       this.reportError('版本历史加载失败', error);
     } finally {
       this.setBusy(null);
@@ -302,10 +492,14 @@ export class SyncDialog {
 
       // 最新版本没有"回滚到它自己"的意义
       const isLatest = version.seq === this.versions[0]?.seq;
+      // 只读查看别的卡片时也不给回滚：在别人的卡上回滚等于往人家的历史里塞版本，
+      // 而用户的本意可能只是"看看"。按钮直接置灰比点了再报错诚实。
+      const isOwnCard = this.effectiveHistoryCardId() === this.sessionCardId();
       const rollbackButton = el('button', 'btn small', '回滚到此版本');
       rollbackButton.type = 'button';
-      rollbackButton.disabled = isLatest;
+      rollbackButton.disabled = isLatest || !isOwnCard;
       if (isLatest) rollbackButton.title = '这已是最新版本';
+      else if (!isOwnCard) rollbackButton.title = '只能回滚当前会话所属的卡片；其他卡片的历史是只读的';
       rollbackButton.addEventListener('click', () => void this.rollback(version));
       actions.append(rollbackButton);
 
@@ -321,26 +515,51 @@ export class SyncDialog {
       return;
     }
 
+    const target = this.callbacks.getUploadTarget();
+    if (!target) {
+      this.callbacks.notify('没有打开的角色卡，无法上传', 'warn');
+      return;
+    }
+
     this.setBusy('生成内容并上传…');
+    this.clearWarning();
     try {
       const text = await this.callbacks.getPayload();
-      const targetCardId = this.cardSelect.value === '__new__' ? null : this.cardSelect.value;
 
       const result: UploadResult = await uploadCard(config, {
         text,
-        cardId: targetCardId,
+        // 目标就是会话自己的 cardId：服务端按它 upsert
+        cardId: target.cardId,
+        // 基线一起送过去，服务端据此判断是否分叉
+        baseSeq: target.baseSeq,
         message: `客户端上传 ${new Date().toISOString()}`,
         author: 'tavern-card-studio',
       });
 
-      this.callbacks.setCurrentCardId(result.cardId);
+      // cardId 与 seq 一起记回会话（分叉判定要这两个一起才有意义）
+      this.callbacks.onUploaded(result.cardId, result.seq);
+      this.renderTarget();
 
-      // 上传成功后刷新版本历史，并把新版本号反馈给用户
-      await this.refreshCardOptionsAndVersions(result.cardId);
+      // 上传成功后刷新列表与版本历史
+      await this.reload();
+
+      if (result.warnings.length > 0) {
+        const codes = [...new Set(result.warnings.map((item) => item.code))];
+        this.showWarning(
+          result.warnings.map((item) => item.message),
+          codes.join(','),
+          codes.includes('FORK')
+            ? `本次内容已写入 v${result.seq}，会话基线随之更新为 v${result.seq}；上一条里的基线指的是这次上传出发时的版本。`
+            : undefined,
+        );
+        // 警告不等于失败：内容已经写进去了，所以状态用 warn 而不是 bad
+        this.callbacks.notify(`已上传 v${result.seq}，但有 ${result.warnings.length} 条警告`, 'warn');
+        return;
+      }
 
       this.callbacks.notify(
         result.created
-          ? `已作为新卡片上传：${result.cardId.slice(0, 8)} · 版本 v${result.seq}`
+          ? `已在服务端新建「${target.cardId}」· 版本 v${result.seq}`
           : `已上传新版本：v${result.seq}（sha256 ${result.sha256.slice(0, 12)}…）`,
         'ok',
       );
@@ -351,21 +570,21 @@ export class SyncDialog {
     }
   }
 
-  private async refreshCardOptionsAndVersions(cardId: string): Promise<void> {
-    const config = this.callbacks.getConfig();
-    if (!config) return;
-    const cards = await listCards(config, { limit: 50 });
-    this.renderCards(cards);
-    this.cardSelect.value = cardId;
-    await this.loadVersions(cardId);
-  }
-
-  /** 回滚：必须确认，且明确告知会覆盖当前编辑内容 */
+  /**
+   * 回滚：必须确认，且明确告知会覆盖当前编辑内容。
+   *
+   * 只允许在**会话自己的卡**上回滚。查看别人的历史是只读的 ——
+   * 在别人的卡上回滚等于给别人的历史塞一个版本，而用户的本意可能只是"看看"。
+   */
   private async rollback(version: VersionSummary): Promise<void> {
     const config = this.callbacks.getConfig();
-    const cardId = this.callbacks.getCurrentCardId();
+    const cardId = this.effectiveHistoryCardId();
     if (!config || !cardId) {
       this.callbacks.notify('请先选择目标卡片', 'warn');
+      return;
+    }
+    if (cardId !== this.sessionCardId()) {
+      this.callbacks.notify('只能回滚当前会话所属的卡片；查看其他卡片的历史是只读的', 'warn');
       return;
     }
 
@@ -389,7 +608,9 @@ export class SyncDialog {
 
       // 取回回滚后的内容并载入编辑器（用户已在上一步确认）
       const text = await fetchVersionText(config, cardId, version.seq);
-      this.callbacks.onRollbackApplied(text, version);
+      // 基线记 result.seq（回滚新建的那个版本），不是目标版本的 seq ——
+      // 记错了下一次上传会被服务端误判成分叉
+      this.callbacks.onRemoteTextApplied(text, version, result.seq);
 
       await this.loadVersions(cardId);
       this.callbacks.notify(
@@ -406,13 +627,14 @@ export class SyncDialog {
   /** 只取回、不改服务端 */
   private async loadVersionIntoEditor(version: VersionSummary): Promise<void> {
     const config = this.callbacks.getConfig();
-    const cardId = this.callbacks.getCurrentCardId();
+    const cardId = this.effectiveHistoryCardId();
     if (!config || !cardId) return;
 
     this.setBusy(`取回 v${version.seq}…`);
     try {
       const text = await fetchVersionText(config, cardId, version.seq);
-      this.callbacks.onRollbackApplied(text, version);
+      // 内容与远端 v{seq} 一致，于是基线就是它
+      this.callbacks.onRemoteTextApplied(text, version, version.seq);
       this.callbacks.notify(`已载入 v${version.seq} 的内容（未改动服务端）`, 'ok');
     } catch (error) {
       this.reportError('取回失败', error);

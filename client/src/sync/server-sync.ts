@@ -70,12 +70,28 @@ export interface VersionSummary {
 }
 
 export interface CardSummary {
+  /** 卡片 ID（= 寻址键，历史/回滚都用它） */
+  cardId: string;
+  /** 与 cardId 同值；保留旧字段名以兼容尚未改名的调用点 */
   id: string;
   name: string;
+  /** 最新版本号；没有任何版本时为 0 */
   latestSeq: number;
   latestSha256: string;
   updatedAt: string;
   deleted: boolean;
+  /** ID 来源：client = 用户指定；auto = 服务端发号（旧版客户端）；legacy = v0.1.1 之前入库 */
+  idSource: 'client' | 'auto' | 'legacy' | null;
+  versionCount: number;
+}
+
+/** 服务端返回的不阻断警告 */
+export interface UploadWarning {
+  code: 'FORK' | 'REMOTE_MISSING' | string;
+  message: string;
+  baseSeq: number | null;
+  remoteLatestSeq: number | null;
+  remoteLatestSha256: string | null;
 }
 
 export interface UploadResult {
@@ -87,6 +103,8 @@ export interface UploadResult {
   size: number;
   /** 是否新建了卡（而非追加版本） */
   created: boolean;
+  /** 分叉等警告：写入已成功，只是需要让用户知道 */
+  warnings: UploadWarning[];
 }
 
 const DEFAULT_TIMEOUT_MS = 15000;
@@ -185,31 +203,53 @@ function toVersionSummary(input: Record<string, unknown>): VersionSummary {
   };
 }
 
+function toUploadWarning(input: unknown): UploadWarning | null {
+  if (typeof input !== 'object' || input === null) return null;
+  const obj = input as Record<string, unknown>;
+  const code = typeof obj['code'] === 'string' ? obj['code'] : '';
+  if (code === '') return null;
+  const numberOrNull = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) ? value : null;
+  return {
+    code,
+    message: typeof obj['message'] === 'string' ? obj['message'] : '',
+    baseSeq: numberOrNull(obj['baseSeq']),
+    remoteLatestSeq: numberOrNull(obj['remoteLatestSeq']),
+    remoteLatestSha256: typeof obj['remoteLatestSha256'] === 'string' ? obj['remoteLatestSha256'] : null,
+  };
+}
+
 /**
- * 上传角色卡。
+ * 上传角色卡（T9.7：**按 ID 归档**）。
  *
- * 语义：
- *   · `cardId` 为空 → 新建（POST /api/cards，seq 恒为 1）
- *   · `cardId` 有值 → 追加版本（POST /api/cards/:id/versions，seq 递增）
+ * 只有一次请求：`POST /api/cards?cardId=<id>&baseSeq=<n>`，服务端 upsert——
+ * 存在则追加版本、不存在则按该 ID 新建。之前是"有没有 cardId 决定调哪个端点"，
+ * 那是个竞态：查存在性与写入之间别人可能刚建了同一张卡。
  *
- * body 是**文本原文本身**（不包 JSON 信封），与服务端的"原始字节入库"约定一致。
+ * `baseSeq` = 本会话上次上传拿到的 seq（没有就不传）。服务端据此判断是不是分叉。
+ *
+ * **旧版服务端会被识别出来并拒绝**：v0.1.0 的服务端不认识 `cardId`，
+ * 会忽略它、自己发一个号，然后在响应里返回那个新号。若不比对，
+ * 客户端会以为"上传成功，但 ID 变了"，接着把会话的 ID 改成服务端发号的那个 ——
+ * 用户的稳定标识就这样被悄悄换掉了。所以这里比对，不一致直接报错。
  */
 export async function uploadCard(
   config: SyncConfig,
-  input: { text: string; cardId?: string | null; message?: string; author?: string },
+  input: { text: string; cardId?: string | null; baseSeq?: number | null; message?: string; author?: string },
   options: RequestOptions = {},
 ): Promise<UploadResult> {
   const query = new URLSearchParams();
   if (input.message) query.set('message', input.message);
   if (input.author) query.set('author', input.author);
-  const suffix = query.toString() === '' ? '' : `?${query.toString()}`;
+  const requestedId = input.cardId?.trim() ? input.cardId.trim() : null;
+  if (requestedId !== null) query.set('cardId', requestedId);
+  if (typeof input.baseSeq === 'number' && input.baseSeq > 0) query.set('baseSeq', String(input.baseSeq));
 
-  const isNew = !input.cardId;
-  const path = isNew ? `/api/cards${suffix}` : `/api/cards/${encodeURIComponent(input.cardId!)}/versions${suffix}`;
+  const suffix = query.toString() === '' ? '' : `?${query.toString()}`;
 
   const response = await request(
     config,
-    path,
+    `/api/cards${suffix}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -220,27 +260,36 @@ export async function uploadCard(
 
   const body = (await response.json()) as Record<string, unknown>;
 
-  // 新建返回 { card, version }，追加返回 version 本体
-  if (isNew) {
-    const card = (body['card'] ?? {}) as Record<string, unknown>;
-    const version = (body['version'] ?? {}) as Record<string, unknown>;
-    return {
-      cardId: String(card['id'] ?? ''),
-      seq: Number(version['seq'] ?? 1),
-      commit: String(version['commit'] ?? ''),
-      sha256: String(version['sha256'] ?? ''),
-      size: Number(version['size'] ?? 0),
-      created: true,
-    };
+  // 新服务端：顶层直接给 cardId / seq / created / warnings
+  // 旧服务端：只有 { card: {id}, version: {seq} }，且 cardId 用的是它自己发的号
+  const card = (body['card'] ?? {}) as Record<string, unknown>;
+  const version = (body['version'] ?? {}) as Record<string, unknown>;
+
+  const returnedId = String(body['cardId'] ?? card['id'] ?? '');
+  const seq = Number(body['seq'] ?? version['seq'] ?? 0);
+
+  if (requestedId !== null && returnedId !== requestedId) {
+    throw new SyncError(
+      'CONFLICT',
+      `服务端没有按 ID「${requestedId}」归档（返回的是「${returnedId}」）：服务端版本过旧，请升级服务端 MSI 后重试`,
+      response.status,
+      'v0.1.0 的服务端会忽略 cardId 并自行发号；v0.1.1 起才支持按 ID 归档',
+    );
   }
 
+  const warningsRaw = body['warnings'];
+  const warnings = Array.isArray(warningsRaw)
+    ? warningsRaw.map(toUploadWarning).filter((item): item is UploadWarning => item !== null)
+    : [];
+
   return {
-    cardId: input.cardId!,
-    seq: Number(body['seq'] ?? 0),
-    commit: String(body['commit'] ?? ''),
-    sha256: String(body['sha256'] ?? ''),
-    size: Number(body['size'] ?? 0),
-    created: false,
+    cardId: returnedId,
+    seq,
+    commit: String(body['commit'] ?? version['commit'] ?? ''),
+    sha256: String(body['sha256'] ?? version['sha256'] ?? ''),
+    size: Number(body['size'] ?? version['size'] ?? 0),
+    created: body['created'] === true || (body['created'] === undefined && input.cardId == null),
+    warnings,
   };
 }
 
@@ -257,14 +306,25 @@ export async function listCards(
   const body = (await response.json()) as Record<string, unknown>;
   const items = Array.isArray(body['items']) ? (body['items'] as Record<string, unknown>[]) : [];
 
-  return items.map((item) => ({
-    id: String(item['id'] ?? ''),
-    name: String(item['name'] ?? ''),
-    latestSeq: Number(item['latestSeq'] ?? item['latest_seq'] ?? 0),
-    latestSha256: String(item['latestSha256'] ?? item['latest_sha256'] ?? ''),
-    updatedAt: String(item['updatedAt'] ?? item['updated_at'] ?? ''),
-    deleted: item['deleted'] === true,
-  }));
+  return items.map((item) => {
+    const id = String(item['cardId'] ?? item['id'] ?? '');
+    const latest = (item['latest'] ?? {}) as Record<string, unknown>;
+    return {
+      cardId: id,
+      id,
+      name: String(item['name'] ?? ''),
+      // 顶层 latestSeq 优先；退回 latest.seq（旧服务端只给嵌套那个）
+      latestSeq: Number(item['latestSeq'] ?? latest['seq'] ?? 0),
+      latestSha256: String(latest['sha256'] ?? ''),
+      updatedAt: String(item['updatedAt'] ?? ''),
+      deleted: item['deletedAt'] !== null && item['deletedAt'] !== undefined,
+      idSource:
+        item['idSource'] === 'client' || item['idSource'] === 'auto' || item['idSource'] === 'legacy'
+          ? (item['idSource'] as 'client' | 'auto' | 'legacy')
+          : null,
+      versionCount: Number(item['versionCount'] ?? 0),
+    };
+  });
 }
 
 /** 拉取版本历史（按 seq 倒序，服务端已排好） */
@@ -320,6 +380,8 @@ export async function rollbackCard(
     sha256: String(version['sha256'] ?? ''),
     size: Number(version['size'] ?? 0),
     created: false,
+    // 回滚不做分叉判定：它本身就是"以旧版新建一个提交"，没有基线概念
+    warnings: [],
   };
 }
 

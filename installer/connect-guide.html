@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tavern Card Studio 服务端 · 如何连接</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 56px;
+    font: 15px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    color: #1f2933; background: #f4f6f8;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 24px; letter-spacing: -0.01em; }
+  .sub { margin: 0 0 26px; color: #667380; font-size: 13px; }
+  section {
+    background: #fff; border: 1px solid #e3e8ee; border-radius: 10px;
+    padding: 20px 22px; margin: 0 0 16px;
+  }
+  h2 { margin: 0 0 10px; font-size: 16px; }
+  h2 .n {
+    display: inline-block; width: 22px; height: 22px; margin-right: 8px;
+    border-radius: 50%; background: #2f6feb; color: #fff;
+    font-size: 12px; line-height: 22px; text-align: center; vertical-align: 2px;
+  }
+  p { margin: 8px 0; }
+  code, .addr {
+    font-family: ui-monospace, Consolas, "Courier New", monospace;
+    font-size: 13px; background: #eef1f5; border-radius: 4px; padding: 1px 5px;
+  }
+  .addr {
+    display: inline-block; padding: 5px 10px; margin: 3px 6px 3px 0;
+    background: #eef4ff; color: #1d4ed8; border: 1px solid #d6e2fb;
+    user-select: all; cursor: text;
+  }
+  ol, ul { margin: 8px 0; padding-left: 22px; }
+  li { margin: 5px 0; }
+  .warn {
+    border-left: 3px solid #e0a020; background: #fff8e8;
+    padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 12px 0 0;
+    font-size: 13.5px; color: #7a4d00;
+  }
+  .note { color: #5b6672; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0 0; font-size: 13.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #e8ecf1; vertical-align: top; }
+  th { background: #f7f9fb; font-weight: 600; color: #4a5561; font-size: 12.5px; }
+  td code { white-space: nowrap; }
+  .path { user-select: all; }
+</style>
+</head>
+<body>
+<main>
+  <h1>服务端已安装 · 如何连接</h1>
+  <p class="sub">Tavern Card Studio Server — 本机部署。本页说明访问地址与访问令牌的获取方式。</p>
+
+  <section>
+    <h2><span class="n">1</span>两个地址，分别用于不同用途</h2>
+    <p><strong>管理面板</strong>（在浏览器里打开，用于查看卡片、改配置、拿令牌）：</p>
+    <div><span class="addr">http://127.0.0.1:8731/</span></div>
+    <p><strong>API</strong>（客户端填这个，不要填面板地址）：</p>
+    <div><span class="addr">http://127.0.0.1:8730</span></div>
+    <p class="note">
+      两个地址是<strong>独立配置</strong>的。把 API 改成 <code>0.0.0.0</code> 给局域网用时，
+      管理面板仍只监听本机（默认 <code>127.0.0.1</code>）——这是刻意设计：面板本身不带登录，
+      不应该出现在局域网上。如需远程运维，请单独修改「管理面板监听地址」并自建 TLS 反向代理。
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="n">2</span>获取访问令牌</h2>
+    <p>首次启动服务时，令牌会自动生成。<strong>首次取令牌用方式 1 或 2，之后可以在面板里随时查看。</strong></p>
+    <ol>
+      <li>
+        <strong>配置文件（最快）</strong>：用记事本打开
+        <code class="path">C:\ProgramData\TavernCardStudio\config.json</code>，
+        找 <code>"token": "..."</code> 这一行，引号里的内容就是令牌。
+      </li>
+      <li>
+        <strong>服务日志</strong>：打开
+        <code class="path">C:\ProgramData\TavernCardStudio\logs\</code>，
+        找 <code>tcs-service-host.out.log</code>，搜索「访问令牌」——
+        首次启动时会打印一次完整令牌。
+      </li>
+      <li>
+        <strong>管理面板（进得去之后最方便）</strong>：打开
+        <span class="addr">http://127.0.0.1:8731/</span>，
+        进入「API 与令牌」页即可看到完整令牌，旁边有复制按钮。
+        <span class="note">面板本身要输令牌才能进，所以首次需要先用上面两种方式取一次。</span>
+      </li>
+    </ol>
+    <div class="warn">
+      <strong>令牌是全权凭证。</strong>拿到令牌等于拥有服务端的全部操作权限，
+      请不要发到群里、截图外传或提交到代码仓库。
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">3</span>在客户端里填好</h2>
+    <ol>
+      <li>打开 Tavern Card Studio 客户端，进入「设置」。</li>
+      <li>「服务端地址」填 <span class="addr">http://127.0.0.1:8730</span>（注意：是 8730，不是面板的 8731）。</li>
+      <li>「访问令牌」粘贴上面取到的令牌。</li>
+      <li>点「测试连接」，看到「已连接 · 令牌有效」即成功。</li>
+    </ol>
+    <p class="note">
+      如果客户端与服务端装在<strong>同一台</strong>机器上，可以直接点「连接本机服务端」按钮，
+      它会自动探测并填好这两项。
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="n">4</span>常见问题</h2>
+    <table>
+      <tr><th style="width:38%">现象</th><th>处置</th></tr>
+      <tr>
+        <td>面板 <code>127.0.0.1:8731</code> 打不开</td>
+        <td>服务可能没启动。打开「服务」(services.msc)，看 <code>Tavern Card Studio Server</code> 的状态，不是「正在运行」就右键启动。</td>
+      </tr>
+      <tr>
+        <td>服务启动失败 / 一直是「正在启动」</td>
+        <td>看 <code class="path">C:\ProgramData\TavernCardStudio\logs\</code> 下的日志；
+            服务依赖 .NET Framework 4.x（Win10/11 自带）。</td>
+      </tr>
+      <tr>
+        <td>客户端提示「令牌无效」</td>
+        <td>重新从面板复制一次（注意别带多余空格）。若在面板里点过「轮换令牌」，旧令牌会立即失效。</td>
+      </tr>
+      <tr>
+        <td>改了端口后连不上</td>
+        <td>回面板「参数配置」页确认实际端口，客户端地址要跟着改。改完需要重启服务。</td>
+      </tr>
+    </table>
+  </section>
+
+  <p class="note" style="text-align:center;margin-top:26px">
+    数据目录：<code class="path">C:\ProgramData\TavernCardStudio\</code>　·　
+    卸载时该目录会保留（里面有卡片与版本历史）
+  </p>
+</main>
+</body>
+</html>

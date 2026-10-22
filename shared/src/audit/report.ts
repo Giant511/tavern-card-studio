@@ -58,10 +58,43 @@ export function sortIssues(issues: readonly AuditIssue[]): AuditIssue[] {
 }
 
 /**
+ * 开发期形状校验：把「参数传错」从静默降级变成响亮失败。
+ *
+ * 起因（2026-10-22 实际踩到）：`buildAuditReport(card, resolvedRule)` ——
+ * 把规则对象直接当 options 传。TS 会报错，但**测试文件是 .mjs**，
+ * 类型检查覆盖不到，于是运行时静默不校验平台规则，issue 列表里只剩格式检查。
+ * 表现出来像"规则没生效"，排查方向会被带偏到规则文件上。
+ *
+ * 为什么是「开发期」而不是无条件抛：
+ * 生产构建里也要保留 —— 因为"少校验一路"是**错误结果**而非降级，
+ * 用户会看到一份"全部通过"的报告，而实际上必填字段是空的。
+ * 宁可抛错让人立刻知道，也不要给出错误的安全感。
+ *
+ * 只做形状判断（不引 zod）：这个函数在热路径上，每次编辑都会跑。
+ */
+function assertAuditOptions(options: unknown): asserts options is AuditOptions {
+  if (options === null || typeof options !== 'object') {
+    throw new TypeError(
+      `buildAuditReport 的第二个参数必须是 options 对象（如 { platformRule }），收到 ${options === null ? 'null' : typeof options}`,
+    );
+  }
+  const suspicious = ['id', 'platformId', 'fields', 'name', 'extends', 'scopes'];
+  for (const key of suspicious) {
+    if (key in (options as Record<string, unknown>)) {
+      throw new TypeError(
+        `buildAuditReport 的第二个参数看起来是「平台规则对象」而不是 options：` +
+          `发现字段 ${key}。请传 { platformRule: <规则> }。`,
+      );
+    }
+  }
+}
+
+/**
  * 组装审计报告。
  * 三个来源：平台规则（T4.2 + 平台内容规则）、格式检查（T4.3）、字数统计（T4.1）。
  */
 export function buildAuditReport(card: UnifiedCard, options: AuditOptions = {}): AuditReport {
+  assertAuditOptions(options);
   const issues: AuditIssue[] = [];
 
   if (options.platformRule) {

@@ -267,14 +267,68 @@ test('上传：新建卡 → POST /api/cards，body 是原文，带 Bearer', asy
   assert.equal(call.init.headers.Authorization, 'Bearer tok');
 });
 
-test('上传：已有 cardId → 追加版本，seq 递增', async () => {
-  const fetchImpl = makeFetch(() => jsonResponse({ seq: 4, commit: 'def', sha256: 'aa', size: 20 }, 201));
+test('上传：带 cardId → 同一个 upsert 端点并回传 cardId / seq（T9.7）', async () => {
+  const fetchImpl = makeFetch(() =>
+    jsonResponse({ cardId: 'c1', seq: 4, created: false, warnings: [], card: { id: 'c1' }, version: { seq: 4 } }, 200),
+  );
 
-  const result = await uploadCard(CONFIG, { text: '{}', cardId: 'c1' }, { fetchImpl });
+  const result = await uploadCard(CONFIG, { text: '{}', cardId: 'c1', baseSeq: 3 }, { fetchImpl });
 
   assert.equal(result.created, false);
+  assert.equal(result.cardId, 'c1');
   assert.equal(result.seq, 4);
-  assert.match(fetchImpl.calls[0].url, /\/api\/cards\/c1\/versions$/);
+
+  const url = fetchImpl.calls[0].url;
+  // 不再是 /api/cards/:id/versions —— 那是个竞态：查存在性与写入之间别人可能刚建了同一张卡
+  assert.match(url, /\/api\/cards\?/);
+  assert.match(url, /cardId=c1/);
+  assert.match(url, /baseSeq=3/, '基线要一起送到服务端，否则判不出分叉');
+});
+
+test('上传：服务端忽略 cardId 自行发号 → 报 CONFLICT，绝不静默换掉用户 ID', async () => {
+  // v0.1.0 的服务端就是这个行为：不认识 cardId，返回它自己发的号
+  const fetchImpl = makeFetch(() =>
+    jsonResponse({ card: { id: 'auto-abc123' }, version: { seq: 1 } }, 201),
+  );
+
+  await assert.rejects(
+    () => uploadCard(CONFIG, { text: '{}', cardId: 'lin-wanzhao-0001' }, { fetchImpl }),
+    (error) => {
+      assert.ok(error instanceof SyncError);
+      assert.equal(error.code, 'CONFLICT');
+      assert.match(error.message, /服务端版本过旧/);
+      assert.match(error.message, /lin-wanzhao-0001/);
+      return true;
+    },
+  );
+});
+
+test('上传：服务端返回 warnings → 原样带出（分叉不阻断写入）', async () => {
+  const fetchImpl = makeFetch(() =>
+    jsonResponse(
+      {
+        cardId: 'c1',
+        seq: 5,
+        created: false,
+        warnings: [
+          {
+            code: 'FORK',
+            message: '远端已有他人修改（最新 v4，你的基线是 v2），本次上传将产生分叉历史',
+            baseSeq: 2,
+            remoteLatestSeq: 4,
+            remoteLatestSha256: 'ff',
+          },
+        ],
+      },
+      200,
+    ),
+  );
+
+  const result = await uploadCard(CONFIG, { text: '{}', cardId: 'c1', baseSeq: 2 }, { fetchImpl });
+  assert.equal(result.seq, 5, '警告不等于失败：版本号照样要返回');
+  assert.equal(result.warnings.length, 1);
+  assert.equal(result.warnings[0].code, 'FORK');
+  assert.equal(result.warnings[0].remoteLatestSeq, 4);
 });
 
 test('上传：401 → UNAUTHORIZED（不要让 UI 猜原因）', async () => {
@@ -355,20 +409,26 @@ test('取版本原文：返回文本（用于取回旧版继续编辑）', async
   assert.equal(text, '{"spec":"chara_card_v2"}');
 });
 
-test('列卡：兼容 latestSeq / latest_seq 两种字段写法', async () => {
+test('列卡：读 cardId + 角色名 + idSource，并且 latestSeq 不再是 0', async () => {
   const fetchImpl = makeFetch(() =>
     jsonResponse({
       items: [
-        { id: 'a', name: 'A', latestSeq: 3, latestSha256: 'x', updatedAt: 't', deleted: false },
-        { id: 'b', name: 'B', latest_seq: 7, latest_sha256: 'y', updated_at: 't2', deleted: true },
+        // 新服务端：顶层 cardId + latestSeq + idSource
+        { cardId: 'lin-0001', id: 'lin-0001', name: '林晚照', latestSeq: 3, idSource: 'client', versionCount: 3 },
+        // 老服务端形态：只有 id 与嵌套 latest.seq（这条曾经导致 latestSeq 恒为 0）
+        { id: 'card-abcdef', name: '遗留卡', latest: { seq: 7, sha256: 'y' }, idSource: 'legacy' },
       ],
     }),
   );
 
   const cards = await listCards(CONFIG, { fetchImpl });
+  assert.equal(cards[0].cardId, 'lin-0001');
+  assert.equal(cards[0].name, '林晚照', '列表要能直接显示角色名');
   assert.equal(cards[0].latestSeq, 3);
-  assert.equal(cards[1].latestSeq, 7);
-  assert.equal(cards[1].deleted, true);
+  assert.equal(cards[0].idSource, 'client');
+  assert.equal(cards[1].cardId, 'card-abcdef');
+  assert.equal(cards[1].latestSeq, 7, '嵌套 latest.seq 必须能读到，否则列表永远显示 v0');
+  assert.equal(cards[1].idSource, 'legacy', '遗留 ID 要能被识别出来');
 });
 
 test('无 token 时不发 Authorization 头（服务端未启用鉴权的情形）', async () => {

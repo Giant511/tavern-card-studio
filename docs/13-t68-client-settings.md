@@ -76,7 +76,7 @@
 import { configGet, configPatch, isShellAvailable } from '../contract';
 ```
 
-`ClientConfig`（`src/contract/types.ts`）本就含这两个字段，无需改契约：
+`ClientConfig`（`src/contract/types.ts`）本就含这些字段。T9.8 追加了 `cardsDir`：
 
 ```ts
 export interface ClientConfig {
@@ -85,8 +85,31 @@ export interface ClientConfig {
   platformRuleId: string | null;
   presetId: string | null;
   highlightSchemeId: string | null;
+  cardsDir: string | null;  // T9.8：卡片存放目录；null = 用壳给的默认值
 }
 ```
+
+`cardsDir` 存 `null` 而不是"默认路径的字符串"，是有意的：默认值由壳解析
+（`document_dir()`，Windows 上可能被重定向到 OneDrive），TS 侧拼不出来。
+存 `null` 表示"用户没改过"，每次打开都重新问壳；一旦用户选了目录，就存绝对路径。
+
+### 3.1b 角色卡目录（T9.8 / F4）
+
+| 行为 | 实现 |
+|---|---|
+| 默认目录 | 壳解析 `<Documents>/TavernCardStudio/cards`（`default_cards_dir`）|
+| 选择目录 | `pickDirectory`（`recursive: false`，见 docs/11 §8.4）|
+| 不存在 | 保存 / 选完之后**尝试创建**；建不出来就**拒绝保存**并给出 OS 的原因 |
+| 不可写 | 允许保存配置，但**黄色警告**「配置已保存，但保存卡片时会失败」|
+| 打开卡片 | 对话框默认落点 = cardsDir；打开的文件不在该目录时提示一句 |
+| 保存卡片 | 默认落点 = cardsDir，文件名预填角色名；重名自动 `名字 (2).json`，不覆盖 |
+
+可写性是**真实写一个探针文件再删掉**（`probe_cards_dir`），不是看属性位 ——
+Windows 上只读属性、ACL 拒绝、网络盘掉线都会让"看起来可写"的目录写不进去。
+
+判定逻辑抽在纯函数 `decideCardsDir(probe, mode)`（`session/cards-path.ts`）里，
+`mode` 分 `save` / `pick` / `open`：三者措辞不同，因为**说话的时刻不同** ——
+`pick` 时还没保存，说"已保存"是假话；`open` 时连保存动作都没发生。
 
 持久化位置：`plugin-store` 的 `client-config.json`，落在应用配置目录
 （Windows 为 `%APPDATA%\com.taverncardstudio.client\`），不进仓库、不由渲染层直接写文件。

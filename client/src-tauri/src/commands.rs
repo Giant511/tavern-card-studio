@@ -378,3 +378,317 @@ pub fn read_rule_text(
 fn app_dir(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok()
 }
+
+// ─────────────────────────────────────────────────────────────
+// 卡片目录（T9.8 / F4）
+// ─────────────────────────────────────────────────────────────
+
+/// 目录探测结果（对应 client/src/contract/types.ts 的 DirProbe）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirProbe {
+    pub path: String,
+    pub path_display: Option<String>,
+    pub exists: bool,
+    pub created: bool,
+    pub writable: bool,
+    pub reason: Option<String>,
+}
+
+/// 卡片目录扫描结果（对应 CardsDirScan）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CardsDirScan {
+    pub path_display: Option<String>,
+    pub names: Vec<String>,
+    pub truncated: bool,
+}
+
+/// 默认卡片目录：`<Documents>/TavernCardStudio/cards`。
+///
+/// 依次尝试：系统文档目录 → `USERPROFILE/Documents` → 应用配置目录。
+/// 为什么不直接在 TS 侧拼字符串：拿 `Documents` 只有壳知道
+/// （Windows 上它可能被重定向到 OneDrive，`%USERPROFILE%\Documents` 未必存在）。
+#[tauri::command]
+pub fn default_cards_dir(app: AppHandle) -> ShellResult<String> {
+    let base = app
+        .path()
+        .document_dir()
+        .ok()
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|home| home.join("Documents"))
+        })
+        .or_else(|| app.path().app_config_dir().ok());
+
+    let base = base.ok_or_else(|| ShellError::EmptyPath)?;
+    let dir = base.join("TavernCardStudio").join("cards");
+    paths::display_path(&dir).ok_or_else(|| ShellError::PathNotAllowed {
+        path: dir.display().to_string(),
+    })
+}
+
+/// 探测（并可选创建）卡片目录。
+///
+/// 可写性用**真实写入一个探针文件再删掉**来判断，不看属性位：
+/// Windows 上只读属性、ACL 拒绝、网络盘掉线都会让"看起来可写"的目录写不进去，
+/// 而属性位只能反映其中一部分。
+#[tauri::command]
+pub fn probe_cards_dir(path: String, create: Option<bool>) -> ShellResult<DirProbe> {
+    let target = paths::absolute_path(&path)?;
+    let want_create = create.unwrap_or(false);
+
+    // 注意这里必须用 `exists()` 而不是 `is_dir()`：
+    // 同名路径可能是一个**文件**，那时 `is_dir()` 也是 false，就会被当成
+    // "目录不存在"去创建 —— 而 `create_dir_all` 必然失败，用户看到的
+    // 原因变成「无法创建目录：文件已存在」，而不是更准确的「这里是个文件」。
+    // 这个分支一开始写成 `else if !target.is_dir()` 是**死代码**，
+    // 被 `probe_reports_file_in_the_way` 这条用例抓出来了。
+    let existed = target.exists();
+    let mut created = false;
+
+    if existed && !target.is_dir() {
+        return Ok(DirProbe {
+            path: path.clone(),
+            path_display: paths::display_path(&target),
+            exists: true,
+            created: false,
+            writable: false,
+            reason: Some("同名路径已存在，但它是一个文件而不是目录".to_string()),
+        });
+    }
+
+    if !existed {
+        if !want_create {
+            return Ok(DirProbe {
+                path: path.clone(),
+                path_display: paths::display_path(&target),
+                exists: false,
+                created: false,
+                writable: false,
+                reason: Some("目录不存在".to_string()),
+            });
+        }
+        if let Err(error) = fs::create_dir_all(&target) {
+            // 创建失败就到此为止：把 OS 的原话带上，用户才知道是权限还是路径非法
+            return Ok(DirProbe {
+                path: path.clone(),
+                path_display: paths::display_path(&target),
+                exists: false,
+                created: false,
+                writable: false,
+                reason: Some(format!("无法创建目录：{}", error)),
+            });
+        }
+        created = true;
+    }
+
+    // 探针文件名带 pid：两个客户端实例同时探测不会互相踩
+    let probe = target.join(format!(".tcs-write-probe-{}", std::process::id()));
+    let writable = match fs::write(&probe, b"probe") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(error) => {
+            return Ok(DirProbe {
+                path: path.clone(),
+                path_display: paths::display_path(&target),
+                exists: existed,
+                created,
+                writable: false,
+                reason: Some(format!("目录不可写：{}", error)),
+            })
+        }
+    };
+
+    Ok(DirProbe {
+        path: path.clone(),
+        path_display: paths::display_path(&target),
+        exists: existed || created,
+        created,
+        writable,
+        reason: None,
+    })
+}
+
+/// 列出卡片目录下的 `.json` 文件名（**不递归、不读内容**）。
+///
+/// 这个能力唯一的用途是「保存前看看有没有同名文件，别静默覆盖」。
+/// 因此它返回的是名字而不是路径，也不下潜子目录 —— 能力范围与用途对齐，
+/// 免得变成一个"任意目录列举器"。
+#[tauri::command]
+pub fn scan_cards_dir(path: String, limit: Option<usize>) -> ShellResult<CardsDirScan> {
+    let target = paths::absolute_path(&path)?;
+    let cap = limit.unwrap_or(5000);
+
+    if !target.is_dir() {
+        // 目录还不存在不算错误：调用方紧接着会去创建它
+        return Ok(CardsDirScan {
+            path_display: paths::display_path(&target),
+            names: Vec::new(),
+            truncated: false,
+        });
+    }
+
+    let entries = fs::read_dir(&target).map_err(|error| ShellError::io(&target, error))?;
+    let mut names: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(value) => value,
+            Err(_) => continue, // 单个条目读不到不影响整体（权限/竞态）
+        };
+        let file_type = match entry.file_type() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue; // 非 UTF-8 文件名不参与重名判断（无法与用户输入比较）
+        };
+        if !name.to_ascii_lowercase().ends_with(".json") {
+            continue;
+        }
+        if names.len() >= cap {
+            truncated = true;
+            break;
+        }
+        names.push(name.to_string());
+    }
+
+    names.sort();
+    Ok(CardsDirScan {
+        path_display: paths::display_path(&target),
+        names,
+        truncated,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────
+// 单元测试（只覆盖不依赖 AppHandle 的目录能力）
+// ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 每次用独立临时目录，避免并行测试互相踩
+    fn temp_dir(tag: &str) -> PathBuf {
+        let unique = format!(
+            "tcs-test-{}-{}-{:?}",
+            tag,
+            std::process::id(),
+            Instant::now()
+        );
+        let dir = std::env::temp_dir().join(unique.replace([':', '.', ' '], "_"));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn probe_creates_missing_dir_and_checks_writability() {
+        let dir = temp_dir("probe-create");
+        assert!(!dir.exists());
+
+        let result = probe_cards_dir(dir.display().to_string(), Some(true)).expect("探测应成功");
+
+        assert!(result.exists, "创建后应报告存在");
+        assert!(result.created, "应标记为本次创建");
+        assert!(result.writable, "新建目录应可写");
+        assert!(result.reason.is_none());
+        assert!(dir.is_dir(), "目录应真的被创建出来");
+
+        // 探针文件必须删干净，不能留在用户的卡片目录里
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "探针文件没删干净：{:?}",
+            leftovers
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_without_create_reports_missing() {
+        let dir = temp_dir("probe-missing");
+
+        let result = probe_cards_dir(dir.display().to_string(), Some(false)).expect("探测应成功");
+
+        assert!(!result.exists);
+        assert!(!result.created);
+        assert!(!result.writable);
+        assert!(result.reason.is_some(), "缺失时应给出原因");
+        assert!(!dir.exists(), "create=false 时不该真的建目录");
+    }
+
+    #[test]
+    fn probe_reports_file_in_the_way() {
+        let dir = temp_dir("probe-file");
+        fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        fs::write(&dir, b"i am a file").unwrap();
+
+        let result = probe_cards_dir(dir.display().to_string(), Some(true)).expect("探测应成功");
+
+        assert!(result.exists, "同名路径确实存在");
+        assert!(!result.created);
+        assert!(!result.writable, "文件不是目录，不可写");
+        assert!(result.reason.is_some());
+
+        let _ = fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn scan_lists_only_json_files_sorted() {
+        let dir = temp_dir("scan");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("b.json"), b"{}").unwrap();
+        fs::write(dir.join("A.json"), b"{}").unwrap();
+        fs::write(dir.join("note.txt"), b"x").unwrap();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub").join("deep.json"), b"{}").unwrap();
+
+        let scan = scan_cards_dir(dir.display().to_string(), None).expect("扫描应成功");
+
+        assert_eq!(scan.names, vec!["A.json", "b.json"], "只列 .json、排序、不递归");
+        assert!(!scan.truncated);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_missing_dir_is_empty_not_error() {
+        let dir = temp_dir("scan-missing");
+
+        let scan = scan_cards_dir(dir.display().to_string(), None).expect("目录不存在不该报错");
+
+        assert!(scan.names.is_empty());
+        assert!(!scan.truncated);
+    }
+
+    #[test]
+    fn scan_respects_limit() {
+        let dir = temp_dir("scan-limit");
+        fs::create_dir_all(&dir).unwrap();
+        for index in 0..5 {
+            fs::write(dir.join(format!("{index}.json")), b"{}").unwrap();
+        }
+
+        let scan = scan_cards_dir(dir.display().to_string(), Some(3)).expect("扫描应成功");
+
+        assert_eq!(scan.names.len(), 3);
+        assert!(scan.truncated, "超过上限要明确标记截断");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

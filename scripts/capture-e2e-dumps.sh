@@ -102,11 +102,19 @@ capture export-blocked   "?export=1&forceError=1"
 capture rules-dialog     "?rules=1"
 capture platform-janitorai "?platform=janitorai"
 capture apply-divider    "?applyPreset=divider&expand=all"
+# F8：渲染预览（覆盖「打开 / 重复 10 次 / 打开期间可输入 / 顶栏按钮全扫」）
+capture preview-open     "?preview=open"
+# F6.1/F6.3：一键连接本机服务端（成功态需要 127.0.0.1:8730 上有本版本服务端在跑）
+capture settings-local   "?settings=1&localConnect=1"
+capture preview-cycle10  "?preview=cycle10"
+capture preview-typing   "?preview=typing"
+capture preview-sweep    "?preview=sweep"
 
 echo "生成截图："
 shot e2e-editor.png      ""
 shot e2e-all-blocks.png  "?expand=all"
 shot e2e-export-gate.png "?export=1&forceError=1"
 shot e2e-rules.png       "?rules=1"
+shot e2e-preview-open.png "?preview=open"
 
 echo "完成。快照在 .verify/e2e-dumps/，截图在 docs/assets/。"

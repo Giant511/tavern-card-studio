@@ -18,7 +18,7 @@ import { analyzeCardBytes } from '../audit/service.js';
 import { AppError } from '../errors.js';
 import type { Logger } from '../log.js';
 import type { BlobStore } from './blobs.js';
-import type { CardRow, Db, NewVersionRow, VersionKind, VersionRow } from './db.js';
+import type { CardIdSource, CardRow, Db, NewVersionRow, VersionKind, VersionRow } from './db.js';
 import { compareBytes, diffJson, diffLines, sha256Of, type ByteComparison, type JsonDiff, type LineDiff } from './diff.js';
 import type { GitStore } from './git-store.js';
 
@@ -32,7 +32,17 @@ export interface WriteOptions {
 }
 
 export interface CardSummaryDto {
+  /**
+   * 卡片 ID —— **寻址键**。历史 / 回滚 / 取原文全用它。
+   *
+   * 与 `id` 同值，但两个字段都留着：`id` 是"记录主键"的既有叫法（旧客户端在用），
+   * `cardId` 是 F11 的领域概念（用户指定、跨端稳定的标识）。合并成一个名字
+   * 会让"这到底是主键还是用户 ID"重新变模糊。
+   */
+  cardId: string;
   id: string;
+  /** 见 `CardIdSource`：`client` = 用户指定；`auto` = 服务端发号；`legacy` = v0.1.1 之前入库 */
+  idSource: CardIdSource;
   name: string;
   spec: string;
   specVersion: string;
@@ -43,6 +53,15 @@ export interface CardSummaryDto {
   updatedAt: string;
   deletedAt: string | null;
   versionCount: number;
+  /**
+   * 最新版本序号（顶层便利字段）。
+   *
+   * 为什么在 `latest.seq` 之外再给一个：客户端列表和"分叉基线"都要读它，
+   * 而 `latest` 可能是 null（没有任何版本的行）。旧客户端曾经按
+   * `latestSeq` 读、服务端只给 `latest.seq`，结果那一列永远是 0 ——
+   * 一个纯靠字段名对不上就静默取默认值的坑。
+   */
+  latestSeq: number | null;
   latest: {
     seq: number;
     commit: string;
@@ -95,6 +114,61 @@ export interface DiffDto {
   lines: LineDiff;
   json: JsonDiff;
   identical: boolean;
+}
+
+/** 上传/追加时可能返回的警告（不阻断写入） */
+export type UploadWarningCode =
+  /** 远端最新版本不是本次会话上次上传的那个 → 本次追加会产生分叉历史 */
+  | 'FORK'
+  /** 客户端声称有基线（baseSeq ≥ 1），但远端已经没有这张卡（被删/库被清） */
+  | 'REMOTE_MISSING';
+
+export interface UploadWarning {
+  code: UploadWarningCode;
+  /** 给用户看的一句话（客户端可直接上屏，避免两端各写一套文案） */
+  message: string;
+  /** 客户端声明的基线序号；null = 客户端没有基线（首次上传） */
+  baseSeq: number | null;
+  /** 远端当前最新序号；null = 远端没有这张卡 */
+  remoteLatestSeq: number | null;
+  remoteLatestSha256: string | null;
+}
+
+/**
+ * 上传结果。
+ *
+ * `cardId` / `seq` 提到**顶层**是有意的：需求要求"响应中明确返回两者"，
+ * 让客户端不必再从 `card.id` / `version.seq` 里挖 —— 嵌套结构里少一层
+ * 就会静默变成默认值（`latestSeq` 那个坑就是这么来的）。
+ */
+export interface UploadOutcome {
+  cardId: string;
+  seq: number;
+  /** true = 本次新建了卡片；false = 追加了一个版本 */
+  created: boolean;
+  warnings: UploadWarning[];
+  card: CardDetailDto;
+  version: VersionDto;
+}
+
+/** ID 最大长度，与客户端 `CARD_ID_MAX_LENGTH` 保持一致 */
+export const CARD_ID_MAX_LENGTH = 64;
+
+/**
+ * 校验客户端指定的角色卡 ID。
+ *
+ * 规则与 `client/src/session/card-id.ts` **必须同构**：只允许 `A-Za-z0-9-`、
+ * 1–64 字符、首尾非连字符、至少含一个字母或数字。
+ *
+ * 客户端那层是"帮用户改对"，服务端这层是"坏 ID 不许进库"。少了后者，
+ * 任何绕过界面的调用（curl、旧版客户端、脚本）都能造出无法寻址的卡 ——
+ * 而那张卡之后**永远打不开**，因为它的 ID 里可能有 `/` 或空格。
+ */
+export function isValidCardId(id: string): boolean {
+  if (id.length === 0 || id.length > CARD_ID_MAX_LENGTH) return false;
+  if (!/^[A-Za-z0-9-]+$/.test(id)) return false;
+  if (id.startsWith('-') || id.endsWith('-')) return false;
+  return /[A-Za-z0-9]/.test(id);
 }
 
 /** 同一张卡的写操作串行化（Node 单进程内足够；跨进程部署时由 supervisor 保证单 worker） */
@@ -153,7 +227,9 @@ export class CardService {
 
   summary(row: CardRow): CardSummaryDto {
     return {
+      cardId: row.id,
       id: row.id,
+      idSource: row.id_source,
       name: row.name,
       spec: row.spec,
       specVersion: row.spec_version,
@@ -164,6 +240,7 @@ export class CardService {
       updatedAt: row.updated_at,
       deletedAt: row.deleted_at,
       versionCount: row.version_count,
+      latestSeq: row.latest_seq,
       latest:
         row.latest_seq === null || row.latest_commit === null || row.latest_sha256 === null
           ? null
@@ -274,112 +351,243 @@ export class CardService {
 
   // ────────────────────────────── 写入 ──────────────────────────────
 
+  /**
+   * 新建卡片（服务端发号）。
+   *
+   * v0.1.1 起这不是主路径了 —— 新客户端一律带 ID（见 {@link upload}）。
+   * 保留它是为了**旧版客户端**（v0.1.0）还能正常上传：它不带卡 ID，
+   * 服务端只能自己发一个。这样升级服务端不会把还在跑的旧客户端打断。
+   */
   async create(bytes: Buffer, options: WriteOptions = {}): Promise<{ card: CardDetailDto; version: VersionDto }> {
     const cardId = this.allocateId(bytes);
-    return this.mutex.run(cardId, async () => {
-      const now = new Date();
-      const version = await this.commitSnapshot({
-        cardId,
-        seq: 1,
-        bytes,
-        parentCommit: null,
-        kind: 'upload',
-        options,
-        createdAt: now.toISOString(),
-        origin: `server:${cardId}`,
-      });
+    return this.mutex.run(cardId, () => this.createLocked(cardId, 'auto', bytes, options));
+  }
 
-      const cardRow: CardRow = {
-        id: cardId,
-        name: version.name,
-        spec: version.analyzed.spec,
-        spec_version: version.analyzed.specVersion,
-        creator: version.analyzed.creator,
-        tags_json: JSON.stringify(version.analyzed.tags),
-        source_filename: options.filename ?? '',
-        created_at: now.toISOString(),
-        updated_at: now.toISOString(),
-        deleted_at: null,
-        version_count: 1,
-        latest_seq: 1,
-        latest_commit: version.row.commit,
-        latest_sha256: version.row.blobSha256,
-        latest_size: version.row.byteSize,
-        latest_message: version.row.message,
-        latest_at: version.row.createdAt,
-        parse_warnings_json: JSON.stringify(
-          version.analyzed.parseIssues.filter((issue) => issue.severity === 'warning'),
-        ),
-        audit_sha256: version.row.auditSha256,
-        audit_error: version.row.auditError,
-        audit_generated_at: version.row.auditGeneratedAt,
-        audit_error_count: version.row.auditSummary?.error ?? null,
-        audit_warning_count: version.row.auditSummary?.warning ?? null,
-        audit_info_count: version.row.auditSummary?.info ?? null,
-        audit_exportable: version.row.auditSummary ? (version.row.auditSummary.exportable ? 1 : 0) : null,
+  /**
+   * 上传入口（T9.7 / F11）：**按 ID 归档**。
+   *
+   * `cardId === null` → 服务端发号（只留给旧版客户端；新客户端总会带 ID）。
+   * `cardId` 有值 → 存在则追加版本、不存在则新建。
+   *
+   * 三个不可妥协的点：
+   *   1. **带了 ID 就一定用它。** 绝不因为"没找到这张卡"就退回发号 ——
+   *      那样客户端以为在更新自己的卡，实际在服务端凭空多出一张，两边永久分叉。
+   *      写入后还有一道断言：落库的 ID 必须等于请求的 ID，不等就是 500 而不是悄悄放过。
+   *      这就是 `assertAuditOptions` 的同一种思路：**能把错误变成响亮的，就别让它静默。**
+   *   2. **ID 先校验再落库。** 非法 ID 进库会造出一张永远打不开的卡
+   *      （ID 里有 `/` 或空格时，连 `/api/cards/:id` 都拼不出来）。
+   *   3. **`baseSeq` 与远端最新不一致 → 返回 FORK 警告，但照常写入。**
+   *      分叉本身不是错误（两个人从同一版各改各的很正常），真正的错误是
+   *      "产生了分叉却不告诉用户"。
+   */
+  async upload(
+    cardId: string | null,
+    bytes: Buffer,
+    options: WriteOptions & { baseSeq?: number | null } = {},
+  ): Promise<UploadOutcome> {
+    if (cardId === null) {
+      const result = await this.create(bytes, options);
+      return {
+        cardId: result.card.cardId,
+        seq: result.version.seq,
+        created: true,
+        warnings: [],
+        card: result.card,
+        version: result.version,
       };
+    }
 
-      const tx = this.db.handle.transaction(() => {
-        this.db.insertCard(cardRow);
-        this.db.insertVersion(version.row);
+    if (!isValidCardId(cardId)) {
+      throw new AppError(400, 'BAD_CARD_ID', `角色卡 ID 不合法：${cardId}`, {
+        hint: '只允许字母、数字、连字符，1–64 字符，首尾不能是连字符',
       });
-      tx();
+    }
 
-      this.db.appendEvent({
-        at: now.toISOString(),
-        level: 'info',
-        action: 'card.create',
-        cardId,
-        detail: { seq: 1, sha256: version.row.blobSha256, size: version.row.byteSize },
-      });
-      this.logger.info('card.create', { cardId, seq: 1, sha256: version.row.blobSha256, size: version.row.byteSize });
+    return this.mutex.run(cardId, async () => {
+      const existing = this.db.getCard(cardId, { includeDeleted: true });
+      if (existing && existing.deleted_at !== null) {
+        // 已软删的 ID 不复用：否则"删除"会变成"隐藏"，用户重新上传同名 ID 就把
+        // 旧历史连带复活了，而他以为这是一张干净的卡。
+        throw new AppError(409, 'CARD_DELETED', `该 ID 已被一张已删除的卡片占用：${cardId}`, {
+          hint: '换一个 ID，或在服务端彻底删除那张卡（DELETE /api/cards/<id>?hard=1）',
+        });
+      }
 
-      const saved = this.requireCard(cardId);
-      const savedVersion = this.db.getVersion(cardId, 1);
-      if (!savedVersion) throw new AppError(500, 'INTERNAL', '版本写入后读回失败');
-      return { card: this.detail(saved), version: this.versionDto(savedVersion) };
+      const baseSeq = typeof options.baseSeq === 'number' ? options.baseSeq : null;
+
+      if (!existing) {
+        // 客户端声明了基线、远端却没有这张卡：历史不在这台服务器上
+        // （被硬删 / 换了库 / ID 拼错）。仍然按新卡写入 —— 内容不能丢 ——
+        // 但必须说清楚"这不是你以为的那张卡"。
+        const warnings: UploadWarning[] =
+          baseSeq !== null && baseSeq > 0
+            ? [
+                {
+                  code: 'REMOTE_MISSING',
+                  message: `服务端没有 ID 为 ${cardId} 的卡片，已作为新卡建立 v1（原有历史不在这台服务器上）`,
+                  baseSeq,
+                  remoteLatestSeq: null,
+                  remoteLatestSha256: null,
+                },
+              ]
+            : [];
+
+        const result = await this.createLocked(cardId, 'client', bytes, options);
+        if (result.card.cardId !== cardId) {
+          throw new AppError(
+            500,
+            'INTERNAL',
+            `入库的卡片 ID 与请求不一致：请求 ${cardId}，实际 ${result.card.cardId}`,
+          );
+        }
+        return { cardId, seq: result.version.seq, created: true, warnings, card: result.card, version: result.version };
+      }
+
+      const latest = this.db.listVersions(cardId, { limit: 1 })[0];
+      const remoteLatestSeq = latest ? latest.seq : null;
+      const warnings: UploadWarning[] =
+        baseSeq !== null && remoteLatestSeq !== null && baseSeq !== remoteLatestSeq
+          ? [
+              {
+                code: 'FORK',
+                message: `远端已有他人修改（最新 v${remoteLatestSeq}，你的基线是 v${baseSeq}），本次上传将产生分叉历史`,
+                baseSeq,
+                remoteLatestSeq,
+                remoteLatestSha256: latest ? latest.blob_sha256 : null,
+              },
+            ]
+          : [];
+
+      const version = await this.addVersionLocked(cardId, bytes, options);
+      const card = this.requireCard(cardId);
+      return { cardId, seq: version.seq, created: false, warnings, card: this.detail(card), version };
     });
   }
 
-  async addVersion(cardId: string, bytes: Buffer, options: WriteOptions = {}): Promise<VersionDto> {
-    return this.mutex.run(cardId, async () => {
-      this.requireCard(cardId);
-      const latest = this.db.listVersions(cardId, { limit: 1 })[0];
-      if (!latest) throw new AppError(500, 'INTERNAL', `角色卡 ${cardId} 缺少版本记录`);
-      const seq = latest.seq + 1;
-      const now = new Date().toISOString();
+  /** 追加版本（已持有该卡的锁时才可调；`upload` 与 `addVersion` 共用） */
+  private async addVersionLocked(cardId: string, bytes: Buffer, options: WriteOptions = {}): Promise<VersionDto> {
+    this.requireCard(cardId);
+    const latest = this.db.listVersions(cardId, { limit: 1 })[0];
+    if (!latest) throw new AppError(500, 'INTERNAL', `角色卡 ${cardId} 缺少版本记录`);
+    const seq = latest.seq + 1;
+    const now = new Date().toISOString();
 
-      const version = await this.commitSnapshot({
-        cardId,
-        seq,
-        bytes,
-        parentCommit: latest.commit_sha,
-        kind: 'update',
-        options,
-        createdAt: now,
-        origin: `server:${cardId}`,
-      });
-
-      const updateRow = { ...version.row, name: version.name };
-      const tx = this.db.handle.transaction(() => {
-        this.db.insertVersion(updateRow);
-        this.db.updateCardFromLatest(cardId, updateRow, { name: version.name, updatedAt: now });
-      });
-      tx();
-
-      this.db.appendEvent({
-        at: now,
-        level: 'info',
-        action: 'card.version',
-        cardId,
-        detail: { seq, sha256: version.row.blobSha256, size: version.row.byteSize, message: updateRow.message },
-      });
-      this.logger.info('card.version', { cardId, seq, sha256: version.row.blobSha256, size: version.row.byteSize });
-
-      const persisted = this.db.getVersion(cardId, seq);
-      if (!persisted) throw new AppError(500, 'INTERNAL', '版本写入后读回失败');
-      return this.versionDto(persisted);
+    const version = await this.commitSnapshot({
+      cardId,
+      seq,
+      bytes,
+      parentCommit: latest.commit_sha,
+      kind: 'update',
+      options,
+      createdAt: now,
+      origin: `server:${cardId}`,
     });
+
+    const updateRow = { ...version.row, name: version.name };
+    const tx = this.db.handle.transaction(() => {
+      this.db.insertVersion(updateRow);
+      this.db.updateCardFromLatest(cardId, updateRow, { name: version.name, updatedAt: now });
+    });
+    tx();
+
+    this.db.appendEvent({
+      at: now,
+      level: 'info',
+      action: 'card.version',
+      cardId,
+      detail: { seq, sha256: version.row.blobSha256, size: version.row.byteSize, message: updateRow.message },
+    });
+    this.logger.info('card.version', { cardId, seq, sha256: version.row.blobSha256, size: version.row.byteSize });
+
+    const persisted = this.db.getVersion(cardId, seq);
+    if (!persisted) throw new AppError(500, 'INTERNAL', '版本写入后读回失败');
+    return this.versionDto(persisted);
+  }
+
+  async addVersion(cardId: string, bytes: Buffer, options: WriteOptions = {}): Promise<VersionDto> {
+    return this.mutex.run(cardId, () => this.addVersionLocked(cardId, bytes, options));
+  }
+
+  /**
+   * 建卡并写入 v1（已持有该卡的锁时才可调）。
+   *
+   * `idSource` 决定这张卡在列表里被怎么标注：`client`（用户指定）/
+   * `auto`（服务端发号，仅旧客户端）/ `legacy`（迁移前入库，只会出现在老数据上）。
+   */
+  private async createLocked(
+    cardId: string,
+    idSource: CardIdSource,
+    bytes: Buffer,
+    options: WriteOptions,
+  ): Promise<{ card: CardDetailDto; version: VersionDto }> {
+    const now = new Date();
+    const version = await this.commitSnapshot({
+      cardId,
+      seq: 1,
+      bytes,
+      parentCommit: null,
+      kind: 'upload',
+      options,
+      createdAt: now.toISOString(),
+      origin: `server:${cardId}`,
+    });
+
+    const cardRow: CardRow = {
+      id: cardId,
+      id_source: idSource,
+      name: version.name,
+      spec: version.analyzed.spec,
+      spec_version: version.analyzed.specVersion,
+      creator: version.analyzed.creator,
+      tags_json: JSON.stringify(version.analyzed.tags),
+      source_filename: options.filename ?? '',
+      created_at: now.toISOString(),
+      updated_at: now.toISOString(),
+      deleted_at: null,
+      version_count: 1,
+      latest_seq: 1,
+      latest_commit: version.row.commit,
+      latest_sha256: version.row.blobSha256,
+      latest_size: version.row.byteSize,
+      latest_message: version.row.message,
+      latest_at: version.row.createdAt,
+      parse_warnings_json: JSON.stringify(
+        version.analyzed.parseIssues.filter((issue) => issue.severity === 'warning'),
+      ),
+      audit_sha256: version.row.auditSha256,
+      audit_error: version.row.auditError,
+      audit_generated_at: version.row.auditGeneratedAt,
+      audit_error_count: version.row.auditSummary?.error ?? null,
+      audit_warning_count: version.row.auditSummary?.warning ?? null,
+      audit_info_count: version.row.auditSummary?.info ?? null,
+      audit_exportable: version.row.auditSummary ? (version.row.auditSummary.exportable ? 1 : 0) : null,
+    };
+
+    const tx = this.db.handle.transaction(() => {
+      this.db.insertCard(cardRow);
+      this.db.insertVersion(version.row);
+    });
+    tx();
+
+    this.db.appendEvent({
+      at: now.toISOString(),
+      level: 'info',
+      action: 'card.create',
+      cardId,
+      detail: { seq: 1, sha256: version.row.blobSha256, size: version.row.byteSize, idSource },
+    });
+    this.logger.info('card.create', {
+      cardId,
+      idSource,
+      seq: 1,
+      sha256: version.row.blobSha256,
+      size: version.row.byteSize,
+    });
+
+    const saved = this.requireCard(cardId);
+    const savedVersion = this.db.getVersion(cardId, 1);
+    if (!savedVersion) throw new AppError(500, 'INTERNAL', '版本写入后读回失败');
+    return { card: this.detail(saved), version: this.versionDto(savedVersion) };
   }
 
   /** 回滚：以目标版本的原始字节新建提交（历史不重写） */
