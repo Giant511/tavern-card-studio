@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tavern Card Studio 服务端 · 如何连接</title>
+<title>Tavern Card Studio 服务端 0.1.2 · 如何连接</title>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
@@ -12,9 +12,10 @@
     font: 15px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
     color: #1f2933; background: #f4f6f8;
   }
-  main { max-width: 760px; margin: 0 auto; }
+  main { max-width: 800px; margin: 0 auto; }
   h1 { margin: 0 0 4px; font-size: 24px; letter-spacing: -0.01em; }
-  .sub { margin: 0 0 26px; color: #667380; font-size: 13px; }
+  .sub { margin: 0 0 22px; color: #667380; font-size: 13px; }
+  .sub b { color: #3d4a57; }
   section {
     background: #fff; border: 1px solid #e3e8ee; border-radius: 10px;
     padding: 20px 22px; margin: 0 0 16px;
@@ -25,6 +26,12 @@
     border-radius: 50%; background: #2f6feb; color: #fff;
     font-size: 12px; line-height: 22px; text-align: center; vertical-align: 2px;
   }
+  h2 .tag {
+    float: right; font-size: 11.5px; font-weight: 500; color: #1c6b3c;
+    background: #e7f6ec; border: 1px solid #c8e8d3; border-radius: 20px;
+    padding: 1px 9px; margin-top: 2px;
+  }
+  h3 { margin: 16px 0 6px; font-size: 13.5px; color: #4a5561; }
   p { margin: 8px 0; }
   code, .addr {
     font-family: ui-monospace, Consolas, "Courier New", monospace;
@@ -35,6 +42,13 @@
     background: #eef4ff; color: #1d4ed8; border: 1px solid #d6e2fb;
     user-select: all; cursor: text;
   }
+  pre {
+    margin: 8px 0; padding: 11px 14px; overflow-x: auto;
+    background: #1e242c; color: #e6edf3; border-radius: 7px;
+    font-family: ui-monospace, Consolas, "Courier New", monospace;
+    font-size: 12.5px; line-height: 1.65; user-select: all;
+  }
+  pre .c { color: #8b98a5; }
   ol, ul { margin: 8px 0; padding-left: 22px; }
   li { margin: 5px 0; }
   .warn {
@@ -42,94 +56,232 @@
     padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 12px 0 0;
     font-size: 13.5px; color: #7a4d00;
   }
+  .danger {
+    border-left: 3px solid #d94a3d; background: #fdf1f0;
+    padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 12px 0 0;
+    font-size: 13.5px; color: #8a2b21;
+  }
   .note { color: #5b6672; font-size: 13px; }
   table { width: 100%; border-collapse: collapse; margin: 10px 0 0; font-size: 13.5px; }
-  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #e8ecf1; vertical-align: top; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e8ecf1; vertical-align: top; }
   th { background: #f7f9fb; font-weight: 600; color: #4a5561; font-size: 12.5px; }
   td code { white-space: nowrap; }
   .path { user-select: all; }
+  .pill {
+    display: inline-block; font-size: 11.5px; padding: 0 7px; border-radius: 20px;
+    background: #eef1f5; color: #4a5561; border: 1px solid #e0e5eb;
+  }
+  .pill.rec { background: #e7f6ec; color: #1c6b3c; border-color: #c8e8d3; }
 </style>
 </head>
 <body>
 <main>
   <h1>服务端已安装 · 如何连接</h1>
-  <p class="sub">Tavern Card Studio Server — 本机部署。本页说明访问地址与访问令牌的获取方式。</p>
+  <p class="sub">
+    Tavern Card Studio Server <b>0.1.2</b>（多账户版）。按 1 → 4 的顺序做完即可连通；
+    放在公网上再加做第 5 节。
+  </p>
 
   <section>
-    <h2><span class="n">1</span>两个地址，分别用于不同用途</h2>
-    <p><strong>管理面板</strong>（在浏览器里打开，用于查看卡片、改配置、拿令牌）：</p>
-    <div><span class="addr">http://127.0.0.1:8731/</span></div>
-    <p><strong>API</strong>（客户端填这个，不要填面板地址）：</p>
-    <div><span class="addr">http://127.0.0.1:8730</span></div>
-    <p class="note">
-      两个地址是<strong>独立配置</strong>的。把 API 改成 <code>0.0.0.0</code> 给局域网用时，
-      管理面板仍只监听本机（默认 <code>127.0.0.1</code>）——这是刻意设计：面板本身不带登录，
-      不应该出现在局域网上。如需远程运维，请单独修改「管理面板监听地址」并自建 TLS 反向代理。
+    <h2><span class="n">1</span>创建管理员账户<span class="tag">必做第一步</span></h2>
+    <p>
+      0.1.2 起服务端按<strong>账户</strong>隔离卡片：没有账户，客户端登录不了
+      （自助注册默认关闭），只能退回用全局令牌做运维。所以装完先建一个账户。
     </p>
-  </section>
-
-  <section>
-    <h2><span class="n">2</span>获取访问令牌</h2>
-    <p>首次启动服务时，令牌会自动生成。<strong>首次取令牌用方式 1 或 2，之后可以在面板里随时查看。</strong></p>
-    <ol>
-      <li>
-        <strong>配置文件（最快）</strong>：用记事本打开
-        <code class="path">C:\ProgramData\TavernCardStudio\config.json</code>，
-        找 <code>"token": "..."</code> 这一行，引号里的内容就是令牌。
-      </li>
-      <li>
-        <strong>服务日志</strong>：打开
-        <code class="path">C:\ProgramData\TavernCardStudio\logs\</code>，
-        找 <code>tcs-service-host.out.log</code>，搜索「访问令牌」——
-        首次启动时会打印一次完整令牌。
-      </li>
-      <li>
-        <strong>管理面板（进得去之后最方便）</strong>：打开
-        <span class="addr">http://127.0.0.1:8731/</span>，
-        进入「API 与令牌」页即可看到完整令牌，旁边有复制按钮。
-        <span class="note">面板本身要输令牌才能进，所以首次需要先用上面两种方式取一次。</span>
-      </li>
-    </ol>
+    <p>
+      <strong>从 0.1.1 或更早版本升级上来的，这一步没有替代做法。</strong>
+      老库是单用户模型 —— 只有一个全局令牌，卡片没有归属。迁移命令一次做三件事：
+      建首账户（自动成为管理员）、把历史卡片接管进它的默认仓库、<strong>动库之前先备份</strong>。
+    </p>
+    <p>以管理员身份打开 PowerShell：</p>
+<pre><span class="c"># 在安装目录里执行 —— tcs-server.cmd 会带对配置文件路径</span>
+cd "C:\Program Files\Tavern Card Studio Server"
+.\tcs-server.cmd user migrate admin</pre>
+    <p class="note">
+      提示「首账户密码」时输入（至少 8 个字符）。密码从标准输入读，
+      不接受命令行参数 —— 那样会留在 shell 历史与进程列表里。
+    </p>
+    <p>跑完大致会看到：</p>
+<pre><span class="c">将创建首账户「admin」（管理员）并接管 12 张历史卡片。
+原库会先自动备份（VACUUM INTO，含最新事务）。
+已创建首账户「admin」（管理员），接管 12 张历史卡片；
+仓库：新建 1 个默认仓库、12 张卡片入库；
+原库已备份到 C:\ProgramData\TavernCardStudio\store\state.db.pre-accounts-….bak</span></pre>
+    <ul>
+      <li><strong>全新安装</strong>也用同一条命令，只是「接管 0 张卡片」。</li>
+      <li><strong>重复执行是安全的</strong>：已有账户时它只补默认仓库、把没归仓库的卡片入库。</li>
+      <li><strong>不需要重启服务</strong>：账户是每次请求现查库的。</li>
+      <li>要加普通成员：<code>.\tcs-server.cmd user add bob --role user</code></li>
+      <li>确认结果：<code>.\tcs-server.cmd user list</code></li>
+    </ul>
     <div class="warn">
-      <strong>令牌是全权凭证。</strong>拿到令牌等于拥有服务端的全部操作权限，
-      请不要发到群里、截图外传或提交到代码仓库。
+      <strong>必须用安装目录里的 <code>tcs-server.cmd</code>。</strong>
+      它替你指定了服务正在用的那份配置（<code class="path">C:\ProgramData\TavernCardStudio\config.json</code>）。
+      如果绕过它直接跑 <code>node.exe app\server\dist\index.js user migrate</code>，
+      程序会按当前目录另算一个数据目录，<strong>等于在旁边新建一个空库</strong> ——
+      症状是「账户明明建好了，服务却说不存在」。
     </div>
   </section>
 
   <section>
-    <h2><span class="n">3</span>在客户端里填好</h2>
-    <ol>
-      <li>打开 Tavern Card Studio 客户端，进入「设置」。</li>
-      <li>「服务端地址」填 <span class="addr">http://127.0.0.1:8730</span>（注意：是 8730，不是面板的 8731）。</li>
-      <li>「访问令牌」粘贴上面取到的令牌。</li>
-      <li>点「测试连接」，看到「已连接 · 令牌有效」即成功。</li>
-    </ol>
+    <h2><span class="n">2</span>两个地址，分别用于不同用途</h2>
+    <table>
+      <tr><th style="width:26%">用途</th><th style="width:44%">地址</th><th>说明</th></tr>
+      <tr>
+        <td>管理面板</td>
+        <td><span class="addr">http://127.0.0.1:8731/</span></td>
+        <td>浏览器打开：看卡片、改配置、取令牌、查日志</td>
+      </tr>
+      <tr>
+        <td>API</td>
+        <td><span class="addr">http://127.0.0.1:8730</span></td>
+        <td>客户端填这个，<strong>不要填面板地址</strong></td>
+      </tr>
+    </table>
     <p class="note">
-      如果客户端与服务端装在<strong>同一台</strong>机器上，可以直接点「连接本机服务端」按钮，
-      它会自动探测并填好这两项。
+      0.1.2 起两者<strong>彻底解耦</strong>：API 监听地址与面板监听地址是两个独立配置项，
+      改一个不会连带改另一个。把 API 改成 <code>0.0.0.0</code> 给局域网用时，
+      面板仍只监听本机 —— 这是刻意设计：面板本身不带登录，不该出现在局域网上。
     </p>
   </section>
 
   <section>
-    <h2><span class="n">4</span>常见问题</h2>
+    <h2><span class="n">3</span>三种令牌，先弄清再用</h2>
+    <p>0.1.2 起服务端有三类凭证，权限范围完全不同：</p>
     <table>
-      <tr><th style="width:38%">现象</th><th>处置</th></tr>
+      <tr>
+        <th style="width:20%">凭证</th>
+        <th style="width:26%">从哪拿</th>
+        <th style="width:30%">能看到什么</th>
+        <th>适用</th>
+      </tr>
+      <tr>
+        <td><strong>账户令牌</strong><br><span class="pill rec">推荐</span></td>
+        <td>客户端「登录」：填用户名 + 密码自动换取，有效期 2 小时并自动续期</td>
+        <td>该账户的<strong>全部仓库</strong></td>
+        <td>客户端日常使用。有账户就该用它</td>
+      </tr>
+      <tr>
+        <td><strong>仓库令牌</strong><br><code>tcr_…</code><span class="pill rec">推荐</span></td>
+        <td>客户端「仓库与令牌」里签发（需先登录账户），可设有效期</td>
+        <td>只限<strong>某一个仓库</strong>，范围分 <code>read</code> / <code>write</code> / <code>rollback</code></td>
+        <td>脚本、CI、共享给他人只读。原文只显示一次</td>
+      </tr>
+      <tr>
+        <td><strong>全局令牌</strong><br><span class="pill">legacy</span></td>
+        <td>面板「API 与令牌」页；或在安装目录运行<br><code>tcs-server.cmd token show</code><br>也写在配置文件 <code>auth.token</code></td>
+        <td><strong>只有尚未归属账户的卡片</strong>（0.1.2 起降权）</td>
+        <td>仅运维：接手历史数据、排查。不要用于日常</td>
+      </tr>
+    </table>
+    <div class="danger">
+      <strong>迁移完成后，全局令牌看不到任何卡片。</strong>
+      因为卡片都已归属到账户，而全局令牌只保留「未归属卡片」的可见范围。
+      它的设计用途是运维凭据，不是给人日常浏览的。
+      需要看卡片，请在客户端里<strong>登录账户</strong>（账户令牌）。
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">4</span>在客户端里连上</h2>
+    <ol>
+      <li>打开 Tavern Card Studio 客户端，进入「设置」。</li>
+      <li>「服务端地址」填 <span class="addr">http://127.0.0.1:8730</span>（是 8730，不是面板的 8731）。</li>
+      <li>点「测试连接」，看到「已连接（服务端 0.1.2），token 有效」说明网络与令牌都通了。</li>
+      <li>再点「登录」，用第 1 节建的账户登录 —— 登录后才会以账户身份看自己的卡片与仓库。</li>
+    </ol>
+    <h3>「连接本机服务端」按钮</h3>
+    <p>
+      客户端与服务端装在<strong>同一台</strong>机器上时，可以直接点这个按钮：
+      它会探测本机的 8730 / 8731，自动把「服务端地址」和「访问令牌」填好，
+      省掉手抄。它填进去的是<strong>全局令牌</strong>，所以<strong>不代替登录</strong>——
+      要看自己的卡片，仍然要点「登录」。
+    </p>
+    <p class="note">
+      如果它报「API 端口对得上、面板对得上，但令牌取不到」，多半是反代没登记信任
+      （见第 5 节 <code>trustProxy</code>）；如果它报「端口变了」，
+      回面板「参数配置」看实际监听地址。
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="n">5</span>公网 / 云部署检查清单</h2>
+    <p>只在本机或内网用，可以跳过这一节。要放到公网上，逐条确认：</p>
+    <table>
+      <tr><th style="width:26%">检查项</th><th>怎么做</th></tr>
+      <tr>
+        <td><strong>① 选对 <code>tls.mode</code></strong></td>
+        <td>
+          <code>off</code> 仅本机/可信内网；<code>selfsigned</code> 自签证书（客户端首次要核对指纹）；
+          <code>custom</code> 用你自己的证书。放在反向代理后面时，业务侧可以是 <code>off</code>，
+          TLS 由代理终止。证书默认在 <code class="path">C:\ProgramData\TavernCardStudio\tls\</code>。
+        </td>
+      </tr>
+      <tr>
+        <td><strong>② 显式配置 <code>trustProxy</code></strong></td>
+        <td>
+          默认是<strong>空数组 = 不信任任何代理头</strong>。放在反向代理后面就必须把代理地址填进去
+          （同机通常是 <code>127.0.0.1</code>），否则服务端只会看到代理的 IP：
+          取令牌接口一律拒绝、登录失败限速会把所有人算成同一个来源。
+          配置后打开面板「总览」页，「可信代理」那一行应当显示已生效的代理数 —— 一直是 0 说明地址写错了。
+        </td>
+      </tr>
+      <tr>
+        <td><strong>③ 防火墙只放 <code>httpsPort</code></strong></td>
+        <td>
+          用 HTTPS 时只对外开 <code>httpsPort</code>（默认 8443），把 <code>port</code>（8730）
+          与面板端口（8731）挡在防火墙后面。注意：开启 TLS 后明文端口仍会同时服务，
+          没有独立关闭开关，所以这一条<strong>只能靠防火墙</strong>做到。
+        </td>
+      </tr>
+    </table>
+    <p class="note">
+      更完整的部署形态（Caddy / nginx 反代、证书选型、首次建管理员流程）见项目文档的云部署手册。
+    </p>
+  </section>
+
+  <section>
+    <h2><span class="n">6</span>常见问题</h2>
+    <table>
+      <tr><th style="width:34%">现象</th><th>处置</th></tr>
       <tr>
         <td>面板 <code>127.0.0.1:8731</code> 打不开</td>
         <td>服务可能没启动。打开「服务」(services.msc)，看 <code>Tavern Card Studio Server</code> 的状态，不是「正在运行」就右键启动。</td>
       </tr>
       <tr>
-        <td>服务启动失败 / 一直是「正在启动」</td>
-        <td>看 <code class="path">C:\ProgramData\TavernCardStudio\logs\</code> 下的日志；
-            服务依赖 .NET Framework 4.x（Win10/11 自带）。</td>
+        <td>服务启动失败（SCM 报 1067 / 一直「正在启动」）</td>
+        <td>
+          看 <code class="path">C:\ProgramData\TavernCardStudio\logs\tcs-service-host.err.log</code>。
+          若出现 <code>Cannot find package</code>，说明安装包缺运行时依赖 ——
+          用 0.1.2 的修复版重装；也可在安装目录跑
+          <code>.\tcs-server.cmd selfcheck</code> 离线核对依赖。
+        </td>
+      </tr>
+      <tr>
+        <td>登录提示账户不存在 / 密码错</td>
+        <td>
+          先在安装目录跑 <code>.\tcs-server.cmd user list</code> 确认账户在服务用的那个库里。
+          如果 list 里也没有，多半是第 1 节那条警告：命令没在安装目录里跑。
+        </td>
+      </tr>
+      <tr>
+        <td>登录后看不到以前上传的卡片</td>
+        <td>
+          历史卡片还没归属。跑 <code>.\tcs-server.cmd user migrate admin</code>
+          （已有账户时它会把没归属的卡片接管进来），或对指定账户跑
+          <code>user adopt &lt;用户名&gt;</code>。
+        </td>
       </tr>
       <tr>
         <td>客户端提示「令牌无效」</td>
-        <td>重新从面板复制一次（注意别带多余空格）。若在面板里点过「轮换令牌」，旧令牌会立即失效。</td>
+        <td>
+          用的是全局令牌，而它已被降权 / 轮换过。改用「登录」。
+          若在面板点过「轮换令牌」，旧全局令牌会立即失效。
+        </td>
       </tr>
       <tr>
         <td>改了端口后连不上</td>
-        <td>回面板「参数配置」页确认实际端口，客户端地址要跟着改。改完需要重启服务。</td>
+        <td>回面板「参数配置」确认实际端口，客户端地址跟着改。改完需要重启服务。</td>
       </tr>
     </table>
   </section>
