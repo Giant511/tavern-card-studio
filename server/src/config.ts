@@ -17,6 +17,25 @@ export const CONFIG_SCHEMA_VERSION = 1 as const;
 /** 服务进程管理模式 */
 export type ServiceMode = 'process' | 'windows-service';
 
+/**
+ * TLS 配置（T10.5 / 需求 F1.3）。
+ *
+ * `httpsPort` 与 HTTP 的 `port` **分开**：需求要求"模式内可同时服务"，
+ * 两个协议各占一个端口，客户端才能先改地址验证、再决定是否关掉 HTTP。
+ */
+export interface TlsConfig {
+  /** off：只走 HTTP（面板与登录页常驻明文警告）｜selfsigned：自签｜custom：自带证书 */
+  mode: 'off' | 'selfsigned' | 'custom';
+  /** HTTPS 端口，默认 8443（与 HTTP 的 8730 区分开） */
+  httpsPort: number;
+  /** custom 模式的证书路径（PEM） */
+  certPath: string;
+  /** custom 模式的私钥路径（PEM） */
+  keyPath: string;
+}
+
+export const DEFAULT_HTTPS_PORT = 8443;
+
 export interface ServiceConfig {
   /** process：由本进程自己启停；windows-service：通过 sc.exe / WinSW 管理的 Windows 服务 */
   mode: ServiceMode;
@@ -104,6 +123,8 @@ export interface ServerConfigFile {
   /** 日志级别 */
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   auth: AuthConfig;
+  /** TLS 三模式（T10.5），见 {@link TlsConfig} */
+  tls: TlsConfig;
   service: ServiceConfig;
   /** 创建时间（ISO 8601） */
   createdAt: string;
@@ -242,6 +263,14 @@ export function createDefaultConfig(overrides: ConfigOverrides = {}): ServerConf
       displayName: 'Tavern Card Studio Server',
       autoStart: true,
     },
+    // 默认 off：v0.1.1 之前全是明文 HTTP，升级后突然要求证书会让所有已装客户端
+    // 立刻连不上。开 TLS 是一次显式的、可回退的决定（需求 F1.3 的"off 保留 HTTP 行为"）。
+    tls: {
+      mode: 'off',
+      httpsPort: DEFAULT_HTTPS_PORT,
+      certPath: '',
+      keyPath: '',
+    },
     createdAt: now,
     updatedAt: now,
   };
@@ -304,6 +333,20 @@ export function normalizeConfig(input: unknown, overrides: ConfigOverrides = {})
       displayName: str(serviceRaw['displayName'], base.service.displayName),
       autoStart: serviceRaw['autoStart'] === undefined ? base.service.autoStart : serviceRaw['autoStart'] !== false,
     },
+    tls: (() => {
+      const rawTls = (raw['tls'] ?? {}) as Record<string, unknown>;
+      const mode = rawTls['mode'];
+      const validModes = ['off', 'selfsigned', 'custom'];
+      const httpsPort = num(rawTls['httpsPort'], base.tls.httpsPort);
+      return {
+        // 非法 mode 回落到 off 而不是 closest match：静默纠正配置比报错更难排查
+        mode: (validModes.includes(mode as string) ? mode : 'off') as TlsConfig['mode'],
+        // 0 或超范围会让 listen(0) 变成随机端口，用户找不到；拉回默认
+        httpsPort: httpsPort >= 1 && httpsPort <= 65535 ? httpsPort : DEFAULT_HTTPS_PORT,
+        certPath: str(rawTls['certPath'], base.tls.certPath),
+        keyPath: str(rawTls['keyPath'], base.tls.keyPath),
+      };
+    })(),
     createdAt: str(raw['createdAt'], base.createdAt),
     updatedAt: str(raw['updatedAt'], base.updatedAt),
   };
@@ -365,6 +408,27 @@ export function assertSafeConfig(config: ServerConfigFile): void {
           'SecurityWarning',
         )
       : undefined;
+  }
+
+  // ── TLS（T10.5）──────────────────────────────────────────
+  //
+  // 这里只做**配置形状**校验；证书文件是否存在、公私钥是否匹配属于
+  // `prepareTlsMaterial`（有 I/O，不该塞进纯函数式的配置校验）。
+  // 但两种"必然失败"的形状要在这里挡掉，否则服务会先起来再在启动后段失败，
+  // 日志里多一段"HTTP 已监听"的噪声。
+  if (config.tls.mode === 'custom') {
+    if (config.tls.certPath.trim() === '' || config.tls.keyPath.trim() === '') {
+      throw new ConfigError(
+        'tls.mode=custom 时必须同时配置 tls.certPath 与 tls.keyPath（PEM 文件路径）；' +
+          '服务端不会因为缺证书而退回明文模式',
+      );
+    }
+  }
+  if (config.tls.mode !== 'off' && config.tls.httpsPort === config.port) {
+    throw new ConfigError(
+      `HTTPS 端口与 HTTP 端口相同（都是 ${String(config.port)}）：请把 tls.httpsPort 改成别的端口，` +
+        '两个协议需要各自监听',
+    );
   }
   if (config.port < 1 || config.port > 65535) {
     throw new ConfigError(`端口非法：${config.port}`);
