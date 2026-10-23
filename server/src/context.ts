@@ -12,7 +12,7 @@ import { CardService } from './storage/cards.js';
 import { Db } from './storage/db.js';
 import { GitStore } from './storage/git-store.js';
 
-export const SERVER_VERSION = '0.1.1';
+export const SERVER_VERSION = '0.1.2';
 export const API_VERSION = 'v1';
 
 export interface ServerContext {

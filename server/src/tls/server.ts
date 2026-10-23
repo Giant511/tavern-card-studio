@@ -183,7 +183,9 @@ export async function startHttpsServer(
   };
 }
 
-/** off 模式的常驻警告文案（面板、登录页、启动日志共用一句） */
+/**
+ * off 模式的常驻警告文案（面板、登录页、启动日志共用一句）
+ */
 export const PLAINTEXT_BANNER = {
   level: 'danger' as const,
   title: '明文传输（HTTP）',
@@ -193,29 +195,62 @@ export const PLAINTEXT_BANNER = {
 };
 
 /**
- * 面板/登录页的 TLS 状态摘要（下发给 Web UI，由前端决定怎么展示）。
+ * 「实际生效的 TLS 状态」——`/api/stats` 下发的 `tls` 就是它（T10.10 抽出来的）。
  *
- * `plaintext: true` 时前端必须显示常驻红色横幅 —— 不是一次性 toast，
- * 因为明文是一个**持续存在**的事实，划过去的提示等于没提示。
+ * 为什么要单独一个函数：这段装配原先写在 worker 里，于是「面板看到的指纹」与
+ * 「用户日志里核对的指纹」是**两段独立代码**算出来的，而单测只能覆盖其中一段。
+ * 更糟的是 T10.5 还留了一个从未被调用的 `tlsSummary()`，输出的是**另一套嵌套形状**
+ * （`tls.certificate.fingerprint`）—— 写验证脚本时按它去读，得到 undefined，
+ * 断言失败而服务端其实完全正常。现在只有这一个函数，线上格式与测试对象是同一份。
+ *
+ * `httpsPort` 传 `null` 表示"HTTPS 没起来"（off 模式，或 selfsigned/custom 的
+ * 端口被占用后 worker 启动失败前的中间态），不能拿配置里的值冒充实际监听。
  */
-export function tlsSummary(config: TlsConfig, info: CertificateInfo | null): Record<string, unknown> {
+export function runtimeTlsState(
+  mode: TlsMode,
+  httpsPort: number | null,
+  prepared: PreparedTls,
+): RuntimeTlsStateShape {
   return {
-    mode: config.mode,
-    httpsPort: config.mode === 'off' ? null : config.httpsPort,
-    plaintext: config.mode === 'off',
-    banner: config.mode === 'off' ? PLAINTEXT_BANNER : null,
-    certificate: info
-      ? {
-          fingerprint: info.fingerprint,
-          subject: info.subject,
-          notBefore: info.notBefore,
-          notAfter: info.notAfter,
-          daysUntilExpiry: info.daysUntilExpiry,
-          selfSigned: info.selfSigned,
-        }
-      : null,
+    mode,
+    httpsPort,
+    fingerprint: prepared.info?.fingerprint ?? null,
+    subject: prepared.info?.subject ?? null,
+    notBefore: prepared.info?.notBefore ?? null,
+    notAfter: prepared.info?.notAfter ?? null,
+    daysUntilExpiry: prepared.info?.daysUntilExpiry ?? null,
+    selfSigned: prepared.info?.selfSigned ?? false,
+    plaintext: prepared.plaintext,
+    warnings: [...prepared.warnings],
   };
 }
+
+/** 与 `context.ts` 的 `RuntimeTlsState` 同形（那边依赖本模块的类型，不能反向 import） */
+export interface RuntimeTlsStateShape {
+  mode: TlsMode;
+  httpsPort: number | null;
+  fingerprint: string | null;
+  subject: string | null;
+  notBefore: string | null;
+  notAfter: string | null;
+  daysUntilExpiry: number | null;
+  selfSigned: boolean;
+  plaintext: boolean;
+  warnings: string[];
+}
+
+/**
+ * 已删除：`tlsSummary()`（T10.5 遗留）。
+ *
+ * 它号称是"下发给 Web UI 的 TLS 状态"，但**没有任何调用方** —— 真正的线上格式是
+ * `ServerContext.tls`（`context.ts` 的 `RuntimeTlsState`，字段是**扁平**的
+ * `fingerprint / selfSigned / …`，由 `/api/stats` 直接下发）。
+ *
+ * 两套同义结构并列存在是纯粹的陷阱：T10.10 写"核对指纹"的验证脚本时，
+ * 按这个函数的形状去读 `stats.tls.certificate.fingerprint`，得到 undefined，
+ * 而服务端其实一切正常 —— 断言失败，但错的是契约。留着它，下一次还会有别人踩。
+ * 单一事实来源是 `RuntimeTlsState`。
+ */
 
 /** 供测试与 supervisor 复用的 HTTP server 类型别名 */
 export type { HttpServer };

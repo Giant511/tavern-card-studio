@@ -125,6 +125,12 @@ export function registerRepoRoutes(router: Registrar, deps: RepoRouteDeps): void
 
   router.get('/api/repos', (ctx) => {
     const caller = requireAccount(ctx, deps);
+    // 仓库令牌**不能**列仓库（T10.10 交叉剧本发现）：
+    // 它绑定的那一个仓库之外的东西不该被它看见（同账户的兄弟仓库名/id 也是）。
+    // 更现实的问题在客户端：`GET /api/repos` 一旦成功，同步面板就会渲染仓库下拉，
+    // 而上传时服务端忽略 query.repo（令牌绑定优先）—— 用户选了个"改了不生效"的下拉。
+    // 拒绝后客户端按"拿不到列表"整行隐藏，与决策 #51 的约定一致。
+    rejectRepoToken(caller);
     const rows = deps.repos.list(caller.userId!);
     sendJson(ctx.res, 200, { items: rows.map((row) => deps.repos.toPublic(row)) });
   });
