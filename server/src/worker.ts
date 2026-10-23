@@ -137,10 +137,47 @@ export async function startWorker(loaded: LoadedConfig): Promise<RunningWorker> 
     trustProxy: loaded.config.trustProxy.length > 0 ? loaded.config.trustProxy : '（未信任任何代理，忽略全部代理头）',
   });
 
+  /**
+   * 回收站清理任务（F13.2）。
+   *
+   * 为什么用 `setInterval` + `unref()` 而不是 cron/外部调度：
+   * 服务端要能在 Windows 服务、绿色包前台、测试进程三种形态下都自己跑起来，
+   * 不依赖任何外部编排。`unref()` 让这个定时器**不阻止进程退出** ——
+   * 否则 worker 收到 SIGTERM 后要等最长一个周期才走，服务停止会明显变慢。
+   *
+   * 间隔 1 小时：保留期以"天"计，分钟级精度没有意义；
+   * 启动时先跑一轮，避免"服务长期不重启 → 过期数据一直不清理"。
+   */
+  const retentionDays = loaded.config.trash.retentionDays;
+  const runTrashCleanup = (): void => {
+    if (retentionDays <= 0) return;
+    void context.cards
+      .purgeExpired(retentionDays)
+      .then((result) => {
+        if (result.purged.length > 0) {
+          context.logger.info('trash.cleanup', {
+            retentionDays,
+            scanned: result.scanned,
+            purged: result.purged.length,
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        // 清理失败不该影响服务可用性：记一条 warn，下一轮再试
+        context.logger.warn('trash.cleanup.failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+  };
+  const trashTimer = setInterval(runTrashCleanup, 60 * 60 * 1000);
+  trashTimer.unref();
+  runTrashCleanup();
+
   let closing = false;
   const close = async (): Promise<void> => {
     if (closing) return;
     closing = true;
+    clearInterval(trashTimer);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (https) await https.close();
     context.db.close();

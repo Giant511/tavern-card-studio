@@ -160,6 +160,41 @@ function rawHeaders(ctx: RouteContext, sha256: string, size: number, filename: s
  *
  * `operation` 的口径由 `requiredScope()` 单一来源决定（delete → write）。
  */
+/**
+ * 仅管理员（F13.1）。
+ *
+ * `legacy` 令牌也算管理员：它在 v0.1.1 时期就是全权运维凭证，
+ * 引入账户后如果反而缩权，"升级后运维脚本突然不能用了"。
+ * 但它的**可见范围**已被降权为"未归属卡片"（docs/29 §2），
+ * 所以它能 purge 的只是那些卡 —— 权限与可见范围是两件事。
+ *
+ * 没有身份（`auth.require=false` 的回环开发模式）视为管理员：
+ * 那种模式本来就没有第二个使用者，拦它只会让人在本地开发时莫名 403。
+ */
+function requireAdmin(gate: TokenGate, routeCtx: RouteContext, what: string): void {
+  const identity = gate.identify(routeCtx.req);
+  if (identity === null) return;
+  if (identity.role !== 'admin') {
+    throw new AppError(403, 'ADMIN_ONLY', `${what}仅管理员可用`, {
+      hint: '普通账户请使用「删除」（进回收站，保留期内可恢复）；彻底清除只能由管理员执行',
+      yourRole: identity.role,
+    });
+  }
+}
+
+/** 审计用：操作者与来源地址（F13.1 要求"审计日志记录操作者"） */
+function auditActor(gate: TokenGate, routeCtx: RouteContext): { actor: string; ip: string | null } {
+  const identity = gate.identify(routeCtx.req);
+  const actor =
+    identity === null
+      ? 'local'
+      : identity.via === 'legacy'
+        ? 'legacy'
+        : (identity.username ?? identity.userId ?? 'unknown');
+  const ip = routeCtx.req.socket.remoteAddress ?? null;
+  return { actor, ip };
+}
+
 function assertPermission(gate: TokenGate, routeCtx: RouteContext, operation: Operation): void {
   const identity = gate.identify(routeCtx.req);
   // 没有身份时交给 TokenGate.check 已经拦过了（这里只处理"有身份但权限不够"）
@@ -472,13 +507,70 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     sendJson(_ctx.res, 200, card);
   });
 
+  /**
+   * 软删除（F13.2）。`?hard=true` 保留为**兼容写法**，但语义已改为 purge
+   * 且仅管理员可用 —— 以前任何有写权限的凭证都能物理删除，那是保留期的漏洞。
+   */
   router.delete('/api/cards/:id', async (_ctx) => {
     assertPermission(gate, _ctx, 'delete');
-    const result = await ctx.cards.delete(_ctx.params['id']!, {
-      hard: queryBool(_ctx.query, 'hard'),
-      scope: scopeFromIdentity(gate.identify(_ctx.req)),
-    });
+    const scope = scopeFromIdentity(gate.identify(_ctx.req));
+    const audit = auditActor(gate, _ctx);
+    if (queryBool(_ctx.query, 'hard')) {
+      requireAdmin(gate, _ctx, '彻底清除');
+      const purged = await ctx.cards.purge(_ctx.params['id']!, { scope, ...audit });
+      sendJson(_ctx.res, 200, { deleted: true, hard: true, ...purged });
+      return;
+    }
+    const result = await ctx.cards.delete(_ctx.params['id']!, { scope, ...audit });
     sendJson(_ctx.res, 200, { deleted: true, ...result });
+  });
+
+  /** 从回收站恢复（F13.2） */
+  router.post('/api/cards/:id/restore', async (_ctx) => {
+    assertPermission(gate, _ctx, 'delete');
+    const result = await ctx.cards.restore(_ctx.params['id']!, {
+      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      ...auditActor(gate, _ctx),
+    });
+    sendJson(_ctx.res, 200, result);
+  });
+
+  /** 彻底清除（F13.2）：仅管理员，绕过保留期 */
+  router.post('/api/cards/:id/purge', async (_ctx) => {
+    assertPermission(gate, _ctx, 'delete');
+    requireAdmin(gate, _ctx, '彻底清除');
+    const result = await ctx.cards.purge(_ctx.params['id']!, {
+      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      ...auditActor(gate, _ctx),
+    });
+    sendJson(_ctx.res, 200, result);
+  });
+
+  /** 清除某版本内容（F13.3）：元数据保留，正文与 sha256 置空 */
+  router.post('/api/cards/:id/versions/:seq/prune', async (_ctx) => {
+    assertPermission(gate, _ctx, 'write');
+    const seq = Number(_ctx.params['seq']);
+    if (!Number.isInteger(seq) || seq < 1) {
+      throw new AppError(400, 'BAD_REQUEST', 'seq 必须是正整数版本序号');
+    }
+    const result = await ctx.cards.prune(_ctx.params['id']!, seq, {
+      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      ...auditActor(gate, _ctx),
+    });
+    sendJson(_ctx.res, 200, result);
+  });
+
+  /** 移动卡片到另一个仓库（F13.4）：改归属，不动 updated_at */
+  router.post('/api/cards/:id/move', async (_ctx) => {
+    assertPermission(gate, _ctx, 'write');
+    const body = parseJsonBody<Record<string, unknown>>(_ctx.body, {});
+    const repoId = typeof body['repo'] === 'string' ? body['repo'].trim() : '';
+    const result = await ctx.cards.move(_ctx.params['id']!, repoId, {
+      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      reason: typeof body['reason'] === 'string' ? body['reason'] : undefined,
+      ...auditActor(gate, _ctx),
+    });
+    sendJson(_ctx.res, 200, result);
   });
 
   router.get('/api/cards/:id/raw', (_ctx) => {

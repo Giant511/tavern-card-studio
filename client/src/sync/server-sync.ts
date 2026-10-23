@@ -55,7 +55,8 @@ export class SyncError extends Error {
 export interface VersionSummary {
   seq: number;
   commit: string;
-  sha256: string;
+  /** 内容被清除（prune）后为 null —— 渲染前必须判空，不能直接 slice */
+  sha256: string | null;
   size: number;
   message: string;
   author: string;
@@ -67,6 +68,10 @@ export interface VersionSummary {
     info: number;
     exportable: boolean;
   } | null;
+  /** F13.3：内容已被清除（元数据仍在） */
+  pruned?: boolean;
+  prunedAt?: string | null;
+  prunedBy?: string | null;
 }
 
 export interface CardSummary {

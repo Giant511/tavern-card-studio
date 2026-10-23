@@ -62,6 +62,21 @@ export class BlobStore {
     return existsSync(this.pathFor(sha256));
   }
 
+  /**
+   * 删除一份 blob（T10.18 / purge 用）。
+   *
+   * **只在确认没有任何版本还引用它时调用** —— blob 是按内容去重的，
+   * 同一份字节可能被多张卡、多个版本共享。调用点必须先查
+   * `Db.countVersionsUsingBlob`，否则会删掉别人还在用的内容
+   * （表现为"另一张卡突然读不出来"，而不是报错）。
+   */
+  remove(sha256: string): boolean {
+    const path = this.pathFor(sha256);
+    if (!existsSync(path)) return false;
+    rmSync(path, { force: true });
+    return true;
+  }
+
   put(bytes: Uint8Array): PutResult {
     const sha256 = BlobStore.sha256(bytes);
     const target = this.pathFor(sha256);

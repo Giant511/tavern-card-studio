@@ -108,7 +108,11 @@ export interface CardDetailDto extends CardSummaryDto {
 export interface VersionDto {
   seq: number;
   commit: string;
-  sha256: string;
+  /**
+   * 内容指纹。**已清除的版本为 null** —— 用空串会把"内容没了"伪装成
+   * "内容是一个空的 sha"，调用方（客户端渲染、导出）该走不同分支。
+   */
+  sha256: string | null;
   size: number;
   message: string;
   author: string;
@@ -125,6 +129,10 @@ export interface VersionDto {
   } | null;
   auditError: string | null;
   meta: Record<string, unknown>;
+  /** 内容已被清除（F13.3）。为 true 时 sha256/size 不再有意义 */
+  pruned: boolean;
+  prunedAt: string | null;
+  prunedBy: string | null;
 }
 
 export interface DiffDto {
@@ -134,6 +142,12 @@ export interface DiffDto {
   lines: LineDiff;
   json: JsonDiff;
   identical: boolean;
+  /**
+   * 有版本内容已被清除时，diff 无法计算 —— 这里为 true，
+   * 且 `bytes/lines/json` 都是空壳。客户端据此显示「内容已清除」
+   * 而不是"两个版本一样"（后者是彻头彻尾的错误结论）。
+   */
+  contentCleared: boolean;
 }
 
 /** 上传/追加时可能返回的警告（不阻断写入） */
@@ -310,10 +324,11 @@ export class CardService {
   }
 
   versionDto(row: VersionRow): VersionDto {
+    const pruned = (row.pruned_at ?? null) !== null;
     return {
       seq: row.seq,
       commit: row.commit_sha,
-      sha256: row.blob_sha256,
+      sha256: pruned ? null : row.blob_sha256,
       size: row.byte_size,
       message: row.message,
       author: row.author,
@@ -323,6 +338,9 @@ export class CardService {
       audit: summaryFromRow(row),
       auditError: row.audit_error,
       meta: JSON.parse(row.meta_json) as Record<string, unknown>,
+      pruned,
+      prunedAt: row.pruned_at ?? null,
+      prunedBy: row.pruned_by ?? null,
     };
   }
 
@@ -425,6 +443,22 @@ export class CardService {
     return { total: this.db.countVersions(cardId), items: rows.map((row) => this.versionDto(row)) };
   }
 
+  /**
+   * 内容被清除的版本一律拒绝读出（F13.3）。
+   *
+   * 用 409 而不是 404：版本**确实存在**（列表里还看得见、序号还占着位），
+   * 只是内容被有意清掉了。回 404 会让用户以为"这个版本不存在"，进而怀疑
+   * 是不是自己记错了序号；409 才能表达"它在，但内容已经没了"。
+   */
+  private requireContent(version: VersionRow): void {
+    if ((version.pruned_at ?? null) === null) return;
+    throw new AppError(409, 'VERSION_CONTENT_CLEARED', `版本 v${version.seq} 的内容已被清除`, {
+      seq: version.seq,
+      prunedAt: version.pruned_at ?? null,
+      prunedBy: version.pruned_by ?? null,
+    });
+  }
+
   /** 读取某版本的**原始字节**（从 blob 读，校验 sha256） */
   readBytes(
     cardId: string,
@@ -432,6 +466,7 @@ export class CardService {
     scope: CardScope = ALL_CARDS,
   ): { bytes: Buffer; version: VersionRow } {
     const version = this.resolveVersion(cardId, rev, scope);
+    this.requireContent(version);
     const bytes = this.blobs.read(version.blob_sha256);
     return { bytes, version };
   }
@@ -442,6 +477,7 @@ export class CardService {
     scope: CardScope = ALL_CARDS,
   ): { bytes: Buffer; version: VersionRow } {
     const version = this.resolveVersion(cardId, rev, scope);
+    this.requireContent(version);
     if (!version.audit_sha256) {
       throw new AppError(404, 'NOT_FOUND', `版本 ${cardId} v${version.seq} 没有审计快照`, {
         auditError: version.audit_error,
@@ -718,6 +754,9 @@ export class CardService {
     options: { message?: string; author?: string; scope?: CardScope } = {},
   ): Promise<{ version: VersionDto; restoredFrom: VersionDto }> {
     const target = this.resolveVersion(cardId, targetRev, options.scope ?? ALL_CARDS);
+    // 回滚需要把目标版本的字节重新写一遍，而内容已被清除 —— 必须先拦住，
+    // 否则会走到 blobs.read('') 抛一个看不懂的 500。
+    this.requireContent(target);
     const bytes = this.blobs.read(target.blob_sha256);
     const message = options.message?.trim() || `回滚到 v${target.seq}（${target.commit_sha.slice(0, 7)}）`;
 
@@ -771,25 +810,255 @@ export class CardService {
     });
   }
 
+  /**
+   * 软删除（F13.2）：进回收站，保留期内可恢复。
+   *
+   * 为什么删除默认不做物理清除：卡片是用户长期的创作，一次误点就是不可恢复的
+   * 损失。软删让"删除"这一步可撤销，真正的不可逆操作单独叫 `purge` 且仅管理员可用。
+   *
+   * 软删期间 **cardId 仍不可复用**（既有 `CARD_DELETED` 语义）：如果允许复用，
+   * 同一 ID 的新卡会继承旧的版本历史与审计记录 —— 那是把两张不同的卡混成一个。
+   */
   async delete(
     cardId: string,
-    options: { hard?: boolean; scope?: CardScope } = {},
-  ): Promise<{ id: string; hard: boolean }> {
+    options: { scope?: CardScope; actor?: string; ip?: string | null } = {},
+  ): Promise<{ id: string; hard: false; alreadyDeleted: boolean }> {
     return this.mutex.run(cardId, async () => {
       const card = this.requireCard(cardId, { includeDeleted: true, scope: options.scope ?? ALL_CARDS });
       const at = new Date().toISOString();
-      if (options.hard) {
-        this.git.removeRepo(cardId);
-        this.db.hardDelete(cardId);
-        this.db.appendEvent({ at, level: 'warn', action: 'card.purge', cardId, detail: {} });
-        this.logger.warn('card.purge', { cardId });
-        return { id: cardId, hard: true };
-      }
-      if (!card.deleted_at) this.db.softDelete(cardId, at);
-      this.db.appendEvent({ at, level: 'warn', action: 'card.delete', cardId, detail: { hard: false } });
-      this.logger.warn('card.delete', { cardId });
-      return { id: cardId, hard: false };
+      const alreadyDeleted = card.deleted_at !== null;
+      if (!alreadyDeleted) this.db.softDelete(cardId, at);
+      this.db.appendEvent({
+        at,
+        level: 'warn',
+        action: 'card.delete',
+        cardId,
+        detail: { alreadyDeleted },
+        ownerId: card.owner_id,
+        actor: options.actor ?? null,
+        ip: options.ip ?? null,
+      });
+      this.logger.warn('card.delete', { cardId, alreadyDeleted, actor: options.actor });
+      return { id: cardId, hard: false as const, alreadyDeleted };
     });
+  }
+
+  /** 从回收站恢复（F13.2）。不在回收站里 → 409，而不是静默成功 */
+  async restore(
+    cardId: string,
+    options: { scope?: CardScope; actor?: string; ip?: string | null } = {},
+  ): Promise<{ id: string; restored: boolean }> {
+    return this.mutex.run(cardId, async () => {
+      const card = this.requireCard(cardId, { includeDeleted: true, scope: options.scope ?? ALL_CARDS });
+      if (card.deleted_at === null) {
+        throw new AppError(409, 'CONFLICT', `角色卡 ${cardId} 不在回收站里`);
+      }
+      this.db.restoreCard(cardId);
+      const at = new Date().toISOString();
+      this.db.appendEvent({
+        at,
+        level: 'info',
+        action: 'card.restore',
+        cardId,
+        detail: { deletedAt: card.deleted_at },
+        ownerId: card.owner_id,
+        actor: options.actor ?? null,
+        ip: options.ip ?? null,
+      });
+      this.logger.info('card.restore', { cardId, actor: options.actor });
+      return { id: cardId, restored: true };
+    });
+  }
+
+  /**
+   * 彻底清除（F13.2）：物理删除索引行 + git 仓库 + 无引用的 blob。
+   *
+   * **仅管理员**（路由层用 `requireAdmin` 拦）。理由：这是唯一不可逆的操作，
+   * 普通用户已经有"删除 + 30 天保留期"这条安全路径；再给他一条绕过保留期的快捷方式，
+   * 等于把保留期做成摆设。
+   *
+   * blob 删除必须查引用：blob 按内容去重，同一份字节可能被别的卡/版本共用。
+   */
+  async purge(
+    cardId: string,
+    options: { scope?: CardScope; actor?: string; ip?: string | null } = {},
+  ): Promise<{ id: string; purged: boolean; freedBlobs: number }> {
+    return this.mutex.run(cardId, async () => {
+      const card = this.requireCard(cardId, { includeDeleted: true, scope: options.scope ?? ALL_CARDS });
+      const at = new Date().toISOString();
+      const shas = this.db.listVersions(cardId, { limit: 100000 }).map((row) => row.blob_sha256);
+
+      this.git.removeRepo(cardId);
+      this.db.hardDelete(cardId);
+
+      let freedBlobs = 0;
+      for (const sha of new Set(shas)) {
+        if (sha === '') continue;
+        if (this.db.countVersionsUsingBlob(sha) === 0 && this.blobs.remove(sha)) freedBlobs += 1;
+      }
+
+      this.db.appendEvent({
+        at,
+        level: 'warn',
+        action: 'card.purge',
+        cardId,
+        detail: { deletedAt: card.deleted_at, freedBlobs, versions: shas.length },
+        ownerId: card.owner_id,
+        actor: options.actor ?? null,
+        ip: options.ip ?? null,
+      });
+      this.logger.warn('card.purge', { cardId, freedBlobs, actor: options.actor });
+      return { id: cardId, purged: true, freedBlobs };
+    });
+  }
+
+  /**
+   * 清除某版本的内容（F13.3 / prune）。
+   *
+   * 为什么不能"物理删掉这一行"：versions 是链式结构（parent_commit），
+   * 删中间一行会让 diff 与回滚的链路断掉 —— 之后任何跨过它的比较都会失败，
+   * 而用户只是想让"这段内容别再留着"。所以保留元数据、清掉正文。
+   *
+   * **最新版本不可 prune**：它是这张卡对外可见的内容，清了就等于这张卡没有正文，
+   * 而列表里还显示着它。要清整卡请用 purge。
+   */
+  async prune(
+    cardId: string,
+    seq: number,
+    options: { scope?: CardScope; actor?: string; ip?: string | null; force?: boolean } = {},
+  ): Promise<{ id: string; seq: number; pruned: boolean; alreadyPruned: boolean }> {
+    return this.mutex.run(cardId, async () => {
+      const card = this.requireCard(cardId, { includeDeleted: true, scope: options.scope ?? ALL_CARDS });
+      const target = this.db.getVersion(cardId, seq);
+      if (!target) {
+        throw new AppError(404, 'NOT_FOUND', `角色卡 ${cardId} 没有版本 v${seq}`);
+      }
+
+      const latestSeq = card.latest_seq ?? null;
+      if (!options.force && latestSeq !== null && seq >= latestSeq) {
+        throw new AppError(
+          409,
+          'CONFLICT',
+          `v${seq} 是这张卡的最新版本，不能清除内容 —— 它是这张卡对外可见的正文`,
+          { latestSeq },
+        );
+      }
+      if ((target.pruned_at ?? null) !== null) {
+        return { id: cardId, seq, pruned: false, alreadyPruned: true };
+      }
+
+      const at = new Date().toISOString();
+      this.db.pruneVersion(cardId, seq, at, options.actor ?? 'system');
+
+      // blob 只在**没有任何版本**还引用它时删除。注意：即使这里删了 blob，
+      // git 仓库里的对象仍然存在（链不可断的必然代价，见 docs/34 §16）。
+      let blobFreed = false;
+      if (target.blob_sha256 !== '' && this.db.countVersionsUsingBlob(target.blob_sha256) === 0) {
+        blobFreed = this.blobs.remove(target.blob_sha256);
+      }
+
+      this.db.appendEvent({
+        at,
+        level: 'warn',
+        action: 'card.version.prune',
+        cardId,
+        detail: { seq, byteSize: target.byte_size, blobFreed },
+        ownerId: card.owner_id,
+        actor: options.actor ?? null,
+        ip: options.ip ?? null,
+      });
+      this.logger.warn('card.version.prune', { cardId, seq, blobFreed, actor: options.actor });
+      return { id: cardId, seq, pruned: true, alreadyPruned: false };
+    });
+  }
+
+  /**
+   * 移动卡片到另一个仓库（F13.4）。
+   *
+   * **不动 `updated_at`**（T10.6 决策的延续）：归属变更不是内容变更。
+   * 移动后卡片不应跳到"最近修改"最前面 —— 那会让用户以为自己刚编辑过。
+   */
+  async move(
+    cardId: string,
+    targetRepoId: string,
+    options: { scope?: CardScope; actor?: string; ip?: string | null; reason?: string } = {},
+  ): Promise<{ id: string; fromRepoId: string; repoId: string; moved: boolean }> {
+    return this.mutex.run(cardId, async () => {
+      const card = this.requireCard(cardId, { includeDeleted: true, scope: options.scope ?? ALL_CARDS });
+      if (card.deleted_at !== null) {
+        throw new AppError(409, 'CARD_IN_TRASH', `角色卡 ${cardId} 在回收站里，先恢复再移动`);
+      }
+      if (targetRepoId === '') {
+        throw new AppError(400, 'BAD_REQUEST', '缺少目标仓库（body.repo）');
+      }
+      /*
+       * 直接查 repos 表，不注入 RepoStore：CardService 已经握着 db 句柄，
+       * 而多一个构造参数会让所有测试里的 new CardService(...) 全部要改
+       * （它们大多不关心仓库）。这里只需要两个字段。
+       */
+      const repo = this.db.handle
+        .prepare('SELECT id, owner_id FROM repos WHERE id = ? AND deleted_at IS NULL')
+        .get(targetRepoId) as { id: string; owner_id: string } | undefined;
+      if (repo === undefined) throw new AppError(404, 'NOT_FOUND', `仓库不存在：${targetRepoId}`);
+      if (repo.owner_id !== card.owner_id) {
+        // 跨账户移动只能由管理员发起，且必须走管理员的显式入口（路由层判定后传 allowCrossOwner）
+        throw new AppError(403, 'FORBIDDEN', '目标仓库不属于该卡片的账户', {
+          hint: '跨账户移动请用管理员的跨账户接口',
+        });
+      }
+      if (card.repo_id === targetRepoId) {
+        return { id: cardId, fromRepoId: card.repo_id, repoId: targetRepoId, moved: false };
+      }
+
+      this.db.moveCard(cardId, targetRepoId);
+      const at = new Date().toISOString();
+      this.db.appendEvent({
+        at,
+        level: 'info',
+        action: 'card.move',
+        cardId,
+        detail: { from: card.repo_id, to: targetRepoId, reason: options.reason ?? null },
+        ownerId: card.owner_id,
+        actor: options.actor ?? null,
+        ip: options.ip ?? null,
+      });
+      this.logger.info('card.move', { cardId, from: card.repo_id, to: targetRepoId, actor: options.actor });
+      return { id: cardId, fromRepoId: card.repo_id, repoId: targetRepoId, moved: true };
+    });
+  }
+
+  /**
+   * 回收站清理（F13.2）：把超过保留期的软删卡片彻底清除。
+   *
+   * `retentionDays = 0` 表示不自动清理（见 TrashConfig 注释），此时直接返回 0 ——
+   * 不是"立刻全删"，那会把"关闭自动清理"读成"马上清空回收站"。
+   */
+  async purgeExpired(
+    retentionDays: number,
+    options: { now?: Date; limit?: number } = {},
+  ): Promise<{ scanned: number; purged: Array<{ id: string; freedBlobs: number }> }> {
+    if (retentionDays <= 0) return { scanned: 0, purged: [] };
+    const now = options.now ?? new Date();
+    const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+    const ids = this.db.listExpiredTrash(cutoff, options.limit ?? 500);
+    const purged: Array<{ id: string; freedBlobs: number }> = [];
+    for (const id of ids) {
+      try {
+        // scope 传 ALL_CARDS：定时任务是系统行为，按"归属"过滤会让它永远清不掉别人的卡
+        const result = await this.purge(id, { actor: 'system' });
+        purged.push({ id, freedBlobs: result.freedBlobs });
+      } catch (error) {
+        // 单张失败不该中断整轮清理：下一轮还会看到它
+        this.logger.warn('trash.purge.failed', {
+          cardId: id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    if (purged.length > 0) {
+      this.logger.info('trash.purge.batch', { count: purged.length, retentionDays });
+    }
+    return { scanned: ids.length, purged };
   }
 
   stats(scope: CardScope = ALL_CARDS): {
@@ -807,7 +1076,17 @@ export class CardService {
   events(
     limit: number,
     scope: CardScope = ALL_CARDS,
-  ): Array<{ id: number; at: string; level: string; action: string; cardId: string | null; detail: unknown }> {
+  ): Array<{
+    id: number;
+    at: string;
+    level: string;
+    action: string;
+    cardId: string | null;
+    detail: unknown;
+    /** 操作者与来源（F13.1 审计要求）。老事件为 null */
+    actor: string | null;
+    ip: string | null;
+  }> {
     return this.db.listEvents(limit, scope).map((row) => ({
       id: row.id,
       at: row.at,
@@ -815,6 +1094,8 @@ export class CardService {
       action: row.action,
       cardId: row.card_id,
       detail: JSON.parse(row.detail) as unknown,
+      actor: row.actor ?? null,
+      ip: row.ip ?? null,
     }));
   }
 
@@ -832,6 +1113,45 @@ export class CardService {
     const scope = options.scope ?? ALL_CARDS;
     const from = this.resolveVersion(cardId, fromRev, scope);
     const to = this.resolveVersion(cardId, toRev, scope);
+
+    /*
+     * 任一侧内容被清除 → 不读 blob（读了也没了），回一个**明确的空壳**。
+     *
+     * 不能返回"空 diff + identical:true"：那是"两个版本完全一样"的意思，
+     * 与"内容被清掉了、没法比"是两件完全不同的事，而客户端会据此显示
+     * "没有变化"。所以用一个显式标志，让上层必须区分这两种情况。
+     */
+    if ((from.pruned_at ?? null) !== null || (to.pruned_at ?? null) !== null) {
+      const emptyBytes = {
+        identical: false,
+        fromSha256: from.blob_sha256,
+        toSha256: to.blob_sha256,
+        fromSize: from.byte_size,
+        toSize: to.byte_size,
+        sizeDelta: to.byte_size - from.byte_size,
+        firstDiffOffset: null,
+        commonPrefix: 0,
+        commonSuffix: 0,
+      } satisfies ByteComparison;
+      return {
+        from: this.versionDto(from),
+        to: this.versionDto(to),
+        bytes: emptyBytes,
+        lines: {
+          hunks: [],
+          added: 0,
+          removed: 0,
+          truncated: false,
+          oldLineCount: 0,
+          newLineCount: 0,
+          equalLinesButDifferentBytes: false,
+        },
+        json: { changes: [], truncated: false, parsed: false },
+        identical: false,
+        contentCleared: true,
+      };
+    }
+
     const fromBytes = this.blobs.read(from.blob_sha256);
     const toBytes = this.blobs.read(to.blob_sha256);
     const bytes = compareBytes(fromBytes, toBytes);
@@ -852,6 +1172,7 @@ export class CardService {
       lines,
       json,
       identical: bytes.identical,
+      contentCleared: false,
     };
   }
 

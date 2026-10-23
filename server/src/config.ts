@@ -136,6 +136,14 @@ export interface ServerConfigFile {
    * 证据都指向一个假来源。默认空至少让"没配"这件事在面板上可见。
    */
   trustProxy: string[];
+  /**
+   * **回收站（F13.2 / T10.18）**。删除卡片是软删除，到期才物理清除。
+   *
+   * 为什么删除不能立刻物理清除：卡片是用户多年的创作，一次误点（或一次
+   * 手滑的 DELETE）就是不可恢复的损失。软删 + 保留期让"删除"可撤销，
+   * 而 `purge`（立即彻底清除）只留给管理员 —— 那才是真正不可逆的操作。
+   */
+  trash: TrashConfig;
   auth: AuthConfig;
   /** TLS 三模式（T10.5），见 {@link TlsConfig} */
   tls: TlsConfig;
@@ -145,6 +153,20 @@ export interface ServerConfigFile {
   /** 最近更新时间（ISO 8601） */
   updatedAt: string;
 }
+
+export interface TrashConfig {
+  /**
+   * 软删卡片的保留天数。默认 30。
+   *
+   * `0` 表示**不自动清理**：删掉的卡片一直留在回收站里，直到管理员手动 purge。
+   * 这不是"关闭回收站"（删除仍然是软删、仍可恢复），只是不做定时物理删除 ——
+   * 对"先攒着、以后统一清理"的用法有意义。
+   */
+  retentionDays: number;
+}
+
+/** 保留期上限：10 年。再大就等于不清理，那种意图应该显式写 0。 */
+export const TRASH_MAX_RETENTION_DAYS = 3650;
 
 export interface ConfigOverrides {
   port?: number;
@@ -268,6 +290,7 @@ export function createDefaultConfig(overrides: ConfigOverrides = {}): ServerConf
     logLevel: overrides.logLevel ?? 'info',
     // 默认不信任任何代理头：见字段注释。空数组下有效 IP 恒等于 socket 地址。
     trustProxy: overrides.trustProxy ?? [],
+    trash: { retentionDays: 30 },
     auth: {
       token: overrides.token ?? generateToken(),
       require: true,
@@ -326,6 +349,17 @@ export function normalizeConfig(input: unknown, overrides: ConfigOverrides = {})
     // 只接受字符串数组；单字符串也接受（手改配置时很容易写成 "127.0.0.1"）。
     // 非法条目**不在这里过滤**：交给 assertSafeConfig 报错并拒绝启动，
     // 否则"写错一条"会变成"这条静默消失"，管理员以为已经信任了。
+    // 回收站保留期：非法值一律回默认 30，而不是保留上一次的值 ——
+    // 这里与 registerMode 的取舍不同：保留期只影响"什么时候自动删"，
+    // 走错方向（误用巨大的值）会让磁盘悄悄涨满，回默认更安全。
+    trash: (() => {
+      const rawTrash = raw['trash'];
+      const value = rawTrash && typeof rawTrash === 'object' ? (rawTrash as Record<string, unknown>)['retentionDays'] : undefined;
+      if (typeof value !== 'number' || !Number.isFinite(value)) return { ...base.trash };
+      const days = Math.trunc(value);
+      if (days < 0 || days > TRASH_MAX_RETENTION_DAYS) return { ...base.trash };
+      return { retentionDays: days };
+    })(),
     trustProxy: (() => {
       const rawTrust = raw['trustProxy'];
       const list = Array.isArray(rawTrust)

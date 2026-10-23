@@ -158,6 +158,9 @@ export function configSummary(config: ServerConfigFile): Record<string, unknown>
     // 面板要回显 trustProxy（并显示"已生效代理数"）。不含它的话，表单保存时
     // 会把这份配置写回成空数组 —— 用户改个端口就把反代信任一起清掉。
     trustProxy: [...config.trustProxy],
+    // 回收站保留期（F13.2）。面板要能显示"删掉的卡多久后彻底消失" ——
+    // 不给的话管理员只能翻配置文件才知道，而这直接关系到磁盘占用。
+    trash: { ...config.trash },
     auth: {
       require: config.auth.require,
       // 面板里只显示掩码，避免截图/日志泄露；完整 token 用 `tcs-server token show`
