@@ -1,5 +1,5 @@
 // T10.4 冒烟：起一个真服务端，跑通 注册→登录→me→刷新→登出→吊销后失效
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -129,6 +129,9 @@ try {
   check('无凭证访问受保护接口被拒', cards.status === 401, `status=${cards.status}`);
 } finally {
   child.kill();
+  // 每次跑都留一个临时库在 %TEMP% 里会越积越多（实测跑几次就 3 个目录），
+  // 这里自己收拾干净 —— 与"后台进程要显式停"是同一条纪律。
+  rmSync(work, { recursive: true, force: true });
 }
 
 const failed = results.filter((r) => !r.ok);
