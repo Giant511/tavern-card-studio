@@ -23,6 +23,7 @@ import { AppError } from '../errors.js';
 import { verifyJwt, type JwtPayload } from '../auth/jwt.js';
 import type { SessionStore } from '../auth/sessions.js';
 import type { UserStore } from '../storage/users.js';
+import { parseScopes, type RepoStore, type TokenScope, type TokenStore } from '../storage/repos.js';
 
 function digest(value: string): Buffer {
   return createHash('sha256').update(value, 'utf8').digest();
@@ -45,12 +46,23 @@ export function extractToken(req: IncomingMessage): string | null {
 
 /** 一次请求的身份。`via: 'legacy'` 表示用的是全局 token（无账户身份） */
 export interface AuthContext {
-  via: 'legacy' | 'jwt';
+  via: 'legacy' | 'jwt' | 'repo-token';
   /** legacy 时为 null */
   userId: string | null;
   sessionId: string | null;
   role: 'admin' | 'user';
   username: string | null;
+  /**
+   * 仓库令牌绑定到的仓库与权限范围（T10.6）。
+   *
+   * 只有 `via === 'repo-token'` 时非 null；jwt 与 legacy 都作用于"该账户的全部仓库"
+   * （jwt 的账户范围由调用方按 userId 过滤；legacy 是运维凭证，视为全部）。
+   */
+  repoToken: {
+    tokenId: string;
+    repoId: string;
+    scopes: TokenScope[];
+  } | null;
 }
 
 /** legacy token 视为管理员：它能做的事与 v0.1.1 完全一样，不能因为引入账户就缩权 */
@@ -60,6 +72,7 @@ export const LEGACY_AUTH: AuthContext = {
   sessionId: null,
   role: 'admin',
   username: null,
+  repoToken: null,
 };
 
 interface FailureRecord {
@@ -77,6 +90,9 @@ export interface TokenGateDeps {
   jwtSecret?: string;
   sessions?: SessionStore;
   users?: UserStore;
+  /** 仓库令牌（T10.6）。不给就只认 legacy + JWT */
+  repoTokens?: TokenStore;
+  repos?: RepoStore;
   now?: () => Date;
 }
 
@@ -111,8 +127,56 @@ export class TokenGate {
     // 先比 legacy token：它最便宜（一次 sha256），也是面板/CLI 的常用路径
     if (this.token && constantTimeEqual(provided, this.token)) return LEGACY_AUTH;
 
+    // 仓库令牌（T10.6）：同样是一次 sha256 查表，比 JWT 验签便宜，
+    // 且前缀能快速排除（非 tcr_ 开头直接跳过）
+    if (provided.startsWith('tcr_')) {
+      return this.verifyRepoToken(provided);
+    }
+
     const jwt = this.verifyAccessToken(provided);
     return jwt;
+  }
+
+  /**
+   * 校验仓库令牌。
+   *
+   * **每次请求都从库里读当前状态**（吊销/过期/权限范围），
+   * 不缓存 —— 否则"改小权限"要等缓存过期才生效，而需求要求逐请求执行。
+   */
+  private verifyRepoToken(raw: string): AuthContext | null {
+    const tokens = this.deps.repoTokens;
+    const repos = this.deps.repos;
+    const users = this.deps.users;
+    if (!tokens || !repos || !users) return null;
+
+    const now = this.deps.now?.() ?? new Date();
+    const row = tokens.findByRaw(raw);
+    if (!row) return null;
+    // 吊销 / 过期都在这里判：库里的状态是唯一真相
+    if (!tokens.isUsable(row, now)) return null;
+
+    const repo = repos.findById(row.repo_id);
+    if (!repo) return null;
+    if (repo.owner_id !== row.owner_id) return null;
+
+    const user = users.findById(row.owner_id);
+    if (!user || user.status !== 'active') return null;
+
+    return {
+      via: 'repo-token',
+      userId: user.id,
+      sessionId: null,
+      // 角色仍按账户算：仓库令牌不提升也不降低账户角色，
+      // 它能做什么是 scopes 决定的（见 checkPermission）
+      role: user.role,
+      username: user.username,
+      repoToken: {
+        tokenId: row.id,
+        repoId: row.repo_id,
+        // scopes 从库里实时解析：管理员 setScopes 收窄后，下一个请求就按新范围判
+        scopes: parseScopes(row.scopes),
+      },
+    };
   }
 
   /** 校验 JWT 并确认会话仍然有效（未吊销、未过期、用户未禁用） */
@@ -145,6 +209,7 @@ export class TokenGate {
       // 角色以**库**为准，不信令牌里的快照（降级后旧令牌不能继续当管理员）
       role: user.role,
       username: user.username,
+      repoToken: null,
     };
   }
 

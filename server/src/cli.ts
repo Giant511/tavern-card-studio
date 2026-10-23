@@ -28,7 +28,8 @@ import {
 } from './config.js';
 import { SERVER_VERSION } from './context.js';
 import { hashPassword } from './auth/password.js';
-import { migrateToFirstAccount, planMigration } from './auth/migrate.js';
+import { migrateRepos, migrateToFirstAccount, planMigration } from './auth/migrate.js';
+import { RepoStore } from './storage/repos.js';
 import { Db } from './storage/db.js';
 import { adoptOrphanCards, countOrphanCards, UserStore } from './storage/users.js';
 import { startSupervisor } from './supervisor.js';
@@ -377,7 +378,12 @@ async function runUserCommand(
       const username = options.positional[2] ?? 'admin';
       const plan = planMigration(db.handle);
       if (!plan.needed) {
-        process.stdout.write(`已有 ${String(users.count())} 个账户，无需迁移\n`);
+        // 已有账户：仍然跑仓库迁移（v0.1.2 升级上来的库可能缺默认仓库 / 卡片没归仓库）
+        const repoResult = migrateRepos(db.handle);
+        process.stdout.write(
+          `已有 ${String(users.count())} 个账户\n` +
+            `仓库迁移：新建 ${String(repoResult.created)} 个默认仓库、${String(repoResult.cardsAssigned)} 张卡片入库\n`,
+        );
         return 0;
       }
       process.stdout.write(
@@ -390,7 +396,43 @@ async function runUserCommand(
       return 0;
     }
 
-    process.stderr.write(`未知的 user 操作：${action}（list/add/passwd/enable/disable/adopt/migrate）\n`);
+    if (action === 'repos' || action === 'repo') {
+      // 列出仓库与卡片数（运维排查"卡片进错仓库"时的第一手信息）
+      const sub = options.positional[2];
+      const repos = new RepoStore(db.handle);
+      const username = options.positional[3];
+      const target = username ? users.findByUsername(username) : users.list()[0] ?? null;
+      if (!target) {
+        process.stderr.write('还没有账户；先运行 `tcs-server user migrate <用户名>`\n');
+        return 1;
+      }
+      if (sub === 'add') {
+        const name = options.positional[4];
+        if (!name) {
+          process.stderr.write('用法：tcs-server user repos add <账户名> <仓库名>\n');
+          return 2;
+        }
+        const row = repos.create({ ownerId: target.id, name });
+        process.stdout.write(`已为「${target.username}」创建仓库「${row.name}」（${row.id}）\n`);
+        return 0;
+      }
+      const list = repos.list(target.id);
+      if (list.length === 0) {
+        process.stdout.write(`「${target.username}」还没有仓库。运行 user migrate 可自动建默认仓库\n`);
+        return 0;
+      }
+      process.stdout.write(`账户「${target.username}」的仓库：\n`);
+      for (const row of list) {
+        process.stdout.write(
+          `  ${row.name}${row.is_default === 1 ? '（默认）' : ''}\t${String(repos.countCards(row.id))} 张卡片\t${row.id}\n`,
+        );
+      }
+      return 0;
+    }
+
+    process.stderr.write(
+      `未知的 user 操作：${action}（list/add/passwd/enable/disable/adopt/migrate/repos）\n`,
+    );
     return 2;
   }
 }

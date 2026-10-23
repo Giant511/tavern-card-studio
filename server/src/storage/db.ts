@@ -32,6 +32,10 @@ export interface CardRow {
   id: string;
   /** 见 {@link CardIdSource}；迁移前的老行由 ALTER TABLE 的默认值补成 `legacy` */
   id_source: CardIdSource;
+  /** 归属账户（T10.3）。空串 = 尚未归属，迁移会划给首账户 */
+  owner_id: string;
+  /** 归属仓库（T10.6）。空串 = 尚未归属，迁移会划给该账户的默认仓库 */
+  repo_id: string;
   name: string;
   spec: string;
   spec_version: string;
@@ -224,6 +228,44 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   locked_until TEXT,
   PRIMARY KEY (kind, key)
 );
+
+-- ── 仓库与仓库令牌（T10.6）──────────────────────────────
+-- 层级：账户 → 仓库（多）→ 卡片（不限）。
+-- 仓库名**在账户内唯一**（唯一索引建在 owner_id+name_key），
+-- 不是全局唯一：两个人各有一个叫 default 的仓库是最自然的事。
+CREATE TABLE IF NOT EXISTS repos (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  name_key TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  deleted_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_owner_name ON repos(owner_id, name_key) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_repos_owner ON repos(owner_id, created_at ASC);
+
+-- 仓库令牌。token_hash 是 sha256 原文；**永不**存原文。
+-- token_prefix 只是给人看的（列表里认出是哪一把），泄露它无法还原令牌。
+CREATE TABLE IF NOT EXISTS repo_tokens (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  repo_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  token_prefix TEXT NOT NULL,
+  scopes TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT,
+  last_used_at TEXT,
+  revoked_at TEXT,
+  revoke_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_tokens_hash ON repo_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_repo_tokens_owner ON repo_tokens(owner_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_repo_tokens_repo ON repo_tokens(repo_id, created_at DESC);
 `;
 
 /**
@@ -258,6 +300,13 @@ export class Db {
     // "归错人"再也分不开（迁移脚本会以为已经处理过）。
     ensureColumn(this.handle, 'cards', 'owner_id', "owner_id TEXT NOT NULL DEFAULT ''");
     this.handle.exec('CREATE INDEX IF NOT EXISTS idx_cards_owner ON cards(owner_id, updated_at DESC)');
+    // v0.1.2（T10.6）：卡片归属仓库。默认空串 = "尚未归属"，
+    // 老库迁移时统一划到该账户的默认仓库。
+    //
+    // 与 owner_id 同样的道理：索引**不能**写进 SCHEMA 常量 ——
+    // 老库的 cards 表在这行执行之前还没有 repo_id 列。
+    ensureColumn(this.handle, 'cards', 'repo_id', "repo_id TEXT NOT NULL DEFAULT ''");
+    this.handle.exec('CREATE INDEX IF NOT EXISTS idx_cards_repo ON cards(repo_id, updated_at DESC)');
   }
 
   close(): void {
@@ -268,12 +317,12 @@ export class Db {
     this.handle
       .prepare(
         `INSERT INTO cards (
-          id, id_source, name, spec, spec_version, creator, tags_json, source_filename, created_at, updated_at,
+          id, id_source, owner_id, repo_id, name, spec, spec_version, creator, tags_json, source_filename, created_at, updated_at,
           deleted_at, version_count, latest_seq, latest_commit, latest_sha256, latest_size, latest_message,
           latest_at, parse_warnings_json, audit_sha256, audit_error, audit_generated_at,
           audit_error_count, audit_warning_count, audit_info_count, audit_exportable
         ) VALUES (
-          @id, @id_source, @name, @spec, @spec_version, @creator, @tags_json, @source_filename, @created_at, @updated_at,
+          @id, @id_source, @owner_id, @repo_id, @name, @spec, @spec_version, @creator, @tags_json, @source_filename, @created_at, @updated_at,
           @deleted_at, @version_count, @latest_seq, @latest_commit, @latest_sha256, @latest_size, @latest_message,
           @latest_at, @parse_warnings_json, @audit_sha256, @audit_error, @audit_generated_at,
           @audit_error_count, @audit_warning_count, @audit_info_count, @audit_exportable
