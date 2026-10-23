@@ -34,7 +34,7 @@ const lines = html
 
 const text = lines.join('\n');
 
-test('首步是创建管理员账户，且命令用真实的 tcs-server.cmd', () => {
+test('首步是创建管理员账户，且主命令不依赖后来才加进去的文件', () => {
   // 顺序也要对：创建账户必须出现在"两个地址"之前，否则用户会先抄地址再卡在登录
   const accountAt = html.indexOf('创建管理员账户');
   const addressAt = html.indexOf('两个地址');
@@ -43,8 +43,30 @@ test('首步是创建管理员账户，且命令用真实的 tcs-server.cmd', ()
 
   assert.match(text, /user migrate/, '必须给出升级路径的迁移命令');
   assert.match(text, /user add/, '必须给出新建账户的命令');
-  assert.match(text, /tcs-server\.cmd/, '命令必须写成产物里真实存在的 tcs-server.cmd');
   assert.match(text, /C:\\Program Files\\Tavern Card Studio Server/, '必须给出安装目录（命令要在里面跑）');
+
+  /*
+   * 2026-10-23 生产反馈：用户在安装目录里执行 `.\tcs-server.cmd` 报"不存在"。
+   * 那个文件是这一版才加进去的，而**同版本覆盖安装不会替换已有文件**
+   * （Windows Installer 对相同版本只做维护），所以老安装上必然没有它。
+   * 教训：用户可见的主命令只能用"装机就有"的东西 —— `node.exe` + `app\`。
+   */
+  assert.match(text, /node\.exe/, '主命令必须用 node.exe（任何安装都有）');
+  assert.match(text, /app\\server\\dist\\index\.js/, '主命令必须指向 app\server\dist\index.js');
+  assert.match(text, /--config/, '必须显式带 --config（否则另建空库）');
+  assert.match(text, /TavernCardStudio[\\/]+config\.json/, '必须给出服务实际用的配置文件路径');
+});
+
+test('tcs-server.cmd 只能作为"可选简写"出现，不能当唯一入口', () => {
+  if (!text.includes('tcs-server.cmd')) return; // 整页不提它也可以
+  // 出现就必须同时说明"没有它也不影响"，否则等于又让人去执行一个可能不存在的文件
+  assert.match(text, /不影响|可选|较新的安装包/, '提到 tcs-server.cmd 时必须说明它是可选简写');
+});
+
+test('同版本覆盖安装的症状与处置写清楚了（REINSTALLMODE）', () => {
+  // 这是"装了新包却还是旧文件"的唯一原因，必须给可执行的处置
+  assert.match(text, /REINSTALL=ALL/, '必须给出强制重装的参数');
+  assert.match(text, /REINSTALLMODE=amus/, 'REINSTALLMODE 要写全');
 });
 
 test('迁移命令必须说明它会接管旧卡并先备份', () => {
@@ -115,7 +137,7 @@ test('「已生效代理数」必须指向总览页（它不在参数配置页�
 test('版本号：0.1.1 只能作为"升级来源"出现，当前版本必须是 0.1.2', () => {
   assert.match(text, /0\.1\.2/, '页面上要标出这是 0.1.2 的流程');
   const stale = lines.filter(
-    (line) => line.includes('0.1.1') && !/升级|更早版本|接管/.test(line),
+    (line) => line.includes('0.1.1') && !/升级|更早版本|接管|≤v0\.1\.1|未升级/.test(line),
   );
   assert.deepEqual(stale, [], `0.1.1 只应出现在升级语境里：\n${stale.join('\n')}`);
 });

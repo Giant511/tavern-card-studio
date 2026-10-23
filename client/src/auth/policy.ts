@@ -46,7 +46,9 @@ export function registerHint(mode: RegisterMode | null): string {
     case 'admin-only':
       return '本服务端仅管理员可创建账户。请让管理员在「账户」里为你建号。';
     case 'closed':
-      return '本服务端未开放自助注册。请让管理员在安装目录运行 `tcs-server.cmd user add <用户名>` 创建账户。';
+      // 不在这里写命令行：产物里有没有那个脚本取决于安装包新旧（同版本覆盖安装
+      // 不会替换文件），写死等于让用户去敲一个可能不存在的命令。指到说明页更稳。
+      return '本服务端未开放自助注册。请联系管理员创建账户（步骤见服务端安装目录里的「如何连接」页）。';
     default:
       return '正在读取服务端的注册策略…';
   }
