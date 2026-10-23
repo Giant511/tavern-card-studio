@@ -13,7 +13,15 @@
  * 声称了就是假话。真实提示见 `isolationNote()`。
  */
 
-import { listCards, SyncError, type CardSummary, type SyncConfig } from './server-sync.ts';
+import {
+  deleteCard,
+  listCards,
+  moveCard,
+  SyncError,
+  type CardSummary,
+  type SyncConfig,
+} from './server-sync.ts';
+import { type RepoSummary } from './repo-client.ts';
 import { emptyCardsText, isolationNote, toCardRow, type CardRowView } from './card-row.ts';
 
 export { isolationNote };
@@ -45,6 +53,11 @@ export interface CardsDialogDeps {
   onUnauthorized?: () => Promise<boolean>;
   /** 登出（仅账户登录时显示按钮）。登出后本地编辑不受影响 */
   onLogout?: () => Promise<void>;
+  /**
+   * 取仓库列表（F13.5「移动…」用）。不提供时移动入口直接隐藏 ——
+   * 没有仓库列表就没法选目标，摆一个点了没用的按钮比不摆更糟。
+   */
+  getRepos?: () => Promise<RepoSummary[]>;
 }
 
 /**
@@ -246,6 +259,105 @@ export class CardsDialog {
     this.countEl.textContent = '—';
   }
 
+  /**
+   * 删除一张卡（软删）。
+   *
+   * 确认框里刻意写清"进回收站、可恢复"，而不是笼统的"确定删除？"：
+   * 前者让用户敢点（知道能撤销），后者会让人宁可不敢用这个功能。
+   */
+  private async confirmDelete(view: CardRowView): Promise<void> {
+    const ok = window.confirm(
+      `删除「${view.name}」？\n\n` +
+        '它会进入回收站：立刻从列表消失，但保留期内可以恢复。\n' +
+        '（彻底清除只能由管理员在管理面板里做，且不可恢复。）',
+    );
+    if (!ok) return;
+
+    const config = this.deps.getConfig();
+    if (!config) {
+      this.deps.notify('请先登录或填写服务端地址', 'warn');
+      return;
+    }
+    try {
+      await deleteCard(config, view.cardId);
+      this.deps.notify(`已删除「${view.name}」（可在回收站恢复）`, 'ok');
+      await this.reload();
+    } catch (error) {
+      this.deps.notify(`删除失败：${error instanceof Error ? error.message : String(error)}`, 'bad');
+    }
+  }
+
+  /** 移动：列出现有仓库让用户选（不弹输入框 —— 仓库 id 没人记得住） */
+  private async openMove(view: CardRowView): Promise<void> {
+    const config = this.deps.getConfig();
+    if (!config || !this.deps.getRepos) {
+      this.deps.notify('请先登录', 'warn');
+      return;
+    }
+
+    let repos: RepoSummary[];
+    try {
+      repos = await this.deps.getRepos();
+    } catch (error) {
+      this.deps.notify(`读取仓库失败：${error instanceof Error ? error.message : String(error)}`, 'bad');
+      return;
+    }
+    if (repos.length === 0) {
+      this.deps.notify('还没有任何仓库', 'warn');
+      return;
+    }
+
+    const overlay = el('div', 'modal-overlay modal-overlay-top');
+    overlay.dataset['role'] = 'move-dialog';
+    const panel = el('div', 'modal');
+    const head = el('div', 'modal-head');
+    head.append(el('h2', 'modal-title', `移动「${view.name}」`));
+    const closeBtn = el('button', 'icon-btn', '×');
+    closeBtn.type = 'button';
+    closeBtn.addEventListener('click', () => overlay.remove());
+    head.append(closeBtn);
+
+    const body = el('div', 'modal-body');
+    body.append(el('p', 'field-hint', `当前仓库：${view.repo}。选择目标仓库后立即生效（不改内容、不改修改时间）。`));
+
+    const select = el('select', 'input') as HTMLSelectElement;
+    select.dataset['role'] = 'move-repo';
+    for (const repo of repos) {
+      const option = document.createElement('option');
+      option.value = repo.id;
+      option.textContent = `${repo.name}${repo.isDefault ? '（默认）' : ''} · ${String(repo.cardCount)} 张`;
+      if (repo.isDefault) option.selected = true;
+      select.append(option);
+    }
+    body.append(select);
+
+    const foot = el('div', 'modal-foot');
+    const cancel = el('button', 'btn ghost', '取消');
+    cancel.type = 'button';
+    cancel.addEventListener('click', () => overlay.remove());
+    const confirm = el('button', 'btn primary', '移动');
+    confirm.type = 'button';
+    confirm.dataset['role'] = 'move-confirm';
+    confirm.addEventListener('click', async () => {
+      confirm.disabled = true;
+      try {
+        const result = await moveCard(config, view.cardId, select.value);
+        overlay.remove();
+        // 目标与当前相同：服务端回 moved:false。如实说"没动"，不要假装成功
+        this.deps.notify(result.moved ? `已移动到「${view.name}」的新仓库` : '它已经在这个仓库里了', result.moved ? 'ok' : 'info');
+        await this.reload();
+      } catch (error) {
+        confirm.disabled = false;
+        this.deps.notify(`移动失败：${error instanceof Error ? error.message : String(error)}`, 'bad');
+      }
+    });
+    foot.append(cancel, confirm);
+
+    panel.append(head, body, foot);
+    overlay.append(panel);
+    document.body.append(overlay);
+  }
+
   private renderRows(items: CardSummary[]): void {
     this.rows = items;
     this.listEl.replaceChildren();
@@ -260,22 +372,53 @@ export class CardsDialog {
 
     for (const item of items) {
       const view = toCardRow(item);
-      const row = el('button', 'cards-row');
-      row.type = 'button';
+      /*
+       * 行从 `<button>` 改成 `<div>`（F13.5）。
+       *
+       * 原因是 HTML 不允许按钮嵌套按钮：行本身要可点（看历史），又要放
+       * 「移动… / 删除…」两个按钮。硬塞会得到一个点哪儿都触发"看历史"的行，
+       * 而删除永远点不到 —— 这种"能渲染但点不动"的问题只有真机点得出来。
+       */
+      const row = el('div', 'cards-row');
       row.dataset['cardId'] = view.cardId;
-      row.title = `查看「${view.name}」的版本历史`;
       if (view.deleted) row.classList.add('deleted');
 
+      const main = el('button', 'cards-row-main');
+      main.type = 'button';
+      main.title = `查看「${view.name}」的版本历史`;
       const nameEl = el('span', 'cards-row-name', view.name);
       const idEl = el('span', 'cards-row-id', view.cardId);
       const repoEl = el('span', 'cards-row-repo', view.repo);
       const verEl = el('span', 'cards-row-version', view.version);
-
-      row.append(nameEl, idEl, repoEl, verEl);
-      row.addEventListener('click', () => {
+      main.append(nameEl, idEl, repoEl, verEl);
+      main.addEventListener('click', () => {
         this.deps.onPick?.(view.cardId);
         this.close();
       });
+
+      const actions = el('div', 'cards-row-actions');
+      if (this.deps.getRepos) {
+        const moveButton = el('button', 'btn small', '移动…');
+        moveButton.type = 'button';
+        moveButton.dataset['role'] = 'card-move';
+        moveButton.dataset['cardId'] = view.cardId;
+        moveButton.addEventListener('click', (event) => {
+          event.stopPropagation();
+          void this.openMove(view);
+        });
+        actions.append(moveButton);
+      }
+      const deleteButton = el('button', 'btn small danger', '删除…');
+      deleteButton.type = 'button';
+      deleteButton.dataset['role'] = 'card-delete';
+      deleteButton.dataset['cardId'] = view.cardId;
+      deleteButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        void this.confirmDelete(view);
+      });
+      actions.append(deleteButton);
+
+      row.append(main, actions);
       this.listEl.append(row);
     }
 

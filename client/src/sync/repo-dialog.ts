@@ -15,6 +15,9 @@
 import {
   RepoClientError,
   createRepo,
+  deleteRepo,
+  renameRepo,
+  setDefaultRepo,
   issueRepoToken,
   listRepos,
   listRepoTokens,
@@ -246,21 +249,152 @@ export class RepoDialog {
     }
 
     for (const repo of this.repos) {
-      const row = el('button', 'repo-row');
-      row.type = 'button';
+      /*
+       * 行从 `<button>` 改成 `<div>` + 主按钮（F13.5 仓库管理）。
+       * 理由同「我的卡片」：HTML 不允许按钮嵌套按钮，而这一行既要"点选看令牌"，
+       * 又要放「改名 / 设默认 / 删除」三个按钮。
+       */
+      const row = el('div', 'repo-row');
       row.dataset['repoId'] = repo.id;
       if (repo.id === this.selectedRepoId) row.classList.add('is-active');
-      row.append(
+
+      const main = el('button', 'repo-row-main');
+      main.type = 'button';
+      main.append(
         el('span', 'repo-row-name', repo.name),
         el('span', 'repo-row-count', `${String(repo.cardCount)} 张`),
       );
-      if (repo.isDefault) row.append(el('span', 'repo-row-badge', '默认'));
-      row.addEventListener('click', () => {
+      if (repo.isDefault) main.append(el('span', 'repo-row-badge', '默认'));
+      main.addEventListener('click', () => {
         this.selectedRepoId = repo.id;
         this.renderRepos();
         void this.reloadTokens();
       });
+
+      const actions = el('div', 'repo-row-actions');
+      const renameButton = el('button', 'btn small', '改名');
+      renameButton.type = 'button';
+      renameButton.dataset['role'] = 'repo-rename';
+      renameButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        void this.rename(repo);
+      });
+      actions.append(renameButton);
+
+      if (!repo.isDefault) {
+        // 默认仓库不能删 —— 只能把别的设为默认（即「转移默认」）
+        const defaultButton = el('button', 'btn small', '设为默认');
+        defaultButton.type = 'button';
+        defaultButton.dataset['role'] = 'repo-set-default';
+        defaultButton.addEventListener('click', (event) => {
+          event.stopPropagation();
+          void this.setDefault(repo);
+        });
+        actions.append(defaultButton);
+
+        const deleteButton = el('button', 'btn small danger', '删除…');
+        deleteButton.type = 'button';
+        deleteButton.dataset['role'] = 'repo-delete';
+        deleteButton.addEventListener('click', (event) => {
+          event.stopPropagation();
+          void this.remove(repo);
+        });
+        actions.append(deleteButton);
+      } else {
+        const hint = el('span', 'repo-row-hint', '默认仓库不可删（先设别的为默认）');
+        hint.dataset['role'] = 'repo-default-hint';
+        actions.append(hint);
+      }
+
+      row.append(main, actions);
       this.repoListEl.append(row);
+    }
+  }
+
+  private async rename(repo: RepoSummary): Promise<void> {
+    const config = this.deps.getConfig();
+    if (!config) return;
+    const input = window.prompt(`「${repo.name}」的新名字：`, repo.name);
+    if (input === null) return;
+    const name = input.trim();
+    if (name === '' || name === repo.name) return;
+    try {
+      await renameRepo(config, repo.id, { name });
+      this.deps.notify(`已改名为「${name}」`, 'ok');
+      await this.reload();
+    } catch (error) {
+      await this.handleError('改名失败', error);
+    }
+  }
+
+  private async setDefault(repo: RepoSummary): Promise<void> {
+    const config = this.deps.getConfig();
+    if (!config) return;
+    const ok = window.confirm(
+      `把「${repo.name}」设为默认仓库？\n\n` +
+        '默认仓库是上传时的预选目标，也是唯一不能删除的那个。\n' +
+        '原来的默认仓库会变成普通仓库（之后才可以删）。',
+    );
+    if (!ok) return;
+    try {
+      await setDefaultRepo(config, repo.id);
+      this.deps.notify(`「${repo.name}」已设为默认仓库`, 'ok');
+      await this.reload();
+    } catch (error) {
+      await this.handleError('设置默认仓库失败', error);
+    }
+  }
+
+  /**
+   * 删除仓库。
+   *
+   * 非空仓库必须选目标 —— 这里**不替用户猜**（"随便挑一个"等于替人做数据迁移）。
+   * 空仓库直接确认删除。
+   */
+  private async remove(repo: RepoSummary): Promise<void> {
+    const config = this.deps.getConfig();
+    if (!config) return;
+
+    const others = this.repos.filter((item) => item.id !== repo.id);
+    let transferTo: string | undefined;
+
+    if (repo.cardCount > 0) {
+      if (others.length === 0) {
+        this.deps.notify(`「${repo.name}」里还有 ${String(repo.cardCount)} 张卡，但没有别的仓库可转移`, 'warn');
+        return;
+      }
+      const options = others.map((item, index) => `${String(index + 1)}. ${item.name}（${String(item.cardCount)} 张）`).join('\n');
+      const answer = window.prompt(
+        `「${repo.name}」里还有 ${String(repo.cardCount)} 张卡片。\n` +
+          '删除前必须把它们转移到另一个仓库 —— 输入编号：\n\n' +
+          options,
+        '1',
+      );
+      if (answer === null) return;
+      const index = Number.parseInt(answer.trim(), 10) - 1;
+      const target = others[index];
+      if (!target) {
+        this.deps.notify('没有选中有效的目标仓库，已取消', 'warn');
+        return;
+      }
+      const confirm = window.confirm(
+        `把 ${String(repo.cardCount)} 张卡片转入「${target.name}」，然后删除「${repo.name}」？\n\n` +
+          '这个操作会同时吊销该仓库的令牌。',
+      );
+      if (!confirm) return;
+      transferTo = target.id;
+    } else {
+      if (!window.confirm(`删除空仓库「${repo.name}」？`)) return;
+    }
+
+    try {
+      const result = await deleteRepo(config, repo.id, { transferTo });
+      const detail = result.movedCards > 0 ? `，转移了 ${String(result.movedCards)} 张卡片` : '';
+      const revoked = result.revokedTokens > 0 ? `，吊销 ${String(result.revokedTokens)} 个令牌` : '';
+      this.deps.notify(`已删除「${repo.name}」${detail}${revoked}`, 'ok');
+      await this.reload();
+    } catch (error) {
+      await this.handleError('删除仓库失败', error);
     }
   }
 

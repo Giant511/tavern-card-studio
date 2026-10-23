@@ -41,6 +41,7 @@
           <button class="nav-item" data-view="config"><span>参数配置</span></button>
           <button class="nav-item" data-view="logs"><span>运行日志</span></button>
           <button class="nav-item" data-view="api"><span>API 与令牌</span></button>
+          <button class="nav-item" data-view="governance"><span>全站治理</span></button>
         </nav>
         <div class="sidebar-foot">
           <div class="pill" id="side-state">未连接</div>
@@ -288,6 +289,72 @@
                 <li><span class="method get">GET</span><code>/api/health</code>（免鉴权）</li>
               </ul>
               <p class="hint">完整说明见 <code>docs/08-server-api.md</code>。</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" data-view="governance" hidden>
+          <!--
+            全站治理需要**管理员账户登录**。
+
+            为什么不能直接用面板的访问令牌：0.1.2 起全局令牌（legacy）已被降权为
+            「只看未归属卡片」，如果为治理页给它全站范围，等于把那次降权撤销 ——
+            而它正是最容易被复制到旧客户端里的那把钥匙。所以这里单独要一次账户登录，
+            拿到的 JWT 只放在 sessionStorage（关掉标签页即失效），不写 localStorage。
+          -->
+          <article class="card" id="gov-login-card">
+            <h3>全站治理 · 需要管理员登录</h3>
+            <p class="muted">
+              这里能查看并处理<strong>所有账户</strong>的仓库、卡片与账户状态，
+              所以要用管理员账户登录 —— 面板的访问令牌在 0.1.2 已降权，看不到别人账户的卡片。
+            </p>
+            <div class="grid three">
+              <label class="field"><span>用户名</span><input id="gov-username" type="text" autocomplete="username" /></label>
+              <label class="field"><span>密码</span><input id="gov-password" type="password" autocomplete="current-password" /></label>
+              <label class="field"><span>&nbsp;</span><button class="btn btn-primary" id="gov-login" type="button">登录</button></label>
+            </div>
+            <p class="hint" id="gov-login-msg"></p>
+          </article>
+
+          <div id="gov-panel" hidden>
+            <article class="card">
+              <div class="card-head">
+                <h3>当前身份</h3>
+                <div class="btn-group">
+                  <button class="btn btn-small" id="gov-refresh" type="button">刷新</button>
+                  <button class="btn btn-small" id="gov-logout" type="button">退出治理</button>
+                </div>
+              </div>
+              <p class="muted" id="gov-who">—</p>
+            </article>
+
+            <article class="card">
+              <h3>账户</h3>
+              <table class="data-table">
+                <thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>注册时间</th><th>最后登录</th><th></th></tr></thead>
+                <tbody id="gov-accounts"><tr><td colspan="6" class="muted">读取中…</td></tr></tbody>
+              </table>
+            </article>
+
+            <article class="card">
+              <h3>仓库（全部账户）</h3>
+              <table class="data-table">
+                <thead><tr><th>仓库</th><th>账户</th><th>卡片</th><th>默认</th><th>操作</th></tr></thead>
+                <tbody id="gov-repos"><tr><td colspan="5" class="muted">读取中…</td></tr></tbody>
+              </table>
+              <p class="hint">删除非空仓库需要先选择转移目标；默认仓库不能删，先转移默认。</p>
+            </article>
+
+            <article class="card">
+              <h3>卡片（全部账户）</h3>
+              <table class="data-table">
+                <thead><tr><th>角色名</th><th>cardId</th><th>仓库</th><th>版本</th><th>状态</th><th>修改时间</th><th>操作</th></tr></thead>
+                <tbody id="gov-cards"><tr><td colspan="7" class="muted">读取中…</td></tr></tbody>
+              </table>
+              <p class="hint">
+                彻底清除<strong>不可恢复</strong>（物理删除索引、Git 仓库与无引用的内容块）。
+                只想让它消失一段时间请用账户自己在客户端里「删除」（进回收站，可恢复）。
+              </p>
             </article>
           </div>
         </section>

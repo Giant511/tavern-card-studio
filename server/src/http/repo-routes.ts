@@ -142,6 +142,22 @@ export function registerRepoRoutes(router: Registrar, deps: RepoRouteDeps): void
     // 而上传时服务端忽略 query.repo（令牌绑定优先）—— 用户选了个"改了不生效"的下拉。
     // 拒绝后客户端按"拿不到列表"整行隐藏，与决策 #51 的约定一致。
     rejectRepoToken(caller);
+    /*
+     * 治理页要按账户分组看全部仓库（T10.20），所以支持 `?all=true`。
+     * 只认管理员 jwt：仓库令牌与 legacy 都不行 —— 前者边界是单个仓库，
+     * 后者的可见范围已被降权为"未归属"，给它全站列表等于把降权撤销。
+     */
+    const all = ctx.query.get('all') === 'true' || ctx.query.get('all') === '1';
+    if (all) {
+      if (caller.via !== 'jwt' || caller.role !== 'admin') {
+        throw new AppError(403, 'ADMIN_ONLY', '查看全部账户的仓库仅管理员可用');
+      }
+      const rows = deps.repos.listAll();
+      sendJson(ctx.res, 200, {
+        items: rows.map((row) => ({ ...deps.repos.toPublic(row), ownerId: row.owner_id })),
+      });
+      return;
+    }
     const rows = deps.repos.list(caller.userId!);
     sendJson(ctx.res, 200, { items: rows.map((row) => deps.repos.toPublic(row)) });
   });

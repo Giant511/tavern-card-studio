@@ -201,6 +201,75 @@ export async function createRepo(
   return toRepo(body['repo'] ?? body);
 }
 
+/** 改名 / 改描述（F13.5 仓库管理） */
+export async function renameRepo(
+  config: RepoClientConfig,
+  repoId: string,
+  input: { name?: string; description?: string },
+  options: RepoRequestOptions = {},
+): Promise<RepoSummary> {
+  const body = (await request(
+    config,
+    `/api/repos/${encodeURIComponent(repoId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...(input.name === undefined ? {} : { name: input.name }),
+        ...(input.description === undefined ? {} : { description: input.description }),
+      }),
+    },
+    options,
+  )) as Record<string, unknown>;
+  return toRepo(body['repo'] ?? body);
+}
+
+/** 设为默认仓库（默认仓库不能删，只能先转移默认） */
+export async function setDefaultRepo(
+  config: RepoClientConfig,
+  repoId: string,
+  options: RepoRequestOptions = {},
+): Promise<RepoSummary> {
+  const body = (await request(
+    config,
+    `/api/repos/${encodeURIComponent(repoId)}/default`,
+    { method: 'POST' },
+    options,
+  )) as Record<string, unknown>;
+  return toRepo(body['repo'] ?? body);
+}
+
+/**
+ * 删除仓库（F13.4）。
+ *
+ * 非空仓库必须给 `transferTo` —— 这里不替调用方猜目标。
+ * 响应里的 `movedCards` 要回给用户看：它回答"刚才到底动了多少东西"。
+ */
+export async function deleteRepo(
+  config: RepoClientConfig,
+  repoId: string,
+  input: { transferTo?: string; reason?: string } = {},
+  options: RepoRequestOptions = {},
+): Promise<{ movedCards: number; revokedTokens: number }> {
+  const body = (await request(
+    config,
+    `/api/repos/${encodeURIComponent(repoId)}`,
+    {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...(input.transferTo === undefined ? {} : { transferTo: input.transferTo }),
+        ...(input.reason === undefined ? {} : { reason: input.reason }),
+      }),
+    },
+    options,
+  )) as Record<string, unknown>;
+  return {
+    movedCards: typeof body['movedCards'] === 'number' ? body['movedCards'] : 0,
+    revokedTokens: typeof body['revokedTokens'] === 'number' ? body['revokedTokens'] : 0,
+  };
+}
+
 export async function listRepoTokens(
   config: RepoClientConfig,
   repoId: string,
