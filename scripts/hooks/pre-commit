@@ -1,5 +1,6 @@
 #!/bin/sh
-# pre-commit：改 PLAN.md 时自动校验决策表序号连续性。
+# pre-commit：改 PLAN.md 时校验决策表序号连续性；
+#              改 CLI 命令面或运维手册时校验 docs/server cmd.md 与实现一致。
 #
 # 为什么只在 PLAN.md 进暂存区时才检查：
 #   钩子必须快（<0.5s），否则会被 `--no-verify` 绕过而形同虚设。
@@ -26,6 +27,22 @@ if git diff --cached --name-only --diff-filter=ACM | grep -qx 'PLAN\.md'; then
     echo ""
     echo "[pre-commit] 提交被拦截：决策表序号不连续，多半是追加条目时吃掉了相邻行。"
     echo "             修好 PLAN.md 后重新 git add。"
+    exit 1
+  fi
+fi
+
+# 运维手册：命令面一变，docs/server cmd.md 必须同提交更新。
+#
+# 触发条件刻意只认两个文件：CLI 命令面的来源（server/src/cli.ts）与手册本身。
+# 其它提交不付这个代价 —— `node --test` 单文件约 1 秒，比 0.5 秒的目标慢，
+# 但只在"改了命令面或改了手册"时付，这种情况本来就该等。
+if git diff --cached --name-only --diff-filter=ACM | grep -qxE 'server/src/cli\.ts|docs/server cmd\.md'; then
+  echo "[pre-commit] 检测到运维命令面变更，校验 docs/server cmd.md…"
+  if ! node --test test/ops-doc.test.mjs > /tmp/tcs-ops-doc.log 2>&1; then
+    grep -E '^not ok|手册缺少|这些行|只能有' /tmp/tcs-ops-doc.log | sed 's/^/    /'
+    echo ""
+    echo "[pre-commit] 提交被拦截：运维手册与 CLI 命令面不一致，或 .gitignore 放行了额外的 docs 文件。"
+    echo "             补好 docs/server cmd.md（或回复 .gitignore）后重新 git add。"
     exit 1
   fi
 fi

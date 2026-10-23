@@ -1,0 +1,7 @@
+# 钩子脚本必须是 LF。
+#
+# 本机 core.autocrlf=true，仓库里没有这条规则时，检出会把 `scripts/hooks/pre-commit`
+# 写成 CRLF —— 首行变成 `#!/bin/sh\r`，Git 执行钩子时报
+# `bad interpreter: /bin/sh^M`，**钩子静默失效**（提交照常通过，决策表序号与
+# 运维手册的一致性都没人检查了）。行尾问题只在"重新检出后"才暴露，很难联想到。
+scripts/hooks/* text eol=lf

@@ -33,6 +33,7 @@
     "check:decisions": "node scripts/check-decision-table.mjs",
     "check:readme": "node scripts/check-readme.mjs",
     "check:unknown-keys": "npm run build:shared && node scripts/check-unknown-keys.mjs",
+    "check:ops-doc": "node --test test/ops-doc.test.mjs",
     "scan:entropy": "node scripts/scan-entropy.mjs",
     "enable:hooks": "node scripts/enable-hooks.mjs",
     "verify:import-atomic": "node scripts/verify-import-atomic.mjs",
