@@ -13,6 +13,16 @@ import type {
   ResolvedPlatformRule,
   Selector,
 } from './platform-rule.js';
+import {
+  PLATFORM_AUTOFIX_KEYS,
+  PLATFORM_FIELD_KEYS,
+  PLATFORM_METADATA_KEYS,
+  PLATFORM_PLACEHOLDER_KEYS,
+  PLATFORM_RULE_ELEMENT_KEYS,
+  PLATFORM_RULE_KEYS,
+  PLATFORM_TARGET_KEYS,
+  checkUnknownKeys,
+} from './unknown-keys.js';
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]{1,63}$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
@@ -32,6 +42,13 @@ const RULE_TYPES = new Set([
 export interface RuleParseResult {
   rule: PlatformRuleFile | null;
   errors: string[];
+  /**
+   * 不阻断导入、但必须让用户看到的问题（T10.10 补 F4：未知字段）。
+   *
+   * 未知字段只算 warning 的理由见 `unknown-keys.ts`：前向兼容（新版本加的字段
+   * 不该让旧版本拒绝整份文件）与"拼错必须可见"两者只能靠分级同时满足。
+   */
+  warnings: string[];
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -63,12 +80,13 @@ function checkRegex(errors: string[], where: string, pattern: string, flags?: st
   }
 }
 
-function validateField(errors: string[], index: number, field: unknown): void {
+function validateField(errors: string[], warnings: string[], index: number, field: unknown): void {
   const where = `fields[${index}]`;
   if (!isObject(field)) {
     errors.push(`${where}: 必须是对象`);
     return;
   }
+  checkUnknownKeys(field, PLATFORM_FIELD_KEYS, where, warnings);
   if (typeof field['path'] !== 'string' || field['path'] === '') errors.push(`${where}: 缺少 path`);
   if (typeof field['label'] !== 'string' || field['label'] === '') errors.push(`${where}: 缺少 label`);
   if (typeof field['required'] !== 'boolean') errors.push(`${where}: required 必须是布尔值`);
@@ -88,12 +106,19 @@ function validateField(errors: string[], index: number, field: unknown): void {
   }
 }
 
-function validateRule(errors: string[], index: number, rule: unknown, declaredTokens: Set<string>): void {
+function validateRule(
+  errors: string[],
+  warnings: string[],
+  index: number,
+  rule: unknown,
+  declaredTokens: Set<string>,
+): void {
   const where = `rules[${index}]`;
   if (!isObject(rule)) {
     errors.push(`${where}: 必须是对象`);
     return;
   }
+  checkUnknownKeys(rule, PLATFORM_RULE_ELEMENT_KEYS, where, warnings);
   const id = rule['id'];
   if (typeof id !== 'string' || !ID_PATTERN.test(id)) errors.push(`${where}: id 不合法（小写字母/数字/._-，2-64 位）`);
   const type = rule['type'];
@@ -134,10 +159,12 @@ function validateRule(errors: string[], index: number, rule: unknown, declaredTo
 
 export function parsePlatformRule(input: unknown): RuleParseResult {
   const errors: string[] = [];
+  const warnings: string[] = [];
 
   if (!isObject(input)) {
-    return { rule: null, errors: ['规则文件顶层必须是对象'] };
+    return { rule: null, errors: ['规则文件顶层必须是对象'], warnings: [] };
   }
+  checkUnknownKeys(input, PLATFORM_RULE_KEYS, '', warnings);
   if (input['schemaVersion'] !== 1) errors.push('schemaVersion 必须为 1');
   if (typeof input['id'] !== 'string' || !ID_PATTERN.test(input['id'])) errors.push('id 不合法');
   if (typeof input['name'] !== 'string' || input['name'] === '') errors.push('name 不能为空');
@@ -146,8 +173,11 @@ export function parsePlatformRule(input: unknown): RuleParseResult {
   const target = input['target'];
   if (!isObject(target)) {
     errors.push('缺少 target');
-  } else if (!['v1', 'v2', 'v3', 'any'].includes(String(target['spec']))) {
-    errors.push('target.spec 只能是 v1/v2/v3/any');
+  } else {
+    checkUnknownKeys(target, PLATFORM_TARGET_KEYS, 'target', warnings);
+    if (!['v1', 'v2', 'v3', 'any'].includes(String(target['spec']))) {
+      errors.push('target.spec 只能是 v1/v2/v3/any');
+    }
   }
 
   const placeholders = input['placeholders'];
@@ -155,6 +185,7 @@ export function parsePlatformRule(input: unknown): RuleParseResult {
   if (!isObject(placeholders)) {
     errors.push('缺少 placeholders');
   } else {
+    checkUnknownKeys(placeholders, PLATFORM_PLACEHOLDER_KEYS, 'placeholders', warnings);
     for (const key of ['char', 'user']) {
       if (!isStringArray(placeholders[key])) errors.push(`placeholders.${key} 必须是非空字符串数组`);
       else declaredTokens.add(key);
@@ -175,11 +206,11 @@ export function parsePlatformRule(input: unknown): RuleParseResult {
 
   const fields = input['fields'];
   if (!Array.isArray(fields)) errors.push('fields 必须是数组');
-  else fields.forEach((field, index) => validateField(errors, index, field));
+  else fields.forEach((field, index) => validateField(errors, warnings, index, field));
 
   const rules = input['rules'];
   if (!Array.isArray(rules)) errors.push('rules 必须是数组');
-  else rules.forEach((rule, index) => validateRule(errors, index, rule, declaredTokens));
+  else rules.forEach((rule, index) => validateRule(errors, warnings, index, rule, declaredTokens));
 
   if (Array.isArray(rules)) {
     const seen = new Set<string>();
@@ -199,6 +230,7 @@ export function parsePlatformRule(input: unknown): RuleParseResult {
           errors.push(`autoFix[${index}]: 必须是对象`);
           return;
         }
+        checkUnknownKeys(op, PLATFORM_AUTOFIX_KEYS, `autoFix[${index}]`, warnings);
         if (!['replace-text', 'replace-regex', 'trim'].includes(String(op['type']))) {
           errors.push(`autoFix[${index}]: type 不受支持`);
         }
@@ -215,8 +247,14 @@ export function parsePlatformRule(input: unknown): RuleParseResult {
     }
   }
 
-  if (errors.length > 0) return { rule: null, errors };
-  return { rule: input as unknown as PlatformRuleFile, errors: [] };
+  const metadata = input['metadata'];
+  if (metadata !== undefined) {
+    if (!isObject(metadata)) errors.push('metadata 必须是对象');
+    else checkUnknownKeys(metadata, PLATFORM_METADATA_KEYS, 'metadata', warnings);
+  }
+
+  if (errors.length > 0) return { rule: null, errors, warnings };
+  return { rule: input as unknown as PlatformRuleFile, errors: [], warnings };
 }
 
 function buildPlaceholderLookup(rule: PlatformRuleFile): Record<string, PlaceholderKey> {
@@ -296,15 +334,19 @@ export function resolveAllPlatformRules(rules: readonly PlatformRuleFile[]): Res
 export function loadPlatformRules(inputs: readonly unknown[]): {
   rules: PlatformRuleFile[];
   errors: { index: number; id: string | null; errors: string[] }[];
+  warnings: { index: number; id: string | null; warnings: string[] }[];
 } {
   const rules: PlatformRuleFile[] = [];
   const errors: { index: number; id: string | null; errors: string[] }[] = [];
+  const warnings: { index: number; id: string | null; warnings: string[] }[] = [];
   inputs.forEach((input, index) => {
     const result = parsePlatformRule(input);
+    const id = isObject(input) && typeof input['id'] === 'string' ? input['id'] : null;
     if (result.rule) rules.push(result.rule);
-    else errors.push({ index, id: isObject(input) && typeof input['id'] === 'string' ? input['id'] : null, errors: result.errors });
+    else errors.push({ index, id, errors: result.errors });
+    if (result.warnings.length > 0) warnings.push({ index, id, warnings: result.warnings });
   });
-  return { rules, errors };
+  return { rules, errors, warnings };
 }
 
 /** 选择器类型守卫，供外部（客户端表单）复用 */
