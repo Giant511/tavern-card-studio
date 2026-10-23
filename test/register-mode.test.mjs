@@ -159,7 +159,27 @@ let workDir = '';
 let port = 0;
 let configPath = '';
 
-function request(path, { method = 'GET', body, token } = {}) {
+/**
+ * 包一层瞬时错误重试。
+ *
+ * 全量并行跑时这套用例偶发 `read ECONNRESET`（单独跑 12/12 稳定）：
+ * 本机同时起十来个服务进程，Windows 的 listen backlog 在高并发下会重置连接。
+ * 这条用例要证的是"策略热更生效"，不是"TCP 在多负载下有多稳" ——
+ * 所以只对 ECONNRESET 重试一次，其它错误照常抛出（别把真故障吞掉）。
+ */
+async function request(path, options = {}, attempt = 0) {
+  try {
+    return await requestOnce(path, options);
+  } catch (error) {
+    if (attempt === 0 && error?.code === 'ECONNRESET') {
+      await delay(120);
+      return request(path, options, 1);
+    }
+    throw error;
+  }
+}
+
+function requestOnce(path, { method = 'GET', body, token } = {}) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body), 'utf8');
     const req = httpRequest(
