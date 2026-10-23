@@ -83,6 +83,10 @@ export interface VersionRow {
   audit_info_count: number | null;
   audit_exportable: number | null;
   meta_json: string;
+  /** 内容被清除的时间（F13.3）；null = 内容仍在 */
+  pruned_at?: string | null;
+  /** 谁清除的（用户名 / `legacy` / `system`） */
+  pruned_by?: string | null;
 }
 
 export interface NewVersionRow {
@@ -110,6 +114,12 @@ export interface EventRow {
   action: string;
   card_id: string | null;
   detail: string;
+  /** 操作者（账户名 / `legacy` / `system`）。老事件为 null */
+  actor: string | null;
+  /** 事件发生时的卡片归属（purge 后仍能按它看到这条记录） */
+  owner_id?: string | null;
+  /** 操作来源 IP（已按 trustProxy 还原）。老事件与系统任务为 null */
+  ip: string | null;
 }
 
 const SCHEMA = `
@@ -309,6 +319,34 @@ export class Db {
     // 老库的 cards 表在这行执行之前还没有 repo_id 列。
     ensureColumn(this.handle, 'cards', 'repo_id', "repo_id TEXT NOT NULL DEFAULT ''");
     this.handle.exec('CREATE INDEX IF NOT EXISTS idx_cards_repo ON cards(repo_id, updated_at DESC)');
+
+    // v0.1.2（T10.18 / F13.3）：版本内容清除（prune）。
+    //
+    // 为什么是"打标记"而不是 DELETE 行：versions 是链式结构（parent_commit），
+    // 删掉中间一行会让 diff 与回滚的链路断开 —— 而用户要的只是"这段内容别再留着"，
+    // 不是"假装这次提交不存在"。所以保留 seq/时间/操作者/commit，只把正文与
+    // sha256 清掉并记下谁清的、什么时候清的。
+    ensureColumn(this.handle, 'versions', 'pruned_at', 'pruned_at TEXT');
+    ensureColumn(this.handle, 'versions', 'pruned_by', 'pruned_by TEXT');
+
+    // v0.1.2（T10.18 / F13.1）：事件表补"谁"和"从哪来"。
+    //
+    // 之前只有动作与目标，没有操作者 —— 多账户之后，"某张卡被删了"却不记是谁删的，
+    // 等于没有审计。IP 用于事后追溯（配合 trustProxy 解析出的有效地址）。
+    ensureColumn(this.handle, 'events', 'actor', 'actor TEXT');
+    ensureColumn(this.handle, 'events', 'ip', 'ip TEXT');
+    /*
+     * 事件也要记下"这张卡当时归谁"。
+     *
+     * 为什么不能只靠 card_id 反查：purge 之后卡片行**没了**，而"谁在什么时候
+     * 彻底删了这张卡"恰恰是最该被看到的审计记录 —— 只靠子查询限定可见范围，
+     * 这条记录会在 purge 的瞬间一起消失。2026-10-23 的测试正是在这里红的
+     * （`事件流里缺少 card.purge`）。
+     *
+     * 老的卡片级事件 owner_id 为 NULL，仍然走原来的子查询回退。
+     */
+    ensureColumn(this.handle, 'events', 'owner_id', 'owner_id TEXT');
+    this.handle.exec('CREATE INDEX IF NOT EXISTS idx_events_owner ON events(owner_id, id DESC)');
   }
 
   close(): void {
@@ -444,11 +482,82 @@ export class Db {
     return (this.handle.prepare(sql).get(params) as { n: number }).n;
   }
 
+  /**
+   * 软删除。
+   *
+   * **只写 `deleted_at`，不碰 `updated_at`** —— 删除不是内容变更。第一版把两者
+   * 一起写了，于是「删除 → 恢复」之后卡片的 updated_at 变成删除时刻，它会跳到
+   * 「最近修改」最前面，让用户以为自己刚编辑过（测试实测：恢复后 updated_at
+   * 从 …184Z 变成 …233Z）。同一个道理已经在 T10.6 决策里写过：归属变更不动
+   * updated_at；删除/恢复同属"生命周期"而非"内容"。
+   */
   softDelete(cardId: string, at: string): boolean {
     const result = this.handle
-      .prepare('UPDATE cards SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
-      .run(at, at, cardId);
+      .prepare('UPDATE cards SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL')
+      .run(at, cardId);
     return result.changes > 0;
+  }
+
+  /**
+   * 从回收站恢复（F13.2）。
+   *
+   * 刻意**不动 `updated_at`**：恢复只改变可见性，卡片内容一个字节都没变。
+   * 若把 updated_at 刷新成现在，卡片会跳到"最近修改"列表最前面，
+   * 让用户以为自己刚改过它 —— 与"归属变更不动 updated_at"是同一个道理。
+   */
+  restoreCard(cardId: string): boolean {
+    const result = this.handle
+      .prepare('UPDATE cards SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL')
+      .run(cardId);
+    return result.changes > 0;
+  }
+
+  /** 回收站里超过保留期的卡片（F13.2 的定时清理用） */
+  listExpiredTrash(cutoffIso: string, limit = 500): string[] {
+    const rows = this.handle
+      .prepare('SELECT id FROM cards WHERE deleted_at IS NOT NULL AND deleted_at < ? ORDER BY deleted_at ASC LIMIT ?')
+      .all(cutoffIso, limit) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
+  /**
+   * 清除一个版本的内容（F13.3 prune）。
+   *
+   * 保留：seq / commit / 时间 / 作者 / message / kind / parent（链路不断）
+   * 清掉：blob_sha256 / audit_sha256 / byte_size（正文没了）
+   *
+   * `byte_size` 归零而不是保留原值：它描述的是"这个版本的内容有多大"，
+   * 内容已经没了还报 12 KB，任何按体积做的统计都会失真。
+   */
+  pruneVersion(cardId: string, seq: number, at: string, by: string): boolean {
+    const result = this.handle
+      .prepare(
+        `UPDATE versions
+            SET blob_sha256 = '', audit_sha256 = NULL, byte_size = 0, pruned_at = ?, pruned_by = ?
+          WHERE card_id = ? AND seq = ? AND pruned_at IS NULL`,
+      )
+      .run(at, by, cardId, seq);
+    return result.changes > 0;
+  }
+
+  /**
+   * 改卡片归属仓库（F13.4）。
+   *
+   * **不动 `updated_at`**（T10.6 决策）：归属变更不是内容变更。
+   * 如果刷新它，"最近修改"排序会把一次整理动作冒充成一次编辑。
+   */
+  moveCard(cardId: string, repoId: string): boolean {
+    const result = this.handle.prepare('UPDATE cards SET repo_id = ? WHERE id = ?').run(repoId, cardId);
+    return result.changes > 0;
+  }
+
+  /** 有多少个版本还引用这份 blob（purge 前必须查，blob 是按内容去重的） */
+  countVersionsUsingBlob(sha256: string): number {
+    if (sha256 === '') return 0;
+    const row = this.handle
+      .prepare('SELECT COUNT(*) AS n FROM versions WHERE blob_sha256 = ?')
+      .get(sha256) as { n: number };
+    return row.n;
   }
 
   hardDelete(cardId: string): void {
@@ -530,10 +639,29 @@ export class Db {
     action: string;
     cardId?: string | null;
     detail?: Record<string, unknown>;
+    /** 操作者。不传则记为 null（老调用点保持原样，不编造一个名字） */
+    actor?: string | null;
+    ip?: string | null;
+    /**
+     * 事件发生时该卡属于谁。**卡片被物理删除后，这条记录仍然要能被它的主人看到**，
+     * 所以归属必须存在事件上，不能只靠 card_id 反查（purge 之后行就没了）。
+     */
+    ownerId?: string | null;
   }): void {
     this.handle
-      .prepare('INSERT INTO events (at, level, action, card_id, detail) VALUES (?, ?, ?, ?, ?)')
-      .run(event.at, event.level, event.action, event.cardId ?? null, JSON.stringify(event.detail ?? {}));
+      .prepare(
+        'INSERT INTO events (at, level, action, card_id, detail, actor, ip, owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        event.at,
+        event.level,
+        event.action,
+        event.cardId ?? null,
+        JSON.stringify(event.detail ?? {}),
+        event.actor ?? null,
+        event.ip ?? null,
+        event.ownerId ?? null,
+      );
   }
 
   /**
@@ -553,9 +681,25 @@ export class Db {
         .prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?')
         .all(limit) as EventRow[];
     }
+
+    /*
+     * 两条通路合成一个可见集合：
+     *   ① `owner_id` 直接匹配 —— 卡片已经被 purge 掉时仍然可见（purge 事件就是靠这条活着）；
+     *   ② `owner_id IS NULL` 的老事件按卡片反查 —— 升级前的记录没有归属字段。
+     *
+     * `card_id IS NULL` 的运维事件（轮换令牌、服务启停）不涉及任何账户内容，保持全体可见。
+     */
     const params: Record<string, unknown> = { limit, ...scoped.params };
+    let ownerClause = '';
+    if (scope.kind === 'unowned') {
+      ownerClause = "owner_id = ''";
+    } else if (scope.kind === 'owner') {
+      ownerClause = 'owner_id = @scopeOwner';
+    }
     const sql = `SELECT * FROM events
-      WHERE card_id IS NULL OR card_id IN (SELECT id FROM cards WHERE ${scoped.clause})
+      WHERE card_id IS NULL
+         OR ${ownerClause === '' ? '0' : ownerClause}
+         OR (owner_id IS NULL AND card_id IN (SELECT id FROM cards WHERE ${scoped.clause}))
       ORDER BY id DESC LIMIT @limit`;
     return this.handle.prepare(sql).all(params) as EventRow[];
   }
