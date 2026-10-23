@@ -15,7 +15,14 @@ import type { Severity, Selector } from '../rules/platform-rule.js';
 
 export const AUDIT_REPORT_SCHEMA_VERSION = 1 as const;
 
-export type IssueCategory = 'completeness' | 'format' | 'platform-rule' | 'structure';
+/**
+ * 问题来源（审计报告的「按来源分组」就是按它）。
+ *
+ * `worldbook` 是 T10.9 新增的第五类：世界书此前的问题混在 `format` 里，
+ * 但它的判据（条目结构 / id / 触发键）与「TXT 分块是否符合预设」完全是两套规则，
+ * 混在一起会让面板上"格式 12 条"看不出到底是文本排版还是世界书条目坏了。
+ */
+export type IssueCategory = 'completeness' | 'format' | 'platform-rule' | 'structure' | 'worldbook';
 
 export interface IssueLocation {
   /** 所属板块；不属于任何板块时为 null（如 meta 字段、全文合计） */

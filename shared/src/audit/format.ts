@@ -6,7 +6,8 @@
  *      另做一次「未编辑板块的原文自洽」检查（assemble 结果必须等于导入原文）。
  *   2. **TXT 分块是否符合当前预设**：标题别名、标题装饰符、板块顺序、分隔符、结构缺失。
  *      顺序/装饰符偏差只给 `info`——按阶段 2 的决定，导出不主动重排，只有点「应用预设」才重排。
- *   3. **世界书格式**：TXT 解析错误（重复 id 等）+ 结构化条目 id 重复。
+ *   3. **世界书**（T10.9 起独立成 `worldbook` 类别）：TXT 解析错误、条目结构、
+ *      id（重复/非整数/缺失）、触发键（无关键词又非常驻 = 永不触发）。
  *
  * **缺省字段的处理（关键）**：有 SillyTavern 缺省值但未写出的字段（constant / insertion_order …）
  * 只产出 **一条 info 级提示**，绝不当 error、绝不计入 exportable=false。
@@ -232,7 +233,14 @@ function labelOf(blockId: BlockId): string {
   return LABELS[blockId] ?? blockId;
 }
 
-// ---------------------------------------------------------------- 3. 世界书格式
+// ---------------------------------------------------------------- 3. 世界书
+//
+// T10.9 起这一路单独成类别（`worldbook`）。三组检查，对应需求说的
+// 「条目结构 / id / 触发键」：
+//   · 结构：正文与关键词的类型、position 取值；
+//   · id：重复 / 非整数 / 缺失（重复是 error——条目按 id 合并，重复会让
+//     extensions 归属不确定；缺失只是 warning，导出时自动补号）；
+//   · 触发键：没有 keys 又非常驻 → 永远不会被触发（这是最容易犯、也最难自查的错）。
 
 export function checkWorldbookFormat(card: UnifiedCard): AuditIssue[] {
   const issues: AuditIssue[] = [];
@@ -247,7 +255,7 @@ export function checkWorldbookFormat(card: UnifiedCard): AuditIssue[] {
       issues.push(
         makeAuditIssue({
           ruleId: `builtin:worldbook-${problem.code}`,
-          category: 'format',
+          category: 'worldbook',
           severity: problem.severity,
           message: problem.message,
           hint: problem.code === 'duplicate-id' ? '重复 id 不会静默合并，请先修正再保存' : undefined,
@@ -262,7 +270,7 @@ export function checkWorldbookFormat(card: UnifiedCard): AuditIssue[] {
     }
   }
 
-  // 结构化侧：条目 id 重复（TXT 可能还没重新渲染）
+  // 结构化侧：TXT 可能还没重新渲染（例如刚从 JSON 导入）
   const seen = new Map<number, number>();
   for (const entry of card.worldbook?.entries ?? []) {
     if (typeof entry.id !== 'number') continue;
@@ -274,7 +282,7 @@ export function checkWorldbookFormat(card: UnifiedCard): AuditIssue[] {
       issues.push(
         makeAuditIssue({
           ruleId: 'builtin:worldbook-duplicate-entry-id',
-          category: 'format',
+          category: 'worldbook',
           severity: 'error',
           message: `世界书存在重复条目 id ${id}（${count} 条）`,
           hint: '条目按 id 合并，重复 id 会导致 extensions 归属不确定',
@@ -284,6 +292,114 @@ export function checkWorldbookFormat(card: UnifiedCard): AuditIssue[] {
         }),
       );
     }
+  }
+
+  issues.push(...checkWorldbookStructure(card));
+  return issues;
+}
+
+/**
+ * 条目结构与触发键（T10.9）。
+ *
+ * 为什么值得单独检查「触发键」：世界书条目的作用是"被关键词触发"，
+ * `keys: []` 且 `constant !== true` 的条目**永远不会出现在对话里**。
+ * 这不影响导出、不报错、在 JSON 里也看不出异常 —— 只有审计能发现，
+ * 所以它必须是 warning 而不是 info。
+ */
+export function checkWorldbookStructure(card: UnifiedCard): AuditIssue[] {
+  const issues: AuditIssue[] = [];
+  const entries = card.worldbook?.entries ?? [];
+
+  const bump = (
+    ruleId: string,
+    severity: 'error' | 'warning' | 'info',
+    message: string,
+    extra: { entryId?: number | null; hint?: string } = {},
+  ): void => {
+    issues.push(
+      makeAuditIssue({
+        ruleId,
+        category: 'worldbook',
+        severity,
+        message,
+        hint: extra.hint,
+        blockId: 'worldbook',
+        field: 'character_book',
+        entryId: extra.entryId ?? null,
+      }),
+    );
+  };
+
+  entries.forEach((entry, index) => {
+    const label = entry.name?.trim() ? `「${entry.name.trim()}」` : `第 ${String(index + 1)} 条`;
+    const entryId = typeof entry.id === 'number' ? entry.id : null;
+
+    // ── id ──
+    if (entry.id === undefined) {
+      bump('builtin:worldbook-entry-missing-id', 'warning', `世界书${label}没有 id，导出时会自动补号`, {
+        hint: '补号会写入文件；若要固定编号，请在导入的 JSON 里显式给出 id',
+      });
+    } else if (typeof entry.id !== 'number' || !Number.isInteger(entry.id) || entry.id < 0) {
+      bump('builtin:worldbook-entry-bad-id', 'error', `世界书${label}的 id 不是非负整数：${JSON.stringify(entry.id)}`, {
+        entryId,
+        hint: 'id 是合并锚点，必须是 0、1、2…… 这样的整数',
+      });
+    }
+
+    // ── 结构：正文 ──
+    if (typeof entry.content !== 'string') {
+      bump('builtin:worldbook-entry-bad-content', 'error', `世界书${label}的正文不是字符串`, { entryId });
+    } else if (entry.content.trim() === '') {
+      bump('builtin:worldbook-entry-empty-content', 'warning', `世界书${label}的正文是空的`, {
+        entryId,
+        hint: '空条目不会给对话提供任何信息，通常应该删除或补内容',
+      });
+    }
+
+    // ── 结构：关键词类型 ──
+    if (!Array.isArray(entry.keys)) {
+      bump('builtin:worldbook-entry-bad-keys', 'error', `世界书${label}的 keys 不是数组`, {
+        entryId,
+        hint: '单关键词也要写成数组： "keys": ["银座"]',
+      });
+      return; // keys 形状不对时，下面的触发键检查没有意义
+    }
+
+    // ── 触发键 ──
+    const keys = entry.keys.filter((key): key is string => typeof key === 'string');
+    const blankKeys = keys.filter((key) => key.trim() === '');
+    if (blankKeys.length > 0) {
+      bump('builtin:worldbook-blank-key', 'warning', `世界书${label}的关键词里有 ${String(blankKeys.length)} 个空项`, {
+        entryId,
+        hint: '空关键词会匹配一切，等于让条目常驻；要常驻请用 constant: true',
+      });
+    }
+
+    const isConstant = entry.constant === true;
+    if (keys.length === 0 && !isConstant) {
+      bump(
+        'builtin:worldbook-no-trigger',
+        'warning',
+        `世界书${label}没有任何关键词，也不是常驻（constant: false）——永远不会被触发`,
+        { entryId, hint: '补关键词，或把 constant 设为 true 让它常驻' },
+      );
+    }
+
+    if (entry.selective === true && !Array.isArray(entry.secondary_keys)) {
+      bump(
+        'builtin:worldbook-selective-without-secondary',
+        'warning',
+        `世界书${label}开启了 selective，但没有 secondary_keys`,
+        { entryId, hint: 'selective 要求次级关键词同时命中；没有次级关键词时该设置不起作用' },
+      );
+    }
+  });
+
+  // ── 世界书整体：条目数上限（ST 运行时按 token 预算扫描，条目过多会拖慢生成）──
+  if (entries.length > 200) {
+    bump('builtin:worldbook-too-many-entries', 'info', `世界书共有 ${String(entries.length)} 个条目`, {
+      hint: '条目越多扫描越慢；建议把长期用不到的分到别的世界书',
+    });
   }
 
   return issues;

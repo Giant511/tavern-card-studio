@@ -68,6 +68,12 @@ export interface LineColumn {
  * 文本偏移 → 行号/列号（T4.4 客户端「点击定位」用）。
  * 换行符一律按「一个断行」计：`\n`、`\r\n`、`\r` 都只 +1 行。
  * 列号按码点计，与 `chars` 口径一致（emoji 不会被算成 2 列）。
+ *
+ * **CRLF 必须成对跳过**（T10.9 修正）：原实现遇到 `\r` 就把行号 +1 并算出
+ * `lineStart`，但循环随后还会走到紧跟的 `\n`，于是又把行号 +1 ——
+ * 一个 CRLF 被算成两个断行。表现是 CRLF 文件里"第 3 行"的报错显示成"第 5 行"
+ * （每隔一个换行多 +1），而本仓库的工作区与 Windows 用户导出的文件普遍是 CRLF。
+ * 以前的用例都在 LF 上跑，所以一直没被发现；`test/text-offsets.test.mjs` 现在同时测两种。
  */
 export function offsetToLineColumn(text: string, offset: number): LineColumn {
   const clamped = Math.max(0, Math.min(offset, text.length));
@@ -76,12 +82,14 @@ export function offsetToLineColumn(text: string, offset: number): LineColumn {
 
   for (let index = 0; index < clamped; index += 1) {
     const char = text[index];
-    if (char === '\n') {
+    if (char === '\r') {
+      // 吞掉 CRLF 里的 `\n`：不跳过的话下一轮会把它当成第二个断行
+      if (text[index + 1] === '\n') index += 1;
       line += 1;
       lineStart = index + 1;
-    } else if (char === '\r') {
+    } else if (char === '\n') {
       line += 1;
-      lineStart = text[index + 1] === '\n' ? index + 2 : index + 1;
+      lineStart = index + 1;
     }
   }
 

@@ -314,7 +314,15 @@ test('T4.4 报告是纯 JSON（可 parse、无 Map/函数）且字段齐全', ()
   assert.equal(typeof report.card.name, 'string');
   assert.ok(report.wordCount.blocks.length === 6);
   assert.deepEqual(Object.keys(report.summary).sort(), ['error', 'exportable', 'info', 'warning']);
-  assert.deepEqual(Object.keys(report.byCategory).sort(), ['completeness', 'format', 'platform-rule', 'structure']);
+  // T10.9：新增 worldbook 类别 —— 世界书的条目结构 / id / 触发键问题
+  // 不再混在「格式」里（混在一起时面板上"格式 12 条"看不出到底是排版还是条目坏了）
+  assert.deepEqual(Object.keys(report.byCategory).sort(), [
+    'completeness',
+    'format',
+    'platform-rule',
+    'structure',
+    'worldbook',
+  ]);
 });
 
 test('T4.4 每条问题都携带位置信息（blockId/field/start/end/line/column 键齐全）', () => {
