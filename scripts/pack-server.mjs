@@ -277,6 +277,42 @@ function main() {
     'utf8',
   );
 
+  // CLI 包装脚本（T10.12 / F6.3）。
+  //
+  // 为什么必须有它：服务启动日志与客户端「未开放注册」文案都在告诉用户跑
+  // `tcs-server user migrate …` / `tcs-server user add …`，但安装目录里此前
+  // **只有** start-server.cmd（写死了 `serve`）—— 用户照提示敲命令只会得到
+  // 「不是内部或外部命令」。说明页第 1 步恰好就是这条命令，不能让它落空。
+  //
+  // 配置路径必须由脚本带对：服务用的 `--config` 是 MSI 的 DATAFOLDER，
+  // 而 CLI 不带 `--config` 时会按 `cwd/server/data` 推默认值 —— 在安装目录下运行
+  // 就会**另起一份空库**，人建好了、服务看不见，症状是"登录说账户不存在"。
+  writeFileSync(
+    join(OUT, 'tcs-server.cmd'),
+    [
+      '@echo off',
+      'setlocal',
+      'set "HERE=%~dp0"',
+      'rem ASCII only: cmd.exe reads .cmd in the OEM code page (CP936 here), so UTF-8',
+      'rem Chinese comments would come out garbled when the user opens the file.',
+      'rem Use the same config file as the service:',
+      'rem   green bundle  -> %HERE%data\\config.json',
+      'rem   installed MSI -> %ProgramData%\\TavernCardStudio\\config.json (DATAFOLDER)',
+      'if not "%TCS_CONFIG%"=="" goto run',
+      'if exist "%HERE%data\\config.json" (',
+      '  set "TCS_CONFIG=%HERE%data\\config.json"',
+      ') else (',
+      '  set "TCS_CONFIG=%ProgramData%\\TavernCardStudio\\config.json"',
+      ')',
+      ':run',
+      'rem Defaults come BEFORE %* so a user-supplied --config (written later) wins.',
+      '"%HERE%node.exe" "%HERE%app\\server\\dist\\index.js" --config "%TCS_CONFIG%" --rules-dir "%HERE%app\\rules" %*',
+      'exit /b %ERRORLEVEL%',
+      '',
+    ].join('\r\n'),
+    'utf8',
+  );
+
   writeFileSync(
     join(APP, 'package.json'),
     `${JSON.stringify({ name: 'tavern-card-studio-server-bundle', private: true, type: 'module' }, null, 2)}\n`,
