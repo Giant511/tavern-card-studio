@@ -12,7 +12,13 @@ import type { LoadedConfig } from './config.js';
 import { createContext, type ServerContext } from './context.js';
 import { createWorkerHandler } from './http/app.js';
 import { warmUpPasswordHashing } from './auth/password.js';
-import { PLAINTEXT_BANNER, prepareTlsMaterial, startHttpsServer, type StartedHttps } from './tls/server.js';
+import {
+  PLAINTEXT_BANNER,
+  prepareTlsMaterial,
+  runtimeTlsState,
+  startHttpsServer,
+  type StartedHttps,
+} from './tls/server.js';
 
 export interface RunningWorker {
   server: Server;
@@ -104,18 +110,7 @@ export async function startWorker(loaded: LoadedConfig): Promise<RunningWorker> 
 
     // 写入实际生效的 TLS 状态（供 /api/stats 与面板使用）。
     // 注意 httpsPort 用回读的实际端口（可能是系统分配的），不是配置里那个。
-    context.tls = {
-      mode: loaded.config.tls.mode,
-      httpsPort: https?.port ?? null,
-      fingerprint: prepared.info?.fingerprint ?? null,
-      subject: prepared.info?.subject ?? null,
-      notBefore: prepared.info?.notBefore ?? null,
-      notAfter: prepared.info?.notAfter ?? null,
-      daysUntilExpiry: prepared.info?.daysUntilExpiry ?? null,
-      selfSigned: prepared.info?.selfSigned ?? false,
-      plaintext: prepared.plaintext,
-      warnings: [...tlsWarnings],
-    };
+    context.tls = runtimeTlsState(loaded.config.tls.mode, https?.port ?? null, prepared);
   } catch (error) {
     // 证书/配置有问题 → 让整个 worker 启动失败。
     // 需求第 4 条明确：custom 不匹配要拒绝启动，不静默退回 off。

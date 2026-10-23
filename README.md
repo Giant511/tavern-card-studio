@@ -212,7 +212,7 @@ msiexec /i "Tavern Card Studio_<版本>_x64_en-US.msi" /qn
 #### selfsigned 模式：自签证书
 
 首次启动会自动生成一张 ECDSA P-256 证书，有效期 365 天，存放在
-`C:\ProgramData\TavernCardStudio\tls\`（`server.crt` + `server.key`）。
+`C:\ProgramData\TavernCardStudio\store\tls\`（`server.crt` + `server.key`）。
 私钥文件的权限会被收紧到只有 `SYSTEM`、`Administrators` 和当前账户可读。
 
 **浏览器会警告「不安全」。** 这是正常的 —— 自签证书不在系统的信任库里，
@@ -252,7 +252,52 @@ msiexec /i "Tavern Card Studio_<版本>_x64_en-US.msi" /qn
 把 `tls.mode` 留在 `off`、只让代理走回环连本机 —— 这样证书续期由代理负责，
 比把私钥交给本服务更省心。
 
-### 10. 规则与预设
+### 10. 公网部署（多用户）
+
+只想自己或内网几个人用，跳过这一节。要让**别人**通过公网登录各自账户，按下面三步，
+不要直接把 8730 端口开到公网。
+
+**第一步：决定谁来做 HTTPS。** 有域名就用反向代理（Caddy / nginx）申请
+Let's Encrypt 证书，服务端 `tls.mode` 留在 `off`、只监听 `127.0.0.1` ——
+证书续期由代理负责，私钥也不落在数据目录里。没有域名、只有 IP 才用
+`selfsigned` 或 `custom`（后者可配 mkcert / 企业 CA 签发的证书）。
+
+**第二步：关掉自助注册。** `config.json` 里把 `auth.registerMode` 设为
+`admin-only`（默认 `closed`）。`open` 只适合公开社区服务 —— 非回环监听时
+启动日志会警告有人在网上能随便建号。
+
+第一个管理员只能用命令行建（这条路不经过 HTTP，所以不受注册开关限制）：
+
+```bat
+cd "C:\Program Files\Tavern Card Studio Server"
+node.exe app\server\dist\index.js user add alice --config "C:\ProgramData\TavernCardStudio\config.json"
+```
+
+提示时输入密码（最短 8 位）。**第一个账户自动是管理员**，之后在面板里加人即可。
+
+**第三步：防火墙只放 443（和签证书时的 80）。** 8730 / 8731 / 8443 一律不要
+从公网可达 —— 开了 TLS 之后 HTTP 端口仍然在服务（见 §9），它不会自己关门。
+
+| 部署形态 | 对外端口 | `tls.mode` | 客户端填的地址 |
+|---|---|---|---|
+| 反向代理 + Let's Encrypt（推荐） | 443 | `off` | `https://你的域名` |
+| 服务端自持证书（只有 IP） | `https` 端口 | `custom` | `https://IP:8443` |
+| 服务端自签证书 | `https` 端口 | `selfsigned` | `https://IP:8443`（首次核对指纹） |
+
+几个反代之后才会遇到的现象，先知道省得排查：
+
+- **「一键连接（取令牌）」在反代下会返回 403** —— 它只允许本机取令牌，
+  而反代让所有请求看起来都来自本机，所以现在一律拒绝经过代理的取令牌请求
+  （否则等于把全权令牌挂在公网接口上）。远程请手工填令牌，或在服务器上
+  `node.exe app\server\dist\index.js token show`。
+- **登录失败 5 次会锁 10 分钟，而且是全局的**：限速按来源 IP 计，反代后所有人
+  都是同一个来源。别把登录页当公开入口用；必要时在代理层加 IP 白名单。
+- **上传大卡片可能 413**：nginx 默认只允许 1 MiB，要调到略大于 32 MiB。
+
+完整手册（含 Caddyfile / nginx 配置、备份升级、故障排查表、上线自查清单）
+随源码本地存放，不随仓库分发。
+
+### 11. 规则与预设
 
 内置五套平台规则（SillyTavern 原生、Character Card V2 / V3、JanitorAI、Chub）、
 三套高亮方案、三套 TXT 预设，开箱即用，不需要下载任何东西。想改就按下一节自己写。

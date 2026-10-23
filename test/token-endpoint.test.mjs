@@ -153,21 +153,35 @@ before(async () => {
     logs += chunk.toString();
   });
 
-  // 等配置生成 + 端口就绪
-  for (let attempt = 0; attempt < 60; attempt += 1) {
+  // 等配置生成 + 端口就绪。
+  //
+  // 失败时必须说清**最后一次尝试看到了什么**：早期版本只抛"服务未能就绪"，
+  // 而这句话在两种完全不同的故障下长得一模一样 ——
+  //   a) 端口还没 listen（ECONNREFUSED）；
+  //   b) 服务已经在听，但健康检查返回了非 200。
+  // 全量 `npm test` 并行跑 8 个会起服务的测试文件时，曾经出现过这类失败，
+  // 没有最后一跳的信息就只能靠猜（实际是并行负载下 worker 起得比 12 秒慢）。
+  let lastProbe = '(从未发起请求：配置文件一直没出现)';
+  // 30 秒预算（150 × 200ms）。这个用例要证的是安全模型，不是"启动够不够快"：
+  // 并行跑全量时本机要同时起 8 个 worker，12 秒曾被顶穿过一次（2026-10-23），
+  // 那次失败与功能无关，纯属预算太紧 —— 把不稳定性留在测试里，等于以后每次红灯都要重判。
+  for (let attempt = 0; attempt < 150; attempt += 1) {
     await delay(200);
-    if (existsSync(configPath)) {
-      const config = JSON.parse(readFileSync(configPath, 'utf8'));
-      token = config.auth.token ?? '';
-      try {
-        const res = await get('/api/health');
-        if (res.status === 200) return;
-      } catch {
-        // 还没起来
-      }
+    if (!existsSync(configPath)) {
+      lastProbe = `第 ${attempt + 1} 次：配置文件尚未生成`;
+      continue;
+    }
+    const config = JSON.parse(readFileSync(configPath, 'utf8'));
+    token = config.auth.token ?? '';
+    try {
+      const res = await get('/api/health');
+      lastProbe = `第 ${attempt + 1} 次：HTTP ${res.status} ${res.text.slice(0, 120)}`;
+      if (res.status === 200) return;
+    } catch (error) {
+      lastProbe = `第 ${attempt + 1} 次：${error?.code ?? error?.message ?? String(error)}`;
     }
   }
-  throw new Error(`服务未能就绪。日志：\n${logs}`);
+  throw new Error(`服务未能就绪（最后一次探测 ${lastProbe}）。日志：\n${logs}`);
 });
 
 after(async () => {
@@ -196,8 +210,28 @@ test('端到端：取令牌不需要令牌（引导接口，否则就是死锁�
   assert.equal(wrongAuth.status, 200, '带错误令牌也不该影响取令牌');
 });
 
-test('端到端：其它接口仍然要求令牌（引导豁免没有把鉴权整体放开）', async () => {
-  const noAuth = await get('/api/stats');
+test('端到端：经反向代理的请求取令牌 → 403，且不回显令牌（T10.10）', async () => {
+  // 同机反向代理（Caddy / nginx）会让**所有**请求的来源都是 127.0.0.1，
+  // 于是"只接受本机请求"这条门禁对公网请求一律成立 —— 谁 curl 一下公网域名
+  // 就能拿到全权令牌。判据只能是"这一跳来自代理"：桌面客户端直连不会有这些头。
+  for (const [name, headers] of [
+    ['X-Forwarded-For', { 'X-Forwarded-For': '203.0.113.9' }],
+    ['X-Real-IP', { 'X-Real-IP': '203.0.113.9' }],
+    ['Forwarded', { Forwarded: 'for=203.0.113.9' }],
+    ['X-Forwarded-Host', { 'X-Forwarded-Host': 'cards.example.com' }],
+  ]) {
+    const res = await get('/api/token', headers);
+    assert.equal(res.status, 403, `带 ${name} 时应 403，实际 ${res.status}`);
+    assert.equal(res.json?.error?.code, 'TOKEN_LOCAL_ONLY', '错误码要能让客户端区分"本机专属"');
+    assert.ok(!res.text.includes(token), `403 响应里不能夹带令牌原文（${name}）`);
+  }
+
+  // 反向证明：这些头不能让整个服务瘫痪 —— 健康检查必须照常
+  const health = await get('/api/health', { 'X-Forwarded-For': '203.0.113.9' });
+  assert.equal(health.status, 200, '反代下的健康检查必须可用');
+});
+
+test('端到端：其它接口仍然要求令牌（引导豁免没有把鉴权整体放开）', async () => {  const noAuth = await get('/api/stats');
   assert.equal(noAuth.status, 401, `未带令牌访问 /api/stats 应 401，实际 ${noAuth.status}`);
 
   const withAuth = await get('/api/stats', { Authorization: `Bearer ${token}` });

@@ -38,8 +38,8 @@ import {
   DEFAULT_HTTPS_PORT,
   PLAINTEXT_BANNER,
   prepareTlsMaterial,
+  runtimeTlsState,
   startHttpsServer,
-  tlsSummary,
 } from '../server/dist/tls/server.js';
 import { assertSafeConfig, normalizeConfig } from '../server/dist/config.js';
 
@@ -615,23 +615,31 @@ test('T10.5 真连接：off 模式不允许启动 HTTPS（没有材料就别假�
 });
 
 // ══════════════════════════════════════════════════════════
-// 8. 面板摘要
+// 8. 实际生效的 TLS 状态（/api/stats 下发的 tls 字段）
 // ══════════════════════════════════════════════════════════
+//
+// T10.5 时期这里测的是一个从未被调用的 `tlsSummary()`，它输出**嵌套**的
+// `tls.certificate.*`；而线上 `/api/stats` 用的是**扁平**的 `RuntimeTlsState`。
+// 两套形状并存导致写验证脚本时按嵌套去读、拿到 undefined。T10.10 删掉了死代码，
+// 装配抽成 `runtimeTlsState()`，worker 与这里的断言对象是同一份。
 
-test('T10.5 面板摘要：off 模式必带明文横幅，且是常驻而非一次性提示', () => {
-  const summary = tlsSummary({ mode: 'off', httpsPort: 8443, certPath: '', keyPath: '' }, null);
-  assert.equal(summary['plaintext'], true);
-  assert.equal(summary['httpsPort'], null);
-  const banner = summary['banner'];
-  assert.ok(banner, 'off 模式必须下发横幅');
-  assert.equal(banner.level, 'danger');
-  assert.match(banner.body, /明文/);
-  assert.match(banner.body, /selfsigned/, '要告诉用户怎么修');
-  // 横幅内容与常量必须是同一份，避免两处文案漂移
-  assert.equal(banner.body, PLAINTEXT_BANNER.body);
+test('T10.5/T10.10 状态摘要：off 模式 plaintext=true 且没有证书信息', async () => {
+  const dir = freshDir();
+  const prepared = await prepareTlsMaterial({
+    config: { mode: 'off', httpsPort: 8443, certPath: '', keyPath: '' },
+    dataDir: dir,
+  });
+  const state = runtimeTlsState('off', null, prepared);
+  assert.equal(state.plaintext, true);
+  assert.equal(state.httpsPort, null, 'off 模式不许报一个"正在监听的 HTTPS 端口"');
+  assert.equal(state.fingerprint, null);
+  assert.equal(state.selfSigned, false);
+  // 横幅文案与常量同源，避免两处漂移（面板直接引用这个常量渲染）
+  assert.match(PLAINTEXT_BANNER.body, /明文/);
+  assert.match(PLAINTEXT_BANNER.body, /selfsigned/, '要告诉用户怎么修');
 });
 
-test('T10.5 面板摘要：selfsigned 模式带指纹与剩余天数（供用户核对）', async () => {
+test('T10.5/T10.10 状态摘要：selfsigned 模式带指纹与剩余天数（供用户核对）', async () => {
   const dir = freshDir();
   const now = new Date('2026-10-23T00:00:00.000Z');
   const prepared = await prepareTlsMaterial({
@@ -640,11 +648,14 @@ test('T10.5 面板摘要：selfsigned 模式带指纹与剩余天数（供用户
     now,
   });
 
-  const summary = tlsSummary({ mode: 'selfsigned', httpsPort: 8443, certPath: '', keyPath: '' }, prepared.info);
-  assert.equal(summary['plaintext'], false);
-  assert.equal(summary['banner'], null);
-  const cert = summary['certificate'];
-  assert.ok(cert, 'selfsigned 模式必须下发证书信息');
-  assert.match(cert.fingerprint, /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/);
-  assert.ok(cert.daysUntilExpiry > 300);
+  const state = runtimeTlsState('selfsigned', 8443, prepared);
+  assert.equal(state.plaintext, false);
+  assert.equal(state.httpsPort, 8443);
+  assert.ok(state.fingerprint, 'selfsigned 模式必须下发证书指纹');
+  assert.match(state.fingerprint, /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/);
+  assert.equal(state.selfSigned, true);
+  assert.ok(state.daysUntilExpiry > 300);
+  // 扁平结构：一旦有人改回嵌套，这条会立刻失败
+  assert.equal(state['certificate'], undefined, '线上形状是扁平的，不要再套一层 certificate');
 });
+

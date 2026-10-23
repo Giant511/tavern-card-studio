@@ -26,7 +26,7 @@
 
 [CmdletBinding()]
 param(
-  [string]$Version = '0.1.1',
+  [string]$Version = '0.1.2',
   [string]$WixPath = '',
   # 留空则在正文里解析（param 默认值阶段 $PSScriptRoot 可能为空，见下方说明）
   [string]$StageDir = '',
