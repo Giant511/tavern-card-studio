@@ -218,6 +218,14 @@ if (-not (Test-Path -LiteralPath $connectGuide)) {
   throw "Missing connect guide: $connectGuide"
 }
 $connectGuideResolved = (Resolve-Path -LiteralPath $connectGuide).Path
+
+# 安装布局标记：`.cmd` 启动器靠它区分"MSI 安装"与"绿色包"，从而选对配置文件。
+# 绿色包里没有这个文件（pack-server 不生成），所以它是一个可靠的显式信号。
+$layoutMarker = Join-Path $scriptDir 'install-layout.ini'
+if (-not (Test-Path -LiteralPath $layoutMarker)) {
+  throw "Missing install layout marker: $layoutMarker"
+}
+$layoutMarkerResolved = (Resolve-Path -LiteralPath $layoutMarker).Path
 $wixArgs = @(
   'build'
   (Join-Path $scriptDir 'Product.wxs')
@@ -227,6 +235,7 @@ $wixArgs = @(
   '-d', "WinSwDir=$winSwResolved"
   '-d', "ServiceHostConfig=$serviceHostResolved"
   '-d', "ConnectGuide=$connectGuideResolved"
+  '-d', "LayoutMarker=$layoutMarkerResolved"
   '-d', "ProductVersion=$Version"
   '-o', $msi
 )
@@ -261,6 +270,7 @@ $missing = @()
 if ($decompiled -notmatch '<CustomAction[^>]*OpenConnectGuide') { $missing += 'CustomAction:OpenConnectGuide' }
 if ($decompiled -notmatch '<Shortcut') { $missing += 'Shortcut' }
 if ($decompiled -notmatch 'connect-guide\.html') { $missing += 'File:connect-guide.html' }
+if ($decompiled -notmatch 'install-layout\.ini') { $missing += 'File:install-layout.ini' }
 if ($missing.Count -gt 0) {
   throw ("MSI is missing expected entries: {0}. The build succeeded but the installer will not behave as expected." -f ($missing -join ', '))
 }

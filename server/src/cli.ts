@@ -575,6 +575,17 @@ export async function main(argv: readonly string[]): Promise<number> {
         `API：http://${reachableHost(loaded.config.host)}:${loaded.config.port}/api\n` +
         `数据目录：${loaded.config.dataDir}\n`,
     );
+    /*
+     * 前台运行时明确说一句"它在跑，怎么停"（2026-10-23 生产反馈）。
+     *
+     * 之前的 banner 打完就没有下文了，而 `serve` 是**前台常驻**进程 ——
+     * 用户看到光标停在那里，把"正在运行"误判成"卡住了"，甚至直接关窗口。
+     * 只在 TTY 下打印：作为 Windows 服务（WinSW）启动时 stdout 是管道，
+     * 这行进了日志只会变成噪音。
+     */
+    if (process.stdout.isTTY === true) {
+      process.stdout.write('服务运行中 · 按 Ctrl+C 停止（关掉这个窗口也会停止服务）\n');
+    }
     return 0;
   }
 
