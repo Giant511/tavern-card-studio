@@ -981,8 +981,22 @@ export class CardService {
   async move(
     cardId: string,
     targetRepoId: string,
-    options: { scope?: CardScope; actor?: string; ip?: string | null; reason?: string } = {},
-  ): Promise<{ id: string; fromRepoId: string; repoId: string; moved: boolean }> {
+    options: {
+      scope?: CardScope;
+      actor?: string;
+      ip?: string | null;
+      reason?: string;
+      /**
+       * 允许移动到**别的账户**的仓库（F13.1 管理员跨账户治理）。
+       *
+       * 默认 false：跨账户移动会让卡片从一个账户的可见范围里消失、出现在另一个人的
+       * 列表里，这必须是一次显式的、被记录的决定，不能因为"调用者是管理员"就默认成立。
+       * 路由层只在 `via === 'jwt' && role === 'admin'` 时传 true ——
+       * 仓库令牌即使属于管理员账户也不能跨账户（它的权限边界就是那个仓库）。
+       */
+      allowCrossOwner?: boolean;
+    } = {},
+  ): Promise<{ id: string; fromRepoId: string; repoId: string; moved: boolean; crossOwner: boolean }> {
     return this.mutex.run(cardId, async () => {
       const card = this.requireCard(cardId, { includeDeleted: true, scope: options.scope ?? ALL_CARDS });
       if (card.deleted_at !== null) {
@@ -1000,30 +1014,62 @@ export class CardService {
         .prepare('SELECT id, owner_id FROM repos WHERE id = ? AND deleted_at IS NULL')
         .get(targetRepoId) as { id: string; owner_id: string } | undefined;
       if (repo === undefined) throw new AppError(404, 'NOT_FOUND', `仓库不存在：${targetRepoId}`);
-      if (repo.owner_id !== card.owner_id) {
-        // 跨账户移动只能由管理员发起，且必须走管理员的显式入口（路由层判定后传 allowCrossOwner）
+      const crossOwner = repo.owner_id !== card.owner_id;
+      if (crossOwner && options.allowCrossOwner !== true) {
         throw new AppError(403, 'FORBIDDEN', '目标仓库不属于该卡片的账户', {
-          hint: '跨账户移动请用管理员的跨账户接口',
+          hint: '跨账户移动需要管理员身份',
         });
       }
       if (card.repo_id === targetRepoId) {
-        return { id: cardId, fromRepoId: card.repo_id, repoId: targetRepoId, moved: false };
+        return { id: cardId, fromRepoId: card.repo_id, repoId: targetRepoId, moved: false, crossOwner };
       }
 
-      this.db.moveCard(cardId, targetRepoId);
+      /*
+       * 跨账户移动必须连 `owner_id` 一起改。
+       *
+       * 只改 `repo_id` 会留下"卡在甲的仓库里、归属还是乙"的不一致：乙仍能在
+       * 「我的卡片」里看到它，而甲在自己的仓库里看不到 —— 两个人都觉得出了问题。
+       */
+      this.db.moveCard(cardId, targetRepoId, crossOwner ? repo.owner_id : undefined);
       const at = new Date().toISOString();
+      if (crossOwner) {
+        // 跨账户移动会同时改掉"谁能看见这张卡"，必须升到 warn 级别并带上两个账户
+        this.db.appendEvent({
+          at,
+          level: 'warn',
+          action: 'card.move.cross-account',
+          cardId,
+          detail: {
+            from: card.repo_id,
+            to: targetRepoId,
+            fromOwner: card.owner_id,
+            toOwner: repo.owner_id,
+            reason: options.reason ?? null,
+          },
+          ownerId: card.owner_id,
+          actor: options.actor ?? null,
+          ip: options.ip ?? null,
+        });
+      }
       this.db.appendEvent({
         at,
         level: 'info',
         action: 'card.move',
         cardId,
-        detail: { from: card.repo_id, to: targetRepoId, reason: options.reason ?? null },
-        ownerId: card.owner_id,
+        detail: { from: card.repo_id, to: targetRepoId, reason: options.reason ?? null, crossOwner },
+        // 这条记在新归属下：跨账户之后，卡片属于新账户，它的日常事件也该在新账户的流里
+        ownerId: crossOwner ? repo.owner_id : card.owner_id,
         actor: options.actor ?? null,
         ip: options.ip ?? null,
       });
-      this.logger.info('card.move', { cardId, from: card.repo_id, to: targetRepoId, actor: options.actor });
-      return { id: cardId, fromRepoId: card.repo_id, repoId: targetRepoId, moved: true };
+      this.logger.info('card.move', {
+        cardId,
+        from: card.repo_id,
+        to: targetRepoId,
+        crossOwner,
+        actor: options.actor,
+      });
+      return { id: cardId, fromRepoId: card.repo_id, repoId: targetRepoId, moved: true, crossOwner };
     });
   }
 

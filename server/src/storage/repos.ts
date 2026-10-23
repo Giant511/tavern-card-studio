@@ -249,6 +249,69 @@ export class RepoStore {
     this.handle.prepare('UPDATE repos SET deleted_at = ?, updated_at = ? WHERE id = ?').run(now, now, id);
   }
 
+  /**
+   * 带转移的仓库删除（F13.4 / T10.19）。
+   *
+   * 语义：空仓库直接删；非空仓库**必须**指定 `transferTo`，卡片批量转移后删除，
+   * **整个过程一个事务** —— 中途失败时不能留下"卡片已移走、仓库还在"或反过来
+   * 的半截状态（那会让用户两边都找不到自己的卡）。
+   *
+   * 三个必须一起处理的边角：
+   *   1. 回收站里的卡片也要一起转移：它们仍指向旧 repo_id，仓库删了就变成
+   *      指向一个不存在的仓库（恢复时才炸）。所以按 repo_id 全量 UPDATE，
+   *      不加 `deleted_at IS NULL` 条件。
+   *   2. 绑定到该仓库的令牌必须吊销：留着等于给一把"打开已不存在仓库"的钥匙，
+   *      而仓库 id 万一被复用（不会，但别依赖这个）就是越权。
+   *   3. 默认仓库不给删 —— 调用方应改用 `setDefault` 把它换掉。
+   */
+  removeWithTransfer(
+    id: string,
+    transferTo: string | null,
+    now = new Date().toISOString(),
+  ): { movedCards: number; revokedTokens: number } {
+    const repo = this.findById(id);
+    if (!repo) throw new RepoNotFoundError(id);
+    if (repo.is_default === 1) {
+      throw new Error('默认仓库不能删除：先把别的仓库设为默认（转移默认），再删这个');
+    }
+
+    const cardCount = this.countCards(id);
+    if (cardCount > 0 && transferTo === null) {
+      throw new Error(`仓库里还有 ${String(cardCount)} 张卡片，删除时必须指定目标仓库（transferTo）`);
+    }
+    if (transferTo !== null && transferTo === id) {
+      throw new Error('目标仓库不能是它自己');
+    }
+
+    if (transferTo !== null) {
+      const target = this.findById(transferTo);
+      if (!target) throw new RepoNotFoundError(transferTo);
+      if (target.owner_id !== repo.owner_id) {
+        throw new Error('只能转移到同一个账户下的仓库');
+      }
+    }
+
+    const tx = this.handle.transaction(() => {
+      let movedCards = 0;
+      if (transferTo !== null) {
+        // 不加 deleted_at 条件：回收站里的卡也必须跟着走，否则恢复后指向死仓库
+        const result = this.handle
+          .prepare('UPDATE cards SET repo_id = ? WHERE repo_id = ?')
+          .run(transferTo, id);
+        movedCards = result.changes;
+      }
+      const revoked = this.handle
+        .prepare(
+          `UPDATE repo_tokens SET revoked_at = ?, revoke_reason = ?
+            WHERE repo_id = ? AND revoked_at IS NULL`,
+        )
+        .run(now, '仓库已删除', id);
+      this.handle.prepare('UPDATE repos SET deleted_at = ?, updated_at = ? WHERE id = ?').run(now, now, id);
+      return { movedCards, revokedTokens: revoked.changes };
+    });
+    return tx();
+  }
+
   setDefault(id: string, now = new Date().toISOString()): void {
     const repo = this.findById(id);
     if (!repo) throw new RepoNotFoundError(id);

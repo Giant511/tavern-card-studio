@@ -15,7 +15,7 @@ import { isLoopbackAddress } from '../config.js';
 import { API_VERSION, SERVER_VERSION, configSummary, type ServerContext } from '../context.js';
 import { readRawBody, parseJsonBody } from './body.js';
 import { TokenGate } from './auth.js';
-import { scopeFromIdentity } from '../storage/card-scope.js';
+import { ALL_CARDS, scopeFromIdentity, type CardScope } from '../storage/card-scope.js';
 import { registerAuthRoutes } from './auth-routes.js';
 import { registerRepoRoutes } from './repo-routes.js';
 import { TrustProxyResolver, decideTokenGate } from '../net/trust-proxy.js';
@@ -28,7 +28,16 @@ import { RepoStore, TokenStore, checkTokenScope, type Operation } from '../stora
 import { COMMON_HEADERS, methodNotAllowed, sendError, sendJson, sendRaw } from './responses.js';
 import { Router, type RouteContext } from './router.js';
 
-const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH']);
+/*
+ * DELETE 也读请求体（T10.19）。
+ *
+ * `DELETE /api/repos/:id {transferTo}` 需要它。HTTP 规范允许 DELETE 带体，
+ * 但**中间代理可能把它丢掉**，所以仓库删除那条路由同时接受
+ * `?transferTo=` 作为等价写法（见 repo-routes.ts）。
+ * 这里不读体的后果很隐蔽：handler 拿到空对象，于是"非空仓库必须指定目标"
+ * 这条规则会把一个**带了 transferTo 的请求**判成没带（测试实测 409）。
+ */
+const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 function queryInt(query: URLSearchParams, key: string, fallback: number, min: number, max: number): number {
   const raw = query.get(key);
@@ -195,6 +204,40 @@ function auditActor(gate: TokenGate, routeCtx: RouteContext): { actor: string; i
   return { actor, ip };
 }
 
+/**
+ * 管理员是否在"治理模式"下（F13.1）。
+ *
+ * 只认 **jwt**：仓库令牌即使属于管理员账户，权限边界也只是它绑定的那个仓库；
+ * legacy 令牌的可见范围已被降权为"未归属卡片"，给它 ALL_CARDS 等于把降权撤销。
+ */
+function isAdminJwt(gate: TokenGate, routeCtx: RouteContext): boolean {
+  const identity = gate.identify(routeCtx.req);
+  return identity !== null && identity.via === 'jwt' && identity.role === 'admin';
+}
+
+/**
+ * **变更**类操作的范围：管理员可以治理所有账户的卡片，所以给 ALL_CARDS。
+ * 读接口不用它 —— 见 {@link readScope}。
+ */
+function mutationScope(gate: TokenGate, routeCtx: RouteContext): CardScope {
+  return isAdminJwt(gate, routeCtx) ? ALL_CARDS : scopeFromIdentity(gate.identify(routeCtx.req));
+}
+
+/**
+ * **读**的范围：默认仍是"自己的"。
+ *
+ * 为什么管理员的读也要显式加 `?all=true`：管理账户不等于有理由在
+ * 「我的卡片」里看到别人的角色卡。治理要看全站时用面板的治理页，
+ * 那里带的是这个显式开关，而不是把默认视图悄悄放大。
+ */
+function readScope(gate: TokenGate, routeCtx: RouteContext): CardScope {
+  if (!queryBool(routeCtx.query, 'all')) return scopeFromIdentity(gate.identify(routeCtx.req));
+  if (!isAdminJwt(gate, routeCtx)) {
+    throw new AppError(403, 'ADMIN_ONLY', '查看全部账户的卡片仅管理员可用');
+  }
+  return ALL_CARDS;
+}
+
 function assertPermission(gate: TokenGate, routeCtx: RouteContext, operation: Operation): void {
   const identity = gate.identify(routeCtx.req);
   // 没有身份时交给 TokenGate.check 已经拦过了（这里只处理"有身份但权限不够"）
@@ -276,6 +319,19 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     repos,
     tokens: repoTokens,
     identify: (context) => gate.identify(context.req),
+    // 跨账户仓库删除要留痕。事件写进同一张 events 表，
+    // 于是它和卡片级操作在面板的治理视图里是同一条时间线。
+    onAudit: (event) => {
+      ctx.db.appendEvent({
+        at: new Date().toISOString(),
+        level: 'warn',
+        action: event.action,
+        cardId: null,
+        detail: { repoId: event.repoId, ...event.detail },
+        actor: event.actor,
+        ownerId: event.ownerId,
+      });
+    },
   });
 
   router.get('/api/health', (_ctx) => {
@@ -404,7 +460,8 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   router.get('/api/events', (_ctx) => {
     const limit = queryInt(_ctx.query, 'limit', 50, 1, 500);
     sendJson(_ctx.res, 200, {
-      items: ctx.cards.events(limit, scopeFromIdentity(gate.identify(_ctx.req))),
+      // 治理页要能看全站时间线（含跨账户删除），所以这条读也走 readScope
+      items: ctx.cards.events(limit, readScope(gate, _ctx)),
     });
   });
 
@@ -437,7 +494,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       limit,
       offset,
       includeDeleted: queryBool(_ctx.query, 'includeDeleted'),
-      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      scope: readScope(gate, _ctx),
     });
     sendJson(_ctx.res, 200, { total: result.total, limit, offset, items: result.items });
   });
@@ -502,7 +559,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     assertPermission(gate, _ctx, 'read');
     const card = ctx.cards.get(_ctx.params['id']!, {
       includeDeleted: queryBool(_ctx.query, 'includeDeleted'),
-      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      scope: readScope(gate, _ctx),
     });
     sendJson(_ctx.res, 200, card);
   });
@@ -529,7 +586,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   router.post('/api/cards/:id/restore', async (_ctx) => {
     assertPermission(gate, _ctx, 'delete');
     const result = await ctx.cards.restore(_ctx.params['id']!, {
-      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      scope: mutationScope(gate, _ctx),
       ...auditActor(gate, _ctx),
     });
     sendJson(_ctx.res, 200, result);
@@ -540,7 +597,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     assertPermission(gate, _ctx, 'delete');
     requireAdmin(gate, _ctx, '彻底清除');
     const result = await ctx.cards.purge(_ctx.params['id']!, {
-      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      scope: mutationScope(gate, _ctx),
       ...auditActor(gate, _ctx),
     });
     sendJson(_ctx.res, 200, result);
@@ -554,7 +611,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       throw new AppError(400, 'BAD_REQUEST', 'seq 必须是正整数版本序号');
     }
     const result = await ctx.cards.prune(_ctx.params['id']!, seq, {
-      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      scope: mutationScope(gate, _ctx),
       ...auditActor(gate, _ctx),
     });
     sendJson(_ctx.res, 200, result);
@@ -566,8 +623,11 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     const body = parseJsonBody<Record<string, unknown>>(_ctx.body, {});
     const repoId = typeof body['repo'] === 'string' ? body['repo'].trim() : '';
     const result = await ctx.cards.move(_ctx.params['id']!, repoId, {
-      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      scope: mutationScope(gate, _ctx),
       reason: typeof body['reason'] === 'string' ? body['reason'] : undefined,
+      // 跨账户移动只允许管理员的 jwt：仓库令牌的边界就是它绑定的仓库，
+      // legacy 的可见范围已被降权，两者都不该借这一步扩大范围。
+      allowCrossOwner: isAdminJwt(gate, _ctx),
       ...auditActor(gate, _ctx),
     });
     sendJson(_ctx.res, 200, result);
@@ -597,7 +657,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     const result = ctx.cards.listVersions(_ctx.params['id']!, {
       limit,
       offset,
-      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      scope: readScope(gate, _ctx),
     });
     sendJson(_ctx.res, 200, { total: result.total, limit, offset, items: result.items });
   });
@@ -607,7 +667,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     const bytes = requireCardBody(_ctx);
     const version = await ctx.cards.addVersion(_ctx.params['id']!, bytes, {
       ...writeOptionsFrom(_ctx.query, ctx),
-      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      scope: readScope(gate, _ctx),
     });
     sendJson(_ctx.res, 201, version, {
       Location: `/api/cards/${_ctx.params['id']}/versions/${version.seq}`,
@@ -669,7 +729,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     const result = await ctx.cards.rollback(_ctx.params['id']!, to, {
       message: meta.message ?? optional(_ctx.query, 'message'),
       author: meta.author ?? optional(_ctx.query, 'author'),
-      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+      scope: readScope(gate, _ctx),
     });
     sendJson(_ctx.res, 201, result);
   });
@@ -700,7 +760,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       const result = ctx.cards.recomputeAudit(_ctx.params['id']!, version, {
         platformId: optional(_ctx.query, 'platform') ?? ctx.config.defaultPlatformRule,
         presetId: optional(_ctx.query, 'preset') ?? ctx.config.defaultPreset,
-        scope: scopeFromIdentity(gate.identify(_ctx.req)),
+        scope: readScope(gate, _ctx),
       });
       sendRaw(_ctx.res, 200, result.reportBytes, {
         'Content-Type': 'application/json; charset=utf-8',

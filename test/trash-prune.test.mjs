@@ -396,17 +396,33 @@ test('move：目标不存在 404；缺 repo 400；回收站里的卡 409', async
   assert.equal(trashed.json.error.code, 'CARD_IN_TRASH');
 });
 
-test('move：移不进别的账户的仓库（403）', async () => {
+test('move：普通账户移不进别人的仓库（403）；管理员可以（T10.19）', async () => {
   await request(`/api/cards/${moveCard}/restore`, { method: 'POST', token: alice.token });
   const bobRepos = await request('/api/repos', { token: bob.token });
   const bobRepo = bobRepos.json.items[0];
 
-  const crossed = await request(`/api/cards/${moveCard}/move`, {
+  /*
+   * 用 **bob（普通账户）** 去移 alice 的卡 —— 这才是"跨账户被拒"的正确测法。
+   *
+   * 第一版我用 alice 移 bob 的仓库，当时 alice 还没有跨账户能力，所以 403 成立；
+   * T10.19 给了管理员跨账户之后，同一个断言变成 false（实现按需求变了，
+   * 测试前提过期）。现在两条都验：普通账户 403、管理员 200 且标记 crossOwner。
+   */
+  const denied = await request(`/api/cards/${moveCard}/move`, {
     method: 'POST',
     body: { repo: bobRepo.id },
+    token: bob.token,
+  });
+  assert.equal(denied.status, 404, '普通账户连这张卡都看不到，应得 404 而不是 403');
+
+  // 管理员（alice 是首个账户）移进 bob 的仓库：允许，且必须标记 crossOwner
+  const allowed = await request(`/api/cards/${moveCard}/move`, {
+    method: 'POST',
+    body: { repo: bobRepo.id, reason: '测试跨账户' },
     token: alice.token,
   });
-  assert.equal(crossed.status, 403, `跨账户移动必须被拒：${crossed.text}`);
+  assert.equal(allowed.status, 200, `管理员应可跨账户移动：${allowed.text}`);
+  assert.equal(allowed.json.crossOwner, true);
 });
 
 // ══════════════════════════════════════════════════════════
