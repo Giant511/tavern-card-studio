@@ -289,6 +289,42 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 
 ---
 
+## 6b. 卸载与数据清理
+
+MSI 的卸载流程会弹一页「Uninstall options」，问要不要**连数据一起删**。
+复选框默认**不勾**（数据保留），勾了才删整个 `C:\ProgramData\TavernCardStudio`。
+
+图形界面卸载（开始菜单 / 设置 → 应用）：按提示走，注意那一页的复选框。
+
+静默卸载两条路，差别只在数据：
+
+```powershell
+# 保留数据（默认）。程序没了，ProgramData 里的版本链、审计、账号都还在
+msiexec /x .\release\TavernCardStudioServer-0.1.2.msi /qn
+
+# 连数据一起删（不可逆）
+msiexec /x .\release\TavernCardStudioServer-0.1.2.msi /qn DELETEDATA=1
+```
+
+两条命令都需要**管理员**终端（`/qn` 不会弹 UAC；权限不够会直接失败，
+日志里是 `MSI_LUA: Elevation prompt disabled for silent installs`）。
+
+只想清数据、不想动程序时，手工删目录即可（先停服务，否则文件被占）：
+
+```powershell
+& $tcs service stop
+Remove-Item -LiteralPath 'C:\ProgramData\TavernCardStudio' -Recurse -Force
+```
+
+**顺序很重要**：`stop` → 删数据 → 再 `Remove-Item` 安装目录残留。反过来会在服务
+还握着日志/数据库句柄时删失败，而且失败得很难看（部分文件已删、部分没删）。
+
+> 卸载动作本身返回 `ignore`：删不掉（例如某个日志文件仍被占用）**不会**让卸载失败
+> 回滚 —— 回滚会留下一个"卸不掉"的安装，比"留下一个目录"糟糕得多。
+> 真删不掉时手工执行上面两条命令即可。
+
+---
+
 ## 7. 启动与诊断
 
 ### 7.1 `serve` —— 前台启动（调试用）

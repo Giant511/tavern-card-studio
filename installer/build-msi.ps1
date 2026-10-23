@@ -14,20 +14,25 @@
 #       unzip wix.zip -d .tools\wix
 #       # 可执行文件位于 .tools\wix\tools\net6.0\any\wix.exe
 #   - 已执行 npm run build（server\dist 需要存在）。
+#   - WiX UI 扩展（WixToolset.UI.wixext）：向导界面与卸载对话框依赖它。
+#     已入库在 vendor\wixext\（755 KiB，来源与 sha256 见那里的 README），
+#     所以离线构建不需要额外下载。若换版本，见该 README 的"更新方法"。
 #
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File installer\build-msi.ps1
 #   powershell -ExecutionPolicy Bypass -File installer\build-msi.ps1 -Version 0.1.1 -Repack
 #   powershell -ExecutionPolicy Bypass -File installer\build-msi.ps1 -WixPath 'C:\tools\wix\wix.exe'
+#   powershell -ExecutionPolicy Bypass -File installer\build-msi.ps1 -WixExt 'C:\ext\WixToolset.UI.wixext.dll'
 #
 # 输出：release\TavernCardStudioServer-<version>.msi
 # 该 MSI 安装服务端、注册 TavernCardStudioServer 自启动 Windows 服务，
-# 数据目录固定在 C:\ProgramData\TavernCardStudio（卸载不删数据）。
+# 数据目录固定在 C:\ProgramData\TavernCardStudio（卸载时询问是否删除，默认保留）。
 
 [CmdletBinding()]
 param(
   [string]$Version = '0.1.2',
   [string]$WixPath = '',
+  [string]$WixExt = '',
   # 留空则在正文里解析（param 默认值阶段 $PSScriptRoot 可能为空，见下方说明）
   [string]$StageDir = '',
   [string]$OutDir = '',
@@ -123,8 +128,80 @@ Offline download:
 
 $wix = Resolve-Wix -Explicit $WixPath
 Write-Host "WiX: $wix"
-& $wix --version
+$wixVersionText = (& $wix --version 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'wix.exe is not runnable (check the .NET runtime)' }
+Write-Host "WiX version: $wixVersionText"
+
+# ------------------------------------------------- WiX UI 扩展（向导 + 卸载对话框）
+#
+# 为什么必须有它：v0.1.2 起卸载流程要问"要不要删数据"（F14.1），
+# 而标准对话框集只有 WixUI_InstallDir 在 Remove 与 Ready 之间留了插页的位置
+# （见 Product.wxs 里那段长注释）。没有这个扩展，Product.wxs 里的
+# <ui:WixUI> 与 <Dialog> 会编译失败。
+#
+# 扩展已入库在 vendor\wixext\，所以离线构建不需要联网。仍然保留三个探测位置，
+# 是为了让"想用自己那份扩展"的人不必改脚本。
+$uiExtExpectedSha = '5ce7f958b6a2b57bcb98c19615c5a3da46976a6e78a6af055fdef99e9e9e8f06'
+
+function Resolve-WixExt {
+  param([string]$Explicit)
+
+  if ($Explicit) {
+    if (-not (Test-Path -LiteralPath $Explicit)) { throw "WiX UI 扩展不存在：$Explicit" }
+    return (Resolve-Path -LiteralPath $Explicit).Path
+  }
+
+  $candidates = @()
+  $vendored = Join-Path $repo 'vendor\wixext'
+  if (Test-Path -LiteralPath $vendored) {
+    $candidates += Get-ChildItem -LiteralPath $vendored -Filter '*.wixext*.dll' -File |
+      Sort-Object Name -Descending | ForEach-Object { $_.FullName }
+  }
+  $tools = Join-Path $repo '.tools\wix-ext'
+  if (Test-Path -LiteralPath $tools) {
+    $candidates += Get-ChildItem -LiteralPath $tools -Filter '*.wixext*.dll' -Recurse -File |
+      Sort-Object Name -Descending | ForEach-Object { $_.FullName }
+  }
+  foreach ($candidate in $candidates) {
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+  }
+
+  throw @'
+WiX UI extension not found (needed for the uninstall dialog since v0.1.2).
+Expected one of:
+  - vendor\wixext\WixToolset.UI.wixext.<version>.dll   (vendored, preferred)
+  - .tools\wix-ext\...\WixToolset.UI.wixext.dll
+  - -WixExt <path to WixToolset.UI.wixext.dll>
+Offline download (then unzip and take wixext5\WixToolset.UI.wixext.dll):
+  curl -L -o ui.nupkg https://www.nuget.org/api/v2/package/WixToolset.UI.wixext/5.0.2
+See vendor\wixext\README.md.
+'@
+}
+
+$wixExt = Resolve-WixExt -Explicit $WixExt
+$wixExtSha = (Get-FileHash -LiteralPath $wixExt -Algorithm SHA256).Hash.ToLower()
+if ($wixExtSha -ne $uiExtExpectedSha) {
+  throw @"
+WiX UI 扩展哈希不符：期望 $uiExtExpectedSha
+                     实际 $wixExtSha
+  文件：$wixExt
+第三方二进制要能被验证。若确实要升级扩展，请同时更新 vendor\wixext\README.md 与本行。
+"@
+}
+
+# 扩展的大版本必须与 wix.exe 一致：v5 的扩展 v6 不认，反之亦然。
+# 文件名里带版本号就是为了能在打包前拦住这种错配，而不是等到用户机器上才发现。
+$extNameVersion = [regex]::Match((Split-Path -Leaf $wixExt), 'wixext\.(\d+)\.(\d+)\.(\d+)\.dll$')
+if ($extNameVersion.Success) {
+  $extMajor = [int]$extNameVersion.Groups[1].Value
+  $wixMajor = [int]([regex]::Match($wixVersionText, '^(\d+)').Groups[1].Value)
+  if ($extMajor -ne $wixMajor) {
+    throw "WiX UI 扩展是 v$extMajor，而 wix.exe 是 $wixVersionText —— 大版本必须一致。"
+  }
+  Write-Host "WiX UI extension: $(Split-Path -Leaf $wixExt) (sha256 verified, v$extMajor matches wix)"
+} else {
+  Write-Host "WiX UI extension: $wixExt (sha256 verified; version not parsed from filename)"
+}
 
 # ---------------------------------------------------------------- 1. 绿色包
 #
@@ -226,16 +303,35 @@ if (-not (Test-Path -LiteralPath $layoutMarker)) {
   throw "Missing install layout marker: $layoutMarker"
 }
 $layoutMarkerResolved = (Resolve-Path -LiteralPath $layoutMarker).Path
+
+# 向导界面用到的两件附属物（F14.1）：
+#   · license.rtf  —— WixUI_InstallDir 编译期强制要求，即使许可页已被跳过；
+#   · ui-text.wxl  —— 覆盖 ExitDialog 的正文，把数据目录位置写进完成页。
+$licenseRtf = Join-Path $scriptDir 'license.rtf'
+if (-not (Test-Path -LiteralPath $licenseRtf)) {
+  throw "Missing license RTF: $licenseRtf (required by WixUI_InstallDir, see Product.wxs)"
+}
+$licenseRtfResolved = (Resolve-Path -LiteralPath $licenseRtf).Path
+
+$uiText = Join-Path $scriptDir 'ui-text.wxl'
+if (-not (Test-Path -LiteralPath $uiText)) {
+  throw "Missing UI text overrides: $uiText (the uninstall finish page would lose the data-directory hint)"
+}
+$uiTextResolved = (Resolve-Path -LiteralPath $uiText).Path
+
 $wixArgs = @(
   'build'
   (Join-Path $scriptDir 'Product.wxs')
   $appFiles
   '-arch', 'x64'
+  '-ext', $wixExt
+  '-loc', $uiTextResolved
   '-d', "StageDir=$stageResolved"
   '-d', "WinSwDir=$winSwResolved"
   '-d', "ServiceHostConfig=$serviceHostResolved"
   '-d', "ConnectGuide=$connectGuideResolved"
   '-d', "LayoutMarker=$layoutMarkerResolved"
+  '-d', "LicenseRtf=$licenseRtfResolved"
   '-d', "ProductVersion=$Version"
   '-o', $msi
 )
@@ -252,10 +348,16 @@ if (-not (Test-Path -LiteralPath $msi)) { throw "wix build reported success but 
 # wix build 退出码 0、日志一条警告都没有，但反编译后 CustomAction 表是空的 ——
 # 装完根本不会弹连接说明。这类问题只有"解包反编译"才能发现。
 #
-# 断言三件事，缺一即失败：
+# 断言这些，缺一即失败：
 #   · CustomAction 表有 OpenConnectGuide（安装后打开说明页）；
 #   · Shortcut 表有快捷方式（开始菜单能再次打开）；
-#   · File 表有 connect-guide.html（说明页本身在包里）。
+#   · File 表有 connect-guide.html（说明页本身在包里）；
+#   · Dialog 表有 DeleteDataDlg，且它的复选框控件绑在 DELETEDATA 上（F14.1）；
+#   · ControlEvent 表有 "MaintenanceTypeDlg / RemoveButton / NewDialog → DeleteDataDlg"
+#     —— 这一条最要紧：控件名写错时 WiX 编译成功、日志无警告、那行直接消失，
+#     界面上就是"根本没有卸载选项那一页"（2026-10-24 实际踩过，写成 Remove 而不是 RemoveButton）；
+#   · Property 表里 DELETEDATA 没有默认值 —— 有值就意味着复选框可能默认勾上；
+#   · ExitDialog 的正文被 ui-text.wxl 换成了带数据目录的版本。
 Write-Host '[4/5] Verifying MSI content (decompile)...'
 $decompDir = Join-Path $OutDir '.decompile'
 if (Test-Path -LiteralPath $decompDir) { Remove-Item -LiteralPath $decompDir -Recurse -Force }
@@ -271,11 +373,33 @@ if ($decompiled -notmatch '<CustomAction[^>]*OpenConnectGuide') { $missing += 'C
 if ($decompiled -notmatch '<Shortcut') { $missing += 'Shortcut' }
 if ($decompiled -notmatch 'connect-guide\.html') { $missing += 'File:connect-guide.html' }
 if ($decompiled -notmatch 'install-layout\.ini') { $missing += 'File:install-layout.ini' }
+if ($decompiled -notmatch '<Dialog Id="DeleteDataDlg"') { $missing += 'Dialog:DeleteDataDlg' }
+if ($decompiled -notmatch 'Property="DELETEDATA"') { $missing += 'Control:DeleteDataCheck(Property=DELETEDATA)' }
+if ($decompiled -notmatch '<CustomAction[^>]*Id="DeleteDataDir"') { $missing += 'CustomAction:DeleteDataDir' }
+if ($decompiled -notmatch 'Data directory \(kept unless you delete it during uninstall\)') { $missing += 'UIText:ExitDialogDescription' }
 if ($missing.Count -gt 0) {
   throw ("MSI is missing expected entries: {0}. The build succeeded but the installer will not behave as expected." -f ($missing -join ', '))
 }
+
+# 复选框默认态：DELETEDATA 只能"声明"，不能有值。
+# 反编译里 `<Property Id="DELETEDATA" .../>` 只要带了 Value 就算失败。
+$deletedataDefault = [regex]::Match($decompiled, '<Property Id="DELETEDATA"[^>]*>')
+if ($deletedataDefault.Success -and $deletedataDefault.Value -match 'Value=') {
+  throw ("Property DELETEDATA 带了默认值（{0}）—— 卸载对话框的复选框会默认勾上，这违反 F14.1 的保守默认。" -f $deletedataDefault.Value)
+}
+
+# 控件名断言：Remove 按钮上的 NewDialog 必须有一条指向 DeleteDataDlg。
+# 反编译把 ControlEvent 表展开成控件下的 <Publish>，所以按控件块抓。
+$removeButtonBlock = [regex]::Match($decompiled, '(?s)<Control Id="RemoveButton".*?</Control>')
+if (-not $removeButtonBlock.Success) {
+  throw 'MSI 里找不到 MaintenanceTypeDlg 的 RemoveButton 控件 —— 标准对话框集可能变了，请复核 Product.wxs 里的 Publish 目标控件名。'
+}
+if ($removeButtonBlock.Value -notmatch 'Value="DeleteDataDlg"') {
+  throw 'MaintenanceTypeDlg.RemoveButton 没有指向 DeleteDataDlg 的 NewDialog —— 卸载对话框不会出现（常见原因：Publish 的 Control 名写成了 Remove）。'
+}
+
 Remove-Item -LiteralPath $decompDir -Recurse -Force
-Write-Host '  CustomAction / Shortcut / connect-guide.html all present'
+Write-Host '  CustomAction / Shortcut / connect-guide.html / DeleteDataDlg / DELETEDATA all present'
 
 # ---------------------------------------------------- 5. 结果与后续操作提示
 $size = (Get-Item -LiteralPath $msi).Length / 1MB
@@ -286,8 +410,10 @@ Write-Host ("Version:  {0}" -f $Version)
 Write-Host ''
 Write-Host 'Install (elevated PowerShell):'
 Write-Host ('  msiexec /i "' + $msi + '" /l*v install.log')
-Write-Host 'Uninstall (keeps data in C:\ProgramData\TavernCardStudio):'
+Write-Host 'Uninstall (asks whether to delete the data directory; default keeps it):'
 Write-Host ('  msiexec /x "' + $msi + '" /l*v uninstall.log')
+Write-Host 'Silent uninstall that also deletes the data directory:'
+Write-Host ('  msiexec /x "' + $msi + '" /qn DELETEDATA=1')
 Write-Host ''
 Write-Host 'Admin panel after install:  http://127.0.0.1:8731/'
 Write-Host 'Service name:              TavernCardStudioServer'

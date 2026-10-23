@@ -6,6 +6,7 @@
     1. npm run pack:server            (stages node.exe + app + runtime deps)
     2. node scripts/gen-wix-fragment.mjs  (generates installer\generated\AppFiles.wxs)
     3. wix build installer\Product.wxs installer\generated\AppFiles.wxs ...
+       -ext <WixToolset.UI.wixext.dll>   (the wizard: see below)
 
   Installed layout:
     C:\Program Files\Tavern Card Studio Server\
@@ -18,10 +19,13 @@
       app\node_modules\...     runtime dependencies
     C:\ProgramData\TavernCardStudio\   data root (config.json, store\, logs\)
 
-  The data directory is intentionally NOT removed on uninstall: it holds card
-  blobs, git repositories and audit snapshots.
+  The data directory is NOT removed on uninstall by default: it holds card
+  blobs, git repositories and audit snapshots, and deleting it is not
+  undoable. Since v0.1.2 the uninstall flow asks (F14.1): a checkbox in
+  `DeleteDataDlg`, unchecked unless the user ticks it.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
 
     Name="Tavern Card Studio Server"
@@ -32,7 +36,15 @@
     Scope="perMachine"
     Compressed="yes">
 
+    <!--
+      Codepage 说明：数据库本身用 65001（UTF-8）——安装包里有中文（开始菜单快捷方式叫
+      "如何连接（地址与令牌）"），1252 装不下，WiX 会直接 WIX0311 拒绝打包。但
+      SummaryInformation 必须用 ANSI 代码页（WIX0349），所以这两处要分开指定。
+      在接入向导（ui-text.wxl）之前，WiX 默认给数据库的就是 UTF-8，从没撞上这条；
+      一旦有了 en-US 的本地化文件，数据库代码页就跟着变成 1252，问题才浮出来。
+    -->
     <SummaryInformation
+      Codepage="1252"
       Description="Character card audit and version control server (local deployment)."
       Manufacturer="Tavern Card Studio" />
 
@@ -42,8 +54,22 @@
 
     <MediaTemplate EmbedCab="yes" />
 
-    <Property Id="ARPNOMODIFY" Value="1" />
+    <!--
+      ARPNOMODIFY 不在这里写：WixUI_InstallDir 自己会设它（该对话框集不支持 Change），
+      我们再写一次会撞 WIX0091 Duplicate Property。这条以前写在 Product 里是能编译的
+      （没有界面的 MSI 没人替我设），接上向导之后就成了重复定义。
+    -->
     <Property Id="ARPCOMMENTS" Value="Local-first character card audit and version control server. Data lives in C:\ProgramData\TavernCardStudio." />
+
+    <!--
+      卸载时是否连带删除数据目录。
+
+      这里**只声明、不给值** —— 空值就是"不勾选"（MSI 的 CheckBox 控件在
+      属性值等于 CheckBoxValue 时才显示为勾上）。这正是 F14.1 要求的保守默认：
+      误删不可逆，多留一份目录只是占地方。静默卸载时可由命令行显式开启：
+        msiexec /x <msi> /qn DELETEDATA=1
+    -->
+    <Property Id="DELETEDATA" Secure="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Tavern Card Studio Server" />
@@ -63,6 +89,102 @@
     </Feature>
 
     <!--
+      许可页用的 RTF。WixUI_InstallDir 编译期强制要求这个变量存在，即使我们
+      把许可页从流程里摘掉了（见下方 Publish）。文件里是 MIT 全文 + 版权行。
+
+      WixUI_InstallDir 而不是 WixUI_Minimal 的原因：只有它在卸载路径上经过
+      VerifyReadyDlg（Minimal 的 Remove 直接 EndDialog 收工），也就是说只有
+      它留出了"在 Remove 与 Ready 之间插一页"的位置 —— 那正是我们要问用户
+      "要不要删数据"的地方。
+
+      InstallDirectory 会顺带设置 WIXUI_INSTALLDIR，因此目录页拿到的就是
+      INSTALLFOLDER（虽然这个页面被我们跳过了，但属性仍然必须合法）。
+    -->
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+
+    <!--
+      自定义界面（F14.1）。WiX v5 只允许 <UI> 作为 <Package> 的直接子元素
+      （放 <Fragment> 里会报 WIX0005: unexpected child element 'UI'），
+      所以它只能写在 Product 里，不能像文件清单那样拆成独立片段。
+
+      挂载点：标准集的卸载路径是
+        MaintenanceWelcomeDlg → MaintenanceTypeDlg → VerifyReadyDlg → 进度 → ExitDialog
+      我们把 MaintenanceTypeDlg 的 Remove 改道到 DeleteDataDlg，Next 再回
+      VerifyReadyDlg：
+        … → MaintenanceTypeDlg →（点 Remove）→ DeleteDataDlg →（点 Next）→ VerifyReadyDlg → …
+
+      **Control 名必须是 RemoveButton**。WiX 里那个按钮的 Control Id 是
+      `RemoveButton`，不是 `Remove`；写成 `Remove` 不报错、不警告，编译成功，
+      但 ControlEvent 行指向一个不存在的控件 —— 运行时永不触发，表现就是
+      "根本没有那一页"。2026-10-24 实测过一次：反编译出来的 MSI 里
+      RemoveButton 只剩指向 VerifyReadyDlg 的那一条，构建日志干干净净。
+      build-msi.ps1 第 4 步因此断言这条 ControlEvent 真的进了表。
+
+      **Order="2"**：同一控件上的多条 Publish 按 Order 升序全部执行，后执行的
+      NewDialog 覆盖先执行的。WiX 自带的 `Remove → VerifyReadyDlg` 是 Order=1，
+      我们这条 Order=2 因此最终生效（Tauri 的 MSI 用同样手法跳过许可页）。
+    -->
+    <UI>
+      <Dialog Id="DeleteDataDlg" Width="370" Height="270" Title="[ProductName] Setup" NoMinimize="yes">
+
+        <!-- 坐标沿用 WiX 标准栅格：370×270，按钮 y=243，Back 180 / Next 236 / Cancel 304，各 56×17。
+             换成别的值也能跑，但翻页时按钮会跳一下。 -->
+        <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="WixUI_Bmp_Dialog" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" TabSkip="no" />
+
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="&amp;Back" />
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Text="&amp;Next" Default="yes" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Text="Cancel" Cancel="yes">
+          <!-- 没有这条，Cancel 就是个"点了没反应"的死按钮：Cancel="yes" 只是把它标成
+               Cancel 按钮（属性位），并不会自动产生任何动作。WiX 5 的 ICE17 不一定会跑，
+               所以这是靠"照标准对话框的写法抄"避免的。 -->
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+
+        <Control Id="Title" Type="Text" X="135" Y="15" Width="220" Height="30" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Bigger}Uninstall options" />
+        <Control Id="Description" Type="Text" X="135" Y="48" Width="220" Height="40" Transparent="yes" NoPrefix="yes"
+                 Text="Only the program will be removed. Its data directory is separate and is kept by default." />
+
+        <Control Id="DataDirLabel" Type="Text" X="135" Y="92" Width="220" Height="12" Transparent="yes" NoPrefix="yes"
+                 Text="Data directory:" />
+        <Control Id="DataDirPath" Type="Text" X="135" Y="105" Width="220" Height="24" Transparent="yes" NoPrefix="yes"
+                 Text="[DATAFOLDER]" />
+
+        <Control Id="DeleteDataCheck" Type="CheckBox" X="135" Y="135" Width="220" Height="34"
+                 Text="Also delete this data directory (card database, configuration, logs)"
+                 Property="DELETEDATA" CheckBoxValue="1" />
+
+        <Control Id="Warning" Type="Text" X="135" Y="176" Width="220" Height="48" Transparent="yes" NoPrefix="yes"
+                 Text="If you tick the box the data can not be restored: card versions, audit records and account credentials all live there." />
+      </Dialog>
+
+      <!-- 本页自己的翻页。注意：Publish 必须是 <UI> 的直接子元素（写进 <Dialog> 里
+           会报 WIX0005），靠 Dialog= 属性指明挂在哪个对话框上。Order 用 1 即可 ——
+           这两条没有竞争者。 -->
+      <Publish Dialog="DeleteDataDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="1" Condition="1" />
+      <Publish Dialog="DeleteDataDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="1" Condition="1" />
+
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="DeleteDataDlg" Order="2" Condition="1" />
+
+      <!--
+        安装路径：Welcome → VerifyReady，跳过许可页与安装目录页。
+
+          · 许可页：本地自用的 MIT 工具，没有人会读那一页，多一次点击只让人觉得
+            装起来麻烦（license.rtf 仍然存在，WixUI_InstallDir 编译期要求它）；
+          · 安装目录页：自 v0.1.0 起安装位置固定，启动器、服务注册、
+            install-layout.ini 都相对它定位。放开选择只会让"路径含空格/中文"
+            这类问题重新出现，而没有任何需求要求它。
+
+        VerifyReadyDlg 的 Back 因此也要改回 WelcomeDlg，否则用户在"准备安装"页
+        按 Back 会掉进那个被刻意藏起来的目录页。
+      -->
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="2" Condition="NOT Installed" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2" Condition="NOT Installed" />
+    </UI>
+
+    <!--
       安装完成后打开连接说明。
 
       **必须在 Package 内**，不能放在 Fragment 里 —— 放在 Fragment 里 WiX 会静默忽略整段，
@@ -77,10 +199,25 @@
     <InstallExecuteSequence>
       <Custom Action="OpenConnectGuide" After="InstallFinalize"
               Condition="NOT REMOVE AND UILevel &gt;= 3" />
+
+      <!--
+        删除数据目录（F14.1 的"勾选后卸载结束删除整个 ProgramData\TavernCardStudio"）。
+
+        时序：StopServices（ServiceControl Stop 在这里跑，服务先停）之后、
+        RemoveFiles 之前 —— 数据文件先走，安装目录随后被 MSI 正常清理，
+        两边不会互相踩。这与 F14.2 要求的顺序（停服务 → 删数据 → 删安装目录残留
+        → 删服务注册）一致，后两步由 MSI 自身的 RemoveFiles / ServiceControl Remove 完成。
+
+        Return="ignore"：删不掉（例如某个日志文件还被句柄占着）**不能**让卸载失败并回滚。
+        回滚会得到一个"卸不掉"的安装，比"留下一个目录"糟糕得多；而数据保留的方向
+        也是保守的（用户还可以手删）。失败痕迹由 T10.23 的清单式清理动作统一落日志。
+      -->
+      <Custom Action="DeleteDataDir" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND DELETEDATA=1" />
     </InstallExecuteSequence>
   </Package>
 
-  <!-- Data directory: created at install, kept at uninstall. -->
+  <!-- Data directory: created at install, kept at uninstall unless DELETEDATA=1. -->
   <Fragment>
     <DirectoryRef Id="DATAFOLDER">
       <Component Id="DataFolderComponent" Guid="2C0B8B6A-6E5F-4B3D-9E44-8A7D1C3F5B21">
@@ -216,7 +353,31 @@
       Execute="immediate"
       Impersonate="yes"
       Return="asyncNoWait" />
+  </Fragment>
 
+  <!--
+    删除数据目录（仅当用户在 DeleteDataDlg 里勾了框）。
+
+    Deferred + Impersonate="yes"：
+      · deferred：必须在脚本生成之后执行，否则它会在"还没停服务"时就去删数据；
+      · impersonate：卸载程序由用户提权运行，此时该用户对 ProgramData 下的目录
+        有删除权限。用 SYSTEM（Impersonate="no"）也能删，但 `%…%` 与用户态路径
+        的解析会跑到 systemprofile 下，对客户端 MSI 那套 %APPDATA% 逻辑是错的 ——
+        两套 MSI 用同一套写法，读起来才不容易搞混。
+
+    Deferred 动作的命令行在**排程时**展开（[DATAFOLDER] 那时已经确定），
+    所以这里可以直接写属性引用。
+
+    `if exist` 兜底：数据目录本来就不存在时 rmdir 会返回非零，看着像失败。
+  -->
+  <Fragment>
+    <CustomAction
+      Id="DeleteDataDir"
+      Directory="SystemFolder"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="ignore"
+      ExeCommand="&quot;[SystemFolder]cmd.exe&quot; /c if exist &quot;[DATAFOLDER]&quot; rmdir /s /q &quot;[DATAFOLDER]&quot;" />
   </Fragment>
 
 </Wix>

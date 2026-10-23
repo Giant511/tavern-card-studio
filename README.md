@@ -114,6 +114,25 @@ msiexec /i "Tavern Card Studio_<版本>_x64_en-US.msi" /qn
 `/qn` 时不会弹「如何连接」页，部署完自己去  
 `C:\ProgramData\TavernCardStudio\config.json` 取令牌即可。
 
+### 卸载（以及你的数据去哪了）
+
+两个 MSI 的卸载流程都会**先问一句**：是否同时删除数据目录。复选框**默认不勾** ——
+卸载只带走程序，数据留着，误删不可逆，所以默认给保守的那一边。
+
+| | 数据目录 | 卸载时默认 |
+| --- | --- | --- |
+| 服务端 | `C:\ProgramData\TavernCardStudio`（角色卡版本链、审计记录、账户凭据、日志） | 保留 |
+| 客户端 | `%APPDATA%\com.taverncardstudio.client`（已保存的服务端地址与访问令牌） | 保留 |
+
+- 勾选后该目录被整棵删除；**不勾选则保留**，卸载完成页会再提示一次位置，想清理就自己删。
+- 客户端的角色卡（`Documents\TavernCardStudio\cards`）**永远不动** —— 那是你的文档，不是应用数据。
+- 静默卸载要连数据一起删，显式给属性：`msiexec /x <msi> /qn DELETEDATA=1`。
+
+```bat
+msiexec /x TavernCardStudioServer-<版本>.msi
+msiexec /x "Tavern Card Studio_<版本>_x64_en-US.msi"
+```
+
 ---
 
 ## 三、配置与使用

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  覆盖标准对话框集里的一句文案（F14.1 "卸载完成页提示数据位置"）。
+
+  为什么用 .wxl 而不是自建一个完成页：
+    WixUI 的 ExitDialog 是标准集里唯一在"成功"之后必然出现的一页
+    （InstallUISequence 里 `Show Dialog="ExitDialog" OnExit="success"`，
+    安装成功和卸载成功都走它）。它的正文来自本地化字符串
+    `ExitDialogDescription`，而 WiX 的规则是**后给的本地化文件覆盖先给的** ——
+    `wix build -loc <file>` 就能改掉它，不用劫持 ExitDialog 的 Finish 按钮。
+    劫持那条 Publish 是行不通的：Finish 上原本就有 `EndDialog Return`（Order=1），
+    我们的 NewDialog（Order=2）会在向导已经结束之后才执行，等于没执行。
+
+  这段文字在**安装成功后也会显示**，所以措辞不能预设"你刚卸载过"：
+  它陈述的是"数据目录在哪、卸载默认不删"，两种场景都成立。
+
+  [DATAFOLDER] 是目录属性，在对话框显示时展开（和 InstallDirDlg 里的
+  [INSTALLDIR] 同一机制），所以这里写属性名而不是硬编码路径。
+-->
+<WixLocalization Culture="en-US" Codepage="65001" xmlns="http://wixtoolset.org/schemas/v4/wxl">
+  <String Id="ExitDialogDescription" Value="Data directory (kept unless you delete it during uninstall): [DATAFOLDER]" />
+</WixLocalization>
