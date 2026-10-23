@@ -60,7 +60,13 @@ const BLOCK_FILTER_OPTIONS: Array<{ value: BlockId | 'all' | null; label: string
   { value: null, label: '仅全文级' },
 ];
 
-const CATEGORIES: IssueCategory[] = ['completeness', 'format', 'platform-rule', 'structure'];
+/**
+ * 筛选条里的类别顺序 = 报告里「按来源分组」的顺序。
+ *
+ * `worldbook`（T10.9）放在最后：它是最具体的一路，用户排查时通常先看
+ * 「完整性」和「格式」，世界书条目问题属于局部细节。
+ */
+const CATEGORIES: IssueCategory[] = ['completeness', 'format', 'platform-rule', 'structure', 'worldbook'];
 
 export class AuditPanel {
   private readonly root: HTMLElement;

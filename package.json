@@ -48,7 +48,8 @@
     "verify:t107": "node scripts/verify-t107.mjs",
     "probe:shortsha": "node scripts/probe-shortsha.mjs",
     "smoke:t108": "node scripts/smoke-t108.mjs",
-    "verify:t108": "node scripts/verify-t108.mjs"
+    "verify:t108": "node scripts/verify-t108.mjs",
+    "verify:t109": "node scripts/verify-t109.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

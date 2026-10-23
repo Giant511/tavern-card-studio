@@ -26,6 +26,9 @@ export const CATEGORY_LABELS: Record<IssueCategory, string> = {
   format: '格式',
   'platform-rule': '平台规则',
   structure: '结构',
+  // T10.9：世界书单独成类。此前它的问题混在「格式」里，
+  // 面板上「格式 12 条」看不出是文本排版还是世界书条目坏了。
+  worldbook: '世界书',
 };
 
 const SEVERITY_ORDER: Record<Severity, number> = { error: 0, warning: 1, info: 2 };
@@ -188,6 +191,7 @@ export function countByCategory(report: AuditReport): Record<IssueCategory, numb
     format: 0,
     'platform-rule': 0,
     structure: 0,
+    worldbook: 0,
   };
   for (const [key, value] of Object.entries(report.byCategory ?? {})) {
     if (key in base && typeof value === 'number') base[key as IssueCategory] = value;

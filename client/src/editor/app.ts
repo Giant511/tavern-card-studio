@@ -79,6 +79,8 @@ import { phaseLabel, phaseTitle } from '../auth/policy';
 import { SettingsDialog } from '../settings/settings-dialog';
 import { NewCardDialog } from '../session/new-card-dialog';
 import { decideShortcut } from './shortcuts';
+import { ImportDialog } from './import-dialog';
+import { applyWorldbookImport, exportWorldbookText, suggestWorldbookFileName } from './import-flow';
 import { CardSession } from '../session/card-session';
 import { effectiveCardsDir, suggestCardFileName } from '../session/cards-dir';
 import { TabBar, type TabItem } from '../session/tab-bar';
@@ -159,6 +161,8 @@ class EditorApp {
   private authSession: AuthSession | null = null;
   private loginDialog: LoginDialog | null = null;
   private cardsDialog: CardsDialog | null = null;
+  /** TXT 角色卡 / 世界书导入对话框（T10.9） */
+  private importDialog: ImportDialog | null = null;
   private repoDialog: RepoDialog | null = null;
   /**
    * 上次选过的上传仓库（T10.8）。
@@ -276,6 +280,7 @@ class EditorApp {
     this.wireRules();
     this.wireExportAndSync();
     this.wireAccount();
+    this.wireImport();
 
     // 未落盘会话的离开拦截（T9.14）。
     // WebView2 认 F5 / Ctrl+R，误按一次就把整个 webview 重载、所有标签的
@@ -573,7 +578,57 @@ class EditorApp {
     return false;
   }
 
-  /** 当前同步配置：连接通过时才返回（未就绪不构造请求参数） */
+  /**
+   * 导入装配（T10.9）。
+   *
+   * 对话框只建一次（它的模式切换要保留状态）；真正的"读文件"由调用方做 ——
+   * 对话框不该知道原生能力，这样它能在 Node 里被纯逻辑测试绕过。
+   */
+  private wireImport(): void {
+    this.importDialog = new ImportDialog({
+      // 严格/宽松判定需要"导入前的卡"做基线，所以给深拷贝而不是引用
+      getCard: () => structuredClone(this.card),
+      getPreset: () => this.rules?.preset ?? null,
+    });
+  }
+
+  /** 世界书板块内的两个按钮（导入 / 导出），由 createBlock 挂在 worldbook 块里 */
+  private buildWorldbookActions(): HTMLElement {
+    const row = el('div', 'worldbook-actions');
+    const importButton = el('button', 'btn small', '导入世界书…') as HTMLButtonElement;
+    importButton.type = 'button';
+    importButton.dataset['role'] = 'worldbook-import';
+    importButton.title = '支持 character_book JSON 与世界书 TXT（自动识别）';
+    importButton.addEventListener('click', () => void this.pickAndImportWorldbook());
+
+    const exportJson = el('button', 'btn small ghost', '导出 JSON…') as HTMLButtonElement;
+    exportJson.type = 'button';
+    exportJson.dataset['role'] = 'worldbook-export-json';
+    exportJson.addEventListener('click', () => void this.exportWorldbookFile('json'));
+
+    const exportTxt = el('button', 'btn small ghost', '导出 TXT…') as HTMLButtonElement;
+    exportTxt.type = 'button';
+    exportTxt.dataset['role'] = 'worldbook-export-txt';
+    exportTxt.addEventListener('click', () => void this.exportWorldbookFile('txt'));
+
+    row.append(importButton, exportJson, exportTxt);
+    return row;
+  }
+
+  /** 选一个世界书文件并导入（扩展名决定预期格式，但真正的识别在 shared 里做） */
+  private async pickAndImportWorldbook(): Promise<void> {
+    try {
+      const path = await pickCardFile(undefined, { allowText: true });
+      if (!path) return;
+      const file = await readTextExact(path);
+      await this.importWorldbookFile(file.pathDisplay ?? path, file.text);
+    } catch (error) {
+      this.setStatus(`读取世界书文件失败：${describe(error)}`, 'bad');
+    }
+  }
+
+  /**
+   * 当前同步配置：连接通过时才返回（未就绪不构造请求参数） */
   private currentSyncConfig(): SyncConfig | null {
     const connection = this.connection;
     if (!connection || !connection.url) return null;
@@ -1106,6 +1161,9 @@ class EditorApp {
     const host = el('div', 'cm-host');
     const preview = el('div', 'preview');
     preview.hidden = true;
+    // 世界书块额外挂「导入 / 导出」——世界书是唯一能从外部独立导入导出的板块，
+    // 入口放在它自己的块里，用户不用去别处找（T10.9）。
+    if (snapshot.id === 'worldbook') body.append(this.buildWorldbookActions());
     body.append(host, preview);
 
     section.append(header, body);
@@ -1832,9 +1890,19 @@ class EditorApp {
   private async openCard(): Promise<void> {
     try {
       const dir = await effectiveCardsDir();
-      const path = await pickCardFile(dir === '' ? undefined : dir);
+      // T10.9：过滤器放开 .txt —— TXT 角色卡**没有 JSON 信封**，整篇按当前预设切板块
+      const path = await pickCardFile(dir === '' ? undefined : dir, { allowText: true });
       if (!path) return;
       const file = await readTextExact(path);
+
+      // 按扩展名分流，而不是「先试 JSON、失败再退回 TXT」：后者会把一个语法错误的
+      // JSON 悄悄当成纯文本再解析一次，用户看到的是一份莫名其妙的板块缺失列表，
+      // 而真正的原因（JSON 少了个逗号）被完全掩盖。
+      if (/\.txt$/i.test(path)) {
+        await this.importCardTextFile(file.pathDisplay ?? path, file.text);
+        return;
+      }
+
       const parsed = parseStCard(file.text);
       this.replaceCard(parsed.card);
       // 打开的文件不在 cardsDir 里时说一句：用户会以为"打开过的卡都在那个目录"
@@ -1880,6 +1948,100 @@ class EditorApp {
       { blockId: runtime.snapshot.id },
     );
     runtime.preview.replaceChildren(fragment);
+  }
+
+  /**
+   * TXT 角色卡导入（T10.9）。
+   *
+   * 与「打开 JSON」分开的原因：TXT 导入有三种结果（成功 / 宽松补空 / 严格中止），
+   * 必须让用户在对话框里看到问题并选择模式，不能悄悄替换掉当前卡。
+   *
+   * 严格模式下用户还可以就地切到宽松 —— docs/06 的两模式语义靠这个切换实现，
+   * 而不是"严格失败就报个错结束"。
+   */
+  private async importCardTextFile(fileName: string, text: string): Promise<void> {
+    if (!this.hasSession) {
+      this.setStatus('先打开或新建一张卡，再导入 TXT（导入会替换当前卡的板块内容）', 'warn');
+      return;
+    }
+    const decision = await this.importDialog?.openCardText(fileName, text);
+    if (!decision || !('card' in decision)) return;
+
+    this.session.replaceCard(decision.card);
+    this.reloadBlocksFromCard();
+    this.scheduleValidate(0);
+
+    const missing = decision.issues.filter(
+      (issue) => issue.code === 'missing-block' && decision.mode === 'lenient',
+    );
+    if (missing.length > 0) {
+      this.setStatus(
+        `已按宽松模式导入：${String(missing.length)} 个板块缺失、已按空处理（${missing
+          .map((issue) => issue.message.match(/「(.+?)」/)?.[1] ?? '')
+          .filter((name) => name !== '')
+          .join('、')}）`,
+        'warn',
+      );
+      return;
+    }
+    this.setStatus(`已导入 TXT：${fileName}（${decision.mode === 'strict' ? '严格' : '宽松'}模式）`, 'ok');
+  }
+
+  /**
+   * 世界书导入（T10.9）。
+   *
+   * 破坏性操作：**替换**整个世界书板块（entries + 文本）。所以：
+   *   · 对话框必须报出条目数（让用户知道覆盖了多少）；
+   *   · `preview.canImport === false` 时一律不写回 —— 残缺结果会把
+   *     "没解析出来的条目"当成"用户删除"，一次导入能清空整个世界书。
+   */
+  private async importWorldbookFile(fileName: string, text: string): Promise<void> {
+    if (!this.hasSession) {
+      this.setStatus('先打开或新建一张卡，再导入世界书', 'warn');
+      return;
+    }
+    const decision = await this.importDialog?.openWorldbook(fileName, text);
+    if (!decision || !('preview' in decision)) return;
+
+    const next = applyWorldbookImport(this.card, decision.preview);
+    if (next === null) {
+      this.setStatus('世界书导入被拒绝：解析结果不完整，未修改当前卡片', 'bad');
+      return;
+    }
+
+    // 记下原文：未改动时导出走逐字节写回（JSON 往返无损的唯一可靠实现）
+    this.session.setWorldbookSource(decision.result);
+    this.session.replaceCard(next);
+    this.reloadBlocksFromCard();
+    this.scheduleValidate(0);
+    this.setStatus(
+      `已导入世界书：${String(decision.result.entries.length)} 个条目（格式 ${
+        decision.result.format === 'json' ? 'JSON' : 'TXT'
+      }），未改动时导出将逐字节还原原文`,
+      'ok',
+    );
+  }
+
+  /** 导出世界书（双向的另一半）。`format` 由用户选，走同一个保存对话框 */
+  private async exportWorldbookFile(format: 'json' | 'txt'): Promise<void> {
+    if (!this.hasSession) return;
+    try {
+      const result = exportWorldbookText(this.card, format, this.session.worldbookSource);
+      const suggested = suggestWorldbookFileName(this.card, format);
+      const dir = await effectiveCardsDir();
+      const path = await pickSavePath(suggested, format, dir === '' ? undefined : dir);
+      if (!path) return;
+      const receipt = await writeFileAtomic(path, result.text);
+      this.setStatus(
+        `已导出世界书：${path}（${String(receipt.bytesWritten)} 字节）` +
+          (result.verbatim
+            ? ' —— 内容未改动，逐字节写回原文'
+            : ` —— ${result.reason ?? '已按规范重新序列化'}`),
+        result.verbatim ? 'ok' : 'warn',
+      );
+    } catch (error) {
+      this.setStatus(`导出世界书失败：${describe(error)}`, 'bad');
+    }
   }
 
   private replaceCard(card: UnifiedCard): void {

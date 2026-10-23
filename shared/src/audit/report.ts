@@ -19,7 +19,7 @@ import type { AuditIssue, AuditReport, IssueCategory } from './types.js';
 import { checkFormat } from './format.js';
 import { countCardWords } from './word-count.js';
 
-const CATEGORIES: readonly IssueCategory[] = ['completeness', 'format', 'platform-rule', 'structure'];
+const CATEGORIES: readonly IssueCategory[] = ['completeness', 'format', 'platform-rule', 'structure', 'worldbook'];
 
 export interface AuditOptions {
   /** 平台规则（不给则跳过「内容是否符合平台规则」这一路） */

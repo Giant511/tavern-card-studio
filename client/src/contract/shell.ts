@@ -121,20 +121,33 @@ export function readRuleText(kind: RuleKind, name: string, maxBytes?: number): P
 // 详见 docs/11 §8。
 
 const CARD_FILTERS = [{ name: '角色卡 JSON', extensions: ['json'] }];
+const CARD_OR_TEXT_FILTERS = [
+  { name: '角色卡 / 文本', extensions: ['json', 'txt'] },
+  { name: '角色卡 JSON', extensions: ['json'] },
+  { name: '纯文本 TXT', extensions: ['txt'] },
+];
 const TEXT_FILTERS = [{ name: '文本文件', extensions: ['txt', 'md'] }];
 
 /**
- * 选一张角色卡 JSON；取消返回 null。
+ * 选一张角色卡文件；取消返回 null。
  *
  * `defaultDir` 是对话框的默认落点（T9.8：接入 cardsDir）。
  * 传目录而不是"目录+文件名"，由 dialog 自己在该目录下打开；
  * 目录不存在时 dialog 会退到父目录，不会报错。
+ *
+ * `allowText`（T10.9）放开 `.txt`：TXT 角色卡导入**没有 JSON 信封**，
+ * 整篇就是文本，按当前预设切板块。放开的是**过滤器**而不是新增原生能力 ——
+ * 仍然走同一个 `open()`，`multiple: false` / `directory: false` 不变，
+ * 所以 C6 的安全约束（只选单文件、不传递归）没有被放宽。
  */
-export async function pickCardFile(defaultDir?: string | null): Promise<string | null> {
+export async function pickCardFile(
+  defaultDir?: string | null,
+  options: { allowText?: boolean } = {},
+): Promise<string | null> {
   const selected = await open({
     multiple: false,
     directory: false,
-    filters: CARD_FILTERS,
+    filters: options.allowText === true ? CARD_OR_TEXT_FILTERS : CARD_FILTERS,
     ...(defaultDir ? { defaultPath: defaultDir } : {}),
   });
   return typeof selected === 'string' ? selected : null;

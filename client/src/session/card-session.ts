@@ -18,6 +18,7 @@ import {
   type AuditReport,
   type BlockId,
   type UnifiedCard,
+  type WorldbookImportResult,
 } from '@tcs/shared';
 
 import { serializeCard, setBlockText } from '../editor/block-doc.ts';
@@ -119,6 +120,14 @@ export class CardSession {
   #presetId: string | null;
   #syncCardId: string | null;
   #lastUploadedSeq: number | null = null;
+  /**
+   * 世界书的导入来源（T10.9）。
+   *
+   * 存在**会话**里而不是 App 上：它描述"这张卡的世界书是从哪个文件导入的"，
+   * 和 filePath / syncCardId 一样属于卡的身份。放在 App 上会在切标签时串卡 ——
+   * 拿 A 卡的原文去写回 B 卡，是那种"导出后才发现内容不对"的错误。
+   */
+  #worldbookSource: WorldbookImportResult | null = null;
   readonly #cardId: string;
 
   constructor(options: CardSessionOptions) {
@@ -149,6 +158,15 @@ export class CardSession {
   /** 是否已关联磁盘文件（false = 未落盘，见需求 F1.1） */
   get persisted(): boolean {
     return this.#filePath !== null;
+  }
+
+  /** 世界书导入来源（T10.9）：未改动时导出走逐字节写回 */
+  get worldbookSource(): WorldbookImportResult | null {
+    return this.#worldbookSource;
+  }
+
+  setWorldbookSource(source: WorldbookImportResult | null): void {
+    this.#worldbookSource = source;
   }
 
   get dirty(): boolean {
