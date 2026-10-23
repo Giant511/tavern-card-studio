@@ -58,7 +58,21 @@ lines.forEach((line, i) => {
 
 // ── 2/3. 用户向纯净度 ──────────────────────────────────────
 lines.forEach((line, i) => {
-  if (/docs\//.test(line)) fail(`第 ${i + 1} 行引用了 docs/ 路径（GitHub 上死链）：${line.trim().slice(0, 80)}`);
+  /*
+   * 唯一的 docs 例外：`docs/server cmd.md` 是运维命令手册，**它是入库的**
+   * （见 .gitignore 的 `docs/*` + `!docs/server cmd.md`），所以链接不是死链。
+   *
+   * 判断按"去掉这一条链接后还有没有 docs/ 引用"来做，而不是简单地白名单整行 ——
+   * 一行里同时写了死链和活链时，前者仍必须被抓出来。
+   *
+   * 两种写法都要剥：链接目标里的 `%20` 与正文里的空格（`docs/server cmd.md`）。
+   */
+  const withoutOpsDoc = line
+    .replace(/docs\/server%20cmd\.md/g, '')
+    .replace(/docs\/server cmd\.md/g, '');
+  if (/docs\//.test(withoutOpsDoc)) {
+    fail(`第 ${i + 1} 行引用了 docs/ 路径（GitHub 上死链）：${line.trim().slice(0, 80)}`);
+  }
   // 代码围栏里的内容不算"开发命令残留"，但要单独标记，避免误判成用户步骤
   const devCmd = /\b(npm run|npm test|npm install|node scripts\/|tsc -b)/;
   if (devCmd.test(line)) {
