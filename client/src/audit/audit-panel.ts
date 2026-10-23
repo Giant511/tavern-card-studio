@@ -69,6 +69,8 @@ export class AuditPanel {
   private readonly wordSection: HTMLElement;
   private readonly listEl: HTMLElement;
   private readonly countEl: HTMLElement;
+  /** 计数行（"审计 N 条"）。必须留引用：clear() 后要靠 ensureMounted() 把它挂回去 */
+  private readonly listHead: HTMLElement;
 
   private report: AuditReport | null = null;
   private filter: AuditFilter = { ...EMPTY_FILTER };
@@ -88,12 +90,12 @@ export class AuditPanel {
     // 字数分布
     this.wordSection = el('div', 'audit-words');
     // 计数 + 列表
-    const listHead = el('div', 'audit-list-head');
+    this.listHead = el('div', 'audit-list-head');
     this.countEl = el('span', 'audit-count', '—');
-    listHead.append(this.countEl);
+    this.listHead.append(this.countEl);
     this.listEl = el('div', 'audit-list');
 
-    this.root.append(this.summaryEl, this.filterBar, this.wordSection, listHead, this.listEl);
+    this.root.append(this.summaryEl, this.filterBar, this.wordSection, this.listHead, this.listEl);
     this.renderFilters();
   }
 
@@ -104,16 +106,46 @@ export class AuditPanel {
   }
 
   /**
+   * 确保五个区块挂在容器里。
+   *
+   * 为什么需要它：`clear()` 曾经用 `root.replaceChildren()` 把容器清空，但
+   * 五个区块的**引用还在这个类里**——它们只是脱离了 DOM。之后 `render()`
+   * 照常往这些游离节点写内容，于是「数据在、计数在、正文永远是空白」，
+   * 控制台一声不响（F6，2026-10-23 复现：容器 0 子节点、report 里 8 条问题）。
+   *
+   * `clear()` 已经改成只清内容，但这个自愈函数保留：面板容器的清空可能来自
+   * 任何一处（样式重置、未来的空态重绘），而"渲染写进游离节点"这种故障
+   * 完全静默，靠测试很难兜住所有入口。挂载是幂等的，代价只有一次比较。
+   */
+  private ensureMounted(): void {
+    if (this.root.childElementCount === 0) {
+      this.root.append(this.summaryEl, this.filterBar, this.wordSection, this.listHead, this.listEl);
+    }
+  }
+
+  /**
    * 清空面板（零标签 / 空工作台时用）。
    *
-   * 为什么单独一个方法而不是 `setReport(null)`：`report` 的类型是非空的，
-   * 若允许 null 会让 render() 里每一处都要判空，反而容易漏。
-   * 这里显式表达"当前没有正在审计的卡"这个状态。
+   * 为什么单独一个方法而不是 `setReport(null)`：这里表达的是"当前没有正在审计
+   * 的卡"，与"审计完了、0 条问题"是两种不同状态（后者要有空态文案）。
+   *
+   * **不要用 `root.replaceChildren()` 实现"清空"。** 那样摘掉的是五个区块本身，
+   * 而它们的引用仍留在本类里；后续 `render()` 会继续往这些脱离 DOM 的节点写，
+   * 界面就永远空白且不报错（F6 事故）。清内容、不清结构。
    */
   clear(): void {
-    this.report = null as unknown as AuditReport;
+    this.report = null;
     this.activeIssueId = null;
-    this.root.replaceChildren();
+    this.ensureMounted();
+
+    this.summaryEl.className = 'audit-summary';
+    this.summaryEl.textContent = '尚未审计（未打开角色卡）';
+    this.wordSection.replaceChildren();
+    this.listEl.replaceChildren();
+    this.countEl.textContent = '—';
+    // 筛选条要重建：它的按钮既承载计数，也是后续 renderFilterCounts 的定位点，
+    // 只清空不重建的话，下次 setReport 时计数就更新不动了。
+    this.renderFilters();
   }
 
   /** 外部要求聚焦某条问题（例如从编辑器跳过来） */
@@ -240,8 +272,12 @@ export class AuditPanel {
 
   // ── 渲染主流程 ────────────────────────────────────────────
   private render(): void {
-    if (!this.report) {
-      this.summaryEl.textContent = '尚未审计';
+    // 先自愈挂载，再写内容：写进游离节点是静默失败，控制台没有任何提示。
+    this.ensureMounted();
+
+    if (this.report === null) {
+      this.summaryEl.className = 'audit-summary';
+      this.summaryEl.textContent = '尚未审计（未打开角色卡）';
       return;
     }
 
