@@ -9,6 +9,8 @@
  */
 
 import { isSyncReady, type ProbeResult } from '../net/server-probe';
+import type { RepoSummary } from './repo-client';
+import { pickRepoId, toRepoOptions } from './repo-select';
 import { connectLocalService, describeLocalSuccess } from '../net/local-connect';
 import {
   SyncError,
@@ -70,6 +72,17 @@ export interface SyncDialogCallbacks {
   onUnauthorized?: () => Promise<boolean>;
   /** 打开「我的卡片」列表（T10.7）：按 角色名 · cardId · 仓库 · vN 展示服务端返回的卡 */
   onOpenCards?: () => void;
+  /**
+   * 可选仓库列表（T10.8）。返回 null / 空数组表示"当前凭证不能选仓库"
+   * （未登录、或用的是仓库令牌），此时上传仓库这一行整行隐藏。
+   */
+  getRepos?: () => Promise<RepoSummary[]>;
+  /** 当前选中的仓库 id（预选见 `pickRepoId`） */
+  getSelectedRepo?: () => string | null;
+  /** 用户改选了仓库（App 记住它，供下一次预选） */
+  onSelectRepo?: (repoId: string) => void;
+  /** 打开「仓库与令牌」面板（T10.8） */
+  onOpenRepos?: () => void;
   notify: (message: string, kind?: 'ok' | 'warn' | 'bad' | 'info') => void;
 }
 
@@ -88,6 +101,10 @@ export class SyncDialog {
   private readonly warningBar: HTMLElement;
   /** F6.1：同步面板的「连接本机服务端」入口（设置面板为主入口，这里给个快捷方式） */
   private readonly connectButton: HTMLButtonElement;
+  /** T10.8：上传仓库选择（未登录时整行隐藏） */
+  private readonly repoRow: HTMLElement;
+  private readonly repoSelect: HTMLSelectElement;
+  private readonly repoHint: HTMLElement;
   private versions: VersionSummary[] = [];
   /** 防止「连接本机服务端」被连点（重入会让两次探测结果互相覆盖） */
   private busy = false;
@@ -141,6 +158,37 @@ export class SyncDialog {
     const targetRow = el('div', 'field-row');
     targetRow.append(this.targetLine, this.uploadButton, this.refreshButton);
     uploadSection.append(targetRow);
+
+    /*
+     * 上传仓库（T10.8）。
+     *
+     * 与上面"不让人选卡"是两件事：**卡 ID 是身份，仓库是存放位置**。
+     * 选错仓库只是把卡放进别的抽屉（可以移），选错卡 ID 会污染另一张卡的历史。
+     * 所以这里给下拉，但默认预选服务端标记的默认仓库。
+     *
+     * 未登录（legacy 令牌或仓库令牌）时不显示：仓库由凭证本身决定，
+     * 给一个改了也不生效的下拉比如实说"由令牌绑定"更糟。
+     */
+    this.repoRow = el('div', 'field-row sync-repo-row');
+    this.repoRow.hidden = true;
+    const repoLabel = el('span', 'field-hint sync-repo-label', '上传到仓库');
+    this.repoSelect = el('select', 'select small') as HTMLSelectElement;
+    this.repoSelect.dataset['role'] = 'upload-repo';
+    this.repoSelect.title = '上传目标仓库（默认仓库已预选）';
+    this.repoSelect.addEventListener('change', () => {
+      this.callbacks.onSelectRepo?.(this.repoSelect.value);
+      this.renderTarget();
+    });
+    this.repoHint = el('span', 'field-hint sync-repo-hint');
+    // 仓库令牌申请入口：放在"选仓库"旁边 —— 用户想给 CI/脚本开权限的时机，
+    // 正是他在选"传到哪个仓库"的时候。
+    const reposButton = el('button', 'btn small ghost', '仓库与令牌…');
+    reposButton.type = 'button';
+    reposButton.dataset['role'] = 'open-repos';
+    reposButton.addEventListener('click', () => this.callbacks.onOpenRepos?.());
+    this.repoRow.append(repoLabel, this.repoSelect, this.repoHint, reposButton);
+    uploadSection.append(this.repoRow);
+
     uploadSection.append(
       el(
         'p',
@@ -332,6 +380,14 @@ export class SyncDialog {
       el('span', 'sync-target-name', target.name || '(未命名)'),
       el('code', 'sync-target-id', target.cardId),
     );
+    // T10.8：把「传到哪个仓库」显示在上传目标里。
+    // 只有仓库下拉可见时才显示 —— 那时它的值就是**这次上传真正会用到的**仓库。
+    // 下拉不可见（legacy 令牌 / 仓库令牌）时干脆不显示，而不是猜一个：
+    // 前者只看未归属卡、后者的仓库由令牌绑定，显示错的名字比不显示更糟。
+    if (!this.repoRow.hidden) {
+      const selectedLabel = this.repoSelect.selectedOptions[0]?.textContent ?? '';
+      if (selectedLabel !== '') this.targetLine.append(el('span', 'sync-target-repo', selectedLabel));
+    }
     if (target.baseSeq !== null) {
       this.targetLine.append(el('span', 'sync-target-base', `基线 v${target.baseSeq}`));
     } else {
@@ -371,6 +427,51 @@ export class SyncDialog {
     this.showWarning([], '');
   }
 
+  /**
+   * 加载上传仓库下拉（T10.8）。
+   *
+   * 失败时**整行隐藏**而不是显示空下拉：空下拉会让用户以为"我没有仓库"，
+   * 而真实原因可能是"当前凭证是仓库令牌，不能选仓库"或"没登录"。
+   * 选中的仓库用 `pickRepoId` 决定（默认仓库优先，记忆值仍存在时优先）。
+   */
+  private async reloadRepos(): Promise<void> {
+    if (!this.callbacks.getRepos) {
+      this.repoRow.hidden = true;
+      return;
+    }
+    try {
+      const repos = await this.callbacks.getRepos();
+      if (repos.length === 0) {
+        this.repoRow.hidden = true;
+        return;
+      }
+      const selected = pickRepoId(repos, this.callbacks.getSelectedRepo?.() ?? null);
+      this.repoSelect.replaceChildren();
+      for (const option of toRepoOptions(repos)) {
+        const node = document.createElement('option');
+        node.value = option.id;
+        node.textContent = option.label;
+        // 存**原始仓库名**：label 带「（默认）」后缀，直接回传会把后缀当进名字里
+        node.dataset['repoName'] = option.name;
+        this.repoSelect.append(node);
+      }
+      if (selected !== null) {
+        this.repoSelect.value = selected;
+        this.callbacks.onSelectRepo?.(selected);
+      }
+      this.repoRow.hidden = false;
+      const current = repos.find((repo) => repo.id === selected);
+      this.repoHint.textContent =
+        current === undefined ? '' : `${String(current.cardCount)} 张卡`;
+      // 目标行里要显示"传到哪个仓库"，而下拉刚刚才出现 —— 重画一次，
+      // 否则用户看到的目标行缺一段（`renderStatus` 那次执行时下拉还是隐藏的）
+      this.renderTarget();
+    } catch {
+      // 拿不到仓库列表（未登录 / 仓库令牌 / 网络）→ 隐藏，不去猜
+      this.repoRow.hidden = true;
+    }
+  }
+
   private async reload(): Promise<void> {
     const ready = this.renderStatus();
     if (!ready) {
@@ -380,6 +481,8 @@ export class SyncDialog {
 
     const config = this.callbacks.getConfig();
     if (!config) return;
+
+    await this.reloadRepos();
 
     this.setBusy('加载卡片列表…');
     try {
@@ -548,6 +651,10 @@ export class SyncDialog {
         cardId: target.cardId,
         // 基线一起送过去，服务端据此判断是否分叉
         baseSeq: target.baseSeq,
+        // T10.8：仓库名（服务端按 owner + 仓库名解析 id）。
+        // 未显示下拉（legacy / 仓库令牌）时不传 —— 后者的仓库由令牌绑定，
+        // 传了也会被服务端忽略，不如不传（避免出现"我选了却没生效"的错觉）。
+        ...(this.repoRow.hidden ? {} : { repo: this.repoSelect.selectedOptions[0]?.dataset['repoName'] ?? null }),
         message: `客户端上传 ${new Date().toISOString()}`,
         author: 'tavern-card-studio',
       });
