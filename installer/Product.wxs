@@ -58,6 +58,7 @@
       <ComponentRef Id="ServiceComponent" />
       <ComponentRef Id="DataFolderComponent" />
       <ComponentRef Id="ConnectGuideComponent" />
+      <ComponentRef Id="LayoutMarkerComponent" />
       <ComponentRef Id="StartMenuShortcutComponent" />
     </Feature>
 
@@ -162,6 +163,21 @@
     <DirectoryRef Id="INSTALLFOLDER">
       <Component Id="ConnectGuideComponent" Guid="8E4A1C72-93B5-4D68-A1F7-6C2D9B4E7053">
         <File Id="ConnectGuideHtml" Source="$(var.ConnectGuide)" Name="connect-guide.html" KeyPath="yes" />
+      </Component>
+
+      <!--
+        安装布局标记（v0.1.2 追加任务）。
+
+        为什么需要它：`.cmd` 启动器要判断"这是 MSI 安装还是绿色包"，才能选对配置文件
+        （安装版在 %ProgramData%\TavernCardStudio，绿色包在 %BASE%\data）。
+        之前用"data\config.json 是否存在"来猜 —— 那是**猜**：绿色包跑过一次就会有这个文件，
+        而 MSI 安装版一旦被误跑一次也会生成，猜错就写进另一个库，两处都不报错。
+
+        为什么不用"同级有没有 tcs-service-host.exe"：绿色包同样带那个 exe（服务注册用），
+        两边完全一样，区分不了。所以改成显式标记：只有 MSI 才装这个文件。
+      -->
+      <Component Id="LayoutMarkerComponent" Guid="C41E7A93-62D8-4F15-B0A7-3E9D5C81F204">
+        <File Id="InstallLayoutIni" Source="$(var.LayoutMarker)" Name="install-layout.ini" KeyPath="yes" />
       </Component>
     </DirectoryRef>
 
