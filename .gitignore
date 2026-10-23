@@ -34,6 +34,10 @@ client/src-tauri/gen/
 # 服务端 config.json（含 auth.token）落在 server/data/ 或 ProgramData，
 # 客户端 client-config.json（含 token）落在 %APPDATA%。
 # 前者已被上面的 server/data/ 覆盖，这里补齐其余可能位置。
+# 仓库根下的 data/ 是「在仓库里直接跑 dist/index.js」时的默认运行时目录
+# （defaultDataDir 取 cwd），里面会有 config.json（明文令牌）与 state.db（密码哈希）。
+# 2026-10-23 一次误跑就在这里生成了一个，差点被 git add -A 带进版本库。
+/data/
 config.json
 config.local.json
 **/client-config.json

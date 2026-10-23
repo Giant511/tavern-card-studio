@@ -15,6 +15,7 @@
  * 退出码：0 全部通过；1 任一时间链断言失败或产物缺失
  */
 
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
@@ -165,7 +166,55 @@ if (serverArtifact) {
 say('');
 
 // ── 交叉说明 ─────────────────────────────────────────────
-say('3. 不做的断言（写在这里，免得下次又有人加）');
+// ── 打包产物可启动 ───────────────────────────────────────
+//
+// 这是 2026-10-23 生产故障（服务端 MSI 启动 1067）留下的**结构性防线**。
+// 那次的现象是：源码对、tsc 过、单测全绿、MSI 构建成功、体积正常 —— 唯独
+// `@node-rs/argon2` 没进包（打包清单是手工硬编码的，T10.3 加依赖时没人回来改）。
+// 靠人核对清单拦不住（实际同时漏了 argon2 与 @peculiar/x509 两个），
+// 所以改成让产物自己跑一遍：用**包内那份 node.exe** 执行 `selfcheck`，
+// 真算哈希、真签证书、真开库、真算 git 对象哈希。任一失败即红。
+say('3. 打包产物可启动（用包内 node.exe 真跑一遍依赖）');
+
+const bundleNode = join(ROOT, 'release/server/node.exe');
+const bundleEntry = join(ROOT, 'release/server/app/server/dist/index.js');
+if (!existsSync(bundleNode) || !existsSync(bundleEntry)) {
+  fail('找不到 release/server 的 node.exe 或 index.js（先执行 npm run pack:server）');
+} else {
+  // 清掉 NODE_OPTIONS：某些宿主会注入 require 钩子，而这里要验的是**裸产物**能不能起
+  const env = { ...process.env };
+  delete env['NODE_OPTIONS'];
+  const started = Date.now();
+  let output = '';
+  let code = 0;
+  try {
+    // 关键：`--bundle-root` 约束"依赖只能从包里解析"。
+    // 不加的话，绿色包放在仓库里时会从**仓库根的 node_modules** 找到缺的包，
+    // 自检全绿而装到 C://Program Files 后立刻崩 —— 我实测过这个假通过。
+    output = execFileSync(bundleNode, [bundleEntry, 'selfcheck', '--bundle-root', join(ROOT, 'release/server/app')], {
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 60_000,
+    });
+  } catch (error) {
+    code = typeof error.status === 'number' ? error.status : 1;
+    output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+  }
+  const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+
+  for (const line of output.split(/\r?\n/)) {
+    if (/^[✔✘]/.test(line) || /^结论：/.test(line)) say(`   ${line.trim()}`);
+  }
+  if (code === 0 && /结论：通过/.test(output)) {
+    say(`   OK 产物自检通过（${elapsed} 秒）`);
+  } else {
+    fail(`打包产物自检失败（退出码 ${String(code)}）—— 产物缺运行时依赖，见上方 ✘ 项`);
+  }
+}
+say('');
+
+say('4. 不做的断言（写在这里，免得下次又有人加）');
 say('   · 不断言「exe ≤ MSI」：Tauri 打完包会再 patch 一次 exe 写 bundle 类型，');
 say('     MSI 则是先临时生成再整体挪位（mtime 被保留），两者先后无意义。');
 say('   · 不用 sha256 比对历史构建：WiX 写入构建时间戳，MSI 不是逐字节可复现的，');

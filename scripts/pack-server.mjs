@@ -116,20 +116,58 @@ function dirSize(dir) {
 
 const require = createRequire(join(ROOT, 'package.json'));
 
-/** 从入口包出发，收集生产依赖（含传递依赖），返回 { name, source, rel } */
+/**
+ * 打包入口 = `server/package.json` 的 `dependencies` 段，**每次现读，不手工维护**。
+ *
+ * 2026-10-23 的生产故障（服务端 MSI 启动 1067）就是这张手工列表造成的：
+ * 原先是写死的 `['better-sqlite3', 'isomorphic-git']`，T10.3 引入
+ * `@node-rs/argon2` 后没人回来加，于是包里有代码、没依赖，服务一起来就
+ * `ERR_MODULE_NOT_FOUND`。同一次核对还发现 `@peculiar/x509`（TLS 自签证书用）
+ * 也漏了 —— **手工清单必然再漏，所以这张表不该存在**。
+ *
+ * `@tcs/shared` 跳过：它是 workspace 里的符号链接，由下面单独放一份实体。
+ */
+function runtimeEntryNames() {
+  const manifest = JSON.parse(readFileSync(join(ROOT, 'server', 'package.json'), 'utf8'));
+  const names = Object.keys(manifest.dependencies ?? {}).filter((name) => name !== '@tcs/shared');
+  if (names.length === 0) {
+    throw new Error('server/package.json 没有 dependencies —— 打包清单从它生成，不能为空');
+  }
+  return names;
+}
+
+/**
+ * 从入口包出发，收集生产依赖（含传递依赖），返回 { name, source, rel }。
+ *
+ * 关于 `optionalDependencies`：`@node-rs/argon2` 把 13 个平台的二进制列为
+ * optionalDependencies，本机只装了 `…-win32-x64-msvc`。**未安装的可选依赖是正常
+ * 状态**（别的平台的包），不能像必装依赖那样抛错 —— 否则一加 argon2 就打包失败。
+ * 但要区分"这个平台本来就不该有"与"该有却没有"：后者会让产物缺 .node 文件，
+ * 所以这里把跳过的名单记下来，由 `assertNativeModules()` 兜底核对。
+ */
 function collectRuntimePackages(entries) {
   const found = new Map();
-  const queue = [...entries];
+  const skippedOptional = [];
+  const queue = entries.map((name) => ({ name, optional: false }));
   while (queue.length > 0) {
-    const name = queue.shift();
-    if (found.has(name)) continue;
-    let manifestPath;
+    const { name, optional } = queue.shift();
+    if (found.has(name) || skippedOptional.includes(name)) continue;
+
+    let manifestPath = null;
     try {
       manifestPath = require.resolve(`${name}/package.json`);
     } catch {
-      manifestPath = join(ROOT_MODULES, name, 'package.json');
+      const fallback = join(ROOT_MODULES, name, 'package.json');
+      if (existsSync(fallback)) manifestPath = fallback;
     }
-    if (!existsSync(manifestPath)) throw new Error(`缺少生产依赖 ${name}，先执行 npm install`);
+    if (manifestPath === null) {
+      if (optional) {
+        skippedOptional.push(name);
+        continue;
+      }
+      throw new Error(`缺少生产依赖 ${name}，先执行 npm install`);
+    }
+
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
     found.set(name, {
       name,
@@ -137,10 +175,37 @@ function collectRuntimePackages(entries) {
       rel: relative(ROOT_MODULES, dirname(manifestPath)),
       version: manifest.version,
     });
-    queue.push(...Object.keys(manifest.dependencies ?? {}));
-    queue.push(...Object.keys(manifest.optionalDependencies ?? {}));
+    for (const dep of Object.keys(manifest.dependencies ?? {})) queue.push({ name: dep, optional: false });
+    for (const dep of Object.keys(manifest.optionalDependencies ?? {})) queue.push({ name: dep, optional: true });
   }
-  return [...found.values()];
+  return { packages: [...found.values()], skippedOptional };
+}
+
+/**
+ * 原生模块（.node）自检。
+ *
+ * 光有包目录不够：`@node-rs/argon2` 的 JS 层会根据平台去 require 对应的
+ * `@node-rs/argon2-win32-x64-msvc`，而里面真正的 `.node` 二进制才是关键。
+ * 少一个二进制，症状和"包没打进去"完全一样（都是运行时 throw）。
+ */
+function assertNativeModules(appModules) {
+  const required = [
+    // better-sqlite3：编译产物，不是 npm 包形式
+    ['better-sqlite3', join(appModules, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node')],
+    // @node-rs/argon2：平台包里的 .node
+    [
+      '@node-rs/argon2-win32-x64-msvc',
+      join(appModules, '@node-rs', 'argon2-win32-x64-msvc', 'argon2.win32-x64-msvc.node'),
+    ],
+  ];
+  const missing = required.filter(([, file]) => !existsSync(file)).map(([name]) => name);
+  if (missing.length > 0) {
+    throw new Error(
+      `原生模块缺失：${missing.join('、')}。` +
+        'better-sqlite3 需在目标架构上 npm rebuild；@node-rs/argon2 需确认平台包已安装。',
+    );
+  }
+  return required.map(([name]) => name);
 }
 
 function main() {
@@ -153,14 +218,25 @@ function main() {
   const sharedTarget = join(APP, 'node_modules', '@tcs', 'shared');
   copyTree(join(APP, 'shared'), sharedTarget);
 
-  const packages = collectRuntimePackages(['better-sqlite3', 'isomorphic-git']);
+  const { packages, skippedOptional } = collectRuntimePackages(runtimeEntryNames());
   for (const pkg of packages) {
     copyTree(pkg.source, join(APP, 'node_modules', pkg.rel));
   }
 
-  const native = join(APP, 'node_modules', 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node');
-  if (!existsSync(native)) {
-    throw new Error('better-sqlite3 原生模块缺失：请在目标架构上执行 npm rebuild better-sqlite3');
+  const natives = assertNativeModules(join(APP, 'node_modules'));
+
+  // 逐个核对 server 的**直接**依赖都在产物里。
+  // 这一步与上面的"从 package.json 生成清单"是两回事：生成清单保证"愿意打"，
+  // 这里保证"真的打进去了"（copyTree 静默跳过、路径写错、符号链接断掉都会在这里现形）。
+  const appModules = join(APP, 'node_modules');
+  const directDeps = Object.keys(
+    JSON.parse(readFileSync(join(ROOT, 'server', 'package.json'), 'utf8')).dependencies ?? {},
+  );
+  const notBundled = directDeps.filter(
+    (name) => name !== '@tcs/shared' && !existsSync(join(appModules, name, 'package.json')),
+  );
+  if (notBundled.length > 0) {
+    throw new Error(`以下生产依赖没有打进 app/node_modules：${notBundled.join('、')}`);
   }
 
   copyFileSync(process.execPath, join(OUT, 'node.exe'));
@@ -209,6 +285,13 @@ function main() {
 
   const size = dirSize(OUT);
   console.log(`✔ 已生成 ${relative(ROOT, OUT)}（${(size / 1024 / 1024).toFixed(1)} MB，${packages.length} 个运行时依赖）`);
+  console.log(`  直接依赖 ${directDeps.length} 个全部就位；原生模块：${natives.join('、')}`);
+  if (skippedOptional.length > 0) {
+    // 只说数量与前两个：13 个平台包全列出来只会淹没真正的信息
+    const head = skippedOptional.slice(0, 2).join('、');
+    const more = skippedOptional.length > 2 ? ` 等 ${skippedOptional.length} 个` : '';
+    console.log(`  跳过未安装的可选依赖（其它平台）：${head}${more}`);
+  }
   console.log('  启动：release\\server\\start-server.cmd');
   console.log('  首次启动会在 release\\server\\data 下生成 config.json 并打印访问令牌');
 }

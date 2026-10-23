@@ -10,6 +10,7 @@
  *   token rotate     重新生成 token（需重启 worker 生效）
  *   service ...      Windows 服务注册 / 卸载 / 启停 / 状态（sc.exe）
  *   version          版本信息
+ *   selfcheck        离线自检：真跑一遍运行时依赖，不读配置、不绑端口
  */
 
 import { spawnSync } from 'node:child_process';
@@ -32,6 +33,7 @@ import { migrateRepos, migrateToFirstAccount, planMigration } from './auth/migra
 import { RepoStore } from './storage/repos.js';
 import { Db } from './storage/db.js';
 import { adoptOrphanCards, countOrphanCards, UserStore } from './storage/users.js';
+import { selfCheckCommand } from './selfcheck.js';
 import { startSupervisor } from './supervisor.js';
 import { startWorker } from './worker.js';
 
@@ -127,7 +129,8 @@ function printHelp(): void {
       `  config show|path      打印配置 / 配置路径\n` +
       `  token show|rotate     查看 / 轮换访问令牌\n` +
       `  service install|uninstall|start|stop|status [--dry-run]\n` +
-      `  version               版本信息\n\n` +
+      `  version               版本信息\n` +
+      `  selfcheck             离线自检：真跑一遍运行时依赖（argon2/x509/sqlite/git）\n\n` +
       `选项：\n` +
       `  --config <路径>       配置文件（默认 ./data/config.json）\n` +
       `  --port <端口>         API 端口（默认 8730）\n` +
@@ -504,6 +507,16 @@ export async function main(argv: readonly string[]): Promise<number> {
   if (options.command === 'version') {
     process.stdout.write(`tcs-server ${SERVER_VERSION} (node ${process.version}, ${process.platform}/${process.arch})\n`);
     return 0;
+  }
+
+  // `selfcheck` 刻意放在最前面（与 version 同级）：它**不读配置文件**，
+  // 也不解析 --config。产物缺依赖时最需要它，而那时配置文件可能还不存在
+  // （全新安装、或数据目录被清）。放在后面就会被 load() 的副作用挡住。
+  if (options.command === 'selfcheck' || group === 'selfcheck') {
+    // 显式把 --bundle-root 传下去：验证产物时必须约束"只能从包里解析"，
+    // 否则绿色包放在仓库里时会从仓库根的 node_modules 找到缺的包，给出假通过。
+    const bundleRoot = options.flags['bundle-root'];
+    return selfCheckCommand(typeof bundleRoot === 'string' ? { bundleRoot } : {});
   }
 
   if (group === 'config') {
