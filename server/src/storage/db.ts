@@ -190,6 +190,40 @@ CREATE TABLE IF NOT EXISTS events (
   detail TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_events_at ON events(at DESC);
+
+-- ── 账户会话与登录限速（T10.4）────────────────────────────
+--
+-- 会话表就是"吊销列表"：revoked_at 非 null 即失效。
+-- **必须落库**：服务端是 Windows 服务，升级/重启/崩溃都会重建进程；
+-- 放内存里等于重启即全量复活吊销，那等于没有吊销。
+--
+-- refresh_hash 存 sha256 不存原文：库文件泄露时也换不出新令牌。
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  refresh_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  revoke_reason TEXT,
+  last_seen_at TEXT,
+  user_agent TEXT NOT NULL DEFAULT '',
+  ip TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_refresh ON sessions(refresh_hash);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, created_at DESC);
+
+-- 登录失败计数。同样落库：内存里的锁会被"重启服务"清掉，
+-- 而重启恰恰是攻击者最想要的效果。
+CREATE TABLE IF NOT EXISTS login_attempts (
+  kind TEXT NOT NULL,
+  key TEXT NOT NULL,
+  failures INTEGER NOT NULL DEFAULT 0,
+  first_at TEXT NOT NULL,
+  locked_until TEXT,
+  PRIMARY KEY (kind, key)
+);
 `;
 
 /**

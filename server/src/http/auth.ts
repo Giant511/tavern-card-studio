@@ -1,18 +1,28 @@
 /**
- * API 鉴权（T5.6）：Bearer token。
+ * API 鉴权（T5.6 起，T10.4 扩展为双模式）。
+ *
+ * 接受两种凭证：
+ *
+ *   1. **legacy 全局 token**（v0.1.0 起的兼容层）—— 无身份、等同"本机管理员"。
+ *      保留它是为了不弄断已装客户端的同步链路（需求 F2.3 明确要求兼容）。
+ *      面板与 CLI 也继续用它。
+ *   2. **JWT access token**（T10.4 起）—— 带 `sub`/`sid`，吊销按会话生效。
+ *      校验时**必须查库**确认会话未吊销，否则"吊销"要等 2h 自然过期才生效。
  *
  * 设计取舍：
- *   · 只接受请求头（`Authorization: Bearer ...` 或 `X-API-Token`），不接受 `?token=`——
- *     query 会进访问日志、浏览器历史、Referer，本地工具也没必要开这个口子；
- *   · 比较用 sha256 + timingSafeEqual，避免长度差与逐字节比较泄露时序；
- *   · 失败次数按来源 IP 计数，5 分钟内 20 次失败即短暂封禁，防止本机其他进程暴力猜 token；
- *   · 监听非回环地址时 `assertSafeConfig` 已强制要求开鉴权（config.ts）。
+ *   · 只接受请求头（`Authorization: Bearer ...` 或 `X-API-Token`），不接受 `?token=`
+ *     —— query 会进访问日志、浏览器历史、Referer；
+ *   · 全局 token 比较用 sha256 + timingSafeEqual，避免长度差与逐字节比较泄露时序；
+ *   · JWT 失败**不回显具体原因**（签名错 ≠ 过期，细到这一步就够攻击者用了）。
  */
 
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 
 import { AppError } from '../errors.js';
+import { verifyJwt, type JwtPayload } from '../auth/jwt.js';
+import type { SessionStore } from '../auth/sessions.js';
+import type { UserStore } from '../storage/users.js';
 
 function digest(value: string): Buffer {
   return createHash('sha256').update(value, 'utf8').digest();
@@ -33,6 +43,25 @@ export function extractToken(req: IncomingMessage): string | null {
   return null;
 }
 
+/** 一次请求的身份。`via: 'legacy'` 表示用的是全局 token（无账户身份） */
+export interface AuthContext {
+  via: 'legacy' | 'jwt';
+  /** legacy 时为 null */
+  userId: string | null;
+  sessionId: string | null;
+  role: 'admin' | 'user';
+  username: string | null;
+}
+
+/** legacy token 视为管理员：它能做的事与 v0.1.1 完全一样，不能因为引入账户就缩权 */
+export const LEGACY_AUTH: AuthContext = {
+  via: 'legacy',
+  userId: null,
+  sessionId: null,
+  role: 'admin',
+  username: null,
+};
+
 interface FailureRecord {
   count: number;
   firstAt: number;
@@ -43,6 +72,14 @@ const WINDOW_MS = 5 * 60 * 1000;
 const MAX_FAILURES = 20;
 const BLOCK_MS = 5 * 60 * 1000;
 
+export interface TokenGateDeps {
+  /** JWT 签名密钥；为空则只接受 legacy token（老配置兼容） */
+  jwtSecret?: string;
+  sessions?: SessionStore;
+  users?: UserStore;
+  now?: () => Date;
+}
+
 export class TokenGate {
   private readonly failures = new Map<string, FailureRecord>();
 
@@ -51,6 +88,7 @@ export class TokenGate {
     private readonly publicPaths: readonly string[],
     /** false 时跳过鉴权（仅允许回环地址，见 assertSafeConfig） */
     private readonly required = true,
+    private readonly deps: TokenGateDeps = {},
   ) {}
 
   isPublic(pathname: string): boolean {
@@ -58,6 +96,56 @@ export class TokenGate {
       if (pattern.endsWith('*')) return pathname.startsWith(pattern.slice(0, -1));
       return pathname === pattern;
     });
+  }
+
+  /**
+   * 解析凭证并返回身份。返回 null 表示"不需要鉴权"。
+   *
+   * 与 {@link check} 的区别：这个方法**不抛 429**，只做身份解析，
+   * 供"可选鉴权"的接口（如注册的 admin-only 判定）使用。
+   */
+  identify(req: IncomingMessage): AuthContext | null {
+    const provided = extractToken(req);
+    if (!provided) return null;
+
+    // 先比 legacy token：它最便宜（一次 sha256），也是面板/CLI 的常用路径
+    if (this.token && constantTimeEqual(provided, this.token)) return LEGACY_AUTH;
+
+    const jwt = this.verifyAccessToken(provided);
+    return jwt;
+  }
+
+  /** 校验 JWT 并确认会话仍然有效（未吊销、未过期、用户未禁用） */
+  private verifyAccessToken(token: string): AuthContext | null {
+    const secret = this.deps.jwtSecret;
+    if (!secret) return null;
+
+    const now = this.deps.now?.() ?? new Date();
+    const result = verifyJwt(token, secret, Math.floor(now.getTime() / 1000));
+    if (!result.ok || !result.payload) return null;
+
+    const payload: JwtPayload = result.payload;
+    const sessions = this.deps.sessions;
+    const users = this.deps.users;
+    if (!sessions || !users) return null;
+
+    const session = sessions.findById(payload.sid);
+    if (!session) return null;
+    // **这一步就是"吊销立即生效"的实现**：查库，不看令牌自身是否过期
+    if (!sessions.isActive(session, now)) return null;
+    if (session.user_id !== payload.sub) return null;
+
+    const user = users.findById(payload.sub);
+    if (!user) return null;
+
+    return {
+      via: 'jwt',
+      userId: user.id,
+      sessionId: session.id,
+      // 角色以**库**为准，不信令牌里的快照（降级后旧令牌不能继续当管理员）
+      role: user.role,
+      username: user.username,
+    };
   }
 
   /** 返回 null 表示通过；否则抛 AppError（401/429） */
@@ -74,9 +162,13 @@ export class TokenGate {
       });
     }
 
-    const provided = extractToken(req);
-    if (provided && constantTimeEqual(provided, this.token)) {
+    const identity = this.identify(req);
+    if (identity) {
       this.failures.delete(ip);
+      if (identity.sessionId && this.deps.sessions) {
+        // 记录"这个会话还活着"，面板的登录设备列表要用
+        this.deps.sessions.touch(identity.sessionId, this.deps.now?.() ?? new Date());
+      }
       return;
     }
 
@@ -90,7 +182,7 @@ export class TokenGate {
     this.failures.set(ip, next);
 
     throw new AppError(401, 'UNAUTHORIZED', '缺少或无效的访问令牌', {
-      hint: '请求头加 Authorization: Bearer <token>，token 见 dataDir/config.json 或 `tcs-server token show`',
+      hint: '请求头加 Authorization: Bearer <token>（全局 token 或登录得到的 access token）',
     });
   }
 
