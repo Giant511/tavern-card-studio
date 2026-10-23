@@ -93,10 +93,14 @@
       老库是单用户模型 —— 只有一个全局令牌，卡片没有归属。迁移命令一次做三件事：
       建首账户（自动成为管理员）、把历史卡片接管进它的默认仓库、<strong>动库之前先备份</strong>。
     </p>
-    <p>以管理员身份打开 PowerShell：</p>
-<pre><span class="c"># 在安装目录里执行 —— tcs-server.cmd 会带对配置文件路径</span>
-cd "C:\Program Files\Tavern Card Studio Server"
-.\tcs-server.cmd user migrate admin</pre>
+    <p>以管理员身份打开 PowerShell，<strong>在安装目录里</strong>执行：</p>
+<pre><span class="c">cd "C:\Program Files\Tavern Card Studio Server"
+
+# $tcs 代表"服务端 CLI"：这几样文件任何 0.1.2 安装都有，不依赖额外脚本
+$tcs = ".\node.exe", ".\app\server\dist\index.js",
+       "--config", "C:\ProgramData\TavernCardStudio\config.json"
+
+&amp; $tcs user migrate admin      <span class="c"># 建首账户 + 接管历史卡片（会先备份）</span></pre>
     <p class="note">
       提示「首账户密码」时输入（至少 8 个字符）。密码从标准输入读，
       不接受命令行参数 —— 那样会留在 shell 历史与进程列表里。
@@ -111,15 +115,20 @@ cd "C:\Program Files\Tavern Card Studio Server"
       <li><strong>全新安装</strong>也用同一条命令，只是「接管 0 张卡片」。</li>
       <li><strong>重复执行是安全的</strong>：已有账户时它只补默认仓库、把没归仓库的卡片入库。</li>
       <li><strong>不需要重启服务</strong>：账户是每次请求现查库的。</li>
-      <li>要加普通成员：<code>.\tcs-server.cmd user add bob --role user</code></li>
-      <li>确认结果：<code>.\tcs-server.cmd user list</code></li>
+      <li>加普通成员：<code>&amp; $tcs user add bob --role user</code></li>
+      <li>确认结果：<code>&amp; $tcs user list</code></li>
     </ul>
     <div class="warn">
-      <strong>必须用安装目录里的 <code>tcs-server.cmd</code>。</strong>
-      它替你指定了服务正在用的那份配置（<code class="path">C:\ProgramData\TavernCardStudio\config.json</code>）。
-      如果绕过它直接跑 <code>node.exe app\server\dist\index.js user migrate</code>，
-      程序会按当前目录另算一个数据目录，<strong>等于在旁边新建一个空库</strong> ——
+      <strong><code>--config</code> 这一段不能省。</strong>
+      它指向服务正在用的那份配置（<code class="path">C:\ProgramData\TavernCardStudio\config.json</code>）。
+      省掉的话，程序会按当前目录另算一个数据目录，<strong>等于在旁边新建一个空库</strong> ——
       症状是「账户明明建好了，服务却说不存在」。
+    </div>
+    <div class="note" style="margin-top:10px">
+      <strong>如果你的安装目录里有 <code>tcs-server.cmd</code></strong>（较新的安装包会带），
+      可以把它当成上面 <code>$tcs</code> 的简写，命令更短：
+      <code>.\tcs-server.cmd user migrate admin</code>（自带 <code>--config</code>）。
+      没有这个文件也<strong>完全不影响</strong> —— 上面的写法在旧版安装上一样能用。
     </div>
   </section>
 
@@ -169,7 +178,7 @@ cd "C:\Program Files\Tavern Card Studio Server"
       </tr>
       <tr>
         <td><strong>全局令牌</strong><br><span class="pill">legacy</span></td>
-        <td>面板「API 与令牌」页；或在安装目录运行<br><code>tcs-server.cmd token show</code><br>也写在配置文件 <code>auth.token</code></td>
+        <td>面板「API 与令牌」页；或在安装目录运行<br><code>&amp; $tcs token show</code><br>也写在配置文件 <code>auth.token</code></td>
         <td><strong>只有尚未归属账户的卡片</strong>（0.1.2 起降权）</td>
         <td>仅运维：接手历史数据、排查。不要用于日常</td>
       </tr>
@@ -254,22 +263,34 @@ cd "C:\Program Files\Tavern Card Studio Server"
           看 <code class="path">C:\ProgramData\TavernCardStudio\logs\tcs-service-host.err.log</code>。
           若出现 <code>Cannot find package</code>，说明安装包缺运行时依赖 ——
           用 0.1.2 的修复版重装；也可在安装目录跑
-          <code>.\tcs-server.cmd selfcheck</code> 离线核对依赖。
+          <code>&amp; $tcs selfcheck --bundle-root "$PWD\app"</code> 离线核对依赖（<code>$tcs</code> 见第 1 节）。
         </td>
       </tr>
       <tr>
         <td>登录提示账户不存在 / 密码错</td>
         <td>
-          先在安装目录跑 <code>.\tcs-server.cmd user list</code> 确认账户在服务用的那个库里。
-          如果 list 里也没有，多半是第 1 节那条警告：命令没在安装目录里跑。
+          先在安装目录跑 <code>&amp; $tcs user list</code>（<code>$tcs</code> 见第 1 节）确认账户在服务用的那个库里。
+          如果 list 里也没有，多半是第 1 节那条警告：漏了 <code>--config</code>，命令写进了另一个库。
         </td>
       </tr>
       <tr>
         <td>登录后看不到以前上传的卡片</td>
         <td>
-          历史卡片还没归属。跑 <code>.\tcs-server.cmd user migrate admin</code>
+          历史卡片还没归属。跑 <code>&amp; $tcs user migrate admin</code>
           （已有账户时它会把没归属的卡片接管进来），或对指定账户跑
-          <code>user adopt &lt;用户名&gt;</code>。
+          <code>&amp; $tcs user adopt &lt;用户名&gt;</code>。
+        </td>
+      </tr>
+      <tr>
+        <td>装完发现安装目录里<br><strong>没有 <code>tcs-server.cmd</code></strong><br>（或说明页还是旧版）</td>
+        <td>
+          你装的是本页之前打出来的 0.1.2 包，或者<strong>同版本覆盖安装没有替换已有文件</strong>
+          —— Windows Installer 对"版本号相同"的安装只做维护，不会重新铺一遍文件。
+          两种办法：<br>
+          ① <strong>不用管它</strong>：第 1 节的 <code>$tcs</code> 写法只依赖
+          <code>node.exe</code> 与 <code>app\</code>，旧包一样能用；<br>
+          ② 想拿到本页与 <code>tcs-server.cmd</code>，用强制重装（管理员 PowerShell）：
+          <code>msiexec /i "TavernCardStudioServer-0.1.2.msi" REINSTALL=ALL REINSTALLMODE=amus</code>
         </td>
       </tr>
       <tr>
