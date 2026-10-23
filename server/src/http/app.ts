@@ -246,6 +246,9 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       uptimeMs: Date.now() - ctx.startedAt,
       version: SERVER_VERSION,
       config: configSummary(ctx.config),
+      // 实际生效的 TLS 状态（含证书指纹）：面板要显示它供用户核对，
+      // 客户端也可以用它判断"我连的是不是我以为的那台服务端"
+      tls: ctx.tls,
       rules: ctx.registry.loadErrors(),
     });
   });

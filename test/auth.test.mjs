@@ -27,7 +27,7 @@ import { UserStore, toPublicUser } from '../server/dist/storage/users.js';
 import { SessionStore } from '../server/dist/auth/sessions.js';
 import { LoginLimiter, DEFAULT_RATE_LIMIT } from '../server/dist/auth/login-limit.js';
 import { AuthService, AuthError, ACCESS_TOKEN_TTL_SECONDS } from '../server/dist/auth/service.js';
-import { hashPassword, verifyPassword, verifyPasswordDummy, ARGON2_PARAMS } from '../server/dist/auth/password.js';
+import { hashPassword, verifyPassword, verifyPasswordDummy, warmUpPasswordHashing, ARGON2_PARAMS } from '../server/dist/auth/password.js';
 import { signJwt, verifyJwt } from '../server/dist/auth/jwt.js';
 import { TokenGate } from '../server/dist/http/auth.js';
 
@@ -671,4 +671,102 @@ test('T10.4 身份：角色以库为准，降级后旧令牌不能继续当管�
 test('T10.4 假校验本身不抛异常（哈希串坏了也不能崩）', async () => {
   const value = await verifyPasswordDummy();
   assert.equal(value, false);
+});
+
+// ── 耗时侧信道：补测与固化（v0.1.2 复审补充）──────────────
+
+test('T10.4 耗时：预热后首次假校验与真实校验同量级（首调用侧信道已消除）', async () => {
+  // 未预热时：首次 dummy 要现算哈希（~45ms）而真实校验只要 ~19ms，比值 2.4×。
+  // 攻击者在服务刚启动时打一发，用耗时就能判断"这个账户不存在"。
+  // 预热把这份一次性开销提前付掉，首调用也就进入同一量级。
+  await warmUpPasswordHashing();
+
+  const hash = await hashPassword('warmup-check-password');
+
+  // **各跑多次取中位数**：单次测量在 Windows 上会被调度抖动影响。
+  // 第一版只测单次、判据 1.5×，实测跑 4 轮里偶发一次 34.5ms vs 52.2ms（1.51×）就红了 ——
+  // 那是测量噪声，不是回归。但判据也不能因此放宽到"随便都过"：
+  // 未预热时是 2.4× 以上，取 2.0 作为分界仍然能把"没预热"这件事抓出来。
+  const dummyTimes = [];
+  const realTimes = [];
+  for (let i = 0; i < 5; i += 1) {
+    let t = process.hrtime.bigint();
+    await verifyPasswordDummy();
+    dummyTimes.push(Number(process.hrtime.bigint() - t) / 1e6);
+
+    t = process.hrtime.bigint();
+    await verifyPassword(hash, 'wrong-password');
+    realTimes.push(Number(process.hrtime.bigint() - t) / 1e6);
+  }
+  const median = (list) => [...list].sort((a, b) => a - b)[Math.floor(list.length / 2)];
+  const dummy = median(dummyTimes);
+  const real = median(realTimes);
+  const ratio = Math.max(dummy, real) / Math.min(dummy, real);
+
+  assert.ok(
+    ratio < 2.0,
+    `预热后两者耗时必须同量级，实测 dummy 中位 ${dummy.toFixed(1)}ms、real 中位 ${real.toFixed(1)}ms（比值 ${ratio.toFixed(2)}）` +
+      `\n单次样本 dummy=${dummyTimes.map((v) => v.toFixed(1)).join('/')} real=${realTimes.map((v) => v.toFixed(1)).join('/')}`,
+  );
+  // 关键判据：两侧都必须真的算了哈希（不能靠"两边都很快"凑出比值
+  // —— 那样等于没做时序防护）
+  assert.ok(dummy > 5, `假校验必须真的花时间，实测中位 ${dummy.toFixed(1)}ms`);
+  assert.ok(real > 5, `真实校验失败路径必须真的花时间，实测中位 ${real.toFixed(1)}ms`);
+});
+
+test('T10.4 耗时：注册的各失败原因耗时同量级（不能靠响应时间探测用户名）', async () => {
+  const env = fresh();
+  try {
+    await makeUser(env, 'occupied-name', 'occupied-password-1');
+
+    const timeIt = async (fn) => {
+      const t = process.hrtime.bigint();
+      await expectAuthError(fn(), 'REGISTRATION_REJECTED');
+      return Number(process.hrtime.bigint() - t) / 1e6;
+    };
+
+    const samples = { occupied: [], badShape: [], badPassword: [] };
+    for (let i = 0; i < 3; i += 1) {
+      samples.occupied.push(
+        await timeIt(() =>
+          env.auth.register({
+            username: 'occupied-name',
+            password: 'valid-password-1',
+            ip: IP,
+            userAgent: UA,
+            callerIsAdmin: false,
+          }),
+        ),
+      );
+      samples.badShape.push(
+        await timeIt(() =>
+          env.auth.register({ username: 'ab', password: 'valid-password-1', ip: IP, userAgent: UA, callerIsAdmin: false }),
+        ),
+      );
+      samples.badPassword.push(
+        await timeIt(() =>
+          env.auth.register({ username: `fresh-${String(i)}`, password: 'short', ip: IP, userAgent: UA, callerIsAdmin: false }),
+        ),
+      );
+    }
+
+    const median = (list) => [...list].sort((a, b) => a - b)[Math.floor(list.length / 2)];
+    const m = {
+      occupied: median(samples.occupied),
+      badShape: median(samples.badShape),
+      badPassword: median(samples.badPassword),
+    };
+    // 三条路径都必须真的算过一次哈希（占用/格式不合规走 hashPassword，
+    // 密码不合规走 verifyPasswordDummy 补时间），所以应当同量级。
+    for (const [name, value] of Object.entries(m)) {
+      if (name === 'occupied') continue;
+      const ratio = Math.max(m.occupied, value) / Math.min(m.occupied, value);
+      assert.ok(
+        ratio < 2,
+        `"已占用" vs "${name}" 耗时比值应 < 2，实测 ${ratio.toFixed(2)}（${m.occupied.toFixed(1)}ms / ${value.toFixed(1)}ms）`,
+      );
+    }
+  } finally {
+    env.db.close();
+  }
 });

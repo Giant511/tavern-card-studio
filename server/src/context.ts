@@ -27,6 +27,45 @@ export interface ServerContext {
   cards: CardService;
   logger: Logger;
   startedAt: number;
+  /**
+   * 实际生效的 TLS 状态（T10.5）。
+   *
+   * 由 worker 在准备完证书后写入：`config.tls` 只说明"用户想用什么"，
+   * 而这里记录"实际用的是什么 + 证书指纹"。两者必须分开 —— 用户核对指纹时
+   * 看的是**实际加载的那张证书**，不是配置里那个路径。
+   */
+  tls: RuntimeTlsState;
+}
+
+export interface RuntimeTlsState {
+  mode: 'off' | 'selfsigned' | 'custom';
+  httpsPort: number | null;
+  /** 证书指纹（SHA-256，`AA:BB:…`）；off 或尚未准备好时为 null */
+  fingerprint: string | null;
+  subject: string | null;
+  notBefore: string | null;
+  notAfter: string | null;
+  daysUntilExpiry: number | null;
+  selfSigned: boolean;
+  /** off 模式恒为 true —— 面板据此常驻红色横幅 */
+  plaintext: boolean;
+  /** 启动期产生的告警（临近过期、custom 自签提醒等） */
+  warnings: string[];
+}
+
+export function emptyTlsState(mode: 'off' | 'selfsigned' | 'custom', httpsPort: number): RuntimeTlsState {
+  return {
+    mode,
+    httpsPort: mode === 'off' ? null : httpsPort,
+    fingerprint: null,
+    subject: null,
+    notBefore: null,
+    notAfter: null,
+    daysUntilExpiry: null,
+    selfSigned: false,
+    plaintext: mode === 'off',
+    warnings: [],
+  };
 }
 
 export function createContext(loaded: LoadedConfig, options: { logDir?: string; role?: string; sink?: (line: string) => void } = {}): ServerContext {
@@ -96,6 +135,8 @@ export function createContext(loaded: LoadedConfig, options: { logDir?: string; 
     cards,
     logger,
     startedAt: Date.now(),
+    // 初始是"配置声明的状态"，worker 准备完证书后会覆盖成实际状态
+    tls: emptyTlsState(config.tls.mode, config.tls.httpsPort),
   };
 }
 
@@ -124,6 +165,16 @@ export function configSummary(config: ServerConfigFile): Record<string, unknown>
       registerMode: config.auth.registerMode,
     },
     service: { ...config.service },
+    tls: {
+      mode: config.tls.mode,
+      httpsPort: config.tls.httpsPort,
+      // **不下发 certPath/keyPath 的完整路径**：面板会被远程访问，路径里常带用户名，
+      // 而且用户不需要在界面上看到磁盘结构。只给"是否已配置"，够判断状态。
+      customConfigured: config.tls.certPath !== '' && config.tls.keyPath !== '',
+      // 面板据此显示常驻红色明文横幅（T10.5 / 需求 F1.3）。
+      // plaintext 是**持续事实**，不是一次性提示，所以由后端给判据、前端常驻渲染。
+      plaintext: config.tls.mode === 'off',
+    },
     createdAt: config.createdAt,
     updatedAt: config.updatedAt,
   };
