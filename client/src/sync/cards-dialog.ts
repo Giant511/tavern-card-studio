@@ -153,6 +153,23 @@ export class CardsDialog {
     this.overlay.hidden = true;
   }
 
+  /**
+   * 静默预取（v0.1.2 追加任务第 4 条）。
+   *
+   * 登录成功后立刻拉一次"我的卡片"，这样用户点「我的卡片」时不用再等一轮；
+   * 失败一律忽略 —— 预取是锦上添花，不该在登录成功的那一刻弹红条。
+   */
+  async preload(): Promise<void> {
+    if (this.deps.getConfig() === null || this.busy) return;
+    try {
+      const items = await listCards(this.deps.getConfig() as SyncConfig, { limit: 100 });
+      this.renderRows(items);
+      document.body.dataset['cardsPreloaded'] = String(items.length);
+    } catch {
+      // 预取失败保持安静：用户点开面板时会自己重试并看到真实错误
+    }
+  }
+
   private async logout(): Promise<void> {
     if (!this.deps.onLogout) return;
     this.logoutButton.disabled = true;
@@ -176,7 +193,15 @@ export class CardsDialog {
       // 注意：这里**不能**先写 countEl 再调 renderRows([]) ——
       // 后者会把计数覆盖成「共 0 张」，于是"未连接"看起来像"这个账户没有卡"。
       // 曾据此误判过（截图里只剩一句"共 0 张"）。空态与失败态要分开渲染。
-      this.renderNotice('未连接服务端：请先在「设置」里填写地址与令牌，或点「登录」。');
+      //
+      // 文案也要分两种（v0.1.2 追加任务）：没登录时说的是"登录后可查看"，
+      // 而不是"未连接服务端" —— 后者把"还没登录"错报成"连不上"，
+      // 正是本次要修的那类错序表述。
+      this.renderNotice(
+        this.deps.isAccountLogin()
+          ? '还没配置服务端地址：请在「设置」里填写，或点「连接本机服务端」。'
+          : '登录后可查看你自己的卡片。',
+      );
       return;
     }
 

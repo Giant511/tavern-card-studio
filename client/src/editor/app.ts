@@ -76,6 +76,13 @@ import type { SyncConfig } from '../sync/server-sync';
 import { AuthSession } from '../auth/session';
 import { LoginDialog } from '../auth/login-dialog';
 import { phaseLabel, phaseTitle } from '../auth/policy';
+import {
+  connectionLabel,
+  hasServerUrl,
+  resolveSyncGate,
+  syncHintText,
+  type SyncGateState,
+} from '../auth/entry-policy';
 import { SettingsDialog } from '../settings/settings-dialog';
 import { NewCardDialog } from '../session/new-card-dialog';
 import { decideShortcut } from './shortcuts';
@@ -397,6 +404,9 @@ class EditorApp {
       // 顶栏指示与三个同步入口的启用状态都读 this.connection，必须同步更新，
       // 否则面板里显示"已连接"、顶栏还写着"未就绪"。
       onConnectionReady: (result) => this.applyConnection(result),
+      // 门槛由 App 统一算（地址 + 凭证），面板只负责按状态说话
+      getGate: () => this.syncGate(),
+      onLogin: () => void this.openAccountEntry(),
       // 401 → 先静默续期，续不上才回登录界面（本地编辑一律不动）
       onUnauthorized: () => this.handleUnauthorized(),
       onOpenCards: () => void this.cardsDialog?.open(),
@@ -455,12 +465,18 @@ class EditorApp {
     this.loginDialog = new LoginDialog({
       session,
       getPolicy: () => session.fetchPolicy(),
+      // 登录只需要地址，不需要任何令牌（免鉴权端点：login/register/refresh/config）
+      getServerUrl: () => this.connection?.url ?? this.authServerUrl,
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
       onAuthenticated: () => {
-        // 换了令牌 → 必须重探一次，否则顶栏还停在「鉴权未通过」，
-        // 而同步按钮一直灰着，用户会以为登录没成功
+        // 换了令牌 → 必须重探一次，否则顶栏还停在旧状态，
+        // 用户会以为登录没成功
         this.refreshAccountButton();
         void this.autoProbe();
+        // 静默续期由 AuthSession 自己接管（refresh 单飞，见 session.ts），
+        // 这里补第 4 条要求的另一半：**登录成功即拉一次「我的卡片」**，
+        // 用户点开面板时不用再等一轮。
+        void this.cardsDialog?.preload();
       },
     });
 
@@ -542,12 +558,27 @@ class EditorApp {
     button.textContent = phaseLabel(phase, user);
     button.title = phaseTitle(phase, user);
     button.dataset['phase'] = phase;
+    // 设置面板里的「已登录：alice（账户令牌）」/「未登录」跟着变：
+    // 登录态可能在任何地方变化（登录、登出、静默过期、401 恢复），
+    // 只在一处改文案，避免两个面板各说一套。
+    this.settings?.refreshIdentity();
   }
 
-  /** 点账户按钮：未登录/已过期 → 登录框；已登录 → 卡片列表（内含登出） */
+  /**
+   * 点账户按钮：已登录 → 卡片列表；否则 → 登录框。
+   *
+   * v0.1.2 追加任务：**不再以"已连上/令牌有效"为前提**。唯一的前置条件是
+   * 服务端地址 —— 没有它，登录框连 `/api/auth/config` 都问不到。
+   * 那种情况直接把用户送到设置页并说明原因，而不是打开一个注定失败的登录框。
+   */
   private async openAccountEntry(): Promise<void> {
     const session = this.authSession;
     if (!session) return;
+    if (!hasServerUrl(this.connection?.url ?? this.authServerUrl)) {
+      this.setStatus('先在设置里填写服务端地址（同机可直接点「连接本机服务端」），再登录。', 'warn');
+      void this.settings?.open();
+      return;
+    }
     if (session.currentPhase === 'authenticated' && session.accessToken !== '') {
       await this.cardsDialog?.open();
       return;
@@ -630,15 +661,32 @@ class EditorApp {
   /**
    * 当前同步配置：连接通过时才返回（未就绪不构造请求参数） */
   private currentSyncConfig(): SyncConfig | null {
-    const connection = this.connection;
-    if (!connection || !connection.url) return null;
-    if (!isSyncReady(connection)) return null;
-    // 账户令牌优先，回落 legacy 全局令牌：两者并存时以登录态为准
+    // v0.1.2 追加任务：**不再要求探测通过**。
+    //
+    // 上一版这里写着 `if (!isSyncReady(connection)) return null`，而 isSyncReady
+    // 要求 tokenValid === true —— 于是"没登录"被表达成"同步配置为空"，
+    // 卡片列表与同步面板于是说"未连接"。凭证只决定**能做什么**，
+    // 不能决定"能不能开始"：这里只要有地址 + 有凭证就交出配置，
+    // 请求失败由各面板自己报（那时才有真实错误可看）。
     const accountToken = this.authSession?.accessToken ?? '';
-    return {
-      serverUrl: connection.url,
-      token: accountToken !== '' ? accountToken : (this.settingsToken ?? ''),
-    };
+    const legacyToken = this.settingsToken ?? '';
+    const token = accountToken !== '' ? accountToken : legacyToken;
+    const serverUrl = this.connection?.url ?? this.authServerUrl;
+    if (!hasServerUrl(serverUrl) || token === '') return null;
+    return { serverUrl, token };
+  }
+
+  /** 当前是否持有可用凭证（账户令牌或 legacy 全局令牌） */
+  private hasCredentials(): boolean {
+    return (this.authSession?.accessToken ?? '') !== '' || (this.settingsToken ?? '') !== '';
+  }
+
+  /**
+   * 同步门槛（v0.1.2 追加任务）：地址 + 凭证，两件事都只看"有没有"。
+   * 探测结果不参与判定 —— 否则"刚打开客户端、探测还没回来"会让面板说"未连接"。
+   */
+  private syncGate(): SyncGateState {
+    return resolveSyncGate(this.connection?.url ?? this.authServerUrl, this.hasCredentials());
   }
 
   /**
@@ -869,6 +917,18 @@ class EditorApp {
         void this.refreshTokenAfterSave();
         this.setStatus('设置已保存', 'ok');
       },
+      // 身份行：登录态从 AuthSession 现读（闭包，构造时 session 可能还不存在）
+      getIdentity: () => ({
+        phase: this.authSession?.currentPhase ?? 'anonymous',
+        user: this.authSession?.user ?? null,
+      }),
+      onLogin: () => void this.openAccountEntry(),
+      onLogout: async () => {
+        await this.authSession?.logout();
+        this.refreshAccountButton();
+        void this.autoProbe();
+        this.setStatus('已登出；本地编辑不受影响', 'info');
+      },
     });
 
     byId<HTMLButtonElement>('btn-settings').addEventListener('click', () => {
@@ -901,10 +961,9 @@ class EditorApp {
     // T6.7：三个同步入口都打开同一个面板（面板内按职责分区：上传 / 历史 / 回滚）
     for (const id of ['btn-upload', 'btn-history', 'btn-rollback']) {
       byId<HTMLButtonElement>(id).addEventListener('click', () => {
-        if (!isSyncReady(this.connection)) {
-          this.setStatus('同步未就绪：请到「设置」检查服务端地址与令牌', 'warn');
-          return;
-        }
+        // 入口永远可点（v0.1.2 追加任务）。面板按 地址 / 凭证 三态说明现状：
+        // 「还没配置地址」或「登录后可同步」都比门口一句"同步未就绪"有用 ——
+        // 后者既说不出缺什么，也让"还没登录"看起来像功能坏了。
         this.syncDialog?.open();
       });
     }
@@ -1100,34 +1159,38 @@ class EditorApp {
     }
   }
 
-  /** 把连接结果映射到界面：胶囊 + 同步按钮 + 提示 */
+  /**
+   * 把连接结果映射到界面：胶囊 + 同步提示。
+   *
+   * v0.1.2 追加任务：**三个同步入口不再置灰**，也不再出现「鉴权未通过」。
+   * 旧逻辑用 `isSyncReady(result)`（= 探测到 token 有效）当门禁，于是"还没登录"
+   * 被显示成「鉴权未通过」、"没配地址"被显示成「未连接」—— 两种状态都说错了对象。
+   * 现在胶囊只描述**连接**（未配置 / 未连接 / 已连接·未登录 / 已连接），
+   * 同步能力由 `syncGate()` 交给面板自己说明。
+   */
   private applyConnection(result: ProbeResult | null): void {
     this.connection = result;
 
     const chip = byId('conn-chip');
     const text = byId('conn-text');
     const hint = byId('sync-hint');
-    const ready = isSyncReady(result);
+    const phase = this.authSession?.currentPhase ?? 'anonymous';
+    const label = connectionLabel(result?.url ?? this.authServerUrl, result, phase);
 
-    chip.className = 'conn-chip ' + (ready ? 'on' : result ? (result.reachable ? 'warn' : 'bad') : 'off');
-    text.textContent = ready ? '已连接' : result?.reachable ? '鉴权未通过' : '未连接';
+    chip.className = `conn-chip ${label.tone}`;
+    text.textContent = label.text;
+    chip.title = `服务端连接状态：${label.text}（账号仅决定能做什么，不是连接的前提）`;
 
     for (const id of ['btn-upload', 'btn-history', 'btn-rollback']) {
-      byId<HTMLButtonElement>(id).disabled = !ready;
+      byId<HTMLButtonElement>(id).disabled = false;
     }
 
-    if (ready) {
-      hint.textContent =
-        result?.cardCount === null || result?.cardCount === undefined
-          ? '同步已就绪'
-          : `同步已就绪 · 服务端现有 ${result.cardCount} 张卡`;
-      hint.className = 'sync-hint ok';
-    } else {
-      hint.textContent = result
-        ? '同步不可用（编辑 / 审计 / 导出不受影响）'
-        : '同步未启用（编辑 / 审计 / 导出不受影响）';
-      hint.className = 'sync-hint warn';
-    }
+    const gate = this.syncGate();
+    const summary = syncHintText(gate, result?.cardCount ?? null);
+    hint.textContent = summary.text;
+    hint.className = `sync-hint ${summary.tone}`;
+    // 端到端断言用：不靠读文案判断门槛
+    document.body.dataset['syncGate'] = gate;
   }
 
   // ── 构造 ────────────────────────────────────────────────
