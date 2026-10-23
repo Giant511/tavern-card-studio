@@ -29,6 +29,7 @@ import {
 
 import {
   configGet,
+  configPatch,
   isShellAvailable,
   pickCardFile,
   pickSavePath,
@@ -68,7 +69,11 @@ import { isSyncReady, probeServer, type ProbeResult } from '../net/server-probe'
 import { ExportDialog } from '../export/export-dialog';
 import { buildExportAsync } from '../export/export-card';
 import { SyncDialog } from '../sync/sync-dialog';
+import { CardsDialog } from '../sync/cards-dialog';
 import type { SyncConfig } from '../sync/server-sync';
+import { AuthSession } from '../auth/session';
+import { LoginDialog } from '../auth/login-dialog';
+import { phaseLabel, phaseTitle } from '../auth/policy';
 import { SettingsDialog } from '../settings/settings-dialog';
 import { NewCardDialog } from '../session/new-card-dialog';
 import { decideShortcut } from './shortcuts';
@@ -143,6 +148,22 @@ class EditorApp {
   // 多标签下"当前是哪张卡"由 activeId 决定，app.ts 再留一份必然串卡。
   /** 设置里保存的 token（同步请求要用；probeServer 的 url 不含 token） */
   private settingsToken = '';
+  /**
+   * 账户登录态（T10.7）。
+   *
+   * 与 `settingsToken` 并存：**账户令牌优先**，为空时回落到 legacy 全局令牌。
+   * 两者都不在时同步入口按未就绪处理。
+   */
+  private authSession: AuthSession | null = null;
+  private loginDialog: LoginDialog | null = null;
+  private cardsDialog: CardsDialog | null = null;
+  /**
+   * 认证请求用的服务端地址。
+   *
+   * 不能复用 `this.connection?.url`：探测失败时 connection 是 null 或没有 url，
+   * 而"探测失败"与"不能登录"不是一回事 —— 用户可能只是令牌还没填。
+   */
+  private authServerUrl = '';
   private validateTimer: number | null = null;
   private activeIssueId: string | null = null;
 
@@ -198,6 +219,10 @@ class EditorApp {
 
   async start(): Promise<void> {
     this.setStatus('加载规则…');
+    // 必须先于 wireToolbar（那里会启动 autoProbe）：浏览器直开时读不到配置，
+    // `?serverUrl=` 是唯一能告诉应用"服务端在哪"的途径。壳里配置优先，
+    // autoProbe 拿到配置后会覆盖它。
+    this.applyDebugServerUrl();
     this.rules = await buildRuleset();
     // 配色来自高亮方案本体（规则资产），不写死在样式表里
     applySchemeStyles(this.rules.highlightFile);
@@ -240,6 +265,7 @@ class EditorApp {
     this.wireSettings();
     this.wireRules();
     this.wireExportAndSync();
+    this.wireAccount();
 
     // 未落盘会话的离开拦截（T9.14）。
     // WebView2 认 F5 / Ctrl+R，误按一次就把整个 webview 重载、所有标签的
@@ -267,7 +293,13 @@ class EditorApp {
     try {
       const config = await configGet();
       this.settingsToken = config.token;
-      const result = await probeServer(config);
+      this.authServerUrl = config.serverUrl;
+      // 与 autoProbe 同一套优先级：账户令牌 > legacy 全局令牌
+      const accountToken = this.authSession?.accessToken ?? '';
+      const result = await probeServer({
+        serverUrl: config.serverUrl,
+        token: accountToken !== '' ? accountToken : config.token,
+      });
       this.applyConnection(result);
     } catch {
       // 浏览器模式读不到配置，忽略
@@ -350,6 +382,9 @@ class EditorApp {
       // 顶栏指示与三个同步入口的启用状态都读 this.connection，必须同步更新，
       // 否则面板里显示"已连接"、顶栏还写着"未就绪"。
       onConnectionReady: (result) => this.applyConnection(result),
+      // 401 → 先静默续期，续不上才回登录界面（本地编辑一律不动）
+      onUnauthorized: () => this.handleUnauthorized(),
+      onOpenCards: () => void this.cardsDialog?.open(),
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
     });
 
@@ -358,12 +393,141 @@ class EditorApp {
     });
   }
 
+  // ── 账户（T10.7）──────────────────────────────────────────
+  //
+  // 分工：
+  //   · `AuthSession` 管令牌（持久化 / 静默续期 / 401 恢复），不认识 DOM；
+  //   · 这里只管"把状态画到顶栏"和"什么时候弹登录框"；
+  //   · 登录/注册界面是 `LoginDialog`，卡片列表是 `CardsDialog`。
+  //
+  // 硬边界：**登录态的任何变化都不触碰本地会话**。标签、未保存内容、当前编辑位置
+  // 属于本地工作，与云端身份无关；这条不是靠调用方记得，而是这几处代码里
+  // 根本没有 `sessions` / `closeSession` / `markSaved` 之类的调用。
+  private wireAccount(): void {
+    const session = new AuthSession({
+      load: async () => {
+        const config = await configGet();
+        return {
+          accessToken: config.accessToken,
+          refreshToken: config.refreshToken,
+          accessExpiresAt: config.accessExpiresAt,
+          authUser: config.authUser,
+        };
+      },
+      save: async (patch) => {
+        // 只写这四个键：`configPatch` 是按 key 合并的，不会动规则/目录等设置
+        await configPatch(patch);
+      },
+      serverUrl: () => (this.authServerUrl.trim() === '' ? null : this.authServerUrl.trim()),
+      onPhaseChange: () => this.refreshAccountButton(),
+    });
+    this.authSession = session;
+
+    this.loginDialog = new LoginDialog({
+      session,
+      getPolicy: () => session.fetchPolicy(),
+      notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
+      onAuthenticated: () => {
+        // 换了令牌 → 必须重探一次，否则顶栏还停在「鉴权未通过」，
+        // 而同步按钮一直灰着，用户会以为登录没成功
+        this.refreshAccountButton();
+        void this.autoProbe();
+      },
+    });
+
+    this.cardsDialog = new CardsDialog({
+      getConfig: () => this.currentSyncConfig(),
+      isAccountLogin: () => session.accessToken !== '' || session.refreshToken !== '',
+      onPick: (cardId) => {
+        // 复用同步面板：点卡片 = 看它的版本历史
+        this.syncDialog?.open();
+        this.syncDialog?.selectCard(cardId);
+      },
+      notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
+      onUnauthorized: () => this.handleUnauthorized(),
+      onLogout: async () => {
+        await session.logout();
+        this.setStatus('已登出：后续同步将使用全局令牌（若有）', 'info');
+        this.refreshAccountButton();
+        void this.autoProbe();
+      },
+    });
+
+    byId<HTMLButtonElement>('btn-account').addEventListener('click', () => void this.openAccountEntry());
+
+    // 启动时读回令牌并**静默**续期。
+    // 不 await：续期要发网络请求，不能挡住首屏渲染；也不在失败时弹窗
+    // （启动瞬间弹登录框，用户第一反应是"是不是被盗号了"）。
+    void session.bootstrap().then((ok) => {
+      this.refreshAccountButton();
+      if (ok) void this.autoProbe();
+    });
+  }
+
+  /** 浏览器直开（无壳）时的服务端地址兜底，与 `?settings=1&serverUrl=…` 调试参数同源 */
+  private applyDebugServerUrl(): void {
+    const debugServer = new URLSearchParams(location.search).get('serverUrl');
+    if (debugServer !== null && debugServer.trim() !== '') {
+      this.authServerUrl = debugServer.trim().replace(/\/+$/, '');
+    }
+  }
+
+  /** 账户按钮的文案与状态（唯一一处改它的地方） */
+  private refreshAccountButton(): void {
+    const button = byId<HTMLButtonElement>('btn-account');
+    const session = this.authSession;
+    const phase = session?.currentPhase ?? 'anonymous';
+    const user = session?.user ?? null;
+    button.textContent = phaseLabel(phase, user);
+    button.title = phaseTitle(phase, user);
+    button.dataset['phase'] = phase;
+  }
+
+  /** 点账户按钮：未登录/已过期 → 登录框；已登录 → 卡片列表（内含登出） */
+  private async openAccountEntry(): Promise<void> {
+    const session = this.authSession;
+    if (!session) return;
+    if (session.currentPhase === 'authenticated' && session.accessToken !== '') {
+      await this.cardsDialog?.open();
+      return;
+    }
+    await this.loginDialog?.open();
+  }
+
+  /**
+   * 收到 401 后的统一处置：先试续期，续不上才回登录界面。
+   *
+   * 返回 true = 已续期成功，调用方可以重试原请求。
+   */
+  private async handleUnauthorized(): Promise<boolean> {
+    const session = this.authSession;
+    if (!session) return false;
+
+    const recovered = await session.recoverAfterUnauthorized();
+    if (recovered) {
+      this.refreshAccountButton();
+      void this.autoProbe();
+      return true;
+    }
+
+    this.refreshAccountButton();
+    // 「回登录界面」= 只打开对话框。刻意不关闭标签、不清除未保存内容：
+    // 用户可能正在写一半的角色卡，重新登录这一下不该让他丢工作。
+    void this.loginDialog?.open('登录已过期或令牌无效，请重新登录。本地未保存的编辑不会丢失。');
+    return false;
+  }
+
   /** 当前同步配置：连接通过时才返回（未就绪不构造请求参数） */
   private currentSyncConfig(): SyncConfig | null {
     const connection = this.connection;
     if (!connection || !connection.url) return null;
     if (!isSyncReady(connection)) return null;
-    return { serverUrl: connection.url, token: this.settingsToken ?? '' };
+    // 账户令牌优先，回落 legacy 全局令牌：两者并存时以登录态为准
+    const accountToken = this.authSession?.accessToken ?? '';
+    return {
+      serverUrl: connection.url,
+      token: accountToken !== '' ? accountToken : (this.settingsToken ?? ''),
+    };
   }
 
   /**
@@ -795,14 +959,33 @@ class EditorApp {
 
   /** 启动时探测一次已保存的配置；失败静默（不打扰编辑） */
   private async autoProbe(): Promise<void> {
+    let serverUrl = this.authServerUrl;
+    let legacyToken = this.settingsToken;
     try {
       const config = await configGet();
       this.settingsToken = config.token;
-      if (!config.serverUrl.trim()) return;
-      const result = await probeServer(config);
+      // 认证请求用的地址与探测用的地址同源：都没配置时一并留空，
+      // 这样"点登录"会明确提示去设置里填地址，而不是打向一个默认端口
+      this.authServerUrl = config.serverUrl;
+      serverUrl = config.serverUrl;
+      legacyToken = config.token;
+    } catch {
+      // 浏览器模式（无 C5 能力）读不到配置：回落到 ?serverUrl= 调试参数。
+      // 这不是给正式用户用的入口 —— 壳里永远能读到配置，走不到这里。
+    }
+
+    if (!serverUrl.trim()) return;
+    // 账户令牌优先：登录后顶栏的"已连接"依据的是**账户**身份，
+    // 不能还拿 v0.1.1 的全局令牌去探（那会掩盖"登录没成功"）
+    const accountToken = this.authSession?.accessToken ?? '';
+    try {
+      const result = await probeServer({
+        serverUrl,
+        token: accountToken !== '' ? accountToken : legacyToken,
+      });
       this.applyConnection(result);
     } catch {
-      // 读不到配置（浏览器模式）或探测失败：保持"未连接"，不影响本地功能
+      // 探测失败：保持"未连接"，不影响本地功能
     }
   }
 
