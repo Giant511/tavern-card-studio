@@ -239,7 +239,32 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
    */
   router.get('/api/token', (_ctx) => {
     // 双重判断：连接来源必须是回环。
-    // 这里刻意不读 X-Forwarded-For —— 那个头由客户端随便写，拿它做门禁等于没有门禁。
+    //
+    // 这里刻意不读 X-Forwarded-For 的**值** —— 那个头由客户端随便写，
+    // 拿它做门禁等于没有门禁。但**头的存在**是一个可信的信号，含义完全不同：
+    //
+    //   反向代理（Caddy / nginx）与业务同机部署时，`socket.remoteAddress` 恒为
+    //   127.0.0.1 —— 于是"只接受本机请求"这条门禁会**对所有公网请求成立**，
+    //   任何人 `curl https://公网域名/api/token` 都能拿到全权令牌（T10.10 发现）。
+    //
+    // 桌面客户端走的是直连 127.0.0.1，不会带这些头；只要带了，就说明这一跳
+    // 来自代理，不是"操作者坐在那台机器前"。这里不判断代理是谁、也不信任头里的 IP，
+    // 只用"存在代理跳"这一个事实做 fail-closed 拒绝。
+    const proxiedHeaders = ['forwarded', 'x-forwarded-for', 'x-forwarded-host', 'x-real-ip'];
+    const proxied = proxiedHeaders.find((name) => _ctx.req.headers[name] !== undefined);
+    if (proxied !== undefined) {
+      throw new AppError(
+        403,
+        'TOKEN_LOCAL_ONLY',
+        `取令牌接口不接受经过反向代理的请求（检测到 ${proxied} 头）：令牌不得经由公网链路下发`,
+        {
+          hint:
+            '请在本机直接访问服务端端口取令牌，或到服务端机器上运行 `tcs-server token show`；' +
+            '远程使用时请手动复制令牌。反向代理侧的推荐配置见 docs/33。',
+        },
+      );
+    }
+
     const remote = _ctx.req.socket.remoteAddress;
     if (!isLoopbackAddress(remote)) {
       throw new AppError(
