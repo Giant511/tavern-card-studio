@@ -185,6 +185,49 @@
             </article>
           </div>
           <article class="card">
+            <div class="card-head">
+              <h3>注册策略</h3>
+              <span class="pill" id="regmode-pill">—</span>
+            </div>
+            <p class="muted">
+              决定客户端是否显示「注册新账户」，以及谁能自助注册。
+              <strong>保存后立即生效，不需要重启后台服务。</strong>
+            </p>
+            <div class="radio-row" id="cfg-registerMode">
+              <label class="check"><input type="radio" name="cfg-registerMode" value="closed" /> 关闭自助注册（默认）</label>
+              <label class="check"><input type="radio" name="cfg-registerMode" value="admin-only" /> 仅管理员创建</label>
+              <label class="check"><input type="radio" name="cfg-registerMode" value="open" /> 开放自助注册</label>
+            </div>
+            <p class="hint" id="regmode-hint"></p>
+            <div class="warn-box" id="regmode-open-warn" hidden>
+              <strong>⚠ 已开放自助注册</strong>
+              <ul class="bullets">
+                <li>任何能访问到这个 API 地址的人都可以<strong>自行创建账户</strong>，不需要审核；</li>
+                <li>服务端按账户隔离数据，但开放注册等于把「谁能进来」交给网络边界——
+                  只在<strong>内网</strong>、或配合邀请制/代理层白名单时使用；</li>
+                <li>若 API 监听非回环地址（当前 <code id="regmode-host">—</code>），
+                  启动日志与配置检查都会给出同一条安全警告，那是同一个判据。</li>
+              </ul>
+            </div>
+            <div id="recent-accounts-wrap" hidden>
+              <div class="card-head" style="margin-top:14px">
+                <h3>最近注册账户</h3>
+                <button class="btn btn-small" id="recent-refresh" type="button">刷新</button>
+              </div>
+              <table class="data-table">
+                <thead>
+                  <tr><th>用户名</th><th>角色</th><th>状态</th><th>注册时间</th><th>最后登录</th><th></th></tr>
+                </thead>
+                <tbody id="recent-accounts-body"><tr><td colspan="6" class="muted">读取中…</td></tr></tbody>
+              </table>
+              <p class="hint">
+                管理员账号请到命令行管理（<code>tcs-server.cmd user add &lt;名&gt; --role admin</code>）；
+                这里只做「看见谁进来了 + 一键禁用」。
+              </p>
+            </div>
+          </article>
+
+          <article class="card">
             <h3>服务注册信息</h3>
             <div class="grid three">
               <label class="field"><span>托管方式</span>

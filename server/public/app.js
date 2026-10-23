@@ -249,6 +249,156 @@
     warn.hidden = LOOPBACK.includes(value);
   }
 
+  // ── 注册策略（F12）────────────────────────────────────
+  //
+  // 这一段是"把配置文件里的一个枚举变成一个能安全点击的开关"。要点有三个：
+  //   ① 切到「开放」必须先过确认框，且默认焦点在取消上 —— 这是唯一会让
+  //      服务端对全网敞开的选项，不能靠"手滑点一下就开"；
+  //   ② 风险说明是**常驻**的（改完仍显示），不是关掉就忘的 toast；
+  //   ③ 「最近注册账户」只在开放时出现 —— 平时它只是噪音，开放时它是
+  //      唯一的可视性来源。
+  const REGISTER_MODE_LABEL = { closed: '关闭自助注册', 'admin-only': '仅管理员创建', open: '开放自助注册' };
+  const REGISTER_MODE_HINT = {
+    closed: '客户端不会出现注册入口。新账户只能由管理员在命令行创建。',
+    'admin-only': '注册入口只对已登录的管理员显示；普通用户看不到——管理员在客户端里可以替别人建号。',
+    open: '客户端会显示注册入口：任何能访问到这个 API 地址的人都能自行创建账户。',
+  };
+
+  function registerModeValue() {
+    const checked = document.querySelector('input[name="cfg-registerMode"]:checked');
+    return checked ? checked.value : 'closed';
+  }
+
+  function setRegisterMode(mode) {
+    const inputs = Array.from(document.querySelectorAll('input[name="cfg-registerMode"]'));
+    for (const input of inputs) input.checked = input.value === mode;
+    updateRegisterModeUi();
+  }
+
+  function updateRegisterModeUi() {
+    const mode = registerModeValue();
+    const hint = $('regmode-hint');
+    if (hint) hint.textContent = REGISTER_MODE_HINT[mode] || '';
+    const pill = $('regmode-pill');
+    if (pill) {
+      pill.textContent = REGISTER_MODE_LABEL[mode] || mode;
+      pill.className = `pill ${mode === 'open' ? 'warn' : mode === 'closed' ? '' : 'ok'}`;
+    }
+    const hostEl = $('regmode-host');
+    if (hostEl) hostEl.textContent = state.status ? state.status.config.host : '—';
+    const warn = $('regmode-open-warn');
+    if (warn) warn.hidden = mode !== 'open';
+    const wrap = $('recent-accounts-wrap');
+    if (wrap) wrap.hidden = mode !== 'open';
+  }
+
+  /**
+   * 切到「开放」时的确认框。
+   *
+   * 为什么不用 window.confirm 的一句话版本：风险有三条，而 confirm 只显示一行
+   * 短文本时用户会条件反射地点确定。这里把三条风险拼成多行，并在结尾明确
+   * 问一次；取消则**把选择退回去**（不留下"看起来已选开放、其实没保存"的假象）。
+   */
+  function confirmOpenRegistration() {
+    const host = state.status ? state.status.config.host : '（未知）';
+    const lines = [
+      '开放自助注册有风险：',
+      '',
+      '1. 任何能访问到本服务端 API 的人都可以自行创建账户，不需要审核；',
+      '2. 服务端按账户隔离数据，但「谁能进来」从此由网络边界决定；',
+      `3. 当前 API 监听 ${host}${host === '127.0.0.1' ? '（仅本机，风险较小）' : '（非回环，公网可达）'}。`,
+      '',
+      '建议只在内网使用，或配合邀请制 / 代理层 IP 白名单。',
+      '确定要开放自助注册吗？',
+    ];
+    return window.confirm(lines.join('\n'));
+  }
+
+  function wireRegisterModeInputs() {
+    const inputs = Array.from(document.querySelectorAll('input[name="cfg-registerMode"]'));
+    for (const input of inputs) {
+      input.addEventListener('change', () => {
+        if (input.value === 'open' && input.checked && !confirmOpenRegistration()) {
+          // 退回上一个已保存的状态：不要在界面上留下"看起来已开放"的假象
+          setRegisterMode(state.status ? state.status.config.auth.registerMode : 'closed');
+          return;
+        }
+        updateRegisterModeUi();
+      });
+    }
+  }
+
+  async function loadRecentAccounts() {
+    const body = $('recent-accounts-body');
+    if (!body) return;
+    body.replaceChildren();
+    const placeholder = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.colSpan = 6;
+    cell.className = 'muted';
+    cell.textContent = '读取中…';
+    placeholder.append(cell);
+    body.append(placeholder);
+    try {
+      const result = await api('/control/accounts?limit=20');
+      body.replaceChildren();
+      const items = result.items || [];
+      if (items.length === 0) {
+        const row = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 6;
+        td.className = 'muted';
+        td.textContent = '还没有任何账户。';
+        row.append(td);
+        body.append(row);
+        return;
+      }
+      for (const item of items) {
+        const row = document.createElement('tr');
+        if (item.status === 'disabled') row.className = 'row-disabled';
+        for (const text of [item.username, item.role === 'admin' ? '管理员' : '普通', item.status === 'disabled' ? '已禁用' : '启用', fmtTime(item.createdAt), item.lastLoginAt ? fmtTime(item.lastLoginAt) : '—']) {
+          const td = document.createElement('td');
+          td.textContent = text;
+          row.append(td);
+        }
+        const actionCell = document.createElement('td');
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `btn btn-small ${item.status === 'disabled' ? '' : 'btn-danger'}`;
+        button.textContent = item.status === 'disabled' ? '启用' : '禁用';
+        button.addEventListener('click', () => void setAccountStatus(item, button.textContent === '禁用' ? 'disabled' : 'active'));
+        actionCell.append(button);
+        row.append(actionCell);
+        body.append(row);
+      }
+    } catch (error) {
+      body.replaceChildren();
+      const row = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 6;
+      td.className = 'muted';
+      td.textContent = `读取失败：${error.message}`;
+      row.append(td);
+      body.append(row);
+    }
+  }
+
+  async function setAccountStatus(item, status) {
+    const verb = status === 'disabled' ? '禁用' : '启用';
+    if (!window.confirm(`${verb}账户「${item.username}」？${status === 'disabled' ? '该账户将立即无法登录（数据保留）。' : ''}`)) return;
+    try {
+      await api(`/control/accounts/${encodeURIComponent(item.id)}/status`, {
+        method: 'POST',
+        body: JSON.stringify({ status }),
+      });
+      toast(`已${verb}「${item.username}」`);
+      await loadRecentAccounts();
+    } catch (error) {
+      // 「最后一个管理员」这类拒绝要原样展示：它解释的是"为什么点不动"
+      toast(error.message, true);
+    }
+  }
+
   function fillConfigForm(config) {
     $('cfg-port').value = config.port;
     $('cfg-controlPort').value = config.controlPort;
@@ -267,6 +417,10 @@
     $('cfg-serviceDisplayName').value = config.service.displayName;
     $('cfg-autoStart').checked = Boolean(config.service.autoStart);
     $('cfg-authRequire').checked = Boolean(config.auth.require);
+    // 注册策略（F12）：回显 + 立刻刷新提示与"最近注册"区块的显隐。
+    // 不回显的话保存会把 registerMode 写成 undefined → 服务端按"保持原值"处理，
+    // 界面上却显示成"关闭自助注册"，管理员会以为自己的选择没生效。
+    setRegisterMode(config.auth.registerMode || 'closed');
     // 每行一条：与输入框的提示文案一致，用户按回车换行不会被悄悄当成一个字符串
     $('cfg-trustProxy').value = (config.trustProxy ?? []).join('\n');
     updateTrustProxyWarning();
@@ -305,6 +459,8 @@
   }
 
   $('cfg-controlHost').addEventListener('input', updateControlHostWarning);
+  wireRegisterModeInputs();
+  $('recent-refresh').addEventListener('click', () => void loadRecentAccounts());
   $('cfg-trustProxy').addEventListener('input', updateTrustProxyWarning);
 
   $('cfg-save').addEventListener('click', async () => {
@@ -331,7 +487,10 @@
         displayName: $('cfg-serviceDisplayName').value.trim(),
         autoStart: $('cfg-autoStart').checked,
       },
-      auth: { require: $('cfg-authRequire').checked },
+      auth: {
+        require: $('cfg-authRequire').checked,
+        registerMode: registerModeValue(),
+      },
     };
     $('cfg-save').disabled = true;
     try {
@@ -340,6 +499,8 @@
       $('cfg-msg').textContent = result.note || '已保存';
       toast(result.workerRestartRequired ? '配置已保存，重启后台服务后生效' : '配置已保存');
       await refreshStatus();
+      // 保存后刷新一次：换了策略时"最近注册账户"的显隐要立刻跟着变
+      if (registerModeValue() === 'open') await loadRecentAccounts();
     } catch (error) {
       toast(error.message, true);
       $('cfg-msg').textContent = error.message;
@@ -437,7 +598,11 @@
       void refreshLogs();
       if ($('logs-auto').checked) state.logTimer = setInterval(refreshLogs, 4000);
     }
-    if (view === 'config') void loadConfigForm();
+    if (view === 'config') {
+      void loadConfigForm().then(() => {
+        if (registerModeValue() === 'open') void loadRecentAccounts();
+      });
+    }
     if (view === 'api') { state.visibleToken = false; $('token-input').value = '（已隐藏，点击显示）'; }
   }
 

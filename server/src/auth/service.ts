@@ -18,6 +18,7 @@
  */
 
 import type { ServerConfigFile } from '../config.js';
+import { isRegisterMode } from '../config-live.js';
 import type { ErrorCode } from '../errors.js';
 import { LoginLimiter, DEFAULT_RATE_LIMIT, type LockState } from './login-limit.js';
 import { hashPassword, needsRehash, verifyPassword, verifyPasswordDummy, CREDENTIALS_REJECTED } from './password.js';
@@ -77,6 +78,14 @@ export interface AuthServiceOptions {
    * 是否上传过卡片，语义上很奇怪 —— 默认仓库应当与账户同时诞生。
    */
   repos?: RepoStore;
+  /**
+   * 注册策略的**实时**取值（F12）。
+   *
+   * 面板与 worker 是两个进程，`config` 只是启动时的快照；不给这个回调时
+   * 就退回快照（单进程测试、或不需要热更的场景）。给了就每次现读配置文件，
+   * 于是"面板上点开放"立刻生效，不需要重启。
+   */
+  liveRegisterMode?: () => ServerConfigFile['auth']['registerMode'];
   /** 注入时钟，便于测试过期/锁定 */
   now?: () => Date;
 }
@@ -88,6 +97,7 @@ export class AuthService {
   private readonly config: ServerConfigFile;
   private readonly now: () => Date;
   private readonly repos: RepoStore | null;
+  private readonly liveRegisterMode: (() => ServerConfigFile['auth']['registerMode']) | null;
 
   constructor(options: AuthServiceOptions) {
     this.users = options.users;
@@ -96,6 +106,7 @@ export class AuthService {
     this.config = options.config;
     this.now = options.now ?? (() => new Date());
     this.repos = options.repos ?? null;
+    this.liveRegisterMode = options.liveRegisterMode ?? null;
   }
 
   /**
@@ -105,7 +116,14 @@ export class AuthService {
    * 而且以后若把策略改成"数据库可配"，这里只有一处需要改。
    */
   get registerMode(): ServerConfigFile['auth']['registerMode'] {
-    return this.config.auth.registerMode;
+    if (this.liveRegisterMode === null) return this.config.auth.registerMode;
+    try {
+      const mode = this.liveRegisterMode();
+      // 回调理论上只返回合法值；万一实现有 bug，宁可沿用快照也不要放行成 open
+      return isRegisterMode(mode) ? mode : this.config.auth.registerMode;
+    } catch {
+      return this.config.auth.registerMode;
+    }
   }
 
   /** 是否强制鉴权。false 时客户端连登录框都不该弹（仅回环开发的宽松模式） */
@@ -216,7 +234,8 @@ export class AuthService {
     /** 调用者是否是已认证的管理员（admin-only 模式用） */
     callerIsAdmin: boolean;
   }): Promise<{ user: UserRow; tokens: IssuedTokens }> {
-    const mode = this.config.auth.registerMode;
+    // 走 getter：面板改完立刻生效（跨进程热更，见 config-live.ts）
+    const mode = this.registerMode;
 
     // closed / admin-only 的拒绝是**明确的**（需求特别强调"不伪装成成功"）
     if (mode === 'closed') {

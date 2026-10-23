@@ -29,11 +29,14 @@ import {
   type ServerConfigFile,
 } from './config.js';
 import { API_VERSION, SERVER_VERSION, configSummary } from './context.js';
+import { isRegisterMode } from './config-live.js';
 import { AppError, toAppError } from './errors.js';
 import { TokenGate } from './http/auth.js';
 import { methodNotAllowed, sendError, sendJson } from './http/responses.js';
 import { Router, type RouteContext } from './http/router.js';
 import { createLogger, type Logger } from './log.js';
+import { Db } from './storage/db.js';
+import { UserStore } from './storage/users.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 const PANEL_PUBLIC_PATHS = ['/', '/index.html', '/app.js', '/styles.css', '/favicon.ico', '/healthz', '/api/health'];
@@ -387,6 +390,65 @@ export async function startSupervisor(loaded: LoadedConfig, options: SupervisorO
     sendJson(_ctx.res, 200, { token: config.auth.token });
   });
 
+  /**
+   * 最近注册的账户（F12 第 3 条：让管理员对"开放注册"有可视性）。
+   *
+   * 为什么读库而不是问 worker：worker 可能已经停了（面板的「停止」按钮真的会停它），
+   * 而这种"谁在什么时候注册进来"的信息不该因为数据面停摆就看不到。
+   * 这里直接以只读方式打开 state.db —— WAL 允许多进程并发读。
+   *
+   * 只返回运营需要的字段，**不含** password_hash / jwt 相关任何东西。
+   */
+  router.get('/control/accounts', (_ctx) => {
+    const raw = Number(_ctx.query.get('limit') ?? 20);
+    const limit = Number.isFinite(raw) ? Math.min(Math.max(Math.trunc(raw), 1), 200) : 20;
+    const items = withUsers(config.dataDir, (users) =>
+      users
+        .list()
+        .slice()
+        .sort((a, b) => b.created_at.localeCompare(a.created_at))
+        .slice(0, limit)
+        .map((row) => ({
+          id: row.id,
+          username: row.username,
+          role: row.role,
+          status: row.status,
+          createdAt: row.created_at,
+          lastLoginAt: row.last_login_at,
+        })),
+    );
+    sendJson(_ctx.res, 200, { items, registerMode: config.auth.registerMode });
+  });
+
+  /**
+   * 启用 / 禁用账户（F12 第 3 条的「一键禁用」）。
+   *
+   * 复用 `UserStore.setStatus` 而不是自己写 UPDATE：那里有「不能禁用最后一个
+   * 管理员」的保护，绕过它等于把自己锁在门外。
+   */
+  router.post('/control/accounts/:id/status', async (_ctx) => {
+    const body = JSON.parse(_ctx.body.toString('utf8') || '{}') as Record<string, unknown>;
+    const status = body['status'];
+    if (status !== 'active' && status !== 'disabled') {
+      throw new AppError(400, 'BAD_REQUEST', 'status 只能是 active 或 disabled');
+    }
+    const id = _ctx.params['id'] ?? '';
+    try {
+      const updated = withUsers(config.dataDir, (users) => {
+        users.setStatus(id, status);
+        const row = users.findById(id);
+        return row === null ? null : { id: row.id, username: row.username, status: row.status };
+      });
+      if (updated === null) throw new AppError(404, 'NOT_FOUND', '账户不存在');
+      logger.info('supervisor.account.status', { id, status });
+      sendJson(_ctx.res, 200, { account: updated });
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      // 「最后一个管理员」这类业务规则不是程序崩溃，回 400 并把话原样带出去
+      throw new AppError(400, 'BAD_REQUEST', (error as Error).message);
+    }
+  });
+
   router.put('/control/config', async (_ctx) => {
     const patch = JSON.parse(_ctx.body.toString('utf8') || '{}') as Record<string, unknown>;
     let candidate: ServerConfigFile;
@@ -669,6 +731,22 @@ function proxy(req: IncomingMessage, res: ServerResponse, config: ServerConfigFi
 }
 
 /** 只允许面板修改已知字段；其余字段忽略（避免手滑写坏配置） */
+/**
+ * 以只读方式短开一个库连接执行一次查询。
+ *
+ * 每次请求都开/关，不做常驻连接：面板这些操作是人工点击级别的频率（一次几毫秒），
+ * 常驻连接反而要处理"库被替换/迁移"的生命周期。`Db` 构造会跑 schema 迁移，
+ * 对已存在的库是幂等的。
+ */
+function withUsers<T>(dataDir: string, run: (users: UserStore) => T): T {
+  const db = new Db(join(dataDir, 'state.db'));
+  try {
+    return run(new UserStore(db.handle));
+  } finally {
+    db.close();
+  }
+}
+
 export function applyConfigPatch(current: ServerConfigFile, patch: Record<string, unknown>): ServerConfigFile {
   const num = (value: unknown, fallback: number): number =>
     typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : fallback;
@@ -701,6 +779,12 @@ export function applyConfigPatch(current: ServerConfigFile, patch: Record<string
       auth: {
         ...current.auth,
         require: bool(auth['require'], current.auth.require),
+        // 注册策略（F12）。与 trustProxy 同样的语义：字段缺席＝保持原值，
+        // 值不合法同样保持原值 —— 面板传错不该把策略悄悄改成别的状态，
+        // 尤其不能因为一个拼写错误掉进 closed 之外的值。
+        registerMode: isRegisterMode(auth['registerMode'])
+          ? auth['registerMode']
+          : current.auth.registerMode,
       },
       service: {
         mode: service['mode'] === 'windows-service' ? 'windows-service' : current.service.mode,

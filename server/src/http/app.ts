@@ -20,6 +20,7 @@ import { registerAuthRoutes } from './auth-routes.js';
 import { registerRepoRoutes } from './repo-routes.js';
 import { TrustProxyResolver, decideTokenGate } from '../net/trust-proxy.js';
 import { AuthService } from '../auth/service.js';
+import { LiveRegisterMode } from '../config-live.js';
 import { LoginLimiter, DEFAULT_RATE_LIMIT } from '../auth/login-limit.js';
 import { SessionStore } from '../auth/sessions.js';
 import { UserStore } from '../storage/users.js';
@@ -187,7 +188,23 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   // 注册时要顺手给新账户建默认仓库。
   const repos = new RepoStore(ctx.db.handle);
   const repoTokens = new TokenStore(ctx.db.handle);
-  const authService = new AuthService({ config: ctx.config, users, sessions, limiter, repos });
+  /**
+   * 注册策略的实时读取（F12）。
+   *
+   * 面板与 worker 是两个进程，配置只在启动时读进内存；面板改了 `auth.registerMode`
+   * 之后必须让 worker 自己发现（见 config-live.ts）。`/api/auth/config` 与
+   * `POST /api/auth/register` 都走这个 getter，于是客户端看到的入口与实际
+   * 能否注册**永远同源** —— 不会出现"界面显示可注册、提交被拒"的错位。
+   */
+  const liveRegisterMode = new LiveRegisterMode(ctx.configPath, ctx.config.auth.registerMode);
+  const authService = new AuthService({
+    config: ctx.config,
+    users,
+    sessions,
+    limiter,
+    repos,
+    liveRegisterMode: () => liveRegisterMode.current(),
+  });
 
   /**
    * 可信反向代理与有效客户端地址（v0.1.2 追加任务 / 需求 F1.4）。
