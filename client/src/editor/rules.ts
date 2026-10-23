@@ -115,6 +115,11 @@ export async function buildRuleset(): Promise<Ruleset> {
         platformLoad.errors.map((e) => `#${e.index}${e.id ? `(${e.id})` : ''}`).join(', '),
     );
   }
+  // 未知字段（多半是拼错）不阻断加载，但启动时要吭一声：规则文件是手写的，
+  // 静默忽略一个 `mach` 的代价是"规则看起来启用着却永远不命中"（F4）。
+  for (const item of platformLoad.warnings) {
+    warnings.push(`平台规则 #${item.index}${item.id ? `(${item.id})` : ''}：${item.warnings.join('；')}`);
+  }
 
   const platform = resolvePlatformRule(DEFAULT_PLATFORM_ID, platformLoad.rules);
 
@@ -134,6 +139,9 @@ export async function buildRuleset(): Promise<Ruleset> {
   const highlightLoad = loadHighlightRules(highlights.items);
   if (highlightLoad.errors.length > 0) {
     warnings.push(`高亮规则有 ${highlightLoad.errors.length} 个文件未通过校验`);
+  }
+  for (const item of highlightLoad.warnings) {
+    warnings.push(`高亮方案 #${item.index}${item.id ? `(${item.id})` : ''}：${item.warnings.join('；')}`);
   }
   const highlightFile: HighlightRuleFile =
     highlightLoad.rules.find((rule) => rule.id === DEFAULT_HIGHLIGHT_ID) ?? highlightLoad.rules[0]!;

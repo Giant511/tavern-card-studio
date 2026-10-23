@@ -1320,6 +1320,26 @@ body {
   word-break: break-word;
 }
 
+/* 同一盒子换成"警告"配色：导入成功但有未知字段等提示（F4） */
+.rule-errors.warn {
+  border-color: #fedf89;
+  background: var(--warn-bg);
+}
+
+.rule-errors.warn .rule-errors-title,
+.rule-errors.warn .rule-errors-count {
+  color: var(--warn);
+}
+
+.rule-errors.warn .rule-error-where {
+  background: #fef0c7;
+  color: #93370d;
+}
+
+.rule-errors.warn .rule-error-msg {
+  color: #93370d;
+}
+
 /* ── 导出（T6.6）────────────────────────────────────────── */
 .format-row {
   display: flex;

@@ -26,6 +26,7 @@ import {
   groupRuleIssues,
   importHighlightScheme,
   importPlatformRule,
+  splitRuleError,
   type ImportOutcome,
   type RuleIssue,
 } from './rule-library';
@@ -439,15 +440,47 @@ export class RulesDialog {
         `导入成功（${outcome.name ?? outcome.id}），但有 ${outcome.warnings.length} 条警告`,
         'warn',
       );
+      // 只给"几条警告"是不够的：用户必须看到**是哪几个字段**，
+      // 否则"导入成功"和"规则没生效"之间的因果永远对不上（F4）。
+      this.showWarnings(`导入成功，但有以下需要注意的问题`, outcome.warnings);
     } else {
+      this.hideErrors();
       this.callbacks.notify(`导入成功：${outcome.name ?? outcome.id}`, 'ok');
     }
     this.refresh();
     this.renderPresetPreview();
   }
 
+  /**
+   * 展示"导入成功但有警告"（T10.10 补 F4：未知字段）。
+   *
+   * 与错误共用同一个盒子，只换配色 —— 两种情况互斥，不会同时出现，
+   * 分成两个盒子反而会出现"上面红框、下面黄框"的混乱布局。
+   */
+  private showWarnings(title: string, warnings: readonly string[]): void {
+    this.errorBox.replaceChildren();
+    this.errorBox.classList.add('warn');
+    this.errorBox.hidden = false;
+
+    const head = el('div', 'rule-errors-head');
+    head.append(el('span', 'rule-errors-title', title));
+    head.append(el('span', 'rule-errors-count', `${warnings.length} 条`));
+    this.errorBox.append(head);
+
+    const section = el('div', 'rule-error-group');
+    for (const text of warnings) {
+      const issue = splitRuleError(text);
+      const row = el('div', 'rule-error-row');
+      if (issue.where) row.append(el('code', 'rule-error-where', issue.where));
+      row.append(el('span', 'rule-error-msg', issue.message));
+      section.append(row);
+    }
+    this.errorBox.append(section);
+  }
+
   private showErrors(title: string, issues: readonly RuleIssue[]): void {
     this.errorBox.replaceChildren();
+    this.errorBox.classList.remove('warn');
     this.errorBox.hidden = false;
 
     const head = el('div', 'rule-errors-head');
@@ -486,6 +519,7 @@ export class RulesDialog {
 
   private hideErrors(): void {
     this.errorBox.hidden = true;
+    this.errorBox.classList.remove('warn');
     this.errorBox.replaceChildren();
   }
 

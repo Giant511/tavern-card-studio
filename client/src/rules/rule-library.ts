@@ -113,7 +113,7 @@ export function importPlatformRule(
       ok: false,
       value: [...current],
       issues: result.errors.map(splitRuleError),
-      warnings: [],
+      warnings: result.warnings,
       id: null,
       name: null,
     };
@@ -148,7 +148,8 @@ export function importPlatformRule(
     ok: true,
     value: merged,
     issues: [],
-    warnings: [],
+    // 未知字段等"不阻断但必须可见"的问题（T10.10 补 F4）
+    warnings: result.warnings,
     id: rule.id,
     name: rule.name,
   };

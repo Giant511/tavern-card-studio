@@ -19,6 +19,7 @@ export * from './format/card-txt.js';
 
 export * from './rules/platform-rule.js';
 export * from './rules/highlight-rule.js';
+export * from './rules/unknown-keys.js';
 export * from './rules/platform-rule-parser.js';
 export * from './rules/highlight-rule-parser.js';
 export * from './rules/scopes.js';

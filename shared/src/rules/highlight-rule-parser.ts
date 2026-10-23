@@ -19,6 +19,16 @@ import type {
   MatchSpec,
   ResolvedHighlightRule,
 } from './highlight-rule.js';
+import {
+  HIGHLIGHT_EDITOR_KEYS,
+  HIGHLIGHT_MATCH_KEYS,
+  HIGHLIGHT_METADATA_KEYS,
+  HIGHLIGHT_RULE_ELEMENT_KEYS,
+  HIGHLIGHT_RULE_KEYS,
+  HIGHLIGHT_SCOPE_KEYS,
+  HIGHLIGHT_THEME_KEYS,
+  checkUnknownKeys,
+} from './unknown-keys.js';
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]{1,63}$/;
 // scope id 会**直接**拼进 CSS 类名（`applySchemeStyles`），所以点号必须排除：
@@ -60,11 +70,12 @@ function checkRegex(errors: string[], where: string, pattern: string, flags?: st
   }
 }
 
-function validateEditor(errors: string[], editor: unknown): void {
+function validateEditor(errors: string[], warnings: string[], editor: unknown): void {
   if (!isObject(editor)) {
     errors.push('editor 必须是对象');
     return;
   }
+  checkUnknownKeys(editor, HIGHLIGHT_EDITOR_KEYS, 'editor', warnings);
   const ranges: [string, number, number][] = [
     ['fontSize', 8, 48],
     ['lineHeight', 1, 3],
@@ -87,11 +98,12 @@ function validateEditor(errors: string[], editor: unknown): void {
   }
 }
 
-function validateTheme(errors: string[], theme: unknown): void {
+function validateTheme(errors: string[], warnings: string[], theme: unknown): void {
   if (!isObject(theme)) {
     errors.push('theme 必须是对象');
     return;
   }
+  checkUnknownKeys(theme, HIGHLIGHT_THEME_KEYS, 'theme', warnings);
   for (const key of ['foreground', 'background']) {
     if (!isColor(theme[key])) errors.push(`theme.${key} 必须是合法颜色值（#RGB / #RRGGBB / rgba() / 颜色名）`);
   }
@@ -108,6 +120,7 @@ function validateScope(errors: string[], warnings: string[], index: number, scop
     errors.push(`${where}: 必须是对象`);
     return;
   }
+  checkUnknownKeys(scope, HIGHLIGHT_SCOPE_KEYS, where, warnings);
   const id = scope['id'];
   if (typeof id !== 'string' || id === '') {
     errors.push(`${where}: 缺少 id`);
@@ -154,6 +167,7 @@ function validateMatch(errors: string[], warnings: string[], where: string, matc
     errors.push(`${where}.match: 必须是对象`);
     return;
   }
+  checkUnknownKeys(match, HIGHLIGHT_MATCH_KEYS, `${where}.match`, warnings);
   const type = match['type'];
   if (typeof type !== 'string' || !MATCH_TYPES.has(type)) {
     errors.push(`${where}.match.type "${String(type)}" 不受支持（应为 regex / word-list / line-prefix / delimiter-block）`);
@@ -224,6 +238,7 @@ export function parseHighlightRule(input: unknown): HighlightParseResult {
   if (!isObject(input)) {
     return { file: null, errors: ['高亮规则文件顶层必须是对象'], warnings: [] };
   }
+  checkUnknownKeys(input, HIGHLIGHT_RULE_KEYS, '', warnings);
   if (input['schemaVersion'] !== 1) errors.push('schemaVersion 必须为 1');
   if (typeof input['id'] !== 'string' || !ID_PATTERN.test(input['id'])) errors.push('id 不合法');
   if (typeof input['name'] !== 'string' || input['name'] === '') errors.push('name 不能为空');
@@ -233,8 +248,8 @@ export function parseHighlightRule(input: unknown): HighlightParseResult {
     errors.push('extends 必须是字符串或 null');
   }
 
-  if (input['editor'] !== undefined) validateEditor(errors, input['editor']);
-  validateTheme(errors, input['theme']);
+  if (input['editor'] !== undefined) validateEditor(errors, warnings, input['editor']);
+  validateTheme(errors, warnings, input['theme']);
 
   // --- scopes ---
   const scopeIds = new Set<string>();
@@ -264,6 +279,7 @@ export function parseHighlightRule(input: unknown): HighlightParseResult {
         errors.push(`${where}: 必须是对象`);
         return;
       }
+      checkUnknownKeys(rule, HIGHLIGHT_RULE_ELEMENT_KEYS, where, warnings);
       const id = rule['id'];
       if (typeof id !== 'string' || !ID_PATTERN.test(id)) errors.push(`${where}: id 不合法`);
       else if (ruleIds.has(id)) errors.push(`${where}: id "${id}" 重复`);
@@ -300,8 +316,11 @@ export function parseHighlightRule(input: unknown): HighlightParseResult {
     });
   }
 
-  if (input['metadata'] !== undefined && !isObject(input['metadata'])) errors.push('metadata 必须是对象');
-
+  const metadata = input['metadata'];
+  if (metadata !== undefined) {
+    if (!isObject(metadata)) errors.push('metadata 必须是对象');
+    else checkUnknownKeys(metadata, HIGHLIGHT_METADATA_KEYS, 'metadata', warnings);
+  }
   if (errors.length > 0) return { file: null, errors, warnings };
   return { file: input as unknown as HighlightRuleFile, errors: [], warnings };
 }
