@@ -570,7 +570,11 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
    */
   router.delete('/api/cards/:id', async (_ctx) => {
     assertPermission(gate, _ctx, 'delete');
-    const scope = scopeFromIdentity(gate.identify(_ctx.req));
+    // 变更类操作走 mutationScope：管理员治理时是 ALL_CARDS（F13.1）。
+    // 第一版这里写的是 scopeFromIdentity —— 于是管理员删别人的卡得到 404，
+    // 而权限矩阵回归正是靠这一格抓到的（补丁式替换只改了 `scope: ...` 字面量，
+    // 漏掉了这种先存进局部变量的写法）。
+    const scope = mutationScope(gate, _ctx);
     const audit = auditActor(gate, _ctx);
     if (queryBool(_ctx.query, 'hard')) {
       requireAdmin(gate, _ctx, '彻底清除');
