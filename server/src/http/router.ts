@@ -57,6 +57,11 @@ export class Router {
     return this.add('PUT', pattern, handler);
   }
 
+  /** PATCH：用于"只改部分字段"的资源（仓库改名、令牌改权限范围） */
+  patch(pattern: string, handler: Handler): this {
+    return this.add('PATCH', pattern, handler);
+  }
+
   delete(pattern: string, handler: Handler): this {
     return this.add('DELETE', pattern, handler);
   }

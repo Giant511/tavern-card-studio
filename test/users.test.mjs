@@ -239,6 +239,8 @@ test('T10.3 迁移：先备份、建首账户、接管历史卡片', async () =>
       db.insertCard({
         id,
         id_source: 'legacy',
+        owner_id: '',
+        repo_id: '',
         name: id,
         spec: 'chara_card_v2',
         spec_version: '2.0',
@@ -342,6 +344,8 @@ test('T10.3 备份是完整快照：包含迁移前的全部卡片', async () =>
   const makeCard = (id) => ({
     id,
     id_source: 'client',
+    owner_id: '',
+    repo_id: '',
     name: id,
     spec: 'chara_card_v2',
     spec_version: '2.0',
