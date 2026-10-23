@@ -632,8 +632,12 @@ export class SyncDialog {
 
       const meta = el('div', 'version-meta');
       meta.append(
-        el('code', 'version-sha', version.sha256.slice(0, 12)),
-        el('span', '', `${version.size} 字节`),
+        // 内容被清除的版本 sha256 为 null（服务端 prune 后）——
+        // 直接 .slice() 会在这种版本上抛 TypeError，把整个列表渲染打断。
+        version.pruned
+          ? el('code', 'version-sha version-pruned', '内容已清除')
+          : el('code', 'version-sha', (version.sha256 ?? '').slice(0, 12)),
+        el('span', '', version.pruned ? '—' : `${version.size} 字节`),
         el('span', '', version.createdAt.replace('T', ' ').slice(0, 19)),
       );
       if (version.message) meta.append(el('span', 'version-msg', version.message));

@@ -47,6 +47,19 @@ export type ErrorCode =
   | 'REGISTRATION_REJECTED'
   | 'ACCOUNT_DISABLED'
   | 'INVALID_REFRESH_TOKEN'
+  // T10.18 / F13：删除与移动体系的专用码。
+  //
+  //   CARD_IN_TRASH           —— 卡片在回收站里（恢复/purge 之外的写操作应拒绝）
+  //   VERSION_CONTENT_CLEARED —— 版本内容已被 prune 清除（不是"不存在"）
+  //   NOT_EMPTY               —— 目标非空（删仓库却没给 transferTo）
+  //   ADMIN_ONLY              —— 该操作仅管理员可用（purge / 跨账户）
+  //
+  // 为什么 purge 用 ADMIN_ONLY 而不是 FORBIDDEN：客户端要能一眼区分
+  // "你没有这个仓库的写权限"（换把令牌就行）与"这件事只有管理员能做"（换令牌也没用）。
+  | 'CARD_IN_TRASH'
+  | 'VERSION_CONTENT_CLEARED'
+  | 'NOT_EMPTY'
+  | 'ADMIN_ONLY'
   | 'INTERNAL';
 
 export class AppError extends Error {
