@@ -61,6 +61,15 @@ export interface SyncDialogCallbacks {
   onRemoteTextApplied: (text: string, version: VersionSummary, remoteSeq: number) => void;
   /** 一键连接成功后把探测结果交回 App（顶栏指示与同步开关据此刷新） */
   onConnectionReady?: (result: ProbeResult) => void;
+  /**
+   * 401 后的统一处置（T10.7）：先试静默续期，续不上才回登录界面。
+   *
+   * 返回 true 表示令牌已恢复，调用方可以重试；这个回调**不负责**清空编辑器，
+   * 本地未保存内容与云端身份无关。
+   */
+  onUnauthorized?: () => Promise<boolean>;
+  /** 打开「我的卡片」列表（T10.7）：按 角色名 · cardId · 仓库 · vN 展示服务端返回的卡 */
+  onOpenCards?: () => void;
   notify: (message: string, kind?: 'ok' | 'warn' | 'bad' | 'info') => void;
 }
 
@@ -161,6 +170,13 @@ export class SyncDialog {
       if (target) void this.loadVersions(target);
     });
     historyHead.append(this.historySelect);
+    // T10.7：账户卡片列表入口。放在这里而不是顶栏：用户想"看我的卡"
+    // 的时机几乎都是在这个面板里（刚上传完、想找另一张卡的历史）。
+    const cardsButton = el('button', 'btn small ghost', '账户卡片…');
+    cardsButton.type = 'button';
+    cardsButton.dataset['role'] = 'open-cards';
+    cardsButton.addEventListener('click', () => this.callbacks.onOpenCards?.());
+    historyHead.append(cardsButton);
     this.versionList = el('div', 'version-list');
     historySection.append(historyHead, this.versionList);
 
@@ -647,10 +663,14 @@ export class SyncDialog {
     if (error instanceof SyncError) {
       const suffix =
         error.code === 'UNAUTHORIZED'
-          ? '（令牌无效，请到「设置」更新）'
+          ? '（登录已过期或令牌无效：请重新登录，或到「设置」更新令牌）'
           : error.code === 'NETWORK' || error.code === 'TIMEOUT'
             ? '（服务端不可达）'
             : '';
+      // 401 交给账户层试一次续期：续得上就不用打扰用户（access 只有 2 小时，
+      // 每两小时弹一次登录框是不可接受的）。fire-and-forget 是刻意的 ——
+      // 这里已经没法重试当前操作了，续期成功后下一次操作自然会成功。
+      if (error.code === 'UNAUTHORIZED') void this.callbacks.onUnauthorized?.();
       this.callbacks.notify(`${prefix}：${error.message}${suffix}`, 'bad');
       return;
     }

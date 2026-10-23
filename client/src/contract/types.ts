@@ -114,8 +114,28 @@ export interface CardsDirScan {
 export interface ClientConfig {
   /** 服务端 API 根地址，如 http://127.0.0.1:8730 */
   serverUrl: string;
-  /** 访问令牌 */
+  /**
+   * legacy 全局访问令牌（v0.1.1 形态）。
+   *
+   * T10.7 起与账户登录并存：填了它就一直能用（等同"全部仓库读写"），
+   * 登录后则优先用 `accessToken`。保留它是因为升级用户的配置里已经有值，
+   * 不能因为引入账户就把他们已有的连接弄断。
+   */
   token: string;
+  /** 账户 access 令牌（JWT，2h）。空串 = 未用账户登录 */
+  accessToken: string;
+  /** refresh 令牌（每次使用都会轮换）。空串 = 未用账户登录 */
+  refreshToken: string;
+  /** access 到期时刻（epoch ms）；0 = 未知（旧配置或手工清过） */
+  accessExpiresAt: number;
+  /**
+   * 已登录账户的公开信息。
+   *
+   * **不含令牌**，也不含哈希 —— 只用于显示"当前是谁"与判断角色。
+   * 结构上与 `auth/auth-client` 的 `AuthUser` 一致（那边是网络层类型，
+   * 这里不该依赖它，避免契约层被网络层牵着走）。
+   */
+  authUser: { userId: string; username: string; role: 'admin' | 'user' } | null;
   /** 当前平台规则 id */
   platformRuleId: string | null;
   /** 当前 TXT 预设 id */
@@ -135,6 +155,10 @@ export interface ClientConfig {
 export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
   serverUrl: 'http://127.0.0.1:8730',
   token: '',
+  accessToken: '',
+  refreshToken: '',
+  accessExpiresAt: 0,
+  authUser: null,
   platformRuleId: null,
   presetId: null,
   highlightSchemeId: null,

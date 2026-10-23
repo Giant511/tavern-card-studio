@@ -98,6 +98,21 @@ export class AuthService {
     this.repos = options.repos ?? null;
   }
 
+  /**
+   * 注册策略（只读）。`GET /api/auth/config` 用它告诉客户端该不该显示注册入口。
+   *
+   * 做成 getter 而不是让路由直接读 config：路由不该知道配置结构，
+   * 而且以后若把策略改成"数据库可配"，这里只有一处需要改。
+   */
+  get registerMode(): ServerConfigFile['auth']['registerMode'] {
+    return this.config.auth.registerMode;
+  }
+
+  /** 是否强制鉴权。false 时客户端连登录框都不该弹（仅回环开发的宽松模式） */
+  get requiresAuth(): boolean {
+    return this.config.auth.require;
+  }
+
   private get jwtSecret(): string {
     const secret = this.config.auth.jwtSecret;
     if (!secret || secret.length < 32) {
