@@ -10,6 +10,8 @@
     timer: null,
     logTimer: null,
     visibleToken: false,
+    /** 治理登录的账户信息（只用于显示"你是谁"） */
+    govUser: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -572,6 +574,280 @@
     }
   });
 
+  // ── 全站治理（F13 / T10.20）──────────────────────────
+  //
+  // 这里的请求**不能**复用 api()：那个函数总是带面板的访问令牌，
+  // 而治理需要管理员账户的 JWT（全局令牌已被降权，看不到别人账户的卡片）。
+  // 所以单独一个 govApi()，只带治理令牌，并且只放在 sessionStorage。
+  const GOV_KEY = 'tcs.gov.token';
+  let govToken = sessionStorage.getItem(GOV_KEY) || '';
+
+  async function govApi(path, options = {}) {
+    const headers = { ...(options.headers || {}) };
+    if (govToken) headers.Authorization = `Bearer ${govToken}`;
+    if (options.body) headers['Content-Type'] = 'application/json';
+    const response = await fetch(path, { ...options, headers });
+    const text = await response.text();
+    let payload = null;
+    if (text) {
+      try { payload = JSON.parse(text); } catch { payload = { raw: text }; }
+    }
+    if (!response.ok) {
+      const message = payload && payload.error ? payload.error.message : `HTTP ${response.status}`;
+      const error = new Error(message);
+      error.status = response.status;
+      error.payload = payload;
+      throw error;
+    }
+    return payload;
+  }
+
+  function govLoggedIn() {
+    return govToken !== '';
+  }
+
+  function renderGovGate() {
+    $('gov-login-card').hidden = govLoggedIn();
+    $('gov-panel').hidden = !govLoggedIn();
+    if (govLoggedIn() && state.govUser) {
+      $('gov-who').textContent = `已登录：${state.govUser.username}（${state.govUser.role === 'admin' ? '管理员' : '普通账户'}）`;
+    }
+  }
+
+  async function govLogin() {
+    const username = $('gov-username').value.trim();
+    const password = $('gov-password').value;
+    if (username === '' || password === '') {
+      $('gov-login-msg').textContent = '请填写用户名与密码';
+      return;
+    }
+    $('gov-login').disabled = true;
+    $('gov-login-msg').textContent = '登录中…';
+    try {
+      // 登录走 worker 的免鉴权端点（不需要面板令牌）
+      const result = await govApi('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ username, password }),
+      });
+      govToken = result.accessToken;
+      sessionStorage.setItem(GOV_KEY, govToken);
+      state.govUser = result.user || { username, role: 'admin' };
+      $('gov-password').value = '';
+      $('gov-login-msg').textContent = '';
+      renderGovGate();
+      await loadGovernance();
+    } catch (error) {
+      // 失败原因照服务端原话显示（INVALID_CREDENTIALS 之类），不本地化：
+      // 服务端刻意把"用户不存在/密码错/被锁"合并成一句，前端再拆就是帮倒忙
+      $('gov-login-msg').textContent = `登录失败：${error.message}`;
+    } finally {
+      $('gov-login').disabled = false;
+    }
+  }
+
+  function govLogout() {
+    govToken = '';
+    state.govUser = null;
+    sessionStorage.removeItem(GOV_KEY);
+    renderGovGate();
+  }
+
+  async function loadGovernance() {
+    if (!govLoggedIn()) return;
+    await Promise.all([loadGovAccounts(), loadGovRepos(), loadGovCards()]);
+  }
+
+  async function loadGovAccounts() {
+    const body = $('gov-accounts');
+    try {
+      const result = await api('/control/accounts?limit=200');
+      const items = result.items || [];
+      renderGovTable(body, 6, items, (item) => {
+        const cells = [item.username, item.role === 'admin' ? '管理员' : '普通', item.status === 'disabled' ? '已禁用' : '启用', fmtTime(item.createdAt), item.lastLoginAt ? fmtTime(item.lastLoginAt) : '—'];
+        const action = document.createElement('button');
+        action.type = 'button';
+        action.className = `btn btn-small ${item.status === 'disabled' ? '' : 'btn-danger'}`;
+        action.textContent = item.status === 'disabled' ? '启用' : '禁用';
+        action.addEventListener('click', async () => {
+          const verb = item.status === 'disabled' ? '启用' : '禁用';
+          if (!window.confirm(`${verb}账户「${item.username}」？`)) return;
+          try {
+            await api(`/control/accounts/${encodeURIComponent(item.id)}/status`, {
+              method: 'POST',
+              body: JSON.stringify({ status: item.status === 'disabled' ? 'active' : 'disabled' }),
+            });
+            toast(`已${verb}「${item.username}」`);
+            await loadGovAccounts();
+          } catch (error) {
+            toast(error.message, true);
+          }
+        });
+        return { cells, action };
+      });
+    } catch (error) {
+      body.replaceChildren(govMessageRow(6, `读取失败：${error.message}`));
+    }
+  }
+
+  async function loadGovRepos() {
+    const body = $('gov-repos');
+    try {
+      const result = await govApi('/api/repos?all=true');
+      const items = result.items || [];
+      renderGovTable(body, 5, items, (item) => {
+        const cells = [item.name, item.ownerId ? item.ownerId.slice(0, 8) + '…' : '—', `${item.cardCount} 张`, item.isDefault ? '默认' : ''];
+        const action = document.createElement('span');
+        if (item.isDefault) {
+          action.className = 'muted';
+          action.textContent = '默认仓库不可删';
+        } else {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'btn btn-small btn-danger';
+          button.textContent = '删除…';
+          button.addEventListener('click', () => void govDeleteRepo(item));
+          action.append(button);
+        }
+        return { cells, action };
+      });
+    } catch (error) {
+      body.replaceChildren(govMessageRow(5, `读取失败：${error.message}`));
+    }
+  }
+
+  async function govDeleteRepo(repo) {
+    let transferTo = null;
+    if (repo.cardCount > 0) {
+      const target = window.prompt(
+        `「${repo.name}」里有 ${repo.cardCount} 张卡，输入目标仓库 id（转移后再删）：`,
+      );
+      if (target === null) return;
+      transferTo = target.trim();
+      if (transferTo === '') return;
+    }
+    if (!window.confirm(`删除仓库「${repo.name}」？${transferTo ? '卡片会先转移。' : ''}`)) return;
+    try {
+      const result = await govApi(`/api/repos/${encodeURIComponent(repo.id)}`, {
+        method: 'DELETE',
+        body: JSON.stringify({ transferTo, reason: '管理面板治理' }),
+      });
+      toast(`已删除「${repo.name}」（转移 ${result.movedCards} 张，吊销 ${result.revokedTokens} 个令牌）`);
+      await loadGovernance();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  }
+
+  async function loadGovCards() {
+    const body = $('gov-cards');
+    try {
+      const [cards, repos] = await Promise.all([
+        /*
+         * `includeDeleted=true` 是**必须**的：治理页的「彻底清除」绝大多数时候
+         * 对象正是回收站里的卡。不列出来的话，管理员在面板上根本够不到它们 ——
+         * 而这是 purge 唯一的图形入口（测试实测表里找不到那行）。
+         */
+        govApi('/api/cards?all=true&includeDeleted=true&limit=200'),
+        govApi('/api/repos?all=true'),
+      ]);
+      const repoOptions = repos.items || [];
+      renderGovTable(body, 7, cards.items || [], (item) => {
+        // 回收站里的卡要显式标注：否则它在表里和正常卡长得一样，
+        // 管理员会以为"这张卡好好的，为什么要清除"
+        const state = item.deletedAt ? '回收站' : '正常';
+        const cells = [item.name, item.id, item.repoName || '—', `v${item.latestSeq ?? 0}`, state, fmtTime(item.updatedAt)];
+        const wrap = document.createElement('span');
+
+        const moveButton = document.createElement('button');
+        moveButton.type = 'button';
+        moveButton.className = 'btn btn-small';
+        moveButton.textContent = '移动…';
+        moveButton.addEventListener('click', async () => {
+          const options = repoOptions.map((repo, index) => `${index + 1}. ${repo.name}（${repo.ownerId ? repo.ownerId.slice(0, 8) : '?'}）`).join('\n');
+          const answer = window.prompt(`把「${item.name}」移到哪个仓库？输入编号：\n\n${options}`, '1');
+          if (answer === null) return;
+          const target = repoOptions[Number.parseInt(answer.trim(), 10) - 1];
+          if (!target) {
+            toast('没有选中有效的仓库', true);
+            return;
+          }
+          const reason = window.prompt('移动原因（会写进审计，可留空）：', '') ?? '';
+          try {
+            const result = await govApi(`/api/cards/${encodeURIComponent(item.id)}/move`, {
+              method: 'POST',
+              body: JSON.stringify({ repo: target.id, reason }),
+            });
+            toast(result.crossOwner ? '已跨账户移动（归属已转）' : '已移动');
+            await loadGovernance();
+          } catch (error) {
+            toast(error.message, true);
+          }
+        });
+
+        const purgeButton = document.createElement('button');
+        purgeButton.type = 'button';
+        purgeButton.className = 'btn btn-small btn-danger';
+        purgeButton.textContent = '彻底清除';
+        purgeButton.addEventListener('click', async () => {
+          // 两次确认：这是唯一不可逆的卡片操作
+          if (!window.confirm(`彻底清除「${item.name}」？\n\n将物理删除索引、Git 仓库与无引用的内容块。`)) return;
+          if (!window.confirm(`再确认一次：清除后无法恢复，也没有回收站。继续？`)) return;
+          try {
+            const result = await govApi(`/api/cards/${encodeURIComponent(item.id)}/purge`, { method: 'POST' });
+            toast(`已清除（释放 ${result.freedBlobs} 个内容块）`);
+            await loadGovernance();
+          } catch (error) {
+            toast(error.message, true);
+          }
+        });
+
+        wrap.append(moveButton, document.createTextNode(' '), purgeButton);
+        return { cells, action: wrap };
+      });
+    } catch (error) {
+      body.replaceChildren(govMessageRow(7, `读取失败：${error.message}`));
+    }
+  }
+
+  function govMessageRow(cols, text) {
+    const row = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.colSpan = cols;
+    cell.className = 'muted';
+    cell.textContent = text;
+    row.append(cell);
+    return row;
+  }
+
+  /** 统一的表格渲染：cells 是文本数组，action 是最后一个单元格里的节点 */
+  function renderGovTable(body, cols, items, build) {
+    body.replaceChildren();
+    if (items.length === 0) {
+      body.append(govMessageRow(cols, '（没有数据）'));
+      return;
+    }
+    for (const item of items) {
+      const row = document.createElement('tr');
+      const { cells, action } = build(item);
+      for (const text of cells) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        row.append(td);
+      }
+      const last = document.createElement('td');
+      last.append(action);
+      row.append(last);
+      body.append(row);
+    }
+  }
+
+  $('gov-login').addEventListener('click', () => void govLogin());
+  $('gov-password').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') void govLogin();
+  });
+  $('gov-logout').addEventListener('click', () => govLogout());
+  $('gov-refresh').addEventListener('click', () => void loadGovernance());
+
   // ── 视图切换 ─────────────────────────────────────────
   const TITLES = {
     overview: ['总览', '本地部署 · 数据不出机器'],
@@ -579,6 +855,7 @@
     config: ['参数配置', '端口、路径、鉴权与服务注册信息'],
     logs: ['运行日志', 'worker 输出与错误'],
     api: ['API 与令牌', '客户端接入所需的信息'],
+    governance: ['全站治理', '所有账户的仓库、卡片与账户状态'],
   };
 
   function switchView(view) {
@@ -604,6 +881,10 @@
       });
     }
     if (view === 'api') { state.visibleToken = false; $('token-input').value = '（已隐藏，点击显示）'; }
+    if (view === 'governance') {
+      renderGovGate();
+      if (govLoggedIn()) void loadGovernance();
+    }
   }
 
   document.querySelectorAll('.nav-item').forEach((button) => {

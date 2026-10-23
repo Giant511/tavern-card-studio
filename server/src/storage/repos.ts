@@ -219,6 +219,18 @@ export class RepoStore {
       .all(ownerId) as RepoRow[];
   }
 
+  /**
+   * 全站仓库（F13 / T10.20 治理页）。
+   *
+   * 只在管理员显式 `?all=true` 时用。返回带 `owner_id`，让治理页能显示归属 ——
+   * 没有归属列的话，管理员看到一堆同名 `default` 根本分不清是谁的。
+   */
+  listAll(): RepoRow[] {
+    return this.handle
+      .prepare('SELECT * FROM repos WHERE deleted_at IS NULL ORDER BY owner_id ASC, is_default DESC, created_at ASC')
+      .all() as RepoRow[];
+  }
+
   countCards(repoId: string): number {
     const row = this.handle
       .prepare('SELECT COUNT(*) AS n FROM cards WHERE repo_id = ? AND deleted_at IS NULL')

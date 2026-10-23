@@ -53,6 +53,7 @@
     "verify:t108": "node scripts/verify-t108.mjs",
     "verify:t109": "node scripts/verify-t109.mjs",
     "verify:t113": "node scripts/verify-t113-authgate.mjs",
+    "verify:t1020": "node scripts/verify-t1020-ui.mjs",
     "verify:t110-matrix": "node scripts/verify-t110-matrix.mjs",
     "smoke:t105": "node scripts/smoke-t105.mjs",
     "smoke:t106": "node scripts/smoke-t106.mjs",

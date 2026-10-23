@@ -18,6 +18,7 @@ import {
   fetchVersionText,
   listCards,
   listVersions,
+  pruneVersion,
   rollbackCard,
   uploadCard,
   type CardSummary,
@@ -647,7 +648,12 @@ export class SyncDialog {
 
       const loadButton = el('button', 'btn small', '取回');
       loadButton.type = 'button';
-      loadButton.title = '把该版本内容载入编辑器（不改变服务端）';
+      // 内容已被清除的版本取不回来（服务端 409）。按钮置灰并说明原因，
+      // 而不是让用户点一下换一个"内容已被清除"的报错。
+      loadButton.disabled = version.pruned === true;
+      loadButton.title = version.pruned
+        ? '这一版的内容已被清除，无法取回'
+        : '把该版本内容载入编辑器（不改变服务端）';
       loadButton.addEventListener('click', () => void this.loadVersionIntoEditor(version));
       actions.append(loadButton);
 
@@ -658,14 +664,79 @@ export class SyncDialog {
       const isOwnCard = this.effectiveHistoryCardId() === this.sessionCardId();
       const rollbackButton = el('button', 'btn small', '回滚到此版本');
       rollbackButton.type = 'button';
-      rollbackButton.disabled = isLatest || !isOwnCard;
-      if (isLatest) rollbackButton.title = '这已是最新版本';
+      rollbackButton.disabled = isLatest || !isOwnCard || version.pruned === true;
+      if (version.pruned === true) rollbackButton.title = '这一版的内容已被清除，无法回滚到它';
+      else if (isLatest) rollbackButton.title = '这已是最新版本';
       else if (!isOwnCard) rollbackButton.title = '只能回滚当前会话所属的卡片；其他卡片的历史是只读的';
       rollbackButton.addEventListener('click', () => void this.rollback(version));
       actions.append(rollbackButton);
 
+      /*
+       * 「清除内容」（F13.3 / F13.5）。
+       *
+       * 最新版置灰并给出**为什么** —— 服务端也会拒（409），两层都拦：
+       * 只靠服务端的话，用户会点出一个"不知道为什么不行"的报错。
+       * 已清除的版本不再显示这个按钮（重复点没有意义，留着只会让人以为还能再清一次）。
+       */
+      if (!version.pruned) {
+        const pruneButton = el('button', 'btn small danger', '清除内容');
+        pruneButton.type = 'button';
+        pruneButton.dataset['role'] = 'version-prune';
+        /*
+         * 只拦最新版，**不**沿用回滚那条"必须是当前会话的卡"的限制。
+         *
+         * 理由：回滚会往服务端写一个新版本，和当前编辑中的卡混在一起容易误操作；
+         * 而 prune 只是清掉某一版的正文，不改内容、不产生版本。F13.3 的要求是
+         * 「用户可 prune 自己的卡」—— 而这里列出的卡本来就都是自己账户下的
+         * （范围由服务端按账户过滤），再加一层"必须是正在编辑的那张"会让
+         * 「从我的卡片 → 看历史 → 清除」这条最自然的路径走不通（实测：
+         * 版本行有按钮但永远是灰的）。
+         */
+        pruneButton.disabled = isLatest;
+        pruneButton.title = isLatest
+          ? '最新版本是对外可见的正文，不能清除（要清整张卡请用删除）'
+          : '清除这一版的正文与摘要，保留版本记录（不可恢复）';
+        pruneButton.addEventListener('click', () => void this.prune(version));
+        actions.append(pruneButton);
+      }
+
       row.append(main, actions);
       this.versionList.append(row);
+    }
+  }
+
+  /**
+   * 清除某版本内容。
+   *
+   * 确认框里写清"不可恢复、只保留元数据"：这个按钮就在「取回」「回滚」旁边，
+   * 手滑的成本太高，笼统一句"确定吗"不足以让人停下来。
+   */
+  private async prune(version: VersionSummary): Promise<void> {
+    const config = this.callbacks.getConfig();
+    const cardId = this.effectiveHistoryCardId();
+    if (!config || !cardId) {
+      this.callbacks.notify('请先登录并选择一张卡片', 'warn');
+      return;
+    }
+    const ok = window.confirm(
+      `清除 v${String(version.seq)} 的内容？\n\n` +
+        '正文与摘要会被清空，版本记录（时间/作者/说明）保留，\n' +
+        '从此不能再取回或回滚到这一版。这个操作不可恢复。',
+    );
+    if (!ok) return;
+
+    this.setBusy('清除版本内容…');
+    try {
+      const result = await pruneVersion(config, cardId, version.seq);
+      this.callbacks.notify(
+        result.alreadyPruned ? `v${String(version.seq)} 的内容之前已清除` : `已清除 v${String(version.seq)} 的内容`,
+        result.alreadyPruned ? 'info' : 'ok',
+      );
+      await this.loadVersions(cardId);
+    } catch (error) {
+      this.callbacks.notify(`清除失败：${error instanceof Error ? error.message : String(error)}`, 'bad');
+    } finally {
+      this.setBusy(null);
     }
   }
 

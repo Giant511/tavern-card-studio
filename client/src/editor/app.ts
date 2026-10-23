@@ -458,7 +458,18 @@ class EditorApp {
         await configPatch(patch);
       },
       serverUrl: () => (this.authServerUrl.trim() === '' ? null : this.authServerUrl.trim()),
-      onPhaseChange: () => this.refreshAccountButton(),
+      /*
+       * 登录态变化的**所有**来源都从这里经过：登录框、bootstrap 恢复、
+       * 静默续期成功、401 后恢复失败回匿名、登出。
+       *
+       * 第一版只刷新账户按钮 —— 于是"静默续期成功"这条路径上，账户按钮已经是
+       * authenticated，而顶栏胶囊与同步提示还停在"未登录"（截图验收时发现）。
+       * 连接本身没变，只是凭证变了，所以用现有 connection 重新 apply 一次即可。
+       */
+      onPhaseChange: () => {
+        this.refreshAccountButton();
+        if (this.connection) this.applyConnection(this.connection);
+      },
     });
     this.authSession = session;
 
@@ -473,6 +484,15 @@ class EditorApp {
         // 用户会以为登录没成功
         this.refreshAccountButton();
         void this.autoProbe();
+        /*
+         * 立刻按现有连接信息重算一次界面文案。
+         *
+         * `autoProbe()` 是一次网络往返，回来之前顶栏与同步提示还是**上一轮探测**的
+         * 结论（探针实测：登录成功、会话已是 authenticated，提示却仍写
+         * "未登录：登录后可同步"）。连接本身没变，只是凭证变了 ——
+         * 用已有的 `connection` 重新 apply 一次就能立刻纠正，不必等探测。
+         */
+        if (this.connection) this.applyConnection(this.connection);
         // 静默续期由 AuthSession 自己接管（refresh 单飞，见 session.ts），
         // 这里补第 4 条要求的另一半：**登录成功即拉一次「我的卡片」**，
         // 用户点开面板时不用再等一轮。
@@ -491,6 +511,15 @@ class EditorApp {
         this.syncDialog?.selectCard(cardId);
       },
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
+      // 「移动…」要选目标仓库：列表由仓库客户端现取（不缓存 —— 用户可能刚在
+      // 仓库面板里新建过一个，缓存会让它在这里看不到）
+      getRepos: async () => {
+        // 仓库管理只认账户 access 令牌（仓库令牌/legacy 都调不了 /api/repos 的管理动作），
+        // 用与仓库面板同一个 helper，避免两处各自拼配置
+        const config = this.repoClientConfig();
+        if (!config) return [];
+        return listRepos(config);
+      },
       onUnauthorized: () => this.handleUnauthorized(),
       onLogout: async () => {
         await session.logout();

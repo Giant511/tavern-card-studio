@@ -2108,15 +2108,38 @@ body {
  * 用 grid 而不是 inline 文本，是为了让四列各自对齐 —— 一列对齐了，
  * 用户才能一眼扫出"哪张卡还没归属仓库""哪张没有版本"。
  */
+/*
+ * F13.5：行不再是 `<button>`，而是"容器 + 主按钮 + 操作区"。
+ *
+ * 为什么：HTML 不允许按钮嵌套按钮。行本身要看历史（主按钮），同时要放
+ * 「移动… / 删除…」。全部塞进一个 button 会得到"点哪儿都看历史、删除永远点不到"，
+ * 而这种"能渲染但点不动"的问题只有真机点才知道。
+ */
 .cards-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 4px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+}
+
+.cards-row:hover {
+  background: var(--app-bg);
+  border-color: var(--border);
+}
+
+.cards-row-main {
   display: grid;
   grid-template-columns: minmax(0, 1.4fr) minmax(0, 1.6fr) minmax(0, 0.8fr) 52px;
   gap: 10px;
   align-items: center;
-  width: 100%;
-  padding: 8px 10px;
-  border: 1px solid transparent;
-  border-radius: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 6px 6px;
+  border: 0;
+  border-radius: 6px;
   background: transparent;
   text-align: left;
   font: inherit;
@@ -2124,10 +2147,40 @@ body {
   cursor: pointer;
 }
 
-.cards-row:hover,
-.cards-row:focus-visible {
-  background: var(--app-bg);
-  border-color: var(--border);
+.cards-row-main:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/*
+ * 操作按钮**常显**（不靠 hover 才出现）。
+ *
+ * 第一版是 `opacity: 0` + hover 才 1 —— 截图验收时发现：不把鼠标移上去，
+ * 根本看不到有「移动… / 删除…」。而这两个正是 F13.5 要求"每张卡加"的入口，
+ * 藏起来等于没加（触屏设备更是永远看不到）。
+ * 现在改成常驻但视觉弱化（0.55），悬停时恢复满不透明度：既能被发现，也不抢戏。
+ */
+.cards-row-actions {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+  opacity: 0.55;
+  transition: opacity 0.12s ease;
+}
+
+.cards-row:hover .cards-row-actions,
+.cards-row:focus-within .cards-row-actions {
+  opacity: 1;
+}
+
+.btn.small.danger,
+.btn.danger.small {
+  color: #b42318;
+  border-color: #f1b5ae;
+}
+.btn.small.danger:hover,
+.btn.danger.small:hover {
+  background: #fdf1f0;
 }
 
 .cards-row.deleted .cards-row-name {
@@ -2237,11 +2290,27 @@ body {
 .repo-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   width: 100%;
-  padding: 8px 10px;
+  padding: 2px 4px;
   border: 1px solid transparent;
   border-radius: 8px;
+}
+
+.repo-row:hover {
+  background: var(--app-bg);
+  border-color: var(--border);
+}
+
+.repo-row-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  padding: 6px;
+  border: 0;
+  border-radius: 6px;
   background: transparent;
   font: inherit;
   color: inherit;
@@ -2249,10 +2318,25 @@ body {
   cursor: pointer;
 }
 
-.repo-row:hover,
-.repo-row:focus-visible {
-  background: var(--app-bg);
-  border-color: var(--border);
+.repo-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  opacity: 0.55;
+  transition: opacity 0.12s ease;
+}
+
+.repo-row:hover .repo-row-actions,
+.repo-row:focus-within .repo-row-actions,
+.repo-row.is-active .repo-row-actions {
+  opacity: 1;
+}
+
+.repo-row-hint {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 .repo-row.is-active {
