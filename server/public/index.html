@@ -92,6 +92,7 @@
                 <dt>API 地址</dt><dd class="mono" id="ov-api">—</dd>
                 <dt>管理面板</dt><dd class="mono" id="ov-panel">—</dd>
                 <dt>数据目录</dt><dd class="mono" id="ov-data">—</dd>
+                <dt>可信代理</dt><dd id="ov-proxy">—</dd>
                 <dt>最近退出</dt><dd id="ov-exit">—</dd>
               </dl>
               <p class="hint" id="ov-hint"></p>
@@ -149,6 +150,20 @@
                   ⚠ 改为非回环地址会把<strong>无鉴权</strong>的后台暴露给对应网络：面板静态页面
                   （<code>/</code>、<code>/app.js</code>）本身不需要令牌，任何人都能看到管理界面，
                   只有控制接口受令牌保护。仅在明确需要远程运维时修改，并建议配合防火墙或反向代理加 TLS。
+                </small>
+              </label>
+              <label class="field">
+                <span>可信反向代理（trustProxy）</span>
+                <textarea id="cfg-trustProxy" rows="3" placeholder="留空 = 不信任任何代理头&#10;填例如 127.0.0.1 / 10.0.0.0/8"></textarea>
+                <small class="hint">
+                  每行一个 IP 或 CIDR。只有登记在这里的地址，才允许用
+                  <code>X-Forwarded-For</code> 说明真实客户端是谁。
+                  <strong>留空＝不信任任何代理头</strong>（默认）。
+                </small>
+                <small class="hint warn-strong" id="cfg-trustProxy-warn" hidden>
+                  ⚠ 你把服务放在反向代理后面，但这里没有登记代理地址：
+                  所有请求会被当成来自代理本身 —— 取令牌接口会拒绝、登录失败限速会把所有人
+                  算在同一个来源上。请把代理的地址（同机通常是 <code>127.0.0.1</code>）加进上面。
                 </small>
               </label>
               <label class="field"><span>上传上限（字节）</span><input id="cfg-maxUploadBytes" type="number" min="1024" /></label>

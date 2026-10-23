@@ -131,6 +131,10 @@ export async function startWorker(loaded: LoadedConfig): Promise<RunningWorker> 
     authRequired: loaded.config.auth.require,
     tlsMode: loaded.config.tls.mode,
     httpsPort: https?.port ?? null,
+    // 反代信任表：启动时打一行，运维不用翻配置就知道"现在按谁判定来源 IP"。
+    // 空数组时必须显式说"未信任任何代理"—— 否则反代部署下会出现
+    // "取令牌 403、限速全局化"这两类现象，而日志里找不到任何线索。
+    trustProxy: loaded.config.trustProxy.length > 0 ? loaded.config.trustProxy : '（未信任任何代理，忽略全部代理头）',
   });
 
   let closing = false;

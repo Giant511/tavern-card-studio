@@ -183,7 +183,7 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
 }
 .field > small.hint.warn-strong strong { color: #7a4d00; }
 .field > small.hint.warn-strong code { background: #f6ead0; }
-.field input, .field select, .token-row input {
+.field input, .field select, .field textarea, .token-row input {
   width: 100%;
   padding: 8px 10px;
   border-radius: 9px;
@@ -192,7 +192,9 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
   outline: none;
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
-.field input:focus, .field select:focus { border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(43, 138, 126, 0.12); background: #fff; }
+.field input:focus, .field select:focus, .field textarea:focus { border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(43, 138, 126, 0.12); background: #fff; }
+/* trustProxy 是多行清单：等宽字体 + 允许纵向拉伸，一眼能看出"一行一条" */
+.field textarea { font-family: var(--mono); font-size: 12.5px; line-height: 1.6; resize: vertical; min-height: 68px; }
 .check { display: flex; align-items: center; gap: 8px; color: var(--text-2); font-size: 12.8px; margin: 6px 0; }
 .check.inline { margin: 0; white-space: nowrap; }
 .check input { accent-color: var(--accent); }

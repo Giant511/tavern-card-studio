@@ -695,6 +695,9 @@ export function applyConfigPatch(current: ServerConfigFile, patch: Record<string
       logLevel: ['debug', 'info', 'warn', 'error'].includes(String(patch['logLevel']))
         ? patch['logLevel']
         : current.logLevel,
+      // trustProxy 必须**显式**下发才改：`null` 表示"清空"（用户确实想关掉），
+      // 字段缺席则保持原值。若像其它字段那样"缺席即保持"，面板上就没法清空了。
+      trustProxy: parseTrustProxyPatch(patch, current.trustProxy),
       auth: {
         ...current.auth,
         require: bool(auth['require'], current.auth.require),
@@ -708,6 +711,34 @@ export function applyConfigPatch(current: ServerConfigFile, patch: Record<string
     },
     {},
   );
+}
+
+/**
+ * 面板提交的 trustProxy。
+ *
+ * 三种输入必须区分开（这是"能否清空"与"能否保持"的分界）：
+ *   · `undefined`（字段缺席）→ 保持原值，避免只改端口的保存把信任表清空；
+ *   · `null` / `[]` / `''`（显式给空）→ 清空，用户确实想关掉反代信任；
+ *   · 字符串（面板用换行/逗号分隔）或字符串数组 → 覆盖。
+ *
+ * `null` 也当"清空"：JSON 里表达"没有"的两种写法（null 与 []）语义相同，
+ * 只认其中一种会让调用方在"我明明传了空"时看到原值不变 —— 第一版就是这样，
+ * 注释写了 null 清空而代码把它归进"保持原值"，实测才发现。
+ */
+function parseTrustProxyPatch(patch: Record<string, unknown>, current: string[]): string[] {
+  const value = patch['trustProxy'];
+  if (value === undefined) return current;
+  if (value === null) return [];
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter((item) => item !== '');
+  }
+  if (typeof value === 'string') {
+    return value
+      .split(/[\n,]/)
+      .map((item) => item.trim())
+      .filter((item) => item !== '');
+  }
+  return current;
 }
 
 /** 供 CLI `service status` 探测端口是否在监听 */
