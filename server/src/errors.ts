@@ -32,6 +32,21 @@ export type ErrorCode =
   //   CARD_DELETED —— 该 ID 已被一张已软删的卡片占用（复用 ID 会把旧历史一起复活）
   | 'BAD_CARD_ID'
   | 'CARD_DELETED'
+  // T10.4 账户与认证的专用码。
+  //
+  // 为什么登录失败只用一个码：`INVALID_CREDENTIALS` 同时覆盖"用户不存在"、
+  // "密码错"、"账户锁定中"三种情况 —— 如果分成三个码，客户端或日志一泄露
+  // 就等于把账户存在性/锁定状态广播出去。需求明确要求这三者对外不可区分。
+  //
+  //   REGISTRATION_CLOSED   —— 服务端关了自助注册（明确拒绝，不伪装成功）
+  //   REGISTRATION_REJECTED —— 注册失败（用户名占用/格式不合规/密码不合规，共用）
+  //   ACCOUNT_DISABLED      —— 密码正确但账户被禁用（走到这里说明密码已对，不构成枚举面）
+  //   INVALID_REFRESH_TOKEN —— refresh 失效（不存在/已吊销/已过期，共用一句）
+  | 'INVALID_CREDENTIALS'
+  | 'REGISTRATION_CLOSED'
+  | 'REGISTRATION_REJECTED'
+  | 'ACCOUNT_DISABLED'
+  | 'INVALID_REFRESH_TOKEN'
   | 'INTERNAL';
 
 export class AppError extends Error {

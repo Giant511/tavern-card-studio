@@ -15,6 +15,11 @@ import { isLoopbackAddress } from '../config.js';
 import { API_VERSION, SERVER_VERSION, configSummary, type ServerContext } from '../context.js';
 import { readRawBody, parseJsonBody } from './body.js';
 import { TokenGate } from './auth.js';
+import { registerAuthRoutes } from './auth-routes.js';
+import { AuthService } from '../auth/service.js';
+import { LoginLimiter, DEFAULT_RATE_LIMIT } from '../auth/login-limit.js';
+import { SessionStore } from '../auth/sessions.js';
+import { UserStore } from '../storage/users.js';
 import { COMMON_HEADERS, methodNotAllowed, sendError, sendJson, sendRaw } from './responses.js';
 import { Router, type RouteContext } from './router.js';
 
@@ -143,8 +148,29 @@ function rawHeaders(ctx: RouteContext, sha256: string, size: number, filename: s
 }
 
 export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, res: ServerResponse) => void {
-  const gate = new TokenGate(ctx.config.auth.token, ctx.config.auth.publicPaths, ctx.config.auth.require);
+  // 账户体系（T10.4）。Session/User 仓储与限速器都建在同一份 SQLite 句柄上，
+  // 所以吊销状态与失败计数天然跟着库走（重启不丢）。
+  const users = new UserStore(ctx.db.handle);
+  const sessions = new SessionStore(ctx.db.handle);
+  const limiter = new LoginLimiter(ctx.db.handle, DEFAULT_RATE_LIMIT);
+  const authService = new AuthService({ config: ctx.config, users, sessions, limiter });
+
+  const gate = new TokenGate(ctx.config.auth.token, ctx.config.auth.publicPaths, ctx.config.auth.require, {
+    jwtSecret: ctx.config.auth.jwtSecret,
+    sessions,
+    users,
+  });
+
+  /** 客户端 IP。只信 socket 地址，不读 X-Forwarded-For（可伪造，会废掉限速） */
+  const clientIp = (context: RouteContext): string => context.req.socket.remoteAddress ?? 'unknown';
+
   const router = new Router();
+
+  registerAuthRoutes(router, {
+    auth: authService,
+    identify: (context) => gate.identify(context.req),
+    clientIp,
+  });
 
   router.get('/api/health', (_ctx) => {
     sendJson(_ctx.res, 200, {
@@ -444,8 +470,14 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       // 为什么不在 auth.publicPaths 里加这一条：publicPaths 是用户可改的配置项，
       // 而这条豁免是安全模型的一部分，不该被误删或误加宽。把它写死在这里，
       // 并让「来源必须是回环」成为唯一条件，审计时一眼能看清。
+      //
+      // 认证端点同理（T10.4）：登录/注册/刷新时调用方必然还没有令牌。
+      // 注意**不含** /api/auth/logout 与 /api/auth/me —— 那两个需要身份。
       const isTokenBootstrap = method === 'GET' && pathname === '/api/token';
-      if (!isTokenBootstrap) {
+      const isAuthEntry =
+        method === 'POST' &&
+        (pathname === '/api/auth/login' || pathname === '/api/auth/register' || pathname === '/api/auth/refresh');
+      if (!isTokenBootstrap && !isAuthEntry) {
         gate.check(req, pathname);
       }
 

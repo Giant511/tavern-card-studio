@@ -50,6 +50,15 @@ export interface AuthConfig {
   publicPaths: string[];
   /** 自助注册策略，见 {@link RegisterMode}；默认 closed */
   registerMode: RegisterMode;
+  /**
+   * JWT 签名密钥（HS256）。
+   *
+   * **必须持久化**：放内存里每次重启都换，所有已签出的令牌会立刻失效 ——
+   * 那会让"吊销"失去意义（重启就等于全量吊销），用户也会莫名其妙被踢下线。
+   * 首次启动自动生成 32 字节；与 `token` 一样只在 `config.json` 里，
+   * 面板与 `configSummary` 只显示掩码。
+   */
+  jwtSecret: string;
 }
 
 export interface ServerConfigFile {
@@ -225,6 +234,7 @@ export function createDefaultConfig(overrides: ConfigOverrides = {}): ServerConf
       require: true,
       publicPaths: [...DEFAULT_PUBLIC_PATHS],
       registerMode: 'closed',
+      jwtSecret: generateToken(),
     },
     service: {
       mode: overrides.serviceMode ?? 'process',
@@ -277,6 +287,16 @@ export function normalizeConfig(input: unknown, overrides: ConfigOverrides = {})
       registerMode: (['closed', 'open', 'admin-only'] as const).includes(authRaw['registerMode'] as never)
         ? (authRaw['registerMode'] as RegisterMode)
         : 'closed',
+      // 老配置里没有这一项 —— 自动补一个并会在下次写盘时落下去。
+      // 不能留空：空密钥会让 AuthService 拒绝签发令牌（宁可报错也不用弱密钥）。
+      //
+      // **弱密钥（< 32 字符）也一并替换掉**：HS256 的安全性完全系于密钥熵，
+      // 用户手填一个 "secret" 是最常见的事故。这里静默换成强随机值 ——
+      // 代价是填过弱值的人会被登出一次，收益是不会有可离线爆破的签名密钥。
+      jwtSecret: (() => {
+        const provided = str(authRaw['jwtSecret'], '');
+        return provided.length >= 32 ? provided : generateToken(48);
+      })(),
     },
     service: {
       mode: serviceRaw['mode'] === 'windows-service' ? 'windows-service' : 'process',
@@ -401,6 +421,15 @@ export function loadConfig(configPath: string, overrides: ConfigOverrides = {}):
   }
   const config = normalizeConfig(parsed, overrides);
   assertSafeConfig(config);
+  // 老配置缺 `auth.jwtSecret` 时必须**立刻回写**：
+  // 不回写的话，每次进程启动都会生成新密钥，所有已签出的令牌随即失效
+  // （等于每次重启把所有人踢下线，而且让 refresh 机制形同虚设）。
+  // 这是一次性迁移，只在字段缺失/过短时触发。
+  const rawAuth = (parsed as { auth?: { jwtSecret?: unknown } }).auth;
+  const providedSecret = typeof rawAuth?.jwtSecret === 'string' ? rawAuth.jwtSecret : '';
+  if (providedSecret !== config.auth.jwtSecret) {
+    writeConfig(absolute, config);
+  }
   return { config, path: absolute, created: false };
 }
 
