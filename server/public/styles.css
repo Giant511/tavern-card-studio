@@ -197,6 +197,39 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
 .field textarea { font-family: var(--mono); font-size: 12.5px; line-height: 1.6; resize: vertical; min-height: 68px; }
 .check { display: flex; align-items: center; gap: 8px; color: var(--text-2); font-size: 12.8px; margin: 6px 0; }
 .check.inline { margin: 0; white-space: nowrap; }
+/* 注册策略：三个单选项横排，窄屏自动折行 */
+.radio-row { display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 10px 0 4px; }
+.radio-row .check { margin: 0; }
+
+/* 常驻警告块（不是一秒就消失的 toast：风险与配置同寿） */
+.warn-box {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid #f0d39a;
+  border-left: 4px solid #d98c00;
+  border-radius: 8px;
+  background: #fdf6e6;
+  color: #6b4a00;
+  font-size: 12.8px;
+  line-height: 1.65;
+}
+.warn-box strong { color: #7a4d00; }
+.warn-box .bullets { margin: 8px 0 0; padding-left: 18px; }
+.warn-box code { background: #f6ead0; padding: 1px 5px; border-radius: 4px; }
+
+/* 最近注册账户表 */
+.data-table { width: 100%; border-collapse: collapse; font-size: 12.6px; margin-top: 4px; }
+.data-table th, .data-table td {
+  text-align: left;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.data-table th { color: var(--muted); font-weight: 600; }
+.data-table td.mono, .data-table td .mono { font-family: var(--mono); }
+.data-table .row-disabled td { color: var(--muted); text-decoration: line-through; }
+.data-table .btn { padding: 3px 10px; font-size: 12px; }
+
 .check input { accent-color: var(--accent); }
 
 /* ── 按钮 ─────────────────────────────────────── */
