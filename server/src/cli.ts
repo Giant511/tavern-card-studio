@@ -90,6 +90,13 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   if (typeof flags['log-level'] === 'string') {
     overrides.logLevel = flags['log-level'] as ServerConfigFile['logLevel'];
   }
+  // `--trust-proxy 127.0.0.1,10.0.0.0/8`。传空串表示"清空"（脚本里显式关掉用）。
+  if (typeof flags['trust-proxy'] === 'string') {
+    overrides.trustProxy = flags['trust-proxy']
+      .split(',')
+      .map((item) => item.trim())
+      .filter((item) => item !== '');
+  }
   if (typeof flags['service-mode'] === 'string') {
     overrides.serviceMode = flags['service-mode'] === 'windows-service' ? 'windows-service' : 'process';
   }
@@ -130,6 +137,7 @@ function printHelp(): void {
       `  --data-dir <路径>     数据目录（blobs / repos / state.db）\n` +
       `  --rules-dir <路径>    规则目录（默认 ./rules）\n` +
       `  --token <token>       指定访问令牌\n` +
+      `  --trust-proxy <列表>  可信反向代理，逗号分隔的 IP 或 CIDR（默认空＝不信任任何代理头）\n` +
       `  --no-worker           只起控制面（serve）\n`,
   );
 }

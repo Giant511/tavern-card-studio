@@ -94,6 +94,14 @@ export interface TokenGateDeps {
   repoTokens?: TokenStore;
   repos?: RepoStore;
   now?: () => Date;
+  /**
+   * 有效客户端地址（v0.1.2 追加任务）。
+   *
+   * 失败计数按它分桶。默认取 `req.socket.remoteAddress` —— 但**反代部署下那是代理 IP**，
+   * 于是全世界共用一格，5 次失败就把所有人锁在门外。调用方传入基于 `trustProxy`
+   * 解析出的有效地址即可恢复"按真实 IP 限速"。
+   */
+  clientIp?: (req: IncomingMessage) => string;
 }
 
 export class TokenGate {
@@ -218,7 +226,7 @@ export class TokenGate {
     if (!this.required) return;
     if (this.isPublic(pathname)) return;
 
-    const ip = req.socket.remoteAddress ?? 'unknown';
+    const ip = this.deps.clientIp ? this.deps.clientIp(req) : (req.socket.remoteAddress ?? 'unknown');
     const now = Date.now();
     const record = this.failures.get(ip);
     if (record && record.blockedUntil > now) {

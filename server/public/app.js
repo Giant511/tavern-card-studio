@@ -168,6 +168,7 @@
     $('ov-api').textContent = worker.url;
     $('ov-panel').textContent = status.urls.panel;
     $('ov-data').textContent = status.config.dataDir;
+    renderProxyTrust(status.config.trustProxy ?? []);
     $('ov-exit').textContent = worker.lastExit
       ? `${fmtTime(worker.lastExit.at)}（code=${worker.lastExit.code ?? '—'}${worker.lastExit.expected ? '，预期' : ''}）`
       : '—';
@@ -204,6 +205,15 @@
       $('stat-versions').textContent = String(stats.versions);
       $('stat-bytes').textContent = fmtBytes(stats.bytes);
       $('stat-blobs').textContent = `blob ${stats.blobs.count} 个 · ${fmtBytes(stats.blobs.bytes)}`;
+      // 「已生效代理」= 真正匹配上并改写过身份的对端地址数（不是配置条数）。
+      // 配置写了但地址写错时，这里会是 0 —— 这正是我们想让管理员看到的信号。
+      if (stats.proxy) {
+        const hits = stats.proxy.trustedProxies ?? [];
+        const detail = hits.map((item) => `${item.address} × ${item.hits}`).join('、');
+        $('ov-proxy').textContent = stats.proxy.entries === 0
+          ? '未信任任何代理（忽略代理头）'
+          : `${hits.length} 个已生效 / 共 ${stats.proxy.entries} 条规则${detail ? ` · ${detail}` : ''}`;
+      }
     } catch {
       /* worker 刚重启时可能短暂失败 */
     }
@@ -257,6 +267,32 @@
     $('cfg-serviceDisplayName').value = config.service.displayName;
     $('cfg-autoStart').checked = Boolean(config.service.autoStart);
     $('cfg-authRequire').checked = Boolean(config.auth.require);
+    // 每行一条：与输入框的提示文案一致，用户按回车换行不会被悄悄当成一个字符串
+    $('cfg-trustProxy').value = (config.trustProxy ?? []).join('\n');
+    updateTrustProxyWarning();
+  }
+
+  /**
+   * 「反代部署但没登记代理」的提示。
+   *
+   * 判据刻意用"面板是从哪访问的"：如果管理员正通过非回环地址打开面板
+   * （说明前面有代理或直接暴露），而 trustProxy 又是空的，那大概率漏配了。
+   * 本机 127.0.0.1 打开时不提示 —— 那是单人本机使用的正常形态，
+   * 每次都弹一条黄色警告只会训练用户忽略提示。
+   */
+  function updateTrustProxyWarning() {
+    const box = $('cfg-trustProxy-warn');
+    if (!box) return;
+    const entries = $('cfg-trustProxy').value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
+    const viaProxy = !/^(127\.|localhost$|\[::1\]$)/.test(location.hostname) || location.protocol === 'https:';
+    box.hidden = !(entries.length === 0 && viaProxy);
+  }
+
+  function renderProxyTrust(entries) {
+    const list = Array.isArray(entries) ? entries : [];
+    $('ov-proxy').textContent = list.length === 0
+      ? '未信任任何代理（忽略代理头）'
+      : `${list.length} 条规则：${list.join('、')}`;
   }
 
   async function loadConfigForm() {
@@ -269,6 +305,7 @@
   }
 
   $('cfg-controlHost').addEventListener('input', updateControlHostWarning);
+  $('cfg-trustProxy').addEventListener('input', updateTrustProxyWarning);
 
   $('cfg-save').addEventListener('click', async () => {
     const payload = {
@@ -282,6 +319,12 @@
       defaultPlatformRule: $('cfg-defaultPlatformRule').value.trim(),
       defaultPreset: $('cfg-defaultPreset').value.trim(),
       logLevel: $('cfg-logLevel').value,
+      // 显式传数组：即使是空数组也要传（"清空 trustProxy"是一个合法意图，
+      // 不传会让服务端按"字段缺席＝保持原值"处理，用户就清不掉了）
+      trustProxy: $('cfg-trustProxy').value
+        .split(/[\n,]/)
+        .map((item) => item.trim())
+        .filter((item) => item !== ''),
       service: {
         mode: $('cfg-serviceMode').value,
         name: $('cfg-serviceName').value.trim(),

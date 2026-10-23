@@ -155,6 +155,9 @@ export function configSummary(config: ServerConfigFile): Record<string, unknown>
     defaultPreset: config.defaultPreset,
     maxUploadBytes: config.maxUploadBytes,
     logLevel: config.logLevel,
+    // 面板要回显 trustProxy（并显示"已生效代理数"）。不含它的话，表单保存时
+    // 会把这份配置写回成空数组 —— 用户改个端口就把反代信任一起清掉。
+    trustProxy: [...config.trustProxy],
     auth: {
       require: config.auth.require,
       // 面板里只显示掩码，避免截图/日志泄露；完整 token 用 `tcs-server token show`

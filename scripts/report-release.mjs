@@ -146,12 +146,20 @@ if (existsSync(shellExe)) {
 assertOrder(sharedSrc, sharedDist, 'shared/src ≤ shared/dist（服务端链路）');
 assertOrder(sharedDist, serverDist, 'shared/dist ≤ server/dist');
 assertOrder(serverSrc, serverDist, 'server/src ≤ server/dist');
-assertOrder(serverPublic, serverDist, 'server/public ≤ server/dist');
+// `server/public` 是**静态资源**，不经过 tsc 编译，所以不能断言它 ≤ server/dist
+// （昨天那条断言本身就是错的：改了 index.html 只会让 public 比 dist 新，而根本不
+//  需要重新编译 —— 它会稳定地报红，逼人去改一条假规则）。
+// 真正该断言的是"面板资源不能晚于打包时刻"，两级：
+//   ① public ≤ release/server 里的副本（pack:server 负责 copy）
+//   ② public ≤ 服务端 MSI
+const bundleServerPublic = newestMtime(join(ROOT, 'release/server/app/server/public'), ['.html', '.js', '.css']);
+assertOrder(serverPublic, { mtime: bundleServerPublic.mtime }, 'server/public ≤ 包内副本（release/server）');
 if (serverArtifact) {
   // MSI 内嵌的是 release/server 里的副本，先断言"副本不旧于刚编的 dist"，
   // 再断言"副本 ≤ MSI"。两级都要，否则"打了包但没重新 pack:server"仍会漏过。
   assertOrder(serverDist, { mtime: bundleServerDist.mtime }, 'server/dist ≤ 包内副本（release/server）');
   assertOrder(serverDist, { mtime: serverArtifact.mtime }, 'server/dist ≤ 服务端 MSI');
+  assertOrder(serverPublic, { mtime: serverArtifact.mtime }, 'server/public ≤ 服务端 MSI');
   assertOrder({ mtime: rulesNewest.mtime }, { mtime: serverArtifact.mtime }, 'rules ≤ 服务端 MSI');
 }
 say('');

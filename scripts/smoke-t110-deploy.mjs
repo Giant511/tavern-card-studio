@@ -1,18 +1,20 @@
 /**
- * T10.10 ① 公网部署面真进程验证。
+ * v0.1.2 追加任务：反向代理穿透 `/api/token` 回环门禁的正式修复 —— 真进程验证。
  *
- * 云部署手册（docs/33）里推荐的形态是「反向代理终止 TLS，业务只监听回环」。
- * 这个形态有一个**不写在代理配置里就看不出来**的安全边界：`GET /api/token`
- * 的门禁是"来源必须是回环地址"。同机反代让**所有**请求的来源都是 127.0.0.1，
- * 于是这条门禁对公网请求一律成立 —— 任何人 curl 一下公网域名就能拿到全权令牌。
+ * 背景：同机反代时 `socket.remoteAddress` 恒为 `127.0.0.1`，于是"只接受本机请求"
+ * 这条门禁对**所有公网请求**成立。止血版"见到代理头就拒"堵上了洞，但把
+ * "反代 + 真实 IP" 这条正确路径一起废掉（连本机经代理都取不到令牌，且无法按真实 IP 限速）。
  *
- * 本脚本用一个真的 HTTP 反代（带 X-Forwarded-For，和 Caddy/nginx 默认行为一致）
- * 复现这个场景，验证：
- *   ① 直连 127.0.0.1 取令牌 → 200（客户端一键连接必须还能用）；
- *   ② 经过反代取令牌 → 403，且响应里不出现令牌原文；
- *   ③ 经过反代访问普通接口 → 正常（反代本身没有被"误伤"）；
- *   ④ 手工塞伪造的 X-Forwarded-For 直连 → 同样 403（不靠值、只靠"有代理跳"）；
- *   ⑤ 非回环来源的直连（用本机网卡 IP 访问）→ 403（原有门禁仍然有效）。
+ * 本脚本用**真的反向代理**（自己追加 `X-Forwarded-For`，与 Caddy/nginx 默认行为一致）
+ * 逐条验证新方案 `trustProxy`：
+ *
+ *   ① 同机反代 + trustProxy 空 → 403（**修复前的洞，作为回归用例**）
+ *   ② 同机反代 + trustProxy 登记了代理 → 公网真实 IP 非回环 → 403；
+ *      回环真实 IP（本机经反代）→ 200
+ *   ③ 客户端自带 XFF（伪造）+ 反代追加 → 取「最右侧非信任条目」，伪造无效
+ *   ④ 限速按**有效 IP** 分桶：经同一反代的两个不同真实 IP 独立计数
+ *   ⑤ 白名单用 CIDR 形式（127.0.0.0/8、::1/128）
+ *   ⑥ 未登记信任时的旧行为对照：两人共用一个桶（证明 ④ 不是碰巧）
  *
  * 用法：node scripts/smoke-t110-deploy.mjs
  */
@@ -24,82 +26,140 @@ import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
+const REPO = new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
 const results = [];
 const check = (name, ok, detail) => {
   results.push({ name, ok, detail });
   console.log(`${ok ? '✔' : '✘'} ${name}${detail ? ' —— ' + detail : ''}`);
 };
 
-const work = mkdtempSync(join(tmpdir(), 'tcs-t110-deploy-'));
-const port = 23400 + Math.floor(Math.random() * 200);
-const proxyPort = port + 1;
 const TOKEN = 't110-deploy-legacy-token-aaaaaaaaaaaaaaaaaaaa';
+const BASE_PORT = 23600 + Math.floor(Math.random() * 200);
 
-writeFileSync(
-  join(work, 'config.json'),
-  JSON.stringify(
-    {
-      schemaVersion: 1,
-      port,
-      controlPort: port + 2,
-      host: '127.0.0.1',
-      controlHost: '127.0.0.1',
-      dataDir: join(work, 'store'),
-      rulesDir: 'rules',
-      defaultPlatformRule: 'sillytavern',
-      defaultPreset: 'default',
-      maxUploadBytes: 33554432,
-      logLevel: 'warn',
-      auth: {
-        token: TOKEN,
-        require: true,
-        publicPaths: ['/api/health'],
-        registerMode: 'closed',
-        jwtSecret: 't110-deploy-jwt-secret-aaaaaaaaaaaaaaaaaaaaa',
+const dirs = [];
+const children = [];
+const proxies = [];
+
+function writeConfig(dir, port, trustProxy) {
+  const path = join(dir, 'config.json');
+  writeFileSync(
+    path,
+    JSON.stringify(
+      {
+        schemaVersion: 1,
+        port,
+        controlPort: port + 2,
+        host: '127.0.0.1',
+        controlHost: '127.0.0.1',
+        dataDir: join(dir, 'store'),
+        rulesDir: 'rules',
+        defaultPlatformRule: 'sillytavern',
+        defaultPreset: 'default',
+        maxUploadBytes: 33554432,
+        // info：B⓪ 要验启动日志是否写明了信任表（warn 级别下 info 行不会输出）
+        logLevel: 'info',
+        // 反代终止 TLS 的形态：业务侧明文，但只在回环上
+        tls: { mode: 'off', httpsPort: port + 1000, certPath: '', keyPath: '' },
+        trustProxy,
+        auth: {
+          token: TOKEN,
+          require: true,
+          publicPaths: ['/api/health'],
+          // 限速用例需要一个"密码正确"的对照组账户，所以这一份配置开放注册。
+          // 这是测试实例，不是生产推荐（生产用 admin-only，见 docs/33 §2.3）。
+          registerMode: 'open',
+          jwtSecret: 't110-deploy-jwt-secret-aaaaaaaaaaaaaaaaaaaaa',
+        },
+        service: { mode: 'process', name: 'T110D', displayName: 'T110D', autoStart: false },
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       },
-      // 反代终止 TLS 的形态：业务侧就是明文，但只在回环上 —— 明文不出主机
-      tls: { mode: 'off', httpsPort: port + 1000, certPath: '', keyPath: '' },
-      service: { mode: 'process', name: 'T110D', displayName: 'T110D', autoStart: false },
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    },
-    null,
-    2,
-  ),
-);
-
-const child = spawn(process.execPath, ['server/dist/index.js', 'worker', '--config', join(work, 'config.json')], {
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
-child.stderr.on('data', (d) => {
-  const text = String(d);
-  if (!/ExperimentalWarning|DeprecationWarning/.test(text)) process.stderr.write(`[srv] ${text}`);
-});
-
-/** 极简反代：行为对齐 Caddy/nginx 的默认——补 X-Forwarded-For，保留原有头 */
-const proxy = createServer((req, res) => {
-  const headers = { ...req.headers };
-  const remote = req.socket.remoteAddress ?? 'unknown';
-  headers['x-forwarded-for'] = headers['x-forwarded-for'] ? `${headers['x-forwarded-for']}, ${remote}` : remote;
-  headers['x-forwarded-host'] = headers['host'] ?? '';
-  const upstream = httpRequest(
-    { host: '127.0.0.1', port, path: req.url, method: req.method, headers },
-    (upstreamRes) => {
-      res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
-      upstreamRes.pipe(res);
-    },
+      null,
+      2,
+    ),
   );
-  upstream.on('error', () => {
-    res.writeHead(502);
-    res.end('bad gateway');
-  });
-  req.pipe(upstream);
-});
+  return path;
+}
 
-async function get(url, headers = {}) {
-  const res = await fetch(url, { headers });
+function startWorker(configPath) {
+  const child = spawn(process.execPath, ['server/dist/index.js', 'worker', '--config', configPath], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const logs = { out: '', err: '' };
+  child.stdout.on('data', (d) => (logs.out += String(d)));
+  child.stderr.on('data', (d) => {
+    logs.err += String(d);
+    const text = String(d);
+    if (!/ExperimentalWarning|DeprecationWarning/.test(text)) process.stderr.write(`[srv] ${text}`);
+  });
+  children.push(child);
+  return { child, logs };
+}
+
+/**
+ * 反向代理：**追加** X-Forwarded-For（不是覆盖）。
+ *
+ * 这一点是刻意的 —— 真实代理（Caddy/nginx）都是"在已有头后面追加自己看到的对端"，
+ * 所以客户端伪造的左侧条目会被保留。我们要验证的正是"服务端从右往左取"，
+ * 用覆盖式的假代理就测不到这条。
+ */
+function startProxy(upstreamPort, appendAddress) {
+  const server = createServer((req, res) => {
+    const headers = { ...req.headers };
+    const existing = headers['x-forwarded-for'];
+    headers['x-forwarded-for'] = existing ? `${existing}, ${appendAddress}` : appendAddress;
+    headers['x-forwarded-host'] = headers['host'] ?? '';
+    const upstream = httpRequest(
+      { host: '127.0.0.1', port: upstreamPort, path: req.url, method: req.method, headers },
+      (upstreamRes) => {
+        res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+        upstreamRes.pipe(res);
+      },
+    );
+    upstream.on('error', () => {
+      res.writeHead(502);
+      res.end('bad gateway');
+    });
+    req.pipe(upstream);
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      proxies.push(server);
+      resolve({ server, port: typeof address === 'object' && address !== null ? address.port : 0 });
+    });
+  });
+}
+
+async function get(url, headers = {}, method = 'GET', body) {
+  const init = { method, headers: { ...headers } };
+  if (body !== undefined) {
+    init.body = JSON.stringify(body);
+    init.headers['Content-Type'] = 'application/json';
+  }
+  const res = await fetch(url, init);
   const text = await res.text();
-  return { status: res.status, text };
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = null;
+  }
+  return { status: res.status, json, text };
+}
+
+async function waitReady(port, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if ((await fetch(`http://127.0.0.1:${String(port)}/api/health`)).ok) return true;
+    } catch {
+      /* 还没起 */
+    }
+    await delay(150);
+  }
+  return false;
 }
 
 function lanAddress() {
@@ -112,98 +172,266 @@ function lanAddress() {
 }
 
 try {
-  let up = false;
-  for (let i = 0; i < 160; i += 1) {
-    try {
-      if ((await fetch(`http://127.0.0.1:${String(port)}/api/health`)).ok) {
-        up = true;
-        break;
-      }
-    } catch {
-      /* 还没起 */
+  // ── 实例 A：trustProxy 空（默认安全姿态）────────────────────
+  {
+    const dir = mkdtempSync(join(tmpdir(), 'tcs-t110-a-'));
+    dirs.push(dir);
+    const port = BASE_PORT;
+    const worker = startWorker(writeConfig(dir, port, []));
+    const ready = await waitReady(port);
+    check('实例 A（trustProxy=[]）就绪', ready, `port=${String(port)}`);
+    if (!ready) throw new Error('实例 A 没起来，后续断言无意义');
+
+    const direct = await get(`http://127.0.0.1:${String(port)}/api/token`);
+    check('A① 本机直连取令牌 → 200（客户端一键连接仍可用）', direct.status === 200, `status=${String(direct.status)}`);
+    check('A① 返回的确实是令牌', direct.text.includes(TOKEN));
+
+    // ① 回归：这就是修复前泄漏的那个场景
+    const proxyA = await startProxy(port, '203.0.113.9');
+    const viaProxy = await get(`http://127.0.0.1:${String(proxyA.port)}/api/token`);
+    check(
+      'A② 回归：同机反代 + trustProxy 空 → 403（修复前的洞）',
+      viaProxy.status === 403,
+      `status=${String(viaProxy.status)}`,
+    );
+    check('A② 403 不含令牌原文（不能"拒绝但顺手回显"）', !viaProxy.text.includes(TOKEN));
+    check(
+      'A② 拒绝原因点名"未登记在 trustProxy"（给出可执行的修法）',
+      /未登记在 trustProxy/.test(viaProxy.text),
+      viaProxy.json?.error?.message?.slice(0, 80) ?? '',
+    );
+
+    // 直连但自己伪造代理头：同样拒绝（判据是"有代理跳"，不看值）
+    for (const [name, header] of [
+      ['X-Forwarded-For', { 'X-Forwarded-For': '127.0.0.1' }],
+      ['X-Real-IP', { 'X-Real-IP': '127.0.0.1' }],
+      ['Forwarded', { Forwarded: 'for=127.0.0.1' }],
+    ]) {
+      const forged = await get(`http://127.0.0.1:${String(port)}/api/token`, header);
+      check(`A③ 直连伪造 ${name} → 403`, forged.status === 403, `status=${String(forged.status)}`);
     }
-    await delay(150);
-  }
-  check('服务端就绪（tls.mode=off，只监听回环）', up, `port=${String(port)}`);
-  if (!up) throw new Error('服务端没起来');
 
-  await new Promise((resolve) => proxy.listen(proxyPort, '127.0.0.1', resolve));
-  check('反代已起（模拟同机 Caddy/nginx）', true, `proxyPort=${String(proxyPort)}`);
+    // 反代下其它接口不受影响
+    const healthViaProxy = await get(`http://127.0.0.1:${String(proxyA.port)}/api/health`);
+    check('A④ 经反代访问 /api/health → 200（没把整个服务误伤）', healthViaProxy.status === 200,
+      `status=${String(healthViaProxy.status)}`);
+    const statsNoAuth = await get(`http://127.0.0.1:${String(proxyA.port)}/api/stats`);
+    check('A④ 经反代无令牌仍 401', statsNoAuth.status === 401, `status=${String(statsNoAuth.status)}`);
 
-  // ── ① 直连取令牌：客户端一键连接必须还能用 ────────────────
-  const direct = await get(`http://127.0.0.1:${String(port)}/api/token`);
-  check('① 直连 127.0.0.1 取令牌 → 200', direct.status === 200, `status=${String(direct.status)}`);
-  check('① 直连返回的确实是令牌', direct.text.includes(TOKEN), `${String(direct.text.length)} 字节`);
-
-  // ── ② 经反代取令牌 → 403，且绝不能夹带令牌 ─────────────────
-  const viaProxy = await get(`http://127.0.0.1:${String(proxyPort)}/api/token`);
-  check('② 经反代取令牌 → 403', viaProxy.status === 403, `status=${String(viaProxy.status)}`);
-  check(
-    '② 403 响应里不含令牌原文（不能"拒绝但顺手回显"）',
-    !viaProxy.text.includes(TOKEN),
-    viaProxy.text.replace(/\s+/g, ' ').slice(0, 120),
-  );
-  check(
-    '② 报错点明了被拒原因（反代头）',
-    /反向代理|x-forwarded-for|x-forwarded-host/i.test(viaProxy.text),
-    '',
-  );
-
-  // ── ③ 反代访问普通接口不受影响（没有误伤）─────────────────
-  const healthViaProxy = await get(`http://127.0.0.1:${String(proxyPort)}/api/health`);
-  check('③ 经反代访问 /api/health → 200', healthViaProxy.status === 200, `status=${String(healthViaProxy.status)}`);
-  const statsViaProxy = await get(`http://127.0.0.1:${String(proxyPort)}/api/stats`, {
-    Authorization: `Bearer ${TOKEN}`,
-  });
-  check('③ 经反代带令牌访问 /api/stats → 200', statsViaProxy.status === 200, `status=${String(statsViaProxy.status)}`);
-  const statsNoAuth = await get(`http://127.0.0.1:${String(proxyPort)}/api/stats`);
-  check('③ 经反代无令牌仍 401（鉴权没被反代影响）', statsNoAuth.status === 401, `status=${String(statsNoAuth.status)}`);
-
-  // ── ④ 直连但手工伪造代理头 → 同样拒绝 ──────────────────────
-  //
-  // 这条防的是"知道漏洞后自己写个头"与"本机装了带 XFF 的本地代理"两种情况。
-  // 判据只有"有没有代理跳"，不看头的值 —— 所以伪造与否都一样被拒。
-  for (const [name, header] of [
-    ['X-Forwarded-For', { 'X-Forwarded-For': '203.0.113.9' }],
-    ['X-Real-IP', { 'X-Real-IP': '203.0.113.9' }],
-    ['Forwarded', { Forwarded: 'for=203.0.113.9' }],
-  ]) {
-    const res = await get(`http://127.0.0.1:${String(port)}/api/token`, header);
-    check(`④ 直连伪造 ${name} → 403`, res.status === 403, `status=${String(res.status)}`);
+    // 只监听回环：网卡 IP 不可达
+    const lan = lanAddress();
+    if (lan !== null) {
+      let reachable = false;
+      try {
+        reachable = (await get(`http://${lan}:${String(port)}/api/health`)).status === 200;
+      } catch {
+        reachable = false;
+      }
+      check('A⑤ host=127.0.0.1 时用网卡 IP 不可达', !reachable, `lan=${lan}`);
+    }
   }
 
-  // ── ⑤ 非回环来源直连 → 403（原有门禁没被放松）──────────────
-  const lan = lanAddress();
-  if (lan === null) {
-    console.log('· 跳过 ⑤：本机没有非回环 IPv4 地址');
-  } else {
-    // 服务端只监听 127.0.0.1，用网卡 IP 连会失败（这正是推荐配置的效果）。
-    // 这里要证的是"即便有人把 host 改成 0.0.0.0，非回环来源也拿不到令牌"，
-    // 所以只看连接结果：连不上 = 结构上已经不可达，同样满足要求。
-    let reachable = false;
-    try {
-      const res = await get(`http://${lan}:${String(port)}/api/health`);
-      reachable = res.status === 200;
-    } catch {
-      reachable = false;
+  // ── 实例 B：trustProxy 用 CIDR 形式登记本机 ────────────────
+  {
+    const dir = mkdtempSync(join(tmpdir(), 'tcs-t110-b-'));
+    dirs.push(dir);
+    const port = BASE_PORT + 10;
+    const worker = startWorker(writeConfig(dir, port, ['127.0.0.0/8', '::1/128']));
+    const ready = await waitReady(port);
+    check('实例 B（trustProxy=["127.0.0.0/8","::1/128"]）就绪', ready, `port=${String(port)}`);
+    if (!ready) throw new Error('实例 B 没起来');
+
+    // 日志要打印信任表，运维不必翻配置
+    check(
+      'B⓪ 启动日志写明信任表',
+      /127\.0\.0\.0\/8/.test(worker.logs.out) && /trustProxy/.test(worker.logs.out),
+      '',
+    );
+
+    const publicProxy = await startProxy(port, '203.0.113.9');
+    const publicPeek = await get(`http://127.0.0.1:${String(publicProxy.port)}/api/token`);
+    check(
+      'B① 已登记代理 + 公网真实 IP → 403（真实来源不是回环）',
+      publicPeek.status === 403,
+      `status=${String(publicPeek.status)}`,
+    );
+    check(
+      'B① 报错里给出有效地址（诊断不必再猜）',
+      publicPeek.json?.error?.details?.effectiveAddress === '203.0.113.9',
+      JSON.stringify(publicPeek.json?.error?.details ?? {}),
+    );
+
+    const loopProxy = await startProxy(port, '127.0.0.1');
+    const loopPeek = await get(`http://127.0.0.1:${String(loopProxy.port)}/api/token`);
+    check(
+      'B② 已登记代理 + 回环真实 IP（本机经反代）→ 200',
+      loopPeek.status === 200,
+      `status=${String(loopPeek.status)}`,
+    );
+
+    // ③ XFF 伪造：客户端自带一段，反代在右边追加真实来源
+    const forgeProxy = await startProxy(port, '203.0.113.9');
+    const forged = await get(`http://127.0.0.1:${String(forgeProxy.port)}/api/token`, {
+      // 伪造"我是本机"，希望门禁放行
+      'X-Forwarded-For': '127.0.0.1',
+    });
+    check(
+      'B③ 客户端伪造 XFF=127.0.0.1 + 反代追加真实 IP → 仍 403（取最右侧非信任条目）',
+      forged.status === 403,
+      `status=${String(forged.status)}`,
+    );
+    check(
+      'B③ 有效地址是反代追加的那一段，不是客户端伪造的那一段',
+      forged.json?.error?.details?.effectiveAddress === '203.0.113.9',
+      `effective=${String(forged.json?.error?.details?.effectiveAddress)}`,
+    );
+
+    // 链里塞垃圾 → fail-closed
+    const junkProxy = await startProxy(port, 'not-an-ip');
+    const junk = await get(`http://127.0.0.1:${String(junkProxy.port)}/api/token`);
+    check(
+      'B④ XFF 链含无法解析条目 → 403（fail-closed）',
+      junk.status === 403 && /无法解析/.test(junk.text),
+      `status=${String(junk.status)}`,
+    );
+
+    // 面板/统计用的代理状态
+    const stats = await get(`http://127.0.0.1:${String(port)}/api/stats`, { Authorization: `Bearer ${TOKEN}` });
+    // 注意 `::1/128` 会被规范化成 `::1`（单主机前缀不写出来，与 `127.0.0.1` 形态一致）。
+    // 这不是丢信息：两者语义相同，规范化换来的是"不会因为写法不同而存成两条规则"。
+    check(
+      'B⑤ /api/stats 下发 proxy.entries 与规范化后的规则',
+      stats.json?.proxy?.entries === 2 && JSON.stringify(stats.json?.proxy?.rules) === '["127.0.0.0/8","::1"]',
+      JSON.stringify(stats.json?.proxy ?? {}),
+    );
+    check(
+      'B⑤ /api/stats 的 trustedProxies 记录了真正生效的对端（127.0.0.1）',
+      (stats.json?.proxy?.trustedProxies ?? []).some((item) => item.address === '127.0.0.1' && item.hits > 0),
+      JSON.stringify(stats.json?.proxy?.trustedProxies ?? []),
+    );
+
+    // ④ 限速按有效 IP 分桶
+    //
+    // 可观测性上的一个坑：**锁定期间返回的仍是 401，不是 429**。
+    // 这是刻意的（`auth/service.ts` 的注释：返回 429 等于告诉攻击者
+    // "你成功触发了锁定"，就变成新的侧信道）。所以不能靠状态码判断是否被锁，
+    // 改用"**密码正确却仍被拒**"这个动作来观测 —— 它只在锁定态出现。
+    const alice = { username: 'alice-limit', password: 'alice-password-1' };
+    const registered = await get(`http://127.0.0.1:${String(port)}/api/auth/register`, {}, 'POST', alice);
+    check(
+      'B⑥ 准备：注册对照账户（用于"密码正确仍被拒"的观测）',
+      registered.status === 201,
+      `status=${String(registered.status)}`,
+    );
+
+    const loginVia = (proxyPort, username, password) =>
+      get(`http://127.0.0.1:${String(proxyPort)}/api/auth/login`, {}, 'POST', { username, password });
+
+    const proxyA = await startProxy(port, '198.51.100.11');
+    const proxyB = await startProxy(port, '198.51.100.22');
+
+    // 5 次失败全部走 IP-A，且用**不同的用户名** —— 否则账户维度会先被锁，
+    // 那就分不清到底是"按 IP 锁"还是"按账户锁"了。
+    const attempts = [];
+    for (let index = 0; index < 5; index += 1) {
+      attempts.push((await loginVia(proxyA.port, `ghost-${String(index)}`, 'wrong-password-xyz')).status);
     }
     check(
-      '⑤ 服务端只监听回环：用网卡 IP 访问不可达（host=127.0.0.1 的实际效果）',
-      !reachable,
-      `lan=${lan}`,
+      'B⑥ 真实 IP 198.51.100.11 连续 5 次失败 → 每次都是 401',
+      attempts.every((status) => status === 401),
+      JSON.stringify(attempts),
+    );
+
+    const lockedCorrect = await loginVia(proxyA.port, alice.username, alice.password);
+    check(
+      'B⑥ 该 IP 下用**正确密码**也登不进（401，锁定生效）',
+      lockedCorrect.status === 401,
+      `status=${String(lockedCorrect.status)}`,
+    );
+
+    // 同一反代后面的**另一个**真实 IP 不受影响 —— 这就是"按有效 IP 限速"
+    const otherOk = await loginVia(proxyB.port, alice.username, alice.password);
+    check(
+      'B⑦ 同一反代后的另一个真实 IP（198.51.100.22）用正确密码**能**登进（200）',
+      otherOk.status === 200,
+      `status=${String(otherOk.status)}`,
+    );
+    check(
+      'B⑦ 返回的是该账户自己的 access token',
+      typeof otherOk.json?.accessToken === 'string' && otherOk.json.accessToken.length > 0,
+      '',
+    );
+  }
+
+  // ── 实例 C：对照 —— trustProxy 空时两人共用一个桶 ───────────
+  //
+  // 这一组存在的意义：证明 B⑦ 不是"限速根本没生效"的假通过。
+  // 同样的两个真实 IP、同样的失败次数，只是不登记代理 → 必须一起被锁。
+  {
+    const dir = mkdtempSync(join(tmpdir(), 'tcs-t110-c-'));
+    dirs.push(dir);
+    const port = BASE_PORT + 20;
+    const worker = startWorker(writeConfig(dir, port, []));
+    const ready = await waitReady(port);
+    check('实例 C（trustProxy=[] 对照组）就绪', ready, `port=${String(port)}`);
+    if (!ready) throw new Error('实例 C 没起来');
+
+    const proxiesC = [await startProxy(port, '198.51.100.11'), await startProxy(port, '198.51.100.22')];
+    const loginC = (proxyPort, username, password) =>
+      get(`http://127.0.0.1:${String(proxyPort)}/api/auth/login`, {}, 'POST', { username, password });
+
+    const bob = { username: 'bob-limit', password: 'bob-password-1' };
+    const registeredC = await get(`http://127.0.0.1:${String(port)}/api/auth/register`, {}, 'POST', bob);
+    check('C⓪ 准备：注册对照账户', registeredC.status === 201, `status=${String(registeredC.status)}`);
+
+    // 4 次走真实 IP-A，1 次走真实 IP-B —— 但未登记信任时两者都归到 127.0.0.1
+    for (let index = 0; index < 4; index += 1) {
+      await loginC(proxiesC[0].port, `void-${String(index)}`, 'wrong-password-xyz');
+    }
+    await loginC(proxiesC[1].port, 'void-fifth', 'wrong-password-xyz');
+
+    const lockedC = await loginC(proxiesC[1].port, bob.username, bob.password);
+    check(
+      'C① 未登记信任时两个真实 IP 共用一个桶（4+1 次即锁）→ 正确密码也被拒',
+      lockedC.status === 401,
+      `status=${String(lockedC.status)}`,
+    );
+    const lockedC2 = await loginC(proxiesC[0].port, bob.username, bob.password);
+    check(
+      'C② 另一条真实 IP 也被一起锁住（这就是"限速全局化"）',
+      lockedC2.status === 401,
+      `status=${String(lockedC2.status)}`,
     );
   }
 } finally {
-  proxy.close();
-  child.kill();
-  await delay(300);
-  try {
-    rmSync(work, { recursive: true, force: true });
-  } catch {
-    /* Windows 偶发占用 */
+  for (const server of proxies) {
+    try {
+      server.close();
+    } catch {
+      /* 已关闭 */
+    }
+  }
+  for (const child of children) {
+    try {
+      child.kill();
+    } catch {
+      /* 已退出 */
+    }
+  }
+  await delay(400);
+  for (const dir of dirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* Windows 偶发占用 */
+    }
   }
 
   const failed = results.filter((item) => !item.ok);
   console.log(`\n合计 ${String(results.length)} 项，失败 ${String(failed.length)} 项`);
-  if (failed.length > 0) process.exitCode = 1;
+  if (failed.length > 0) {
+    console.log('\n失败项：');
+    for (const item of failed) console.log(`  ✘ ${item.name}${item.detail ? ' —— ' + item.detail : ''}`);
+    process.exitCode = 1;
+  }
 }

@@ -18,6 +18,7 @@ import { TokenGate } from './auth.js';
 import { scopeFromIdentity } from '../storage/card-scope.js';
 import { registerAuthRoutes } from './auth-routes.js';
 import { registerRepoRoutes } from './repo-routes.js';
+import { TrustProxyResolver, decideTokenGate } from '../net/trust-proxy.js';
 import { AuthService } from '../auth/service.js';
 import { LoginLimiter, DEFAULT_RATE_LIMIT } from '../auth/login-limit.js';
 import { SessionStore } from '../auth/sessions.js';
@@ -188,16 +189,28 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   const repoTokens = new TokenStore(ctx.db.handle);
   const authService = new AuthService({ config: ctx.config, users, sessions, limiter, repos });
 
+  /**
+   * 可信反向代理与有效客户端地址（v0.1.2 追加任务 / 需求 F1.4）。
+   *
+   * 这个 resolver 是**所有**"按来源 IP 判定"的唯一入口：`/api/token` 的门禁、
+   * 登录失败限速、TokenGate 的失败计数都走它的结果。之前各处各读
+   * `req.socket.remoteAddress`，同机反代下会一起看错人（详情见
+   * `server/src/net/trust-proxy.ts` 文件头）。
+   */
+  const proxyResolver = new TrustProxyResolver(ctx.config.trustProxy);
+
+  /** 有效客户端 IP：登记过的代理会按 X-Forwarded-For 还原真实来源 */
+  const clientIp = (context: RouteContext): string => proxyResolver.resolve(context.req).address;
+
   const gate = new TokenGate(ctx.config.auth.token, ctx.config.auth.publicPaths, ctx.config.auth.require, {
     jwtSecret: ctx.config.auth.jwtSecret,
     sessions,
     users,
     repoTokens,
     repos,
+    // 失败计数也要按有效地址：否则反代后所有人的失败都记在代理 IP 上
+    clientIp: (req) => proxyResolver.resolve(req).address,
   });
-
-  /** 客户端 IP。只信 socket 地址，不读 X-Forwarded-For（可伪造，会废掉限速） */
-  const clientIp = (context: RouteContext): string => context.req.socket.remoteAddress ?? 'unknown';
 
   const router = new Router();
 
@@ -238,42 +251,31 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
    * 取而代之的门禁是**回环来源检查**。
    */
   router.get('/api/token', (_ctx) => {
-    // 双重判断：连接来源必须是回环。
+    // 门禁分两层，缺一不可：
     //
-    // 这里刻意不读 X-Forwarded-For 的**值** —— 那个头由客户端随便写，
-    // 拿它做门禁等于没有门禁。但**头的存在**是一个可信的信号，含义完全不同：
+    //   1. **有效 IP 必须是回环** —— 令牌不得出本机。
+    //   2. **代理跳必须已登记** —— 只有 `trustProxy` 里明确写过的地址，
+    //      才允许用 X-Forwarded-For 说明"真实客户端是谁"。
     //
-    //   反向代理（Caddy / nginx）与业务同机部署时，`socket.remoteAddress` 恒为
-    //   127.0.0.1 —— 于是"只接受本机请求"这条门禁会**对所有公网请求成立**，
-    //   任何人 `curl https://公网域名/api/token` 都能拿到全权令牌（T10.10 发现）。
+    // 第 2 条是这一版的核心（需求 F1.4）。此前两版都错过：
+    //   · v0.1.2 之前只看 `socket.remoteAddress` —— 同机反代下它对所有公网请求
+    //     都是 127.0.0.1，于是任何人 curl 一下公网域名就拿到全权令牌；
+    //   · 止血版"见到代理头就拒"—— 洞堵上了，但把"反代 + 真实 IP"这条正确路径
+    //     也一起废掉：连本机经代理访问都取不到令牌，且没法按真实 IP 限速。
     //
-    // 桌面客户端走的是直连 127.0.0.1，不会带这些头；只要带了，就说明这一跳
-    // 来自代理，不是"操作者坐在那台机器前"。这里不判断代理是谁、也不信任头里的 IP，
-    // 只用"存在代理跳"这一个事实做 fail-closed 拒绝。
-    const proxiedHeaders = ['forwarded', 'x-forwarded-for', 'x-forwarded-host', 'x-real-ip'];
-    const proxied = proxiedHeaders.find((name) => _ctx.req.headers[name] !== undefined);
-    if (proxied !== undefined) {
-      throw new AppError(
-        403,
-        'TOKEN_LOCAL_ONLY',
-        `取令牌接口不接受经过反向代理的请求（检测到 ${proxied} 头）：令牌不得经由公网链路下发`,
-        {
-          hint:
-            '请在本机直接访问服务端端口取令牌，或到服务端机器上运行 `tcs-server token show`；' +
-            '远程使用时请手动复制令牌。反向代理侧的推荐配置见 docs/33。',
-        },
-      );
+    // 现在改由信任声明裁决：没登记的同机反代不再天然穿透，登记过的才放行。
+    const resolved = proxyResolver.resolve(_ctx.req);
+    const verdict = decideTokenGate(resolved);
+    if (!verdict.allowed) {
+      throw new AppError(403, 'TOKEN_LOCAL_ONLY', verdict.reason, {
+        hint: verdict.hint,
+        // 诊断字段：排查"到底是谁被当成了来源"时不必再猜
+        effectiveAddress: resolved.address,
+        socketAddress: resolved.socketAddress,
+        trustProxy: proxyResolver.isEmpty ? [] : proxyResolver.stats().rules,
+      });
     }
 
-    const remote = _ctx.req.socket.remoteAddress;
-    if (!isLoopbackAddress(remote)) {
-      throw new AppError(
-        403,
-        'TOKEN_LOCAL_ONLY',
-        '取令牌接口只接受来自本机的请求（令牌不得出本机）',
-        { hint: '请在服务端所在的这台机器上运行客户端；远程使用请手动复制令牌' },
-      );
-    }
     if (ctx.config.auth.token === '') {
       // 防御性分支：正常配置流程下**走不到这里**。
       // `normalizeConfig` 用 `generateToken()` 兜底，所以服务端永远有令牌；
@@ -334,6 +336,16 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
         kind: scope.kind,
         repoId: scope.kind === 'owner' ? scope.repoId : null,
       },
+      /**
+       * 可信反向代理的实际生效情况（需求 F1.4 第 5 条）。
+       *
+       * `entries` 是配置条目数，`trustedProxies` 是**真正匹配上并改写过身份**的
+       * 对端地址。后者才是"我的配置到底生效没有"的答案 —— 只看 entries 会在
+       * "写了但地址写错"时给出虚假的安心。
+       *
+       * 不含任何凭证信息，可以给任何已鉴权的调用方看。
+       */
+      proxy: proxyResolver.stats(),
     });
   });
 

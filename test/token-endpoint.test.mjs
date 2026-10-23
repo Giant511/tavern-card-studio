@@ -309,7 +309,12 @@ test('端到端：未启用鉴权时仍返回令牌，但标注 authRequired=fal
   const savedPort = port;
   try {
     let ready = false;
-    for (let attempt = 0; attempt < 50; attempt += 1) {
+    let lastProbe = '(从未发起请求)';
+    // 30 秒预算（150 × 200ms），与文件顶部主实例的等待同口径。
+    // 原来这里是 50 × 200ms = 10 秒：并行跑全量时会话要同时起多个 serve + worker，
+    // 实测顶穿过（2026-10-23，全量 732 项里只有这一条红，单独跑全绿）。
+    // 这条用例要证的是"未启用鉴权时的行为"，不是"启动够不够快"。
+    for (let attempt = 0; attempt < 150; attempt += 1) {
       await delay(200);
       try {
         const res = await new Promise((resolve, reject) => {
@@ -323,15 +328,17 @@ test('端到端：未启用鉴权时仍返回令牌，但标注 authRequired=fal
           req.on('error', reject);
           req.end();
         });
+        lastProbe = `第 ${attempt + 1} 次：HTTP ${res}`;
         if (res === 200) {
           ready = true;
           break;
         }
-      } catch {
-        // 还没起来
+      } catch (error) {
+        // 还没起来 —— 但要记下是"连接被拒"还是别的（两种故障长得一样，不能都写"没起来"）
+        lastProbe = `第 ${attempt + 1} 次：${error?.code ?? error?.message ?? String(error)}`;
       }
     }
-    assert.ok(ready, `未启用鉴权的实例未就绪。日志：\n${noAuthLogs}`);
+    assert.ok(ready, `未启用鉴权的实例未就绪（最后一次探测 ${lastProbe}）。日志：\n${noAuthLogs}`);
 
     port = authPort;
     const res = await get('/api/token');
