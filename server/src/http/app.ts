@@ -16,10 +16,12 @@ import { API_VERSION, SERVER_VERSION, configSummary, type ServerContext } from '
 import { readRawBody, parseJsonBody } from './body.js';
 import { TokenGate } from './auth.js';
 import { registerAuthRoutes } from './auth-routes.js';
+import { registerRepoRoutes } from './repo-routes.js';
 import { AuthService } from '../auth/service.js';
 import { LoginLimiter, DEFAULT_RATE_LIMIT } from '../auth/login-limit.js';
 import { SessionStore } from '../auth/sessions.js';
 import { UserStore } from '../storage/users.js';
+import { RepoStore, TokenStore, checkTokenScope, type Operation } from '../storage/repos.js';
 import { COMMON_HEADERS, methodNotAllowed, sendError, sendJson, sendRaw } from './responses.js';
 import { Router, type RouteContext } from './router.js';
 
@@ -147,18 +149,50 @@ function rawHeaders(ctx: RouteContext, sha256: string, size: number, filename: s
   };
 }
 
+/**
+ * 逐请求的权限校验（T10.6）。
+ *
+ * **每次请求都调用它**，不缓存判定结果 —— 这是需求"权限校验在服务端逐请求执行
+ * （不只在签发时）"的落地。改小令牌范围后，下一个请求就按新范围判。
+ *
+ * `operation` 的口径由 `requiredScope()` 单一来源决定（delete → write）。
+ */
+function assertPermission(gate: TokenGate, routeCtx: RouteContext, operation: Operation): void {
+  const identity = gate.identify(routeCtx.req);
+  // 没有身份时交给 TokenGate.check 已经拦过了（这里只处理"有身份但权限不够"）
+  if (!identity) return;
+  if (identity.via !== 'repo-token') return; // jwt / legacy 不受 scopes 限制
+
+  const bound = identity.repoToken;
+  if (!bound) return;
+  // 身份解析时已经验证过吊销与过期，这里只需要判范围
+  const result = checkTokenScope({ scopes: bound.scopes.join(',') }, operation);
+  if (!result.allowed) {
+    throw new AppError(403, 'FORBIDDEN', `${result.reason}：无法执行 ${operation} 操作`, {
+      requiredScope: result.missing,
+      tokenScopes: bound.scopes,
+    });
+  }
+}
+
 export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, res: ServerResponse) => void {
   // 账户体系（T10.4）。Session/User 仓储与限速器都建在同一份 SQLite 句柄上，
   // 所以吊销状态与失败计数天然跟着库走（重启不丢）。
   const users = new UserStore(ctx.db.handle);
   const sessions = new SessionStore(ctx.db.handle);
   const limiter = new LoginLimiter(ctx.db.handle, DEFAULT_RATE_LIMIT);
-  const authService = new AuthService({ config: ctx.config, users, sessions, limiter });
+  // 仓库与仓库令牌（T10.6）。必须在 authService 之前建好：
+  // 注册时要顺手给新账户建默认仓库。
+  const repos = new RepoStore(ctx.db.handle);
+  const repoTokens = new TokenStore(ctx.db.handle);
+  const authService = new AuthService({ config: ctx.config, users, sessions, limiter, repos });
 
   const gate = new TokenGate(ctx.config.auth.token, ctx.config.auth.publicPaths, ctx.config.auth.require, {
     jwtSecret: ctx.config.auth.jwtSecret,
     sessions,
     users,
+    repoTokens,
+    repos,
   });
 
   /** 客户端 IP。只信 socket 地址，不读 X-Forwarded-For（可伪造，会废掉限速） */
@@ -170,6 +204,12 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     auth: authService,
     identify: (context) => gate.identify(context.req),
     clientIp,
+  });
+
+  registerRepoRoutes(router, {
+    repos,
+    tokens: repoTokens,
+    identify: (context) => gate.identify(context.req),
   });
 
   router.get('/api/health', (_ctx) => {
@@ -279,6 +319,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   // ── T5.1 CRUD ────────────────────────────────────────────────
 
   router.get('/api/cards', (_ctx) => {
+    assertPermission(gate, _ctx, 'read');
     const limit = queryInt(_ctx.query, 'limit', 50, 1, 500);
     const offset = queryInt(_ctx.query, 'offset', 0, 0, Number.MAX_SAFE_INTEGER);
     const result = ctx.cards.list({
@@ -304,11 +345,36 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
    * 内容不能因为"可能有冲突"就丢掉，但用户必须知道。
    */
   router.post('/api/cards', async (_ctx) => {
+    assertPermission(gate, _ctx, 'write');
     const bytes = requireCardBody(_ctx);
     const cardId = resolveUploadCardId(_ctx);
+
+    // 归属解析（T10.6）：
+    //   · 仓库令牌 → 固定绑到它自己的仓库，忽略 query（不能越界写到别的仓库）
+    //   · 账户登录 → query 里的 repo 或该账户的默认仓库
+    //   · legacy 全局 token → 无归属（空串），由运维用 user adopt 处理
+    const identity = gate.identify(_ctx.req);
+    let ownerId: string | null = identity?.userId ?? null;
+    let repoId: string | null = null;
+    if (identity?.via === 'repo-token' && identity.repoToken) {
+      repoId = identity.repoToken.repoId;
+      ownerId = identity.userId;
+    } else if (ownerId) {
+      const requested = optional(_ctx.query, 'repo');
+      const repo = requested
+        ? repos.findByOwnerAndName(ownerId, requested)
+        : repos.ensureDefault(ownerId);
+      if (!repo) {
+        throw new AppError(404, 'NOT_FOUND', `仓库「${requested ?? ''}」不存在`);
+      }
+      repoId = repo.id;
+    }
+
     const result = await ctx.cards.upload(cardId, bytes, {
       ...writeOptionsFrom(_ctx.query, ctx),
       baseSeq: parseBaseSeq(_ctx.query),
+      ownerId,
+      repoId,
     });
     sendJson(_ctx.res, result.created ? 201 : 200, result, {
       Location: `/api/cards/${encodeURIComponent(result.cardId)}`,
@@ -319,16 +385,19 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   });
 
   router.get('/api/cards/:id', (_ctx) => {
+    assertPermission(gate, _ctx, 'read');
     const card = ctx.cards.get(_ctx.params['id']!, { includeDeleted: queryBool(_ctx.query, 'includeDeleted') });
     sendJson(_ctx.res, 200, card);
   });
 
   router.delete('/api/cards/:id', async (_ctx) => {
+    assertPermission(gate, _ctx, 'delete');
     const result = await ctx.cards.delete(_ctx.params['id']!, { hard: queryBool(_ctx.query, 'hard') });
     sendJson(_ctx.res, 200, { deleted: true, ...result });
   });
 
   router.get('/api/cards/:id/raw', (_ctx) => {
+    assertPermission(gate, _ctx, 'read');
     const { bytes, version } = ctx.cards.readBytes(_ctx.params['id']!, optional(_ctx.query, 'version') ?? optional(_ctx.query, 'rev'));
     sendRaw(
       _ctx.res,
@@ -341,6 +410,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   // ── T5.2 版本 ────────────────────────────────────────────────
 
   router.get('/api/cards/:id/versions', (_ctx) => {
+    assertPermission(gate, _ctx, 'read');
     const limit = queryInt(_ctx.query, 'limit', 50, 1, 500);
     const offset = queryInt(_ctx.query, 'offset', 0, 0, Number.MAX_SAFE_INTEGER);
     const result = ctx.cards.listVersions(_ctx.params['id']!, { limit, offset });
@@ -348,6 +418,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   });
 
   router.post('/api/cards/:id/versions', async (_ctx) => {
+    assertPermission(gate, _ctx, 'write');
     const bytes = requireCardBody(_ctx);
     const version = await ctx.cards.addVersion(_ctx.params['id']!, bytes, writeOptionsFrom(_ctx.query, ctx));
     sendJson(_ctx.res, 201, version, {
@@ -356,11 +427,13 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   });
 
   router.get('/api/cards/:id/versions/:rev', (_ctx) => {
+    assertPermission(gate, _ctx, 'read');
     const version = ctx.cards.resolveVersion(_ctx.params['id']!, _ctx.params['rev']);
     sendJson(_ctx.res, 200, ctx.cards.versionDto(version));
   });
 
   router.get('/api/cards/:id/versions/:rev/raw', (_ctx) => {
+    assertPermission(gate, _ctx, 'read');
     const { bytes, version } = ctx.cards.readBytes(_ctx.params['id']!, _ctx.params['rev']);
     sendRaw(
       _ctx.res,
@@ -371,6 +444,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   });
 
   router.get('/api/cards/:id/diff', (_ctx) => {
+    assertPermission(gate, _ctx, 'read');
     const toRev = optional(_ctx.query, 'to') ?? 'latest';
     const to = ctx.cards.resolveVersion(_ctx.params['id']!, toRev);
     const fromRev = optional(_ctx.query, 'from') ?? String(Math.max(1, to.seq - 1));
@@ -390,6 +464,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   });
 
   router.post('/api/cards/:id/rollback', async (_ctx) => {
+    assertPermission(gate, _ctx, 'rollback');
     const meta = parseJsonBody<{ to?: string | number; message?: string; author?: string }>(_ctx.body, {});
     const to = String(meta.to ?? optional(_ctx.query, 'to') ?? '');
     if (to === '') throw new AppError(400, 'BAD_REQUEST', '缺少回滚目标：body.to 或 ?to=（版本序号 / 提交 sha）');
@@ -420,6 +495,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   });
 
   router.get('/api/cards/:id/audit', (_ctx) => {
+    assertPermission(gate, _ctx, 'read');
     const version = optional(_ctx.query, 'version') ?? optional(_ctx.query, 'rev');
     if (queryBool(_ctx.query, 'refresh')) {
       const result = ctx.cards.recomputeAudit(_ctx.params['id']!, version, {

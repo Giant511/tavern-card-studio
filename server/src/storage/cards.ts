@@ -29,6 +29,15 @@ export interface WriteOptions {
   presetId?: string | null;
   includeStDefaults?: boolean;
   filename?: string;
+  /**
+   * 归属账户与仓库（T10.6）。
+   *
+   * 为什么放在 WriteOptions 而不是单独的参数：新建卡片时要同时写进 `cards` 行，
+   * 与 message/author 属同一类"这次写入的上下文"。缺省（legacy 全局 token 上传）
+   * 时留空 —— 那种情况下卡片没有账户归属，由运维用 `user adopt` 处理。
+   */
+  ownerId?: string | null;
+  repoId?: string | null;
 }
 
 export interface CardSummaryDto {
@@ -535,6 +544,10 @@ export class CardService {
     const cardRow: CardRow = {
       id: cardId,
       id_source: idSource,
+      // 归属：上传者账户 + 其仓库（T10.6）。缺省为空串 = 未归属，
+      // 由 `user adopt` / 仓库迁移处理，不在这里编一个假 id。
+      owner_id: options.ownerId ?? '',
+      repo_id: options.repoId ?? '',
       name: version.name,
       spec: version.analyzed.spec,
       spec_version: version.analyzed.specVersion,

@@ -24,6 +24,7 @@ import { hashPassword, needsRehash, verifyPassword, verifyPasswordDummy, CREDENT
 import { SessionStore } from './sessions.js';
 import { signJwt } from './jwt.js';
 import { UserStore, assertUsernameShape, normalizeUsername, type UserRow } from '../storage/users.js';
+import type { RepoStore } from '../storage/repos.js';
 
 /** access token 有效期：2 小时（需求 F1.2 硬约束） */
 export const ACCESS_TOKEN_TTL_SECONDS = 2 * 60 * 60;
@@ -68,6 +69,14 @@ export interface AuthServiceOptions {
   users: UserStore;
   sessions: SessionStore;
   limiter: LoginLimiter;
+  /**
+   * 仓库（T10.6）。给了就在注册成功后自动建默认仓库。
+   *
+   * 为什么在注册时建而不是"上传时才懒建"：用户登录后第一件事往往是看仓库列表，
+   * 一个空列表会让人以为"这个功能没做好"。懒建还会让"默认仓库"的存在取决于
+   * 是否上传过卡片，语义上很奇怪 —— 默认仓库应当与账户同时诞生。
+   */
+  repos?: RepoStore;
   /** 注入时钟，便于测试过期/锁定 */
   now?: () => Date;
 }
@@ -78,6 +87,7 @@ export class AuthService {
   private readonly limiter: LoginLimiter;
   private readonly config: ServerConfigFile;
   private readonly now: () => Date;
+  private readonly repos: RepoStore | null;
 
   constructor(options: AuthServiceOptions) {
     this.users = options.users;
@@ -85,6 +95,7 @@ export class AuthService {
     this.limiter = options.limiter;
     this.config = options.config;
     this.now = options.now ?? (() => new Date());
+    this.repos = options.repos ?? null;
   }
 
   private get jwtSecret(): string {
@@ -234,6 +245,13 @@ export class AuthService {
         passwordHash,
         role: this.users.count() === 0 ? 'admin' : 'user',
       });
+      // 默认仓库与账户同时诞生（T10.6）。失败不该阻断注册 ——
+      // 仓库可以在第一次上传时由 `ensureDefault` 补上，而账户建不回来。
+      try {
+        this.repos?.ensureDefault(user.id, this.now().toISOString());
+      } catch {
+        /* 尽力而为，见上 */
+      }
       if (mode === 'admin-only') {
         // 管理员替别人建号：不自动登录成对方（拿到别人的会话是越权）
         return {

@@ -21,6 +21,7 @@ import { dirname } from 'node:path';
 import type Database from 'better-sqlite3';
 
 import { hashPassword } from '../auth/password.js';
+import { RepoStore } from '../storage/repos.js';
 import {
   adoptOrphanCards,
   countOrphanCards,
@@ -44,10 +45,56 @@ export interface MigrationResult {
   adoptedCards: number;
   /** 备份文件绝对路径；未迁移时为 null */
   backupPath: string | null;
+  /** 仓库迁移结果（T10.6）：建了几个默认仓库、多少卡片被划进仓库 */
+  repos: { created: number; cardsAssigned: number };
   message: string;
 }
 
-/** 探测是否需要迁移 —— **只读**，不改任何数据（启动时先跑它，用于打印计划） */
+/**
+ * 仓库迁移（T10.6）：给每个账户补默认仓库，并把无仓库归属的卡片划进去。
+ *
+ * 幂等且**可以单独跑**（不依赖账户迁移是否刚发生）：
+ *   · v0.1.2 升级上来的库既有账户、又有 repo_id 为空的卡片；
+ *   · 迁移只需要"每个账户有个默认仓库 + 卡片都落进去"这两件事成立。
+ *
+ * **必须在账户迁移之后调用**：没有账户就没有"给谁建仓库"。
+ */
+export function migrateRepos(handle: Database.Database, now = new Date().toISOString()): {
+  created: number;
+  cardsAssigned: number;
+} {
+  const users = new UserStore(handle);
+  const repos = new RepoStore(handle);
+  let created = 0;
+  let cardsAssigned = 0;
+
+  for (const user of users.list()) {
+    // 已经有默认仓库就不重复建（幂等）；没有则建一个
+    if (!repos.findDefault(user.id)) {
+      repos.ensureDefault(user.id, now);
+      created += 1;
+    }
+    const repo = repos.findDefault(user.id);
+    if (!repo) continue;
+
+    // 把该账户下"没有仓库归属"的卡片划进默认仓库。
+    // 不动 updated_at：归属变更不是内容变更（会让卡片列表按"最近更新"乱跳）。
+    const result = handle
+      .prepare("UPDATE cards SET repo_id = ? WHERE owner_id = ? AND (repo_id IS NULL OR repo_id = '')")
+      .run(repo.id, user.id);
+    cardsAssigned += result.changes;
+  }
+
+  return { created, cardsAssigned };
+}
+
+/** 统计还没有仓库归属的卡片（自检信号：正常应恒为 0） */
+export function countCardsWithoutRepo(handle: Database.Database): number {
+  const row = handle.prepare("SELECT COUNT(*) AS n FROM cards WHERE repo_id IS NULL OR repo_id = ''").get() as {
+    n: number;
+  };
+  return row.n;
+}
 export function planMigration(handle: Database.Database): MigrationPlan {
   const users = new UserStore(handle);
   const hasUsers = users.count() > 0;
@@ -121,14 +168,19 @@ export async function migrateToFirstAccount(
   const plan = planMigration(handle);
   if (!plan.needed) {
     const first = users.list()[0] ?? null;
+    // 已有账户时仍然要跑仓库迁移：v0.1.2 升级上来的库既有账户、
+    // 又有 repo_id 为空的卡片（T10.3 建了 owner_id 但那时还没有仓库概念）
+    const repoResult = migrateRepos(handle, now.toISOString());
     return {
       migrated: false,
       user: first,
       adoptedCards: 0,
       backupPath: null,
-      message: plan.orphanCards === 0
-        ? `已有 ${users.count()} 个账户，无需迁移`
-        : `已有 ${users.count()} 个账户，但仍有 ${plan.orphanCards} 张卡片没有归属（请检查上传路径是否漏写 owner_id）`,
+      repos: repoResult,
+      message:
+        repoResult.created === 0 && repoResult.cardsAssigned === 0
+          ? `已有 ${users.count()} 个账户，无需迁移`
+          : `已有 ${users.count()} 个账户；仓库迁移：新建 ${repoResult.created} 个默认仓库、${repoResult.cardsAssigned} 张卡片划入仓库`,
     };
   }
 
@@ -138,9 +190,9 @@ export async function migrateToFirstAccount(
   // 备份失败 -> 直接抛错，不继续。宁可迁移不做，也不能在没有备份的情况下动唯一数据
   const backupPath = backupDatabase(handle, options.dbFile, now);
 
-  // 建账户 + 接管卡片放在同一个事务里：中途失败要整体回滚，
-  // 否则会留下"账户建好了、卡片还没归属"的半迁移状态
-  const runMigration = handle.transaction((): { user: UserRow; adopted: number } => {
+  // 建账户 + 接管卡片 + 建默认仓库 + 卡片入库，全在同一个事务里：
+  // 中途失败要整体回滚，否则会留下"账户建好了、卡片还没归属/没进仓库"的半迁移状态
+  const runMigration = handle.transaction((): { user: UserRow; adopted: number; repos: { created: number; cardsAssigned: number } } => {
     const user = users.create({
       username: options.username,
       passwordHash,
@@ -149,16 +201,21 @@ export async function migrateToFirstAccount(
       now: now.toISOString(),
     });
     const adopted = adoptOrphanCards(handle, user.id);
-    return { user, adopted };
+    const repoResult = migrateRepos(handle, now.toISOString());
+    return { user, adopted, repos: repoResult };
   });
 
-  const { user, adopted } = runMigration();
+  const { user, adopted, repos: repoResult } = runMigration();
 
   return {
     migrated: true,
     user,
     adoptedCards: adopted,
     backupPath,
-    message: `已创建首账户「${user.username}」（管理员），接管 ${adopted} 张历史卡片；原库已备份到 ${backupPath}`,
+    repos: repoResult,
+    message:
+      `已创建首账户「${user.username}」（管理员），接管 ${String(adopted)} 张历史卡片；` +
+      `仓库：新建 ${String(repoResult.created)} 个默认仓库、${String(repoResult.cardsAssigned)} 张卡片入库；` +
+      `原库已备份到 ${backupPath}`,
   };
 }
