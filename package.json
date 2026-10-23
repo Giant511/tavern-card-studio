@@ -44,7 +44,9 @@
     "verify:highlight-live": "node scripts/verify-highlight-live.mjs",
     "diagnose:rules": "node scripts/diagnose-rules.mjs",
     "compare:highlight": "node scripts/compare-highlight.mjs",
-    "shot:newcard": "node scripts/shot-newcard.mjs"
+    "shot:newcard": "node scripts/shot-newcard.mjs",
+    "verify:t107": "node scripts/verify-t107.mjs",
+    "probe:shortsha": "node scripts/probe-shortsha.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

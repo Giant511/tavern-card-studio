@@ -105,6 +105,25 @@ type Registrar = {
 export function registerAuthRoutes(router: Registrar, deps: AuthRouteDeps): void {
   const { auth } = deps;
 
+  /**
+   * 公开的认证策略（T10.7）。
+   *
+   * 客户端必须在**画出登录框之前**知道 `registerMode`：需求要求 closed 时
+   * 干脆不显示注册入口，而不是等用户点了才报错。所以这个端点必须免鉴权。
+   *
+   * 只回策略，不回任何账户信息 —— 没有可枚举的东西。刻意**不**返回
+   * 是否已有账户（那会让公网探测到"这台机器还没初始化"）。
+   */
+  router.get('/api/auth/config', (ctx) => {
+    sendJson(ctx.res, 200, {
+      registerMode: auth.registerMode,
+      /** access 有效期（秒），客户端据此决定什么时候静默续期 */
+      accessTtlSeconds: ACCESS_TOKEN_TTL_SECONDS,
+      /** 是否需要令牌：false 时连登录界面都不必弹（仅回环 + auth.require=false） */
+      authRequired: auth.requiresAuth,
+    });
+  });
+
   router.post('/api/auth/register', async (ctx) => {
     const body = bodyJson(ctx);
     const caller = deps.identify(ctx);

@@ -108,7 +108,21 @@ function get(path, headers = {}) {
 
 before(async () => {
   workDir = mkdtempSync(join(tmpdir(), 'tcs-token-'));
-  port = 19500 + Math.floor(Math.random() * 300);
+  /*
+   * 端口段必须与其它测试文件**不重叠**。
+   *
+   * 曾经这里与 `card-id-archive.test.mjs` 都用 `19500 + rand(300)` ——
+   * 两个文件在 `node --test` 下是并发的，撞上同一端口时，后启动的那个
+   * `listen` 失败（EADDRINUSE），而它前面的 `waitFor(health)` 反而成功
+   * （连到了先启动的实例），于是整个文件所有请求都打到别人的库上，
+   * 一次性红一片。这种"整文件连败"看起来像产品坏了，实际只是端口撞了。
+   *
+   * 划分办法：每个测试文件独占一段，段内随机（减少与上次运行的 TIME_WAIT 冲突）。
+   *   19100–19399  server.test.mjs
+   *   19500–19799  card-id-archive.test.mjs
+   *   19900–20199  token-endpoint.test.mjs（本文件）
+   */
+  port = 19900 + Math.floor(Math.random() * 300);
   const configPath = join(workDir, 'config.json');
 
   child = spawn(

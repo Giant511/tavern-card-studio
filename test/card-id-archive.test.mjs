@@ -24,6 +24,14 @@ const ROOT = join(import.meta.dirname, '..');
 const NODE = process.execPath;
 const ENTRY = join(ROOT, 'server', 'dist', 'index.js');
 
+/*
+ * 端口段按测试文件独占，不要与其它文件重叠：
+ *   19100–19399  server.test.mjs
+ *   19500–19799  本文件
+ *   19900–20199  token-endpoint.test.mjs
+ * 重叠时两个并发文件会抢同一端口，表现为"某个文件整片失败"
+ * （先启动的实例被后启动的测试连上，请求全打到别人的库）。
+ */
 const PORT = 19500 + Math.floor(Math.random() * 300);
 const BASE = `http://127.0.0.1:${PORT}`;
 

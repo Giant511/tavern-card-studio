@@ -556,7 +556,11 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       const isAuthEntry =
         method === 'POST' &&
         (pathname === '/api/auth/login' || pathname === '/api/auth/register' || pathname === '/api/auth/refresh');
-      if (!isTokenBootstrap && !isAuthEntry) {
+      // `GET /api/auth/config` 也必须免鉴权（T10.7）：客户端要在**登录框出现之前**
+      // 就知道该不该显示「注册」入口。它只回公开的策略（注册模式、版本号），
+      // 不含任何账户信息 —— 因此没有信息泄露面。
+      const isAuthPolicy = method === 'GET' && pathname === '/api/auth/config';
+      if (!isTokenBootstrap && !isAuthEntry && !isAuthPolicy) {
         gate.check(req, pathname);
       }
 

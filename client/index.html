@@ -33,6 +33,12 @@
           <span class="conn-dot"></span><span id="conn-text">未连接</span>
         </span>
         <button id="btn-settings" type="button" class="btn ghost">设置…</button>
+        <!--
+          T10.7：账户入口。文案与 title 由 app.refreshAccountButton() 按登录态改写
+          （未登录 / 用户名（管理员） / 登录已过期），所以这里给的是初始值。
+        -->
+        <button id="btn-account" type="button" class="btn ghost" data-phase="anonymous"
+                title="未登录：点此登录或注册账户">登录…</button>
       </div>
     </header>
 

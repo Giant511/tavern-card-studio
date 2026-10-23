@@ -1946,3 +1946,159 @@ body {
   color: var(--warn);
   opacity: 0.9;
 }
+
+/* ── 账户：登录/注册对话框（T10.7）────────────────────── */
+/*
+ * 内边距沿用 F5 的尺寸基线（≥24px），但**只作用于这两个新对话框**。
+ * `.modal-body` 是共用基类，在基类上加 padding 会把设置、导出、规则面板
+ * 一起改形 —— F5 那次已经明确过这条边界。
+ */
+.auth-modal {
+  width: min(460px, 100%);
+}
+
+.auth-modal .modal-body,
+.cards-modal .modal-body {
+  padding: 22px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.auth-hint {
+  margin: 0;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+/* 错误区常驻：服务端文案可能较长，而且要能被反复读 */
+.auth-error {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--danger-bg);
+  border: 1px solid rgba(220, 80, 80, 0.35);
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+/* ── 账户：我的卡片列表（T10.7）────────────────────────── */
+.cards-modal {
+  width: min(860px, 100%);
+}
+
+.cards-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.cards-toolbar .input {
+  flex: 1 1 auto;
+}
+
+.cards-note {
+  margin: 0;
+  line-height: 1.6;
+  font-size: 12px;
+  color: var(--warn);
+}
+
+.cards-count {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.cards-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 52vh;
+  overflow: auto;
+}
+
+/*
+ * 一行四列：角色名 · cardId · 仓库 · vN。
+ * 用 grid 而不是 inline 文本，是为了让四列各自对齐 —— 一列对齐了，
+ * 用户才能一眼扫出"哪张卡还没归属仓库""哪张没有版本"。
+ */
+.cards-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1.6fr) minmax(0, 0.8fr) 52px;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.cards-row:hover,
+.cards-row:focus-visible {
+  background: var(--app-bg);
+  border-color: var(--border);
+}
+
+.cards-row.deleted .cards-row-name {
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+.cards-row-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cards-row-id {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cards-row-repo {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cards-row-version {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  text-align: right;
+  color: var(--muted);
+}
+
+.cards-empty {
+  margin: 0;
+  padding: 18px 4px;
+  text-align: center;
+  color: var(--muted);
+}
+
+/*
+ * 登录框提到最上层。
+ *
+ * 它会在"令牌过期"时被被动打开，而那一刻用户可能正开着别的对话框
+ * （我的卡片 / 同步面板）。所有 .modal-overlay 同为 z-index 50，
+ * 按 DOM 顺序叠放 —— 不抬一层的话，登录框会被压在下面，
+ * 用户只会看到"面板里的数据突然空了"（端到端截图抓到过这一幕）。
+ * 只抬这一个类，其余对话框的叠放关系不变。
+ */
+.modal-overlay-top {
+  z-index: 60;
+}

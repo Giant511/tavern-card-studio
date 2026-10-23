@@ -75,6 +75,14 @@ export interface CardSummary {
   /** 与 cardId 同值；保留旧字段名以兼容尚未改名的调用点 */
   id: string;
   name: string;
+  /**
+   * 所属仓库（T10.6 起服务端下发）。
+   *
+   * 空串 = 尚未归属（v0.1.2 升级前的历史卡）；`repoName` 为 null 时
+   * **不要**在显示层猜一个名字，交给 `card-row.ts` 统一成「未归属」。
+   */
+  repoId: string;
+  repoName: string | null;
   /** 最新版本号；没有任何版本时为 0 */
   latestSeq: number;
   latestSha256: string;
@@ -313,6 +321,8 @@ export async function listCards(
       cardId: id,
       id,
       name: String(item['name'] ?? ''),
+      repoId: String(item['repoId'] ?? ''),
+      repoName: typeof item['repoName'] === 'string' ? item['repoName'] : null,
       // 顶层 latestSeq 优先；退回 latest.seq（旧服务端只给嵌套那个）
       latestSeq: Number(item['latestSeq'] ?? latest['seq'] ?? 0),
       latestSha256: String(latest['sha256'] ?? ''),

@@ -53,6 +53,16 @@ export interface CardSummaryDto {
   /** 见 `CardIdSource`：`client` = 用户指定；`auto` = 服务端发号；`legacy` = v0.1.1 之前入库 */
   idSource: CardIdSource;
   name: string;
+  /**
+   * 所属仓库（T10.6）。空串 = 尚未归属（v0.1.2 升级前的历史卡，
+   * 由 `user migrate` 补进默认仓库）。
+   *
+   * 与 `repoName` 分开给：客户端要拿 id 做后续操作（上传指定仓库），
+   * 名字只用于显示。只给名字的话客户端还得反查一次。
+   */
+  repoId: string;
+  /** 仓库名；仓库不存在或未归属时为 null（不让显示层猜） */
+  repoName: string | null;
   spec: string;
   specVersion: string;
   creator: string;
@@ -234,12 +244,14 @@ export class CardService {
 
   // ────────────────────────────── 查询 ──────────────────────────────
 
-  summary(row: CardRow): CardSummaryDto {
+  summary(row: CardRow, repoName: string | null = null): CardSummaryDto {
     return {
       cardId: row.id,
       id: row.id,
       idSource: row.id_source,
       name: row.name,
+      repoId: row.repo_id,
+      repoName,
       spec: row.spec,
       specVersion: row.spec_version,
       creator: row.creator,
@@ -268,9 +280,32 @@ export class CardService {
 
   detail(row: CardRow): CardDetailDto {
     return {
-      ...this.summary(row),
+      ...this.summary(row, this.repoNameOf(row.repo_id)),
       parseWarnings: JSON.parse(row.parse_warnings_json) as CardDetailDto['parseWarnings'],
     };
+  }
+
+  /**
+   * 仓库名批量查（列表用一次 IN 查询，不逐行 findById）。
+   *
+   * 为什么放在这里而不是注入 RepoStore：RepoStore 的所有方法都以 owner 为
+   * 第一个参数（仓库归属是它的核心概念），而这里只需要「id → 名字」。
+   * 为了一个显示字段把整套权限语境引进来，反而会让「卡片查询还没按账户过滤」
+   * 这件事变得更容易被误读成"已经过滤了"。
+   */
+  private repoNameMap(repoIds: readonly string[]): Map<string, string> {
+    const ids = [...new Set(repoIds.filter((id) => id !== ''))];
+    if (ids.length === 0) return new Map();
+    const placeholders = ids.map(() => '?').join(', ');
+    const rows = this.db.handle
+      .prepare(`SELECT id, name FROM repos WHERE id IN (${placeholders})`)
+      .all(...ids) as Array<{ id: string; name: string }>;
+    return new Map(rows.map((row) => [row.id, row.name]));
+  }
+
+  private repoNameOf(repoId: string): string | null {
+    if (repoId === '') return null;
+    return this.repoNameMap([repoId]).get(repoId) ?? null;
   }
 
   versionDto(row: VersionRow): VersionDto {
@@ -295,7 +330,11 @@ export class CardService {
     items: CardSummaryDto[];
   } {
     const rows = this.db.listCards(options);
-    return { total: this.db.countCards(options), items: rows.map((row) => this.summary(row)) };
+    const names = this.repoNameMap(rows.map((row) => row.repo_id));
+    return {
+      total: this.db.countCards(options),
+      items: rows.map((row) => this.summary(row, names.get(row.repo_id) ?? null)),
+    };
   }
 
   get(cardId: string, options: { includeDeleted?: boolean } = {}): CardDetailDto {
@@ -319,11 +358,32 @@ export class CardService {
       if (!latest) throw new AppError(404, 'NOT_FOUND', `角色卡 ${cardId} 还没有任何版本`);
       return latest;
     }
+
+    /*
+     * 数字形态的 rev 有**两种**合法含义，必须都试：
+     *   · 版本序号（`/versions/2`）；
+     *   · 全数字的提交短 sha 前缀（`/versions/1991`）。
+     *
+     * 这不是理论问题：git sha 是十六进制，4 位全是 0-9 的概率是 (10/16)^4 ≈ 15%，
+     * 8 位约 2.3%。只按"数字 = 序号"解析的话，这些提交的短 sha 一查就是
+     * `版本不存在：… v1991` —— 明明提交在库里，用户却拿不到，且报错文案
+     * 把人往"是不是版本号写错了"的方向带。
+     * （2026-10-23 全量测试偶发失败正是这条：`T5.2` 用 8 位短 sha 取版本，
+     *   碰上一次纯数字前缀就 404。见 scripts/probe-shortsha.mjs 的实证。）
+     *
+     * 顺序是「先序号、后 sha」：序号是主用法且是确定值，`/versions/2` 不该
+     * 因为某次提交恰好以 `2` 开头就变成歧义。
+     */
     if (/^\d+$/.test(raw)) {
-      const version = this.db.getVersion(cardId, Number.parseInt(raw, 10));
-      if (!version) throw new AppError(404, 'NOT_FOUND', `版本不存在：${cardId} v${raw}`);
-      return version;
+      const bySeq = this.db.getVersion(cardId, Number.parseInt(raw, 10));
+      if (bySeq) return bySeq;
+      const bySha = this.db.findVersionByCommit(cardId, raw.toLowerCase());
+      if (bySha) return bySha;
+      throw new AppError(404, 'NOT_FOUND', `版本不存在：${cardId} v${raw}`, {
+        hint: '该标识既不是版本序号，也不是任何提交的 sha 前缀',
+      });
     }
+
     if (/^[0-9a-fA-F]{4,40}$/.test(raw)) {
       const version = this.db.findVersionByCommit(cardId, raw.toLowerCase());
       if (!version) throw new AppError(404, 'NOT_FOUND', `提交不存在：${cardId} ${raw}`, { hint: '可用提交短 sha（至少 4 位）' });
