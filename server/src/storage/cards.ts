@@ -18,6 +18,7 @@ import { analyzeCardBytes } from '../audit/service.js';
 import { AppError } from '../errors.js';
 import type { Logger } from '../log.js';
 import type { BlobStore } from './blobs.js';
+import { ALL_CARDS, rowInScope, type CardScope } from './card-scope.js';
 import type { CardIdSource, CardRow, Db, NewVersionRow, VersionKind, VersionRow } from './db.js';
 import { compareBytes, diffJson, diffLines, sha256Of, type ByteComparison, type JsonDiff, type LineDiff } from './diff.js';
 import type { GitStore } from './git-store.js';
@@ -325,24 +326,47 @@ export class CardService {
     };
   }
 
-  list(options: { q?: string; limit: number; offset: number; includeDeleted?: boolean }): {
+  /**
+   * 列表查询（T10.8：按可见范围过滤）。
+   *
+   * `scope` 缺省为 `ALL_CARDS`——**只在测试与运维脚本里**才该走缺省；
+   * HTTP 路由一律显式传 `scopeFromIdentity(...)` 的结果。
+   */
+  list(options: {
+    q?: string;
+    limit: number;
+    offset: number;
+    includeDeleted?: boolean;
+    scope?: CardScope;
+  }): {
     total: number;
     items: CardSummaryDto[];
   } {
-    const rows = this.db.listCards(options);
+    const scope = options.scope ?? ALL_CARDS;
+    const rows = this.db.listCards({ ...options, scope });
     const names = this.repoNameMap(rows.map((row) => row.repo_id));
     return {
-      total: this.db.countCards(options),
+      total: this.db.countCards({ ...options, scope }),
       items: rows.map((row) => this.summary(row, names.get(row.repo_id) ?? null)),
     };
   }
 
-  get(cardId: string, options: { includeDeleted?: boolean } = {}): CardDetailDto {
+  get(cardId: string, options: { includeDeleted?: boolean; scope?: CardScope } = {}): CardDetailDto {
     const row = this.requireCard(cardId, options);
     return this.detail(row);
   }
 
-  private requireCard(cardId: string, options: { includeDeleted?: boolean } = {}): CardRow {
+  /**
+   * 取一张卡并要求它在范围内。
+   *
+   * 「不存在」与「不属于你」在这里合流：范围条件进了 SQL（`db.getCard`），
+   * 所以两种情况都返回同一个 `undefined` → 同一条 404 文案。这不是靠人工
+   * 对齐措辞做到的，而是结构上没有第二条分支（docs/29 §2.1–2.2）。
+   */
+  private requireCard(
+    cardId: string,
+    options: { includeDeleted?: boolean; scope?: CardScope } = {},
+  ): CardRow {
     const row = this.db.getCard(cardId, options);
     if (!row) {
       throw new AppError(404, 'NOT_FOUND', `角色卡不存在：${cardId}`);
@@ -350,8 +374,8 @@ export class CardService {
     return row;
   }
 
-  resolveVersion(cardId: string, rev?: string | null): VersionRow {
-    this.requireCard(cardId, { includeDeleted: true });
+  resolveVersion(cardId: string, rev?: string | null, scope: CardScope = ALL_CARDS): VersionRow {
+    this.requireCard(cardId, { includeDeleted: true, scope });
     const raw = rev === undefined || rev === null || rev === '' ? 'latest' : String(rev).trim();
     if (raw === 'latest') {
       const latest = this.db.listVersions(cardId, { limit: 1 })[0];
@@ -392,24 +416,32 @@ export class CardService {
     throw new AppError(400, 'BAD_REQUEST', `无法识别的版本标识：${raw}（可用 latest / 序号 / 提交 sha）`);
   }
 
-  listVersions(cardId: string, options: { limit: number; offset: number }): {
+  listVersions(cardId: string, options: { limit: number; offset: number; scope?: CardScope }): {
     total: number;
     items: VersionDto[];
   } {
-    this.requireCard(cardId, { includeDeleted: true });
+    this.requireCard(cardId, { includeDeleted: true, scope: options.scope ?? ALL_CARDS });
     const rows = this.db.listVersions(cardId, options);
     return { total: this.db.countVersions(cardId), items: rows.map((row) => this.versionDto(row)) };
   }
 
   /** 读取某版本的**原始字节**（从 blob 读，校验 sha256） */
-  readBytes(cardId: string, rev?: string | null): { bytes: Buffer; version: VersionRow } {
-    const version = this.resolveVersion(cardId, rev);
+  readBytes(
+    cardId: string,
+    rev?: string | null,
+    scope: CardScope = ALL_CARDS,
+  ): { bytes: Buffer; version: VersionRow } {
+    const version = this.resolveVersion(cardId, rev, scope);
     const bytes = this.blobs.read(version.blob_sha256);
     return { bytes, version };
   }
 
-  readAuditBytes(cardId: string, rev?: string | null): { bytes: Buffer; version: VersionRow } {
-    const version = this.resolveVersion(cardId, rev);
+  readAuditBytes(
+    cardId: string,
+    rev?: string | null,
+    scope: CardScope = ALL_CARDS,
+  ): { bytes: Buffer; version: VersionRow } {
+    const version = this.resolveVersion(cardId, rev, scope);
     if (!version.audit_sha256) {
       throw new AppError(404, 'NOT_FOUND', `版本 ${cardId} v${version.seq} 没有审计快照`, {
         auditError: version.audit_error,
@@ -452,7 +484,7 @@ export class CardService {
   async upload(
     cardId: string | null,
     bytes: Buffer,
-    options: WriteOptions & { baseSeq?: number | null } = {},
+    options: WriteOptions & { baseSeq?: number | null; scope?: CardScope } = {},
   ): Promise<UploadOutcome> {
     if (cardId === null) {
       const result = await this.create(bytes, options);
@@ -472,8 +504,20 @@ export class CardService {
       });
     }
 
+    const scope = options.scope ?? ALL_CARDS;
+
     return this.mutex.run(cardId, async () => {
-      const existing = this.db.getCard(cardId, { includeDeleted: true });
+      // 先**不带范围**查一次：要区分「真的不存在」与「存在但归别人」。
+      // 后者绝不能当"不存在"去新建 —— 那是主键冲突；也绝不能追加版本 ——
+      // 那是往别人卡里写内容。一律 404，且与真不存在的响应逐字节相同
+      // （docs/29 §2.1：不能让它变成"这个 id 存在"的探针）。
+      const anyRow = this.db.getCard(cardId, { includeDeleted: true });
+      const visible = anyRow !== undefined && rowInScope(anyRow, scope);
+      if (anyRow !== undefined && !visible) {
+        throw new AppError(404, 'NOT_FOUND', `角色卡不存在：${cardId}`);
+      }
+      const existing = visible ? anyRow : undefined;
+
       if (existing && existing.deleted_at !== null) {
         // 已软删的 ID 不复用：否则"删除"会变成"隐藏"，用户重新上传同名 ID 就把
         // 旧历史连带复活了，而他以为这是一张干净的卡。
@@ -573,7 +617,11 @@ export class CardService {
     return this.versionDto(persisted);
   }
 
-  async addVersion(cardId: string, bytes: Buffer, options: WriteOptions = {}): Promise<VersionDto> {
+  async addVersion(
+    cardId: string,
+    bytes: Buffer,
+    options: WriteOptions & { scope?: CardScope } = {},
+  ): Promise<VersionDto> {
     return this.mutex.run(cardId, () => this.addVersionLocked(cardId, bytes, options));
   }
 
@@ -667,9 +715,9 @@ export class CardService {
   async rollback(
     cardId: string,
     targetRev: string,
-    options: { message?: string; author?: string } = {},
+    options: { message?: string; author?: string; scope?: CardScope } = {},
   ): Promise<{ version: VersionDto; restoredFrom: VersionDto }> {
-    const target = this.resolveVersion(cardId, targetRev);
+    const target = this.resolveVersion(cardId, targetRev, options.scope ?? ALL_CARDS);
     const bytes = this.blobs.read(target.blob_sha256);
     const message = options.message?.trim() || `回滚到 v${target.seq}（${target.commit_sha.slice(0, 7)}）`;
 
@@ -723,9 +771,12 @@ export class CardService {
     });
   }
 
-  async delete(cardId: string, options: { hard?: boolean } = {}): Promise<{ id: string; hard: boolean }> {
+  async delete(
+    cardId: string,
+    options: { hard?: boolean; scope?: CardScope } = {},
+  ): Promise<{ id: string; hard: boolean }> {
     return this.mutex.run(cardId, async () => {
-      const card = this.requireCard(cardId, { includeDeleted: true });
+      const card = this.requireCard(cardId, { includeDeleted: true, scope: options.scope ?? ALL_CARDS });
       const at = new Date().toISOString();
       if (options.hard) {
         this.git.removeRepo(cardId);
@@ -741,18 +792,23 @@ export class CardService {
     });
   }
 
-  stats(): {
+  stats(scope: CardScope = ALL_CARDS): {
     cards: number;
     versions: number;
     bytes: number;
     blobs: { count: number; bytes: number };
   } {
-    const totals = this.db.totals();
+    const totals = this.db.totals(scope);
+    // blob 是全局的去重存储，无法按账户切分；它只反映"磁盘占用"，
+    // 不泄露任何卡片内容或归属，所以保持全局值。
     return { ...totals, blobs: this.blobs.stats() };
   }
 
-  events(limit: number): Array<{ id: number; at: string; level: string; action: string; cardId: string | null; detail: unknown }> {
-    return this.db.listEvents(limit).map((row) => ({
+  events(
+    limit: number,
+    scope: CardScope = ALL_CARDS,
+  ): Array<{ id: number; at: string; level: string; action: string; cardId: string | null; detail: unknown }> {
+    return this.db.listEvents(limit, scope).map((row) => ({
       id: row.id,
       at: row.at,
       level: row.level,
@@ -767,10 +823,15 @@ export class CardService {
     cardId: string,
     fromRev: string,
     toRev: string,
-    options: { include?: { bytes?: boolean; lines?: boolean; json?: boolean }; context?: number } = {},
+    options: {
+      include?: { bytes?: boolean; lines?: boolean; json?: boolean };
+      context?: number;
+      scope?: CardScope;
+    } = {},
   ): DiffDto {
-    const from = this.resolveVersion(cardId, fromRev);
-    const to = this.resolveVersion(cardId, toRev);
+    const scope = options.scope ?? ALL_CARDS;
+    const from = this.resolveVersion(cardId, fromRev, scope);
+    const to = this.resolveVersion(cardId, toRev, scope);
     const fromBytes = this.blobs.read(from.blob_sha256);
     const toBytes = this.blobs.read(to.blob_sha256);
     const bytes = compareBytes(fromBytes, toBytes);
@@ -879,13 +940,17 @@ export class CardService {
   }
 
   /** 用当前规则重算某版本的审计（不覆盖历史快照，供「按现行规则复核」使用） */
-  recomputeAudit(cardId: string, rev: string | undefined, options: { platformId?: string | null; presetId?: string | null }): {
+  recomputeAudit(
+    cardId: string,
+    rev: string | undefined,
+    options: { platformId?: string | null; presetId?: string | null; scope?: CardScope },
+  ): {
     report: AuditReport;
     reportBytes: Buffer;
     version: VersionDto;
     storedAuditSha256: string | null;
   } {
-    const { bytes, version } = this.readBytes(cardId, rev);
+    const { bytes, version } = this.readBytes(cardId, rev, options.scope ?? ALL_CARDS);
     const result = this.audit.run(bytes, options, `server:${cardId}`);
     return {
       report: result.report,

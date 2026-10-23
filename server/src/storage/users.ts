@@ -220,10 +220,28 @@ export function countOrphanCards(handle: Database.Database): number {
  * **不动 `updated_at`**：归属变更不是内容变更。若顺手刷新了它，
  * 卡片列表会按"最近更新"重排，用户看到一堆自己没动过的卡跳到最前面。
  */
-export function adoptOrphanCards(handle: Database.Database, ownerId: string): number {
-  const result = handle
-    .prepare("UPDATE cards SET owner_id = ? WHERE owner_id IS NULL OR owner_id = ''")
-    .run(ownerId);
+/**
+ * 把无归属的卡片全部划给某个账户。
+ *
+ * `repoId` 给了就顺手把卡片也归进该仓库。**为什么必须一起给**：T10.8 起
+ * 账户的可见范围是 `owner_id`，而仓库令牌还叠加 `repo_id`。只填 owner 不填 repo
+ * 会得到一种尴尬的中间态 —— 卡片在账户列表里可见（标着「未归属仓库」），
+ * 但用仓库令牌一个都看不到。归属和入库位置本来就是同一件事的两面。
+ */
+export function adoptOrphanCards(
+  handle: Database.Database,
+  ownerId: string,
+  options: { repoId?: string | null } = {},
+): number {
+  const repoId = options.repoId ?? null;
+  const sql =
+    repoId === null
+      ? "UPDATE cards SET owner_id = ? WHERE owner_id IS NULL OR owner_id = ''"
+      : "UPDATE cards SET owner_id = ?, repo_id = CASE WHEN repo_id IS NULL OR repo_id = '' THEN ? ELSE repo_id END WHERE owner_id IS NULL OR owner_id = ''";
+  const result =
+    repoId === null
+      ? handle.prepare(sql).run(ownerId)
+      : handle.prepare(sql).run(ownerId, repoId);
   return result.changes;
 }
 

@@ -247,9 +247,15 @@ test('T10.7 空列表文案区分"没有卡"与"搜索无结果"', () => {
   assert.match(emptyCardsText('  abc '), /abc/);
 });
 
-test('T10.7 隔离提示只在账户登录时出现（legacy 本就该看到全部）', () => {
-  assert.equal(isolationNote(false), null);
-  assert.match(isolationNote(true), /尚未按账户过滤/);
+test('T10.8 隔离提示：账户登录 + 服务端未隔离才提示（服务端说 true 就不提）', () => {
+  // 服务端已强制隔离（T10.8 起恒为 true）→ 不该再出现"未隔离"的免责声明
+  assert.equal(isolationNote(true, true), null);
+  // 旧版服务端没有该字段 → 那提示仍然是真的，必须保留
+  assert.match(isolationNote(true, null), /没有按账户过滤/);
+  assert.match(isolationNote(true, false), /没有按账户过滤/);
+  // legacy 只该看到未归属卡片，对它说"未隔离"是废话
+  assert.equal(isolationNote(false, null), null);
+  assert.equal(isolationNote(false, true), null);
 });
 
 test('T10.7 源码守卫：认证客户端里没有本地化的凭证文案（只看字符串字面量）', () => {

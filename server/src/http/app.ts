@@ -15,6 +15,7 @@ import { isLoopbackAddress } from '../config.js';
 import { API_VERSION, SERVER_VERSION, configSummary, type ServerContext } from '../context.js';
 import { readRawBody, parseJsonBody } from './body.js';
 import { TokenGate } from './auth.js';
+import { scopeFromIdentity } from '../storage/card-scope.js';
 import { registerAuthRoutes } from './auth-routes.js';
 import { registerRepoRoutes } from './repo-routes.js';
 import { AuthService } from '../auth/service.js';
@@ -279,8 +280,19 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     });
   });
 
+  /**
+   * 统计（T10.8：按可见范围过滤）。
+   *
+   * 计数必须跟着凭证走：卡片数 / 版本数 / 字节数任何一个漏掉过滤，
+   * 都会变成"能推出别人有多少张卡"的侧信道。
+   *
+   * `isolationEnforced: true` 是给客户端的一个**明确信号**：服务端已经在
+   * 服务端侧做了隔离，客户端不该再显示"尚未按账户过滤"这类提示
+   * （否则会变成一句永远为真的免责声明）。
+   */
   router.get('/api/stats', (_ctx) => {
-    const stats = ctx.cards.stats();
+    const scope = scopeFromIdentity(gate.identify(_ctx.req));
+    const stats = ctx.cards.stats(scope);
     sendJson(_ctx.res, 200, {
       ...stats,
       uptimeMs: Date.now() - ctx.startedAt,
@@ -290,12 +302,21 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       // 客户端也可以用它判断"我连的是不是我以为的那台服务端"
       tls: ctx.tls,
       rules: ctx.registry.loadErrors(),
+      /** 服务端是否强制了按凭证隔离（v0.1.2 / T10.8 起恒为 true） */
+      isolationEnforced: true,
+      /** 本凭证实际可见的范围，供面板与客户端如实展示「你看到的是哪一片」 */
+      scope: {
+        kind: scope.kind,
+        repoId: scope.kind === 'owner' ? scope.repoId : null,
+      },
     });
   });
 
   router.get('/api/events', (_ctx) => {
     const limit = queryInt(_ctx.query, 'limit', 50, 1, 500);
-    sendJson(_ctx.res, 200, { items: ctx.cards.events(limit) });
+    sendJson(_ctx.res, 200, {
+      items: ctx.cards.events(limit, scopeFromIdentity(gate.identify(_ctx.req))),
+    });
   });
 
   // ── 规则资产（只读） ──────────────────────────────────────────
@@ -327,6 +348,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       limit,
       offset,
       includeDeleted: queryBool(_ctx.query, 'includeDeleted'),
+      scope: scopeFromIdentity(gate.identify(_ctx.req)),
     });
     sendJson(_ctx.res, 200, { total: result.total, limit, offset, items: result.items });
   });
@@ -375,6 +397,9 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       baseSeq: parseBaseSeq(_ctx.query),
       ownerId,
       repoId,
+      // 判「这个 ID 是不是别人的卡」要用同一套范围判据，否则 legacy 就能
+      // 往账户的卡里追加版本（那是跨账户写入，比读更严重）
+      scope: scopeFromIdentity(identity),
     });
     sendJson(_ctx.res, result.created ? 201 : 200, result, {
       Location: `/api/cards/${encodeURIComponent(result.cardId)}`,
@@ -386,19 +411,29 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
 
   router.get('/api/cards/:id', (_ctx) => {
     assertPermission(gate, _ctx, 'read');
-    const card = ctx.cards.get(_ctx.params['id']!, { includeDeleted: queryBool(_ctx.query, 'includeDeleted') });
+    const card = ctx.cards.get(_ctx.params['id']!, {
+      includeDeleted: queryBool(_ctx.query, 'includeDeleted'),
+      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+    });
     sendJson(_ctx.res, 200, card);
   });
 
   router.delete('/api/cards/:id', async (_ctx) => {
     assertPermission(gate, _ctx, 'delete');
-    const result = await ctx.cards.delete(_ctx.params['id']!, { hard: queryBool(_ctx.query, 'hard') });
+    const result = await ctx.cards.delete(_ctx.params['id']!, {
+      hard: queryBool(_ctx.query, 'hard'),
+      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+    });
     sendJson(_ctx.res, 200, { deleted: true, ...result });
   });
 
   router.get('/api/cards/:id/raw', (_ctx) => {
     assertPermission(gate, _ctx, 'read');
-    const { bytes, version } = ctx.cards.readBytes(_ctx.params['id']!, optional(_ctx.query, 'version') ?? optional(_ctx.query, 'rev'));
+    const { bytes, version } = ctx.cards.readBytes(
+      _ctx.params['id']!,
+      optional(_ctx.query, 'version') ?? optional(_ctx.query, 'rev'),
+      scopeFromIdentity(gate.identify(_ctx.req)),
+    );
     sendRaw(
       _ctx.res,
       200,
@@ -413,14 +448,21 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     assertPermission(gate, _ctx, 'read');
     const limit = queryInt(_ctx.query, 'limit', 50, 1, 500);
     const offset = queryInt(_ctx.query, 'offset', 0, 0, Number.MAX_SAFE_INTEGER);
-    const result = ctx.cards.listVersions(_ctx.params['id']!, { limit, offset });
+    const result = ctx.cards.listVersions(_ctx.params['id']!, {
+      limit,
+      offset,
+      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+    });
     sendJson(_ctx.res, 200, { total: result.total, limit, offset, items: result.items });
   });
 
   router.post('/api/cards/:id/versions', async (_ctx) => {
     assertPermission(gate, _ctx, 'write');
     const bytes = requireCardBody(_ctx);
-    const version = await ctx.cards.addVersion(_ctx.params['id']!, bytes, writeOptionsFrom(_ctx.query, ctx));
+    const version = await ctx.cards.addVersion(_ctx.params['id']!, bytes, {
+      ...writeOptionsFrom(_ctx.query, ctx),
+      scope: scopeFromIdentity(gate.identify(_ctx.req)),
+    });
     sendJson(_ctx.res, 201, version, {
       Location: `/api/cards/${_ctx.params['id']}/versions/${version.seq}`,
     });
@@ -428,13 +470,21 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
 
   router.get('/api/cards/:id/versions/:rev', (_ctx) => {
     assertPermission(gate, _ctx, 'read');
-    const version = ctx.cards.resolveVersion(_ctx.params['id']!, _ctx.params['rev']);
+    const version = ctx.cards.resolveVersion(
+      _ctx.params['id']!,
+      _ctx.params['rev'],
+      scopeFromIdentity(gate.identify(_ctx.req)),
+    );
     sendJson(_ctx.res, 200, ctx.cards.versionDto(version));
   });
 
   router.get('/api/cards/:id/versions/:rev/raw', (_ctx) => {
     assertPermission(gate, _ctx, 'read');
-    const { bytes, version } = ctx.cards.readBytes(_ctx.params['id']!, _ctx.params['rev']);
+    const { bytes, version } = ctx.cards.readBytes(
+      _ctx.params['id']!,
+      _ctx.params['rev'],
+      scopeFromIdentity(gate.identify(_ctx.req)),
+    );
     sendRaw(
       _ctx.res,
       200,
@@ -446,7 +496,8 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   router.get('/api/cards/:id/diff', (_ctx) => {
     assertPermission(gate, _ctx, 'read');
     const toRev = optional(_ctx.query, 'to') ?? 'latest';
-    const to = ctx.cards.resolveVersion(_ctx.params['id']!, toRev);
+    const scope = scopeFromIdentity(gate.identify(_ctx.req));
+    const to = ctx.cards.resolveVersion(_ctx.params['id']!, toRev, scope);
     const fromRev = optional(_ctx.query, 'from') ?? String(Math.max(1, to.seq - 1));
     const includeRaw = optional(_ctx.query, 'include');
     const include = includeRaw
@@ -459,6 +510,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     const diff = ctx.cards.diff(_ctx.params['id']!, fromRev, String(to.seq), {
       include,
       context: queryInt(_ctx.query, 'context', 3, 0, 20),
+      scope,
     });
     sendJson(_ctx.res, 200, diff);
   });
@@ -471,6 +523,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     const result = await ctx.cards.rollback(_ctx.params['id']!, to, {
       message: meta.message ?? optional(_ctx.query, 'message'),
       author: meta.author ?? optional(_ctx.query, 'author'),
+      scope: scopeFromIdentity(gate.identify(_ctx.req)),
     });
     sendJson(_ctx.res, 201, result);
   });
@@ -501,6 +554,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       const result = ctx.cards.recomputeAudit(_ctx.params['id']!, version, {
         platformId: optional(_ctx.query, 'platform') ?? ctx.config.defaultPlatformRule,
         presetId: optional(_ctx.query, 'preset') ?? ctx.config.defaultPreset,
+        scope: scopeFromIdentity(gate.identify(_ctx.req)),
       });
       sendRaw(_ctx.res, 200, result.reportBytes, {
         'Content-Type': 'application/json; charset=utf-8',
@@ -510,7 +564,11 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       });
       return;
     }
-    const { bytes, version: row } = ctx.cards.readAuditBytes(_ctx.params['id']!, version);
+    const { bytes, version: row } = ctx.cards.readAuditBytes(
+      _ctx.params['id']!,
+      version,
+      scopeFromIdentity(gate.identify(_ctx.req)),
+    );
     sendRaw(_ctx.res, 200, bytes, {
       'Content-Type': 'application/json; charset=utf-8',
       ETag: `"${row.audit_sha256}"`,

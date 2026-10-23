@@ -243,12 +243,24 @@ function toUploadWarning(input: unknown): UploadWarning | null {
  */
 export async function uploadCard(
   config: SyncConfig,
-  input: { text: string; cardId?: string | null; baseSeq?: number | null; message?: string; author?: string },
+  input: {
+    text: string;
+    cardId?: string | null;
+    baseSeq?: number | null;
+    message?: string;
+    author?: string;
+    /**
+     * 目标仓库名（T10.8）。只对账户登录生效：服务端按 `owner + 名字` 解析仓库 id；
+     * 仓库令牌的仓库由令牌绑定，传了也会被忽略；legacy 传了也没有账户可挂。
+     */
+    repo?: string | null;
+  },
   options: RequestOptions = {},
 ): Promise<UploadResult> {
   const query = new URLSearchParams();
   if (input.message) query.set('message', input.message);
   if (input.author) query.set('author', input.author);
+  if (input.repo) query.set('repo', input.repo);
   const requestedId = input.cardId?.trim() ? input.cardId.trim() : null;
   if (requestedId !== null) query.set('cardId', requestedId);
   if (typeof input.baseSeq === 'number' && input.baseSeq > 0) query.set('baseSeq', String(input.baseSeq));

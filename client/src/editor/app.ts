@@ -70,6 +70,8 @@ import { ExportDialog } from '../export/export-dialog';
 import { buildExportAsync } from '../export/export-card';
 import { SyncDialog } from '../sync/sync-dialog';
 import { CardsDialog } from '../sync/cards-dialog';
+import { RepoDialog } from '../sync/repo-dialog';
+import { listRepos } from '../sync/repo-client';
 import type { SyncConfig } from '../sync/server-sync';
 import { AuthSession } from '../auth/session';
 import { LoginDialog } from '../auth/login-dialog';
@@ -157,6 +159,14 @@ class EditorApp {
   private authSession: AuthSession | null = null;
   private loginDialog: LoginDialog | null = null;
   private cardsDialog: CardsDialog | null = null;
+  private repoDialog: RepoDialog | null = null;
+  /**
+   * 上次选过的上传仓库（T10.8）。
+   *
+   * 只活在内存里：不进配置。理由是这个选择跟"我正在做哪件事"绑定，
+   * 跨会话记住它反而会让下次上传悄悄落到上次那个仓库里。
+   */
+  private selectedRepoId: string | null = null;
   /**
    * 认证请求用的服务端地址。
    *
@@ -385,6 +395,20 @@ class EditorApp {
       // 401 → 先静默续期，续不上才回登录界面（本地编辑一律不动）
       onUnauthorized: () => this.handleUnauthorized(),
       onOpenCards: () => void this.cardsDialog?.open(),
+      // ── 仓库联动（T10.8）────────────────────────────────
+      // 只对**账户登录**提供仓库列表：legacy 与仓库令牌都没有"选仓库"的自由，
+      // 返回 null 让面板把这一行整行隐藏（而不是显示一个改了也不生效的下拉）
+      getRepos: async () => {
+        const config = this.repoClientConfig();
+        if (!config) return [];
+        return listRepos(config);
+      },
+      getSelectedRepo: () => this.selectedRepoId,
+      onSelectRepo: (repoId) => {
+        // 记住选择：连着上传几张卡时不用反复选（`pickRepoId` 会优先用它）
+        this.selectedRepoId = repoId;
+      },
+      onOpenRepos: () => void this.repoDialog?.open(),
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
     });
 
@@ -438,6 +462,8 @@ class EditorApp {
     this.cardsDialog = new CardsDialog({
       getConfig: () => this.currentSyncConfig(),
       isAccountLogin: () => session.accessToken !== '' || session.refreshToken !== '',
+      // T10.8：服务端说"已隔离"就不再提示未隔离（避免永远为真的免责声明）
+      isIsolationEnforced: () => this.connection?.isolationEnforced ?? null,
       onPick: (cardId) => {
         // 复用同步面板：点卡片 = 看它的版本历史
         this.syncDialog?.open();
@@ -455,6 +481,19 @@ class EditorApp {
 
     byId<HTMLButtonElement>('btn-account').addEventListener('click', () => void this.openAccountEntry());
 
+    /*
+     * 仓库与令牌面板（T10.8）。
+     *
+     * 与登录框同一条规则：**只存在于账户身份**。仓库管理不接受 legacy 令牌
+     * （没有账户可挂）、也不接受仓库令牌（能自签 = 一次泄露可无限续期）。
+     * 所以 `getConfig` 在这里返回 null 而不是"退化成 legacy"。
+     */
+    this.repoDialog = new RepoDialog({
+      getConfig: () => this.repoClientConfig(),
+      notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
+      onUnauthorized: () => this.handleUnauthorized(),
+    });
+
     // 启动时读回令牌并**静默**续期。
     // 不 await：续期要发网络请求，不能挡住首屏渲染；也不在失败时弹窗
     // （启动瞬间弹登录框，用户第一反应是"是不是被盗号了"）。
@@ -470,6 +509,23 @@ class EditorApp {
     if (debugServer !== null && debugServer.trim() !== '') {
       this.authServerUrl = debugServer.trim().replace(/\/+$/, '');
     }
+  }
+
+  /**
+   * 仓库管理/令牌用的客户端配置。
+   *
+   * 只有**账户 access 令牌**才返回配置：
+   *   · legacy 全局令牌没有账户身份，仓库归谁无从谈起；
+   *   · 仓库令牌能读写卡片，但**不能管理仓库或令牌**（服务端会 403，
+   *     这里直接返回 null，避免让用户看到一个注定失败的按钮）。
+   * 未登录时返回 null → 面板显示"需要先登录账户"。
+   */
+  private repoClientConfig(): { serverUrl: string; accessToken: string } | null {
+    const connection = this.connection;
+    const token = this.authSession?.accessToken ?? '';
+    const serverUrl = connection?.url ?? this.authServerUrl;
+    if (token === '' || serverUrl === '' || serverUrl === undefined) return null;
+    return { serverUrl, accessToken: token };
   }
 
   /** 账户按钮的文案与状态（唯一一处改它的地方） */

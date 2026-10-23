@@ -2102,3 +2102,190 @@ body {
 .modal-overlay-top {
   z-index: 60;
 }
+
+/* ── 仓库与令牌（T10.8）──────────────────────────────── */
+.sync-repo-row {
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sync-repo-label {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.sync-repo-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.sync-target-repo {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--app-bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.repo-modal .modal-body {
+  padding: 22px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.repo-note {
+  margin: 0;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.repo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 24vh;
+  overflow: auto;
+}
+
+.repo-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.repo-row:hover,
+.repo-row:focus-visible {
+  background: var(--app-bg);
+  border-color: var(--border);
+}
+
+.repo-row.is-active {
+  border-color: var(--accent);
+  background: var(--app-bg);
+}
+
+.repo-row-name {
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+
+.repo-row-count {
+  font-size: 12px;
+  color: var(--muted);
+  flex: 1 1 auto;
+}
+
+.repo-row-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+}
+
+.token-scopes {
+  gap: 14px;
+}
+
+.token-issued {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--app-bg);
+}
+
+.token-issued-title {
+  margin: 0;
+  font-weight: 600;
+}
+
+/*
+ * 「只显示这一次」的说明。
+ *
+ * 用 warn 色而不是普通灰字：这句话是**操作后果**（关掉就再也看不到），
+ * 和普通提示放在同一视觉层级，就会被当成可跳过的说明。
+ */
+.token-issued-warn {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--warn);
+}
+
+.token-value {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+}
+
+.token-issued-note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.token-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 26vh;
+  overflow: auto;
+}
+
+.token-row {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+
+.token-row[data-state='revoked'],
+.token-row[data-state='expired'] {
+  opacity: 0.65;
+}
+
+.token-row-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.token-row-name {
+  font-weight: 600;
+}
+
+.token-row-prefix {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.token-row-scopes,
+.token-row-expiry {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.token-row-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--border);
+  color: var(--muted);
+}

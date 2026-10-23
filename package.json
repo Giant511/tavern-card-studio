@@ -15,7 +15,7 @@
   },
   "scripts": {
     "validate:rules": "node scripts/validate-rules.mjs",
-    "typecheck": "tsc -b --pretty false",
+    "typecheck": "tsc -p shared/tsconfig.json --noEmit && tsc -p server/tsconfig.json --noEmit && tsc -p client/tsconfig.json --noEmit",
     "build": "tsc -b --pretty false",
     "build:shared": "tsc -b shared",
     "build:server": "tsc -b server",
@@ -46,7 +46,9 @@
     "compare:highlight": "node scripts/compare-highlight.mjs",
     "shot:newcard": "node scripts/shot-newcard.mjs",
     "verify:t107": "node scripts/verify-t107.mjs",
-    "probe:shortsha": "node scripts/probe-shortsha.mjs"
+    "probe:shortsha": "node scripts/probe-shortsha.mjs",
+    "smoke:t108": "node scripts/smoke-t108.mjs",
+    "verify:t108": "node scripts/verify-t108.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

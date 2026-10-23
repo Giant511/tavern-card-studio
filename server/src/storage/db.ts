@@ -12,6 +12,8 @@ import { dirname } from 'node:path';
 
 import type { AuditSummary } from '@tcs/shared';
 
+import { ALL_CARDS, scopeSql, type CardScope } from './card-scope.js';
+
 export type VersionKind = 'upload' | 'update' | 'rollback' | 'import';
 
 /**
@@ -331,10 +333,27 @@ export class Db {
       .run(row);
   }
 
-  getCard(id: string, options: { includeDeleted?: boolean } = {}): CardRow | undefined {
-    const row = this.handle.prepare('SELECT * FROM cards WHERE id = ?').get(id) as CardRow | undefined;
-    if (!row) return undefined;
-    if (row.deleted_at && !options.includeDeleted) return undefined;
+  /**
+   * 取单张卡（T10.8：带可见范围）。
+   *
+   * 范围条件写进 SQL 的 WHERE。**这是"归属不匹配一律 404"的实现方式**：
+   * 不属于本凭证的卡在这一层就等同于"不存在"，上层拿到的永远是同一个
+   * `undefined`，因此不可能因为"多一个分支"而露出存在性。
+   */
+  getCard(
+    id: string,
+    options: { includeDeleted?: boolean; scope?: CardScope } = {},
+  ): CardRow | undefined {
+    const where = ['id = @id'];
+    const params: Record<string, unknown> = { id };
+    if (!options.includeDeleted) where.push('deleted_at IS NULL');
+    const scoped = scopeSql(options.scope ?? ALL_CARDS);
+    if (scoped.clause !== '') where.push(scoped.clause);
+    Object.assign(params, scoped.params);
+
+    const row = this.handle
+      .prepare(`SELECT * FROM cards WHERE ${where.join(' AND ')}`)
+      .get(params) as CardRow | undefined;
     return row;
   }
 
@@ -380,7 +399,19 @@ export class Db {
       });
   }
 
-  listCards(options: { q?: string; limit: number; offset: number; includeDeleted?: boolean }): CardRow[] {
+  /**
+   * 列表查询（T10.8：带可见范围）。
+   *
+   * `scope` 走 `scopeSql()` 生成的条件，与"不存在"共享同一条路径 ——
+   * 所以不属于本凭证的卡在这里**根本不会出现**，而不是取出来再过滤掉。
+   */
+  listCards(options: {
+    q?: string;
+    limit: number;
+    offset: number;
+    includeDeleted?: boolean;
+    scope?: CardScope;
+  }): CardRow[] {
     const where: string[] = [];
     const params: Record<string, unknown> = { limit: options.limit, offset: options.offset };
     if (!options.includeDeleted) where.push('deleted_at IS NULL');
@@ -388,12 +419,16 @@ export class Db {
       where.push('(name LIKE @q OR id LIKE @q)');
       params['q'] = `%${options.q.trim()}%`;
     }
+    const scoped = scopeSql(options.scope ?? ALL_CARDS);
+    if (scoped.clause !== '') where.push(scoped.clause);
+    Object.assign(params, scoped.params);
+
     const sql = `SELECT * FROM cards ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
       ORDER BY updated_at DESC, id ASC LIMIT @limit OFFSET @offset`;
     return this.handle.prepare(sql).all(params) as CardRow[];
   }
 
-  countCards(options: { q?: string; includeDeleted?: boolean } = {}): number {
+  countCards(options: { q?: string; includeDeleted?: boolean; scope?: CardScope } = {}): number {
     const where: string[] = [];
     const params: Record<string, unknown> = {};
     if (!options.includeDeleted) where.push('deleted_at IS NULL');
@@ -401,6 +436,10 @@ export class Db {
       where.push('(name LIKE @q OR id LIKE @q)');
       params['q'] = `%${options.q.trim()}%`;
     }
+    const scoped = scopeSql(options.scope ?? ALL_CARDS);
+    if (scoped.clause !== '') where.push(scoped.clause);
+    Object.assign(params, scoped.params);
+
     const sql = `SELECT COUNT(*) AS n FROM cards ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`;
     return (this.handle.prepare(sql).get(params) as { n: number }).n;
   }
@@ -497,16 +536,67 @@ export class Db {
       .run(event.at, event.level, event.action, event.cardId ?? null, JSON.stringify(event.detail ?? {}));
   }
 
-  listEvents(limit = 50): EventRow[] {
-    return this.handle
-      .prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?')
-      .all(limit) as EventRow[];
+  /**
+   * 事件流（T10.8：按可见范围过滤）。
+   *
+   * 事件里带 `card_id` 与 `action`（"谁对哪张卡做了什么"），不过滤的话
+   * 账户 A 能从 /api/events 看到账户 B 的卡 id 与操作节奏 —— 与直接读卡片
+   * 属于同一类泄露，只是绕了一层。这里用子查询限定到可见卡片集合。
+   *
+   * 没有 `card_id` 的事件（token 轮换、服务启动等）属于运维事件，
+   * 与任何账户的卡片无关，保持可见。
+   */
+  listEvents(limit = 50, scope: CardScope = ALL_CARDS): EventRow[] {
+    const scoped = scopeSql(scope);
+    if (scoped.clause === '') {
+      return this.handle
+        .prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?')
+        .all(limit) as EventRow[];
+    }
+    const params: Record<string, unknown> = { limit, ...scoped.params };
+    const sql = `SELECT * FROM events
+      WHERE card_id IS NULL OR card_id IN (SELECT id FROM cards WHERE ${scoped.clause})
+      ORDER BY id DESC LIMIT @limit`;
+    return this.handle.prepare(sql).all(params) as EventRow[];
   }
 
-  totals(): { cards: number; versions: number; bytes: number } {
-    const cards = (this.handle.prepare('SELECT COUNT(*) AS n FROM cards WHERE deleted_at IS NULL').get() as { n: number }).n;
-    const versions = (this.handle.prepare('SELECT COUNT(*) AS n FROM versions').get() as { n: number }).n;
-    const bytes = (this.handle.prepare('SELECT COALESCE(SUM(byte_size), 0) AS n FROM versions').get() as { n: number }).n;
+  /**
+   * 汇总（T10.8：按可见范围过滤）。
+   *
+   * 卡片数与版本数都要收窄 —— 只收窄卡片数、版本数照旧的话，
+   * "总版本数"就成了一个能推出"别人有多少张卡"的侧信道。
+   * `bytes` 同理（版本字节总和）。
+   */
+  totals(scope: CardScope = ALL_CARDS): { cards: number; versions: number; bytes: number } {
+    const scoped = scopeSql(scope);
+    if (scoped.clause === '') {
+      const cards = (this.handle.prepare('SELECT COUNT(*) AS n FROM cards WHERE deleted_at IS NULL').get() as { n: number }).n;
+      const versions = (this.handle.prepare('SELECT COUNT(*) AS n FROM versions').get() as { n: number }).n;
+      const bytes = (this.handle.prepare('SELECT COALESCE(SUM(byte_size), 0) AS n FROM versions').get() as { n: number }).n;
+      return { cards, versions, bytes };
+    }
+
+    const params = scoped.params;
+    const cards = (
+      this.handle
+        .prepare(`SELECT COUNT(*) AS n FROM cards WHERE deleted_at IS NULL AND ${scoped.clause}`)
+        .get(params) as { n: number }
+    ).n;
+    // 版本按"其卡片可见"来限定：子查询而不是 JOIN，避免 SUM 因 JOIN 重复计数
+    const versions = (
+      this.handle
+        .prepare(
+          `SELECT COUNT(*) AS n FROM versions WHERE card_id IN (SELECT id FROM cards WHERE ${scoped.clause})`,
+        )
+        .get(params) as { n: number }
+    ).n;
+    const bytes = (
+      this.handle
+        .prepare(
+          `SELECT COALESCE(SUM(byte_size), 0) AS n FROM versions WHERE card_id IN (SELECT id FROM cards WHERE ${scoped.clause})`,
+        )
+        .get(params) as { n: number }
+    ).n;
     return { cards, versions, bytes };
   }
 }
