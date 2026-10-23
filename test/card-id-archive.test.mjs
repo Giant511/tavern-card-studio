@@ -106,15 +106,38 @@ before(async () => {
   child.stdout.on('data', (chunk) => logs.push(chunk));
   child.stderr.on('data', (chunk) => logs.push(chunk));
 
+  // 启动预算 60 秒（原来 20 秒）。
+  // 并行跑全量时本机要同时起多个 worker（token-endpoint 两个实例 + 这个 + 若干浏览器冒烟），
+  // 2026-10-23 实测 20 秒被顶穿过一次：报「服务端未创建配置」+ 空日志，
+  // 与真正的启动失败长得一模一样。**同一个坑这是第三次**（前两次在 token-endpoint），
+  // 所以这次连诊断一起补：失败时必须说清"最后一次看到什么"。
+  let configProbe = '(从未探测)';
   const configured = await waitFor(() => {
-    if (!existsSync(join(workDir, 'config.json'))) return false;
+    if (!existsSync(join(workDir, 'config.json'))) {
+      configProbe = '配置文件尚未生成';
+      return false;
+    }
+    configProbe = '配置文件已生成';
     token = JSON.parse(readFileSync(join(workDir, 'config.json'), 'utf8')).auth.token;
     return true;
-  });
-  if (!configured) throw new Error(`服务端未创建配置：\n${logs.join('')}`);
+  }, 60000);
+  if (!configured) {
+    throw new Error(
+      `服务端未创建配置（最后一次探测：${configProbe}；子进程退出码 ${String(child.exitCode)}）：\n${logs.join('')}`,
+    );
+  }
 
-  const healthy = await waitFor(async () => (await request('/api/health', { token: null })).status === 200);
-  if (!healthy) throw new Error(`服务端未就绪：\n${logs.join('')}`);
+  let healthProbe = '(从未探测)';
+  const healthy = await waitFor(async () => {
+    const res = await request('/api/health', { token: null });
+    healthProbe = `HTTP ${String(res.status)}`;
+    return res.status === 200;
+  }, 60000);
+  if (!healthy) {
+    throw new Error(
+      `服务端未就绪（最后一次探测：${healthProbe}；子进程退出码 ${String(child.exitCode)}）：\n${logs.join('')}`,
+    );
+  }
 });
 
 after(async () => {

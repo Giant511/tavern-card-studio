@@ -241,6 +241,10 @@ export async function probeServer(
   }
 
   // ③ 要求鉴权但没填 token
+  //
+  // 措辞注意（v0.1.2 追加任务）：没令牌**不是**失败，也不该读起来像服务端在索要令牌。
+  // 0.1.2 起 login / register / refresh / config 都是免鉴权端点，
+  // "没登录"只意味着同步用不了，不意味着连不上。
   const token = input.token.trim();
   if (token === '') {
     return {
@@ -252,7 +256,7 @@ export async function probeServer(
       isolationEnforced: null,
       latencyMs: health.elapsed,
       url: base,
-      message: `已连接${version ? `（服务端 ${version}）` : ''}，但服务端要求鉴权：未填写 token`,
+      message: `已连接${version ? `（服务端 ${version}）` : ''}，未登录：登录后可同步`,
       stage: 'auth',
     };
   }
