@@ -1649,8 +1649,38 @@ body {
 }
 
 /* ── 新建角色卡对话框（F11）──────────────────────────── */
+/*
+ * 尺寸基线（v0.1.2 / F5，2026-10-23）：
+ *   · 对话框宽度 ≥480px（宽屏 560px，窄屏退到 92vw，不在小屏上硬撑）
+ *   · 输入框高度 ≥40px（触控与误点都更稳）
+ *   · 说明文字行高 1.6（原来是 1.5，两行提示会挤在一起）
+ *   · 内容区内边距 ≥24px（`.modal-body` 原先**没有任何 padding**，
+ *     文字直接贴到弹窗边缘 —— 1920 宽屏下尤其明显，这是"内容区挤压"的主因）
+ * 这些数值写死而不是用 rem：对话框是固定版式的表单，不随正文字号缩放。
+ */
 .new-card-modal {
-  width: min(520px, 92vw);
+  width: min(560px, 92vw);
+  min-width: min(480px, 92vw);
+}
+
+.new-card-modal .modal-body {
+  padding: 22px 24px 6px;
+}
+
+.new-card-modal .field {
+  margin-bottom: 18px;
+  gap: 7px;
+}
+
+.new-card-modal .input {
+  min-height: 40px;
+  padding: 9px 12px;
+  font-size: 13px;
+}
+
+.new-card-modal .field-hint {
+  line-height: 1.6;
+  font-size: 12px;
 }
 
 /* 角色卡 ID 是机器可读的标识，用等宽字体便于核对字符是否一致 */
