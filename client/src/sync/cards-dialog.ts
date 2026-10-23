@@ -34,6 +34,11 @@ export interface CardsDialogDeps {
   getConfig: () => SyncConfig | null;
   /** 是否已用账户登录（决定要不要显示"尚未按账户过滤"的诚实提示） */
   isAccountLogin: () => boolean;
+  /**
+   * 服务端是否已强制隔离（来自 /api/stats 的 isolationEnforced）。
+   *  时**不再显示**未隔离提示 —— 否则就是一句永远为真的免责声明。
+   */
+  isIsolationEnforced: () => boolean | null;
   onPick?: (cardId: string) => void;
   notify: (message: string, kind?: 'ok' | 'warn' | 'bad' | 'info') => void;
   /** 401 后尝试恢复（续期）；返回 false 表示要回登录界面 */
@@ -135,7 +140,7 @@ export class CardsDialog {
 
   async open(): Promise<void> {
     this.overlay.hidden = false;
-    const note = isolationNote(this.deps.isAccountLogin());
+    const note = isolationNote(this.deps.isAccountLogin(), this.deps.isIsolationEnforced());
     this.noteEl.hidden = note === null;
     if (note !== null) this.noteEl.textContent = note;
     this.logoutButton.hidden = this.deps.onLogout === undefined || !this.deps.isAccountLogin();

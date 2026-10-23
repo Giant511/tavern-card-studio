@@ -90,8 +90,16 @@ export interface ProbeResult {
    * null = 无法判定（不可达，或服务端不要求鉴权）
    */
   tokenValid: boolean | null;
-  /** 服务端现有卡片数（仅在 token 有效时拿到） */
+  /** 服务端现有卡片数（仅在 token 有效时拿到；T10.8 起是**本凭证可见**的条数） */
   cardCount: number | null;
+  /**
+   * 服务端是否按凭证强制隔离（T10.8）。
+   *
+   *  = 服务端已经在服务端侧过滤，客户端不该再显示尚未按账户过滤之类提示
+   * —— 那种提示会变成永远为真的免责声明。
+   *  /  = 旧版服务端（v0.1.2 之前），确实没有隔离，提示必须留着。
+   */
+  isolationEnforced: boolean | null;
   /** health 往返耗时（毫秒） */
   latencyMs: number | null;
   /** 归一化后的地址（失败时为 null） */
@@ -121,6 +129,7 @@ function failure(
     authRequired: null,
     tokenValid: null,
     cardCount: null,
+    isolationEnforced: null,
     latencyMs: null,
     url: null,
     message,
@@ -223,6 +232,7 @@ export async function probeServer(
       authRequired: false,
       tokenValid: null,
       cardCount: null,
+      isolationEnforced: null,
       latencyMs: health.elapsed,
       url: base,
       message: `已连接${version ? `（服务端 ${version}）` : ''}，服务端未启用鉴权`,
@@ -239,6 +249,7 @@ export async function probeServer(
       authRequired: true,
       tokenValid: null,
       cardCount: null,
+      isolationEnforced: null,
       latencyMs: health.elapsed,
       url: base,
       message: `已连接${version ? `（服务端 ${version}）` : ''}，但服务端要求鉴权：未填写 token`,
@@ -269,6 +280,7 @@ export async function probeServer(
       authRequired: true,
       tokenValid: false,
       cardCount: null,
+      isolationEnforced: null,
       latencyMs: health.elapsed,
       url: base,
       message: '已连接，但 token 无效（401）——请从服务端配置或管理面板重新获取',
@@ -305,6 +317,8 @@ export async function probeServer(
     authRequired: true,
     tokenValid: true,
     cardCount,
+    // 只有服务端明确说 true 才算已隔离；缺字段 = 旧版服务端 = 未隔离
+    isolationEnforced: statsBody['isolationEnforced'] === true,
     latencyMs: health.elapsed,
     url: base,
     message:

@@ -369,7 +369,10 @@ async function runUserCommand(
         process.stderr.write(`用户「${username}」不存在\n`);
         return 1;
       }
-      const adopted = adoptOrphanCards(db.handle, user.id);
+      const adopted = adoptOrphanCards(db.handle, user.id, {
+        // 一起归进默认仓库：否则会出现"账户能看到、仓库令牌看不到"的中间态
+        repoId: new RepoStore(db.handle).ensureDefault(user.id).id,
+      });
       process.stdout.write(`已把 ${String(adopted)} 张无归属卡片划给「${user.username}」\n`);
       return 0;
     }

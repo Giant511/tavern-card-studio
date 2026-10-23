@@ -55,14 +55,21 @@ export function emptyCardsText(query: string): string {
 /**
  * 「服务端还没按账户过滤」的诚实提示。
  *
- * 只有"账户登录"时才提：legacy 全局令牌本来就该看到全部卡片，
- * 对它说"还没隔离"是废话。而账户登录下不提，用户会误以为列表已经按账户过滤。
+ * 两个条件同时成立才提示：
+ *   · 用的是**账户登录**（legacy 全局令牌本来就只该看到未归属卡片，
+ *     对它说"未隔离"是废话）；
+ *   · 服务端**明确说没有隔离**（`isolationEnforced !== true`）。
  *
- * 这条提示在 T10.10（卡片按账户 + 仓库过滤）落地后应当删除 ——
- * 留着会变成一句永远为真的免责声明。
+ * T10.8 起服务端恒为 `isolationEnforced: true`，所以这条提示在正常部署下
+ * 不会出现 —— 这是刻意的：留一句永远为真的免责声明，等于训练用户忽略提示。
+ * 只有当客户端连到 **v0.1.2 之前的旧服务端**（没有该字段）时才会出现，
+ * 那时它仍然是真的。
  */
-export function isolationNote(isAccountLogin: boolean): string | null {
-  return isAccountLogin
-    ? '服务端尚未按账户过滤（v0.1.2 已知限制）：列表可能包含其他账户的卡片。'
-    : null;
+export function isolationNote(
+  isAccountLogin: boolean,
+  isolationEnforced: boolean | null,
+): string | null {
+  if (!isAccountLogin) return null;
+  if (isolationEnforced === true) return null;
+  return '当前服务端没有按账户过滤（版本较旧）：列表可能包含其他账户的卡片。升级服务端 MSI 后会消失。';
 }
