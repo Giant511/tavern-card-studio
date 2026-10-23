@@ -9,6 +9,8 @@
  */
 
 import { randomBytes } from 'node:crypto';
+
+import { parseTrustProxyEntries } from './net/trust-proxy.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 
@@ -122,6 +124,18 @@ export interface ServerConfigFile {
   maxUploadBytes: number;
   /** 日志级别 */
   logLevel: 'debug' | 'info' | 'warn' | 'error';
+  /**
+   * **可信反向代理**（v0.1.2 追加任务 / 需求 F1.4）。IP 或 CIDR，默认空数组。
+   *
+   * 只有登记在这里的地址，才允许用 `X-Forwarded-For` 改写"客户端是谁"。
+   * 空数组 = 完全忽略代理头，等价于 v0.1.2 之前的"只看 socket 地址"。
+   *
+   * 为什么默认空（而不是"同机自动信任"）：同机反代让所有公网请求的对端都是
+   * `127.0.0.1`，若默认信任它就等于把门禁与限速一起废掉。乐观默认最坏的地方
+   * 不是不安全，而是**管理员不知道自己在按代理 IP 判定** —— 出问题时所有
+   * 证据都指向一个假来源。默认空至少让"没配"这件事在面板上可见。
+   */
+  trustProxy: string[];
   auth: AuthConfig;
   /** TLS 三模式（T10.5），见 {@link TlsConfig} */
   tls: TlsConfig;
@@ -143,6 +157,8 @@ export interface ConfigOverrides {
   rulesDir?: string;
   token?: string;
   logLevel?: ServerConfigFile['logLevel'];
+  /** 可信反向代理（CLI `--trust-proxy`，逗号分隔） */
+  trustProxy?: string[];
   serviceMode?: ServiceMode;
   serviceName?: string;
 }
@@ -250,6 +266,8 @@ export function createDefaultConfig(overrides: ConfigOverrides = {}): ServerConf
     defaultPreset: 'default',
     maxUploadBytes: 32 * 1024 * 1024,
     logLevel: overrides.logLevel ?? 'info',
+    // 默认不信任任何代理头：见字段注释。空数组下有效 IP 恒等于 socket 地址。
+    trustProxy: overrides.trustProxy ?? [],
     auth: {
       token: overrides.token ?? generateToken(),
       require: true,
@@ -305,6 +323,18 @@ export function normalizeConfig(input: unknown, overrides: ConfigOverrides = {})
     logLevel: (['debug', 'info', 'warn', 'error'] as const).includes(raw['logLevel'] as never)
       ? (raw['logLevel'] as ServerConfigFile['logLevel'])
       : base.logLevel,
+    // 只接受字符串数组；单字符串也接受（手改配置时很容易写成 "127.0.0.1"）。
+    // 非法条目**不在这里过滤**：交给 assertSafeConfig 报错并拒绝启动，
+    // 否则"写错一条"会变成"这条静默消失"，管理员以为已经信任了。
+    trustProxy: (() => {
+      const rawTrust = raw['trustProxy'];
+      const list = Array.isArray(rawTrust)
+        ? rawTrust.filter((item): item is string => typeof item === 'string')
+        : typeof rawTrust === 'string'
+          ? rawTrust.split(',')
+          : [];
+      return list.map((item) => item.trim()).filter((item) => item !== '');
+    })(),
     auth: {
       token: str(authRaw['token'], base.auth.token),
       require: authRaw['require'] === undefined ? base.auth.require : authRaw['require'] !== false,
@@ -365,6 +395,9 @@ export function normalizeConfig(input: unknown, overrides: ConfigOverrides = {})
   if (overrides.rulesDir !== undefined) config.rulesDir = resolve(overrides.rulesDir);
   if (overrides.token !== undefined && overrides.token !== '') config.auth.token = overrides.token;
   if (overrides.logLevel !== undefined) config.logLevel = overrides.logLevel;
+  // CLI 覆盖是"整份替换"而不是追加：`--trust-proxy` 缺省时不该悄悄沿用旧值，
+  // 那样在脚本里改配置会看起来"没生效"。
+  if (overrides.trustProxy !== undefined) config.trustProxy = [...overrides.trustProxy];
   if (overrides.serviceMode !== undefined) config.service.mode = overrides.serviceMode;
   if (overrides.serviceName !== undefined) config.service.name = overrides.serviceName;
 
@@ -408,6 +441,18 @@ export function assertSafeConfig(config: ServerConfigFile): void {
           'SecurityWarning',
         )
       : undefined;
+  }
+
+  // ── 可信反向代理（v0.1.2 追加任务）────────────────────────
+  //
+  // 写错一条不能静默跳过：少一条会让本该可信的代理失效（取令牌被拒、限速全局化），
+  // 而"以为配了其实没配"比"没配"更难排查 —— 所以非法条目一律拒绝启动。
+  const trustProxy = parseTrustProxyEntries(config.trustProxy);
+  if (trustProxy.problems.length > 0) {
+    throw new ConfigError(
+      `trustProxy 配置有误：${trustProxy.problems.join('；')}。` +
+        '该字段只接受 IP 或 CIDR（如 127.0.0.1、10.0.0.0/8、::1），默认空数组表示不信任任何代理头。',
+    );
   }
 
   // ── TLS（T10.5）──────────────────────────────────────────
