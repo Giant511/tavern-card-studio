@@ -1,0 +1,471 @@
+<?if $(sys.BUILDARCH)="x86"?>
+    <?define Win64 = "no" ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?elseif $(sys.BUILDARCH)="x64"?>
+    <?define Win64 = "yes" ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?elseif $(sys.BUILDARCH)="arm64"?>
+    <?define Win64 = "yes" ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else?>
+    <?error Unsupported value of sys.BUILDARCH=$(sys.BUILDARCH)?>
+<?endif?>
+
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Product
+            Id="*"
+            Name="{{product_name}}"
+            UpgradeCode="{{upgrade_code}}"
+            Language="!(loc.TauriLanguage)"
+            Manufacturer="{{manufacturer}}"
+            Version="{{version}}">
+
+        <Package Id="*"
+                 Keywords="Installer"
+                 InstallerVersion="450"
+                 Languages="0"
+                 Compressed="yes"
+                 InstallScope="perMachine"
+                 SummaryCodepage="!(loc.TauriCodepage)"/>
+
+        <!-- https://docs.microsoft.com/en-us/windows/win32/msi/reinstallmode -->
+        <!-- reinstall all files; rewrite all registry entries; reinstall all shortcuts -->
+        <Property Id="REINSTALLMODE" Value="amus" />
+
+        <!-- Auto launch app after installation, useful for passive mode which usually used in updates -->
+        <Property Id="AUTOLAUNCHAPP" Secure="yes" />
+        <!-- Property to forward cli args to the launched app to not lose those of the pre-update instance -->
+        <Property Id="LAUNCHAPPARGS" Secure="yes" />
+
+        <!-- ===================================================================
+             Tavern Card Studio 追加：卸载时询问是否删除客户端配置（F14.1 / T10.22）
+
+             这一段不是 Tauri 模板自带的，是本项目改的。改这个文件的前提见
+             client/src-tauri/wix/README.md：接管模板之后，升级 Tauri 必须重新对齐。
+
+             为什么非接管不可：Tauri 的 `bundle.windows.wix.fragmentPaths` 只把
+             **被 ComponentRef 引用的组件**链接进 MSI；片段里单独声明的
+             <Property> / <CustomAction> / <UI> 会被 light 静默丢弃（2026-10-24 实测：
+             candle 编译通过、wixobj 里符号齐全、链接出的 MSI 里一行都没有）。
+             而这条需求恰恰全部是 Property + CustomAction + Dialog。
+             =================================================================== -->
+
+        <!-- 只声明、不给值：空值 = 复选框不勾（MSI 的 CheckBox 在属性值等于
+             CheckBoxValue 时才显示为勾上）。误删不可逆，保守默认。 -->
+        <Property Id="DELETEDATA" Secure="yes" />
+
+        <!--
+          删客户端配置目录（仅当用户在卸载选项页勾选）。
+
+          · Directory="INSTALLDIR"：这里只是"工作目录"。不能用 SystemFolder —— Tauri 的
+            模板没有在 Directory 表里声明它，linker 会报 LGHT0094 Unresolved reference，
+            而 `[SystemFolder]` 这种格式化字段同样要靠 Directory 行才解析得出来。
+          · 因此命令行走环境变量形式 `[%ComSpec]`，它由 Environment 表/进程环境解析，
+            不依赖 Directory 表。
+          · Deferred + Impersonate="yes"：卸载由同一个用户提权执行，`%APPDATA%`
+            仍指向这个用户的漫游目录。若用 SYSTEM，`%APPDATA%` 会变成
+            C:\Windows\System32\config\systemprofile\AppData\Roaming —— 删的不是用户的配置，
+            而且不会报错。
+          · Return="ignore"：删不掉不能让卸载失败并回滚。
+        -->
+        <CustomAction Id="DeleteClientDataDir"
+                      Directory="INSTALLDIR"
+                      Execute="deferred"
+                      Impersonate="yes"
+                      Return="ignore"
+                      ExeCommand="[%ComSpec] /c if exist &quot;%APPDATA%\com.taverncardstudio.client&quot; rmdir /s /q &quot;%APPDATA%\com.taverncardstudio.client&quot;" />
+
+        {{#if allow_downgrades}}
+            <MajorUpgrade Schedule="afterInstallInitialize" AllowDowngrades="yes" />
+        {{else}}
+            <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="!(loc.DowngradeErrorMessage)" AllowSameVersionUpgrades="yes" />
+        {{/if}}
+
+        <InstallExecuteSequence>
+            <RemoveShortcuts>Installed AND NOT UPGRADINGPRODUCTCODE</RemoveShortcuts>
+            <!-- 删客户端配置：StopServices 之后（service 停干净）、RemoveFiles 之前。
+                 条件里的 REMOVE="ALL" 保证只在卸载时执行，修复/升级不动配置。 -->
+            <Custom Action="DeleteClientDataDir" Before="RemoveFiles">REMOVE=&quot;ALL&quot; AND DELETEDATA=1</Custom>
+        </InstallExecuteSequence>
+
+        <Media Id="1" Cabinet="app.cab" EmbedCab="yes" />
+
+        {{#if banner_path}}
+        <WixVariable Id="WixUIBannerBmp" Value="{{banner_path}}" />
+        {{/if}}
+        {{#if dialog_image_path}}
+        <WixVariable Id="WixUIDialogBmp" Value="{{dialog_image_path}}" />
+        {{/if}}
+        {{#if license}}
+        <WixVariable Id="WixUILicenseRtf" Value="{{license}}" />
+        {{/if}}
+
+        <Icon Id="ProductIcon" SourceFile="{{icon_path}}"/>
+        <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
+        <Property Id="ARPNOREPAIR" Value="yes" Secure="yes" />      <!-- Remove repair -->
+        <SetProperty Id="ARPNOMODIFY" Value="1" After="InstallValidate" Sequence="execute"/>
+
+        {{#if homepage}}
+        <Property Id="ARPURLINFOABOUT" Value="{{homepage}}"/>
+        <Property Id="ARPHELPLINK" Value="{{homepage}}"/>
+        <Property Id="ARPURLUPDATEINFO" Value="{{homepage}}"/>
+        {{/if}}
+
+        <!-- NOTE: The order of RegistrySearch elements below matters. In WIX, when multiple
+             RegistrySearch elements are listed under a single Property, the LAST successful
+             match wins. We list the NSIS default-key search first and the MSI InstallDir
+             search second so that the MSI-specific path takes priority when both keys exist. -->
+        <Property Id="INSTALLDIR">
+          <!-- First attempt: Search for the default key value (this is how the nsis installer stores the path) -->
+          <RegistrySearch Id="PrevInstallDirNoName" Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Type="raw" />
+
+          <!-- Second attempt: Search for "InstallDir" which takes priority if found (this is how the msi installer stores the path) -->
+          <RegistrySearch Id="PrevInstallDirWithName" Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Name="InstallDir" Type="raw" />
+        </Property>
+
+        <!-- launch app checkbox -->
+        <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="!(loc.LaunchApp)" />
+        <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1"/>
+        <CustomAction Id="LaunchApplication" Impersonate="yes" FileKey="Path" ExeCommand="[LAUNCHAPPARGS]" Return="asyncNoWait" />
+
+        <UI>
+            <!-- launch app checkbox -->
+            <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed</Publish>
+
+            <Property Id="WIXUI_INSTALLDIR" Value="INSTALLDIR" />
+
+            {{#unless license}}
+            <!-- Skip license dialog -->
+            <Publish Dialog="WelcomeDlg"
+                     Control="Next"
+                     Event="NewDialog"
+                     Value="InstallDirDlg"
+                     Order="2">1</Publish>
+            <Publish Dialog="InstallDirDlg"
+                     Control="Back"
+                     Event="NewDialog"
+                     Value="WelcomeDlg"
+                     Order="2">1</Publish>
+            {{/unless}}
+
+            <!-- ===============================================================
+                 Tavern Card Studio 追加：卸载选项页（F14.1 / T10.22）
+
+                 挂载点：WixUI_InstallDir 的卸载路径
+                     MaintenanceWelcomeDlg → MaintenanceTypeDlg → VerifyReadyDlg → 进度 → ExitDialog
+                 把 MaintenanceTypeDlg 的 Remove 改道到 DeleteDataDlg，Next 再回
+                 VerifyReadyDlg。Order=2 在 WiX 自带那条（Order=1）之后执行，
+                 后执行者覆盖目标对话框。
+
+                 **控件名必须是 RemoveButton**。写成 Remove 不报错、不警告，
+                 那行 ControlEvent 指向不存在的控件，运行时永不触发 ——
+                 界面上就是"没有这一页"。
+                 =============================================================== -->
+
+            <Dialog Id="DeleteDataDlg" Width="370" Height="270" Title="[ProductName] Setup" NoMinimize="yes">
+                <!-- 坐标沿用 WiX 标准栅格：370×270，按钮 y=243，Back 180 / Next 236 / Cancel 304 -->
+                <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="WixUI_Bmp_Dialog" />
+                <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" TabSkip="no" />
+
+                <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="&amp;Back" />
+                <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Text="&amp;Next" Default="yes" />
+                <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Text="Cancel" Cancel="yes">
+                    <!-- 没有这条，按钮就是个"点了没反应"的死按钮（ICE17 报的正是这个） -->
+                    <Publish Event="SpawnDialog" Value="CancelDlg" />
+                </Control>
+
+                <Control Id="Title" Type="Text" X="135" Y="15" Width="220" Height="30" Transparent="yes" NoPrefix="yes"
+                         Text="{\WixUI_Font_Bigger}Uninstall options" />
+                <Control Id="Description" Type="Text" X="135" Y="48" Width="220" Height="40" Transparent="yes" NoPrefix="yes"
+                         Text="Only the application is removed. Its configuration is kept by default." />
+
+                <Control Id="DataDirLabel" Type="Text" X="135" Y="92" Width="220" Height="12" Transparent="yes" NoPrefix="yes"
+                         Text="Configuration directory:" />
+                <Control Id="DataDirPath" Type="Text" X="135" Y="105" Width="220" Height="24" Transparent="yes" NoPrefix="yes"
+                         Text="%APPDATA%\com.taverncardstudio.client" />
+
+                <Control Id="DeleteDataCheck" Type="CheckBox" X="135" Y="135" Width="220" Height="34"
+                         Text="Also delete this configuration directory (saved servers and access token)"
+                         Property="DELETEDATA" CheckBoxValue="1" />
+
+                <Control Id="Warning" Type="Text" X="135" Y="176" Width="220" Height="48" Transparent="yes" NoPrefix="yes"
+                         Text="Your character cards are NOT touched: they live in Documents\TavernCardStudio\cards and stay where they are." />
+            </Dialog>
+
+            <Publish Dialog="DeleteDataDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="1">1</Publish>
+            <Publish Dialog="DeleteDataDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="1">1</Publish>
+            <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="DeleteDataDlg" Order="2">1</Publish>
+
+        </UI>
+
+        <UIRef Id="WixUI_InstallDir" />
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="DesktopFolder" Name="Desktop">
+                <Component Id="ApplicationShortcutDesktop" Guid="*">
+                    <Shortcut Id="ApplicationDesktopShortcut" Name="{{product_name}}" Description="Runs {{product_name}}" Target="[!Path]" WorkingDirectory="INSTALLDIR" />
+                    <RemoveFolder Id="DesktopFolder" On="uninstall" />
+                    <RegistryValue Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Name="Desktop Shortcut" Type="integer" Value="1" KeyPath="yes" />
+                </Component>
+            </Directory>
+            <Directory Id="$(var.PlatformProgramFilesFolder)" Name="PFiles">
+                <Directory Id="INSTALLDIR" Name="{{product_name}}"/>
+            </Directory>
+            <Directory Id="ProgramMenuFolder">
+                <Directory Id="ApplicationProgramsFolder" Name="{{product_name}}"/>
+            </Directory>
+        </Directory>
+
+        <DirectoryRef Id="INSTALLDIR">
+            <Component Id="RegistryEntries" Guid="*">
+                <RegistryKey Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}">
+                    <RegistryValue Name="InstallDir" Type="string" Value="[INSTALLDIR]" KeyPath="yes" />
+                </RegistryKey>
+                <!-- Change the Root to HKCU for perUser installations -->
+                {{#each deep_link_protocols as |protocol| ~}}
+                <RegistryKey Root="HKLM" Key="Software\Classes\\{{protocol}}">
+                    <RegistryValue Type="string" Name="URL Protocol" Value=""/>
+                    <RegistryValue Type="string" Value="URL:{{bundle_id}} protocol"/>
+                    <RegistryKey Key="DefaultIcon">
+                        <RegistryValue Type="string" Value="&quot;[!Path]&quot;,0" />
+                    </RegistryKey>
+                    <RegistryKey Key="shell\open\command">
+                        <RegistryValue Type="string" Value="&quot;[!Path]&quot; &quot;%1&quot;" />
+                    </RegistryKey>
+                </RegistryKey>
+                {{/each~}}
+            </Component>
+            <Component Id="Path" Guid="{{path_component_guid}}" Win64="$(var.Win64)">
+                <File Id="Path" Source="{{main_binary_path}}" KeyPath="yes" Checksum="yes"/>
+                {{#each file_associations as |association| ~}}
+                {{#each association.ext as |ext| ~}}
+                <ProgId Id="{{../../product_name}}.{{ext}}" Advertise="yes" Description="{{association.description}}">
+                    <Extension Id="{{ext}}" Advertise="yes">
+                        <Verb Id="open" Command="Open with {{../../product_name}}" Argument="&quot;%1&quot;" />
+                    </Extension>
+                </ProgId>
+                {{/each~}}
+                {{/each~}}
+            </Component>
+            {{#each binaries as |bin| ~}}
+            <Component Id="{{ bin.id }}" Guid="{{bin.guid}}" Win64="$(var.Win64)">
+                <File Id="Bin_{{ bin.id }}" Source="{{bin.path}}" KeyPath="yes"/>
+            </Component>
+            {{/each~}}
+            {{#if enable_elevated_update_task}}
+            <Component Id="UpdateTask" Guid="C492327D-9720-4CD5-8DB8-F09082AF44BE" Win64="$(var.Win64)">
+                <File Id="UpdateTask" Source="update.xml" KeyPath="yes" Checksum="yes"/>
+            </Component>
+            <Component Id="UpdateTaskInstaller" Guid="011F25ED-9BE3-50A7-9E9B-3519ED2B9932" Win64="$(var.Win64)">
+                <File Id="UpdateTaskInstaller" Source="install-task.ps1" KeyPath="yes" Checksum="yes"/>
+            </Component>
+            <Component Id="UpdateTaskUninstaller" Guid="D4F6CC3F-32DC-5FD0-95E8-782FFD7BBCE1" Win64="$(var.Win64)">
+                <File Id="UpdateTaskUninstaller" Source="uninstall-task.ps1" KeyPath="yes" Checksum="yes"/>
+            </Component>
+            {{/if}}
+            {{resources}}
+            <Component Id="CMP_UninstallShortcut" Guid="*">
+
+                <Shortcut Id="UninstallShortcut"
+						  Name="Uninstall {{product_name}}"
+						  Description="Uninstalls {{product_name}}"
+						  Target="[System64Folder]msiexec.exe"
+						  Arguments="/x [ProductCode]" />
+
+				<RemoveFolder Id="INSTALLDIR"
+							  On="uninstall" />
+
+				<RegistryValue Root="HKCU"
+							   Key="Software\\{{manufacturer}}\\{{product_name}}"
+							   Name="Uninstaller Shortcut"
+							   Type="integer"
+							   Value="1"
+							   KeyPath="yes" />
+            </Component>
+        </DirectoryRef>
+
+        <DirectoryRef Id="ApplicationProgramsFolder">
+            <Component Id="ApplicationShortcut" Guid="*">
+                <Shortcut Id="ApplicationStartMenuShortcut"
+                    Name="{{product_name}}"
+                    Description="Runs {{product_name}}"
+                    Target="[!Path]"
+                    Icon="ProductIcon"
+                    WorkingDirectory="INSTALLDIR">
+                    <ShortcutProperty Key="System.AppUserModel.ID" Value="{{bundle_id}}"/>
+                </Shortcut>
+                <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall"/>
+                <RegistryValue Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Name="Start Menu Shortcut" Type="integer" Value="1" KeyPath="yes"/>
+           </Component>
+        </DirectoryRef>
+
+        {{#each merge_modules as |msm| ~}}
+        <DirectoryRef Id="TARGETDIR">
+            <Merge Id="{{ msm.name }}" SourceFile="{{ msm.path }}" DiskId="1" Language="!(loc.TauriLanguage)" />
+        </DirectoryRef>
+
+        <Feature Id="{{ msm.name }}" Title="{{ msm.name }}" AllowAdvertise="no" Display="hidden" Level="1">
+            <MergeRef Id="{{ msm.name }}"/>
+        </Feature>
+        {{/each~}}
+
+        <Feature
+                Id="MainProgram"
+                Title="Application"
+                Description="!(loc.InstallAppFeature)"
+                Level="1"
+                ConfigurableDirectory="INSTALLDIR"
+                AllowAdvertise="no"
+                Display="expand"
+                Absent="disallow">
+
+            <ComponentRef Id="RegistryEntries"/>
+
+            {{#each resource_file_ids as |resource_file_id| ~}}
+                <ComponentRef Id="{{ resource_file_id }}"/>
+            {{/each~}}
+
+            {{#if enable_elevated_update_task}}
+                <ComponentRef Id="UpdateTask" />
+                <ComponentRef Id="UpdateTaskInstaller" />
+                <ComponentRef Id="UpdateTaskUninstaller" />
+            {{/if}}
+
+            <Feature Id="ShortcutsFeature"
+                Title="Shortcuts"
+                Level="1">
+                <ComponentRef Id="Path"/>
+                <ComponentRef Id="CMP_UninstallShortcut" />
+                <ComponentRef Id="ApplicationShortcut" />
+                <ComponentRef Id="ApplicationShortcutDesktop" />
+            </Feature>
+
+            <Feature
+                Id="Environment"
+                Title="PATH Environment Variable"
+                Description="!(loc.PathEnvVarFeature)"
+                Level="1"
+                Absent="allow">
+            <ComponentRef Id="Path"/>
+            {{#each binaries as |bin| ~}}
+            <ComponentRef Id="{{ bin.id }}"/>
+            {{/each~}}
+            </Feature>
+        </Feature>
+
+        <Feature Id="External" AllowAdvertise="no" Absent="disallow">
+            {{#each component_group_refs as |id| ~}}
+            <ComponentGroupRef Id="{{ id }}"/>
+            {{/each~}}
+            {{#each component_refs as |id| ~}}
+            <ComponentRef Id="{{ id }}"/>
+            {{/each~}}
+            {{#each feature_group_refs as |id| ~}}
+            <FeatureGroupRef Id="{{ id }}"/>
+            {{/each~}}
+            {{#each feature_refs as |id| ~}}
+            <FeatureRef Id="{{ id }}"/>
+            {{/each~}}
+            {{#each merge_refs as |id| ~}}
+            <MergeRef Id="{{ id }}"/>
+            {{/each~}}
+        </Feature>
+
+        {{#if install_webview}}
+        <!-- WebView2 -->
+        <Property Id="INSTALLED_WEBVIEW2_VERSION">
+            <RegistrySearch Id="Webview2VersionSystemx64" Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" Name="pv" Type="raw" />
+            <RegistrySearch Id="Webview2VersionSystemx86" Root="HKLM" Key="SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" Name="pv" Type="raw" />
+            <RegistrySearch Id="Webview2VersionUser" Root="HKCU" Key="SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" Name="pv" Type="raw"/>
+        </Property>
+
+        {{#if download_bootstrapper}}
+        <!-- Download webview bootstrapper mode -->
+        <CustomAction Id='DownloadAndInvokeBootstrapper' Directory="INSTALLDIR" Execute="deferred" ExeCommand='powershell.exe -NoProfile -windowstyle hidden try [\{] [\[]Net.ServicePointManager[\]]::SecurityProtocol = [\[]Net.SecurityProtocolType[\]]::Tls12 [\}] catch [\{][\}]; Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile "$env:TEMP\MicrosoftEdgeWebview2Setup.exe" ; Start-Process -FilePath "$env:TEMP\MicrosoftEdgeWebview2Setup.exe" -ArgumentList ({{webview_installer_args}} &apos;/install&apos;) -Wait' Return='check'/>
+        <InstallExecuteSequence>
+            <Custom Action='DownloadAndInvokeBootstrapper' Before='InstallFinalize'>
+                <![CDATA[NOT(REMOVE OR INSTALLED_WEBVIEW2_VERSION)]]>
+            </Custom>
+        </InstallExecuteSequence>
+        {{/if}}
+
+        {{#if webview2_bootstrapper_path}}
+        <!-- Embedded webview bootstrapper mode -->
+        <Binary Id="MicrosoftEdgeWebview2Setup.exe" SourceFile="{{webview2_bootstrapper_path}}"/>
+        <CustomAction Id='InvokeBootstrapper' BinaryKey='MicrosoftEdgeWebview2Setup.exe' Execute="deferred" ExeCommand='{{webview_installer_args}} /install' Return='check' />
+        <InstallExecuteSequence>
+            <Custom Action='InvokeBootstrapper' Before='InstallFinalize'>
+                <![CDATA[NOT(REMOVE OR INSTALLED_WEBVIEW2_VERSION)]]>
+            </Custom>
+        </InstallExecuteSequence>
+        {{/if}}
+
+        {{#if webview2_installer_path}}
+        <!-- Embedded offline installer -->
+        <Binary Id="MicrosoftEdgeWebView2RuntimeInstaller.exe" SourceFile="{{webview2_installer_path}}"/>
+        <CustomAction Id='InvokeStandalone' BinaryKey='MicrosoftEdgeWebView2RuntimeInstaller.exe' Execute="deferred" ExeCommand='{{webview_installer_args}} /install' Return='check' />
+        <InstallExecuteSequence>
+            <Custom Action='InvokeStandalone' Before='InstallFinalize'>
+                <![CDATA[NOT(REMOVE OR INSTALLED_WEBVIEW2_VERSION)]]>
+            </Custom>
+        </InstallExecuteSequence>
+        {{/if}}
+
+        {{#if minimum_webview2_version}}
+        <!-- Update WebView2 if minimum version requirement not met -->
+        <Property Id="MINIMUM_WEBVIEW2_VERSION" Value="{{minimum_webview2_version}}" />
+        <Property Id="EDGEUPDATE_PATH">
+            <RegistrySearch Id="EdgeUpdateLocalMachine64" Root="HKLM" Key="SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate" Name="path" Type="raw" />
+            <RegistrySearch Id="EdgeUpdateLocalMachine32" Root="HKLM" Key="SOFTWARE\Microsoft\EdgeUpdate" Name="path" Type="raw"/>
+            <RegistrySearch Id="EdgeUpdateCurrentUser" Root="HKCU" Key="SOFTWARE\Microsoft\EdgeUpdate" Name="path" Type="raw"/>
+        </Property>
+        <!-- Chromium updater docs: https://source.chromium.org/chromium/chromium/src/+/main:docs/updater/user_manual.md -->
+        <!-- Modified from "HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft EdgeWebView\ModifyPath" -->
+        <CustomAction Id="UpdateWebView2ViaEdgeUpdate" Execute="deferred" Property="EDGEUPDATE_PATH" Return="check" Impersonate="no" ExeCommand="/install appguid={F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}&amp;needsadmin=true" />
+        <InstallExecuteSequence>
+            <Custom Action='UpdateWebView2ViaEdgeUpdate' Before='InstallFinalize'>
+                <![CDATA[
+                  NOT REMOVE
+                  AND INSTALLED_WEBVIEW2_VERSION
+                  AND (INSTALLED_WEBVIEW2_VERSION < MINIMUM_WEBVIEW2_VERSION)
+                ]]>
+            </Custom>
+        </InstallExecuteSequence>
+        {{/if}}
+
+        {{/if}}
+
+        {{#if enable_elevated_update_task}}
+        <!-- Install an elevated update task within Windows Task Scheduler -->
+        <CustomAction
+            Id="CreateUpdateTask"
+            Return="check"
+            Directory="INSTALLDIR"
+            Execute="commit"
+            Impersonate="yes"
+            ExeCommand="powershell.exe -WindowStyle hidden .\install-task.ps1" />
+        <InstallExecuteSequence>
+            <Custom Action='CreateUpdateTask' Before='InstallFinalize'>
+                NOT(REMOVE)
+            </Custom>
+        </InstallExecuteSequence>
+        <!-- Remove elevated update task during uninstall -->
+        <CustomAction
+            Id="DeleteUpdateTask"
+            Return="check"
+            Directory="INSTALLDIR"
+            ExeCommand="powershell.exe -WindowStyle hidden .\uninstall-task.ps1" />
+        <InstallExecuteSequence>
+            <Custom Action="DeleteUpdateTask" Before='InstallFinalize'>
+                (REMOVE = "ALL") AND NOT UPGRADINGPRODUCTCODE
+            </Custom>
+        </InstallExecuteSequence>
+        {{/if}}
+
+        <InstallExecuteSequence>
+          <Custom Action="LaunchApplication" After="InstallFinalize">AUTOLAUNCHAPP AND NOT Installed</Custom>
+        </InstallExecuteSequence>
+
+        <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLDIR]" After="CostFinalize"/>
+    </Product>
+</Wix>
