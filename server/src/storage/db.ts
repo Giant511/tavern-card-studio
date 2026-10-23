@@ -545,9 +545,16 @@ export class Db {
    *
    * **不动 `updated_at`**（T10.6 决策）：归属变更不是内容变更。
    * 如果刷新它，"最近修改"排序会把一次整理动作冒充成一次编辑。
+   *
+   * `ownerId` 只在校验后的跨账户移动时传：卡片进了别人的仓库，归属必须一起转，
+   * 否则会出现"卡在甲的仓库里、`owner_id` 还是乙"这种两头都不一致的状态
+   * （乙仍能看见它，甲在自己的仓库里看不到它 —— 测试实测过）。
    */
-  moveCard(cardId: string, repoId: string): boolean {
-    const result = this.handle.prepare('UPDATE cards SET repo_id = ? WHERE id = ?').run(repoId, cardId);
+  moveCard(cardId: string, repoId: string, ownerId?: string): boolean {
+    const result =
+      ownerId === undefined
+        ? this.handle.prepare('UPDATE cards SET repo_id = ? WHERE id = ?').run(repoId, cardId)
+        : this.handle.prepare('UPDATE cards SET repo_id = ?, owner_id = ? WHERE id = ?').run(repoId, ownerId, cardId);
     return result.changes > 0;
   }
 

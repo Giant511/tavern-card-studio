@@ -5,7 +5,7 @@
  *   GET    /api/repos                    列出自己的仓库
  *   POST   /api/repos                    新建仓库
  *   PATCH  /api/repos/:id                改名 / 改描述
- *   DELETE /api/repos/:id                软删（有卡片时拒绝）
+ *   DELETE /api/repos/:id                软删；非空必须带 {transferTo}（T10.19）；管理员可跨账户
  *   POST   /api/repos/:id/default        设为默认
  *
  *   GET    /api/repos/:id/tokens          列出该仓库的令牌（只给前缀）
@@ -38,6 +38,17 @@ export interface RepoRouteDeps {
   tokens: TokenStore;
   identify: (ctx: RouteContext) => AuthContext | null;
   now?: () => Date;
+  /**
+   * 审计回调（T10.19）。仓库层的跨账户操作需要落到 `events` 表，
+   * 但仓库路由不持有 Db —— 由装配处注入，和卡片服务共用同一个事件流。
+   */
+  onAudit?: (event: {
+    action: string;
+    repoId: string;
+    ownerId: string;
+    actor: string;
+    detail: Record<string, unknown>;
+  }) => void;
 }
 
 function bodyJson(ctx: RouteContext): Record<string, unknown> {
@@ -173,14 +184,55 @@ export function registerRepoRoutes(router: Registrar, deps: RepoRouteDeps): void
     }
   });
 
+  /**
+   * 删除仓库（F13.4 / T10.19）。
+   *
+   * - 空仓库：直接删；
+   * - 非空：**必须**带 `transferTo`，卡批量转移后删除（一个事务）；
+   * - 默认仓库：拒绝，并指向「转移默认」（`POST /api/repos/:id/default`）；
+   * - 管理员：可以删**别的账户**的仓库（`owner_id` 不匹配时要求 admin），
+   *   这种跨账户操作会写一条带 actor 的审计事件。
+   */
   router.delete('/api/repos/:id', (ctx) => {
     const caller = requireAccount(ctx, deps);
     rejectRepoToken(caller);
     const repo = deps.repos.findById(ctx.params['id']!);
-    if (!repo || repo.owner_id !== caller.userId) throw new AppError(404, 'NOT_FOUND', '仓库不存在');
+    if (!repo) throw new AppError(404, 'NOT_FOUND', '仓库不存在');
+
+    const isCrossAccount = repo.owner_id !== caller.userId;
+    if (isCrossAccount && caller.role !== 'admin') {
+      // 归属不匹配一律 404（docs/29 §2）：403 会确认"这个 id 确实是个仓库"
+      throw new AppError(404, 'NOT_FOUND', '仓库不存在');
+    }
+
+    const body = bodyJson(ctx);
+    const transferToRaw = body['transferTo'];
+    // 体里的优先；没有就看 query —— 有些反向代理会丢掉 DELETE 的请求体，
+    // 只认体的话那些部署下"带 transferTo 删除"永远走不通。
+    const fromBody = typeof transferToRaw === 'string' && transferToRaw.trim() !== '' ? transferToRaw.trim() : '';
+    const fromQuery = (ctx.query.get('transferTo') ?? '').trim();
+    const transferTo = fromBody !== '' ? fromBody : fromQuery !== '' ? fromQuery : null;
+    const reason = str(body, 'reason') || (ctx.query.get('reason') ?? '');
+
     try {
-      deps.repos.remove(repo.id, now().toISOString());
-      sendJson(ctx.res, 200, { deleted: true, id: repo.id });
+      const result = deps.repos.removeWithTransfer(repo.id, transferTo, now().toISOString());
+      if (isCrossAccount) {
+        // 跨账户删除是管理员的高危动作，必须留痕（谁、对谁的仓库、为什么）
+        deps.onAudit?.({
+          action: 'repo.delete.cross-account',
+          repoId: repo.id,
+          ownerId: repo.owner_id,
+          actor: caller.username ?? caller.userId ?? 'admin',
+          detail: { name: repo.name, movedCards: result.movedCards, reason },
+        });
+      }
+      sendJson(ctx.res, 200, {
+        deleted: true,
+        id: repo.id,
+        movedCards: result.movedCards,
+        revokedTokens: result.revokedTokens,
+        transferredTo: transferTo,
+      });
     } catch (error) {
       if (error instanceof Error) throw new AppError(409, 'CONFLICT', error.message);
       throw error;
