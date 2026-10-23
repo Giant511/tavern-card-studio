@@ -195,10 +195,25 @@ function toVersionSummary(input: Record<string, unknown>): VersionSummary {
   const auditObj =
     typeof audit === 'object' && audit !== null ? (audit as Record<string, unknown>) : null;
 
+  /*
+   * `pruned` / `sha256: null` 必须**照原样**映射过来。
+   *
+   * 这里原本写 `sha256: String(input['sha256'] ?? '')` —— 服务端在 prune 后
+   * 明确给 `null`（表示"内容没了"），被转成空串后：
+   *   · 界面拿去 `.slice(0,12)` 显示一个空白的 sha 格子；
+   *   · 而 `pruned` 根本没被映射，于是"已清除"的判断永远是 false ——
+   *     实测表现为：服务端已 pruned、DOM 里也显示 0 字节，但「清除内容」
+   *     按钮还挂着（能被再点一次），版本行也没有"已清除"标记。
+   * 类型上 `sha256: string | null` 就是为了让这个区别活到渲染层。
+   */
+  const pruned = input['pruned'] === true;
   return {
     seq: Number(input['seq'] ?? 0),
     commit: String(input['commit'] ?? ''),
-    sha256: String(input['sha256'] ?? ''),
+    sha256: pruned ? null : String(input['sha256'] ?? ''),
+    pruned,
+    prunedAt: typeof input['prunedAt'] === 'string' ? input['prunedAt'] : null,
+    prunedBy: typeof input['prunedBy'] === 'string' ? input['prunedBy'] : null,
     size: Number(input['size'] ?? 0),
     message: String(input['message'] ?? ''),
     author: String(input['author'] ?? ''),
@@ -372,6 +387,97 @@ export async function listVersions(
   const body = (await response.json()) as Record<string, unknown>;
   const items = Array.isArray(body['items']) ? (body['items'] as Record<string, unknown>[]) : [];
   return items.map(toVersionSummary);
+}
+
+/**
+ * 删除卡片（F13.2）：**软删除**，进回收站，保留期内可恢复。
+ *
+ * 为什么不在这里提供"彻底清除"：那是不可逆操作、仅管理员可用，客户端不做入口
+ * （面板的治理页才给）。误点一次删除还能恢复，误点一次彻底清除就只能认了。
+ */
+export async function deleteCard(
+  config: SyncConfig,
+  cardId: string,
+  options: RequestOptions = {},
+): Promise<{ id: string; alreadyDeleted: boolean }> {
+  const response = await request(
+    config,
+    `/api/cards/${encodeURIComponent(cardId)}`,
+    { method: 'DELETE' },
+    options,
+  );
+  const body = (await response.json()) as Record<string, unknown>;
+  return {
+    id: typeof body['id'] === 'string' ? body['id'] : cardId,
+    alreadyDeleted: body['alreadyDeleted'] === true,
+  };
+}
+
+/** 从回收站恢复（F13.2） */
+export async function restoreCard(
+  config: SyncConfig,
+  cardId: string,
+  options: RequestOptions = {},
+): Promise<{ id: string; restored: boolean }> {
+  const response = await request(
+    config,
+    `/api/cards/${encodeURIComponent(cardId)}/restore`,
+    { method: 'POST' },
+    options,
+  );
+  const body = (await response.json()) as Record<string, unknown>;
+  return { id: typeof body['id'] === 'string' ? body['id'] : cardId, restored: body['restored'] === true };
+}
+
+/**
+ * 清除某版本的内容（F13.3）。
+ *
+ * 最新版本服务端会拒绝（409）—— 客户端也把入口置灰，两层都拦：
+ * 只靠服务端的话，用户会点出一个"不知道为什么不行"的报错。
+ */
+export async function pruneVersion(
+  config: SyncConfig,
+  cardId: string,
+  seq: number,
+  options: RequestOptions = {},
+): Promise<{ seq: number; pruned: boolean; alreadyPruned: boolean }> {
+  const response = await request(
+    config,
+    `/api/cards/${encodeURIComponent(cardId)}/versions/${String(seq)}/prune`,
+    { method: 'POST' },
+    options,
+  );
+  const body = (await response.json()) as Record<string, unknown>;
+  return {
+    seq: typeof body['seq'] === 'number' ? body['seq'] : seq,
+    pruned: body['pruned'] === true,
+    alreadyPruned: body['alreadyPruned'] === true,
+  };
+}
+
+/** 把卡片移到另一个仓库（F13.4）：改归属，不动内容与 updated_at */
+export async function moveCard(
+  config: SyncConfig,
+  cardId: string,
+  repoId: string,
+  options: RequestOptions & { reason?: string } = {},
+): Promise<{ repoId: string; fromRepoId: string; moved: boolean }> {
+  const response = await request(
+    config,
+    `/api/cards/${encodeURIComponent(cardId)}/move`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo: repoId, reason: options.reason }),
+    },
+    options,
+  );
+  const body = (await response.json()) as Record<string, unknown>;
+  return {
+    repoId: typeof body['repoId'] === 'string' ? body['repoId'] : repoId,
+    fromRepoId: typeof body['fromRepoId'] === 'string' ? body['fromRepoId'] : '',
+    moved: body['moved'] === true,
+  };
 }
 
 /**
