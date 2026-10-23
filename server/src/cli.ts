@@ -27,6 +27,10 @@ import {
   type ServerConfigFile,
 } from './config.js';
 import { SERVER_VERSION } from './context.js';
+import { hashPassword } from './auth/password.js';
+import { migrateToFirstAccount, planMigration } from './auth/migrate.js';
+import { Db } from './storage/db.js';
+import { adoptOrphanCards, countOrphanCards, UserStore } from './storage/users.js';
 import { startSupervisor } from './supervisor.js';
 import { startWorker } from './worker.js';
 
@@ -245,6 +249,196 @@ function serviceCommand(action: string, loaded: LoadedConfig, dryRun: boolean): 
   }
 }
 
+/**
+ * `tcs-server user …` —— 账户运维命令（T10.3）。
+ *
+ * 为什么要这么一组命令：注册策略默认**关闭**（需求 F1.1），所以第一个账户
+ * 和后续管理员建的账户都只能从命令行/面板产生。CLI 这条路不依赖 HTTP，
+ * 面板进不去时（比如忘了密码）还能救回来。
+ *
+ * 密码**只从 stdin 读**，不接受 `--password` 参数：命令行参数会进 shell 历史、
+ * 也会出现在进程列表里（`ps`/任务管理器都能看到），等于把密码写在公告板上。
+ */
+async function userCommand(action: string | undefined, options: CliOptions): Promise<number> {
+  const loaded = load(options.configPath, options.overrides);
+  const dbFile = join(loaded.config.dataDir, 'state.db');
+  const db = new Db(dbFile);
+  try {
+    return await runUserCommand(action, options, db, dbFile);
+  } catch (error) {
+    // 业务错误（重名、最后一个管理员、密码不合规）不是"程序崩了"，
+    // 不该把堆栈甩给用户 —— 说清哪错了、怎么办就够。
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    return 1;
+  } finally {
+    db.close();
+  }
+}
+
+async function runUserCommand(
+  action: string | undefined,
+  options: CliOptions,
+  db: Db,
+  dbFile: string,
+): Promise<number> {
+  {
+    const users = new UserStore(db.handle);
+
+    if (action === 'list' || action === undefined) {
+      const rows = users.list();
+      if (rows.length === 0) {
+        process.stdout.write('还没有任何账户。用 `tcs-server user add <用户名>` 创建第一个（管理员）。\n');
+        return 0;
+      }
+      process.stdout.write('用户名\t角色\t状态\t创建时间\t最后登录\n');
+      for (const row of rows) {
+        process.stdout.write(
+          `${row.username}\t${row.role}\t${row.status}\t${row.created_at}\t${row.last_login_at ?? '-'}\n`,
+        );
+      }
+      const orphans = countOrphanCards(db.handle);
+      if (orphans > 0) {
+        process.stderr.write(`\n注意：有 ${String(orphans)} 张卡片没有归属账户。` +
+          '用 `tcs-server user adopt <用户名>` 把它们划给某个账户。\n');
+      }
+      return 0;
+    }
+
+    if (action === 'add' || action === 'create') {
+      const username = options.positional[2];
+      if (!username) {
+        process.stderr.write('用法：tcs-server user add <用户名> [--role admin|user]\n');
+        return 2;
+      }
+      const role = options.flags['role'] === 'admin' ? 'admin' : 'user';
+      const password = await readPasswordFromStdin('设置密码');
+      const passwordHash = await hashPassword(password);
+      // 第一个账户强制管理员：否则建完就没人能管理服务端
+      const finalRole = users.count() === 0 ? 'admin' : role;
+      const row = users.create({ username, passwordHash, role: finalRole });
+      process.stdout.write(`已创建账户「${row.username}」（${row.role}）\n`);
+      if (finalRole !== role) {
+        process.stderr.write('（这是第一个账户，已自动设为管理员）\n');
+      }
+      return 0;
+    }
+
+    if (action === 'passwd' || action === 'password') {
+      const username = options.positional[2];
+      if (!username) {
+        process.stderr.write('用法：tcs-server user passwd <用户名>\n');
+        return 2;
+      }
+      const user = users.findByUsername(username);
+      if (!user) {
+        process.stderr.write(`用户「${username}」不存在\n`);
+        return 1;
+      }
+      const password = await readPasswordFromStdin('新密码');
+      users.setPassword(user.id, await hashPassword(password));
+      process.stdout.write(`已更新「${user.username}」的密码\n`);
+      return 0;
+    }
+
+    if (action === 'disable' || action === 'enable') {
+      const username = options.positional[2];
+      if (!username) {
+        process.stderr.write(`用法：tcs-server user ${action} <用户名>\n`);
+        return 2;
+      }
+      const user = users.findByUsername(username);
+      if (!user) {
+        process.stderr.write(`用户「${username}」不存在\n`);
+        return 1;
+      }
+      users.setStatus(user.id, action === 'disable' ? 'disabled' : 'active');
+      process.stdout.write(`已${action === 'disable' ? '禁用' : '启用'}「${user.username}」\n`);
+      return 0;
+    }
+
+    if (action === 'adopt') {
+      const username = options.positional[2];
+      if (!username) {
+        process.stderr.write('用法：tcs-server user adopt <用户名>\n');
+        return 2;
+      }
+      const user = users.findByUsername(username);
+      if (!user) {
+        process.stderr.write(`用户「${username}」不存在\n`);
+        return 1;
+      }
+      const adopted = adoptOrphanCards(db.handle, user.id);
+      process.stdout.write(`已把 ${String(adopted)} 张无归属卡片划给「${user.username}」\n`);
+      return 0;
+    }
+
+    if (action === 'migrate') {
+      const username = options.positional[2] ?? 'admin';
+      const plan = planMigration(db.handle);
+      if (!plan.needed) {
+        process.stdout.write(`已有 ${String(users.count())} 个账户，无需迁移\n`);
+        return 0;
+      }
+      process.stdout.write(
+        `将创建首账户「${username}」（管理员）并接管 ${String(plan.orphanCards)} 张历史卡片。\n` +
+          '原库会先自动备份（VACUUM INTO，含最新事务）。\n',
+      );
+      const password = await readPasswordFromStdin('首账户密码');
+      const result = await migrateToFirstAccount(db.handle, { username, password, dbFile });
+      process.stdout.write(`${result.message}\n`);
+      return 0;
+    }
+
+    process.stderr.write(`未知的 user 操作：${action}（list/add/passwd/enable/disable/adopt/migrate）\n`);
+    return 2;
+  }
+}
+
+/**
+ * 从 stdin 读一行密码（不回显、不入 shell 历史）。
+ *
+ * 非交互场景（测试、脚本）允许用环境变量 `TCS_PASSWORD`：
+ * 环境变量不会进进程列表的可见命令行，但仍可能被同用户进程读到，
+ * 所以只在无法交互时才用它。
+ */
+async function readPasswordFromStdin(prompt: string): Promise<string> {
+  const fromEnv = process.env['TCS_PASSWORD'];
+  if (fromEnv !== undefined && fromEnv !== '') return fromEnv;
+
+  if (!process.stdin.isTTY) {
+    // 管道输入：读一整行
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+    const text = Buffer.concat(chunks).toString('utf8').split(/\r?\n/)[0] ?? '';
+    if (text === '') throw new Error(`${prompt}：没有从 stdin 读到内容`);
+    return text;
+  }
+
+  process.stderr.write(`${prompt}：`);
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  let value = '';
+  try {
+    for await (const chunk of process.stdin) {
+      const char = String(chunk);
+      if (char === '\r' || char === '\n') break;
+      if (char === '\u0003') throw new Error('已取消'); // Ctrl+C
+      if (char === '\u007f' || char === '\b') {
+        value = value.slice(0, -1);
+        continue;
+      }
+      value += char;
+    }
+  } finally {
+    process.stdin.setRawMode(false);
+    process.stdin.pause();
+    process.stderr.write('\n');
+  }
+  if (value === '') throw new Error(`${prompt}：不能为空`);
+  return value;
+}
+
 export async function main(argv: readonly string[]): Promise<number> {
   const options = parseArgs(argv);
   const group = options.positional[0] ?? 'serve';
@@ -288,6 +482,10 @@ export async function main(argv: readonly string[]): Promise<number> {
   if (group === 'service') {
     const loaded = load(options.configPath, options.overrides);
     return serviceCommand(action ?? 'status', loaded, options.flags['dry-run'] === true);
+  }
+
+  if (group === 'user') {
+    return userCommand(action, options);
   }
 
   if (options.command === 'worker') {
