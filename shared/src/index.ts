@@ -14,6 +14,7 @@ export * from './format/description.js';
 export * from './format/preset.js';
 export * from './format/sillytavern-io.js';
 export * from './format/worldbook.js';
+export * from './format/worldbook-io.js';
 export * from './format/card-txt.js';
 
 export * from './rules/platform-rule.js';

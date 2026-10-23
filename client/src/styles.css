@@ -2289,3 +2289,96 @@ body {
   background: var(--border);
   color: var(--muted);
 }
+
+/* ── 导入对话框（T10.9）──────────────────────────────── */
+.import-modal .modal-body {
+  padding: 22px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.import-subtitle {
+  margin: 0;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.import-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.import-summary-line {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.import-summary-line.bad {
+  color: var(--danger);
+}
+
+/*
+ * 「导入将替换当前世界书」用 warn 色：这是**破坏性提示**，
+ * 和普通摘要放在同一视觉层级会被当成可跳过的说明。
+ */
+.import-summary-line.warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.import-issues-head {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.import-issues-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ok);
+}
+
+.import-issues-list {
+  margin: 0;
+  padding-left: 18px;
+  max-height: 34vh;
+  overflow: auto;
+}
+
+.import-issue {
+  font-size: 12px;
+  line-height: 1.6;
+  margin-bottom: 2px;
+}
+
+.import-issue[data-severity='error'] .import-issue-text {
+  color: var(--danger);
+}
+
+.import-issue[data-severity='warning'] .import-issue-text {
+  color: var(--warn);
+}
+
+.import-issue-hint {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* 世界书块内的导入/导出按钮行 */
+.worldbook-actions {
+  display: flex;
+  gap: 8px;
+  padding: 6px 0 8px;
+  flex-wrap: wrap;
+}
+
+/* 导入对话框要压在其它对话框之上（与登录框同理：它可能从同步面板里弹出） */
+.import-mode {
+  gap: 14px;
+  align-items: center;
+}
