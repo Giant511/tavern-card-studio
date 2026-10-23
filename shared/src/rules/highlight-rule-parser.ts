@@ -21,7 +21,10 @@ import type {
 } from './highlight-rule.js';
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]{1,63}$/;
-const SCOPE_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,47}$/;
+// scope id 会**直接**拼进 CSS 类名（`applySchemeStyles`），所以点号必须排除：
+// 它在选择器里是类的连接符，含点号的 id 生成的规则永远匹配不上（静默失效）。
+// 独立的错误消息见 validateScope —— 这里只保证放行集合与 CSS 安全字符集一致。
+const SCOPE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
 const COLOR_PATTERN = /^(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)|[a-zA-Z]{3,20})$/;
 const FLAGS_PATTERN = /^[gimsu]*$/;
@@ -106,7 +109,30 @@ function validateScope(errors: string[], warnings: string[], index: number, scop
     return;
   }
   const id = scope['id'];
-  if (typeof id !== 'string' || !SCOPE_ID_PATTERN.test(id)) errors.push(`${where}: id 不合法`);
+  if (typeof id !== 'string' || id === '') {
+    errors.push(`${where}: 缺少 id`);
+  } else if (id.includes('.')) {
+    // 点号**必须单独报**，不能笼统说"id 不合法"。
+    //
+    // 为什么：`applySchemeStyles` 把 scope id 直接拼进 CSS 类名
+    // （`client/src/editor/highlight.ts`），点号在 CSS 选择器里是"类的连接符"，
+    // 于是 id `placeholder.char` 会生成 `.tcs-hl-placeholder.char`，含义变成
+    // 「同时具有 tcs-hl-placeholder 与 char 两个类」，而元素上是**单个**类名
+    // `tcs-hl-placeholder.char` —— 永不匹配。整份方案的规则一条都不会上色，
+    // 且主题色（theme）照常生效，看起来像"导入成功了却没反应"。
+    //
+    // 这个组合（解析器认为合法 + CSS 层静默失效）在 v0.1.2 之前真实存在过：
+    // 用户附件 `通用高亮配置.json` 的 9 个 scope id 全部含点号，
+    // 实测 computed color 是 theme.foreground —— 规则全灭。
+    // 因此在这里显式拒绝，并在消息里直接给出改名结果。
+    errors.push(
+      `${where}: scope id 不能包含 . （收到 "${id}"）。` +
+        `点号是 CSS 选择器的类连接符，会让样式永远匹配不上；` +
+        `请改成 "${id.replace(/\./g, '-')}"（点号换成连字符）。`,
+    );
+  } else if (!SCOPE_ID_PATTERN.test(id)) {
+    errors.push(`${where}: id 不合法（只允许小写字母、数字、连字符、下划线，最长 48 字符）`);
+  }
   if (typeof scope['label'] !== 'string' || scope['label'] === '') errors.push(`${where}: 缺少 label`);
   if (!isColor(scope['color'])) errors.push(`${where}: color 必须是合法颜色值`);
   const background = scope['backgroundColor'];

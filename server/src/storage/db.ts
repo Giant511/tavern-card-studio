@@ -107,9 +107,23 @@ export interface EventRow {
 }
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  username TEXT NOT NULL,
+  username_key TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'user',
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_login_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_key ON users(username_key);
+
 CREATE TABLE IF NOT EXISTS cards (
   id TEXT PRIMARY KEY,
   id_source TEXT NOT NULL DEFAULT 'legacy',
+  owner_id TEXT NOT NULL DEFAULT '',
   name TEXT NOT NULL,
   spec TEXT NOT NULL DEFAULT '',
   spec_version TEXT NOT NULL DEFAULT '',
@@ -137,6 +151,11 @@ CREATE TABLE IF NOT EXISTS cards (
 );
 CREATE INDEX IF NOT EXISTS idx_cards_updated ON cards(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cards_name ON cards(name);
+-- 注意：owner_id 的索引【不能】写在这里。
+-- 老库的 cards 表没有 owner_id 列（它是 T10.3 才加的，靠 ensureColumn 补），
+-- 而 CREATE TABLE IF NOT EXISTS 对已存在的表什么都不做 —— 于是这条
+-- CREATE INDEX 会在补列【之前】执行并抛 "no such column: owner_id"，
+-- 整个服务起不来。索引改在构造函数里、ensureColumn 之后建。
 
 CREATE TABLE IF NOT EXISTS versions (
   card_id TEXT NOT NULL,
@@ -200,6 +219,11 @@ export class Db {
     this.handle.exec(SCHEMA);
     // v0.1.1（T9.7）：卡片 ID 从"服务端发号"改为"客户端指定"，需要记录来源以区分遗留卡
     ensureColumn(this.handle, 'cards', 'id_source', "id_source TEXT NOT NULL DEFAULT 'legacy'");
+    // v0.1.2（T10.3）：账户体系。默认空串表示"尚未归属"——迁移会把这类卡片
+    // 一次性划给首账户。**不能**给一个假的默认 owner，否则"没归属"与
+    // "归错人"再也分不开（迁移脚本会以为已经处理过）。
+    ensureColumn(this.handle, 'cards', 'owner_id', "owner_id TEXT NOT NULL DEFAULT ''");
+    this.handle.exec('CREATE INDEX IF NOT EXISTS idx_cards_owner ON cards(owner_id, updated_at DESC)');
   }
 
   close(): void {

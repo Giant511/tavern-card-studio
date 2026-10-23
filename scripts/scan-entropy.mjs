@@ -42,6 +42,12 @@ for (const f of files) {
       if (h <= 4.5) continue;
       if (/^[0-9a-f]{40,64}$/i.test(tok)) continue;
       if (tok.endsWith('.node') || tok.includes('/') || tok.includes('\\')) continue;
+      // npm 的完整性哈希：`sha512-<base64>`。它是**包内容**的哈希，公开可查、
+      // 不携带任何凭据，扫它只会让每次改依赖都刷出上百条噪声（实测 41 条）。
+      //
+      // 精确排除到前缀而不是整个 `package-lock.json`：lock 里还有 resolved URL、
+      // 包名等字段，万一有人在里面写了 token 仍然要能抓到。
+      if (/^(sha512|sha256|sha1)-/.test(tok)) continue;
       hits += 1;
       console.log('HIGH-ENTROPY ' + f + ':' + String(idx + 1) + '  len=' + String(tok.length) + ' H=' + h.toFixed(2) + '  ' + tok.slice(0, 10) + '...');
     }

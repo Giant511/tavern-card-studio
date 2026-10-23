@@ -10,6 +10,7 @@
     "build": "tsc -b"
   },
   "dependencies": {
+    "@node-rs/argon2": "^2.2.2",
     "@tcs/shared": "*",
     "better-sqlite3": "^11.10.0",
     "isomorphic-git": "^1.44.3"

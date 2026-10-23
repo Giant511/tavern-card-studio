@@ -28,6 +28,19 @@ export interface ServiceConfig {
   autoStart: boolean;
 }
 
+/**
+ * 注册策略（T10.3 / 需求 F1.1）。
+ *
+ *   · `closed`     —— 默认。谁都不能自助注册，账户只能由管理员通过 CLI/面板创建；
+ *   · `open`       —— 任何能访问到 API 的人都能注册（**只在可信网络/内网**开）；
+ *   · `admin-only` —— 注册接口只允许已登录的管理员调用（等价于"面板建号"）。
+ *
+ * 默认 `closed` 是刻意的：v0.1.1 之前服务端只有"一个全局 token"，没有账户概念，
+ * 升级后如果默认开放注册，等于把一个原本只有持有 token 才能用的服务
+ * 变成"公网任何人可注册"——这是**权限放大**，不能作为默认行为。
+ */
+export type RegisterMode = 'closed' | 'open' | 'admin-only';
+
 export interface AuthConfig {
   /** 访问令牌；空串表示「未生成」——启动时若 require 为 true 会自动生成 */
   token: string;
@@ -35,6 +48,8 @@ export interface AuthConfig {
   require: boolean;
   /** 允许免鉴权的路径前缀（默认只有 /api/health） */
   publicPaths: string[];
+  /** 自助注册策略，见 {@link RegisterMode}；默认 closed */
+  registerMode: RegisterMode;
 }
 
 export interface ServerConfigFile {
@@ -209,6 +224,7 @@ export function createDefaultConfig(overrides: ConfigOverrides = {}): ServerConf
       token: overrides.token ?? generateToken(),
       require: true,
       publicPaths: [...DEFAULT_PUBLIC_PATHS],
+      registerMode: 'closed',
     },
     service: {
       mode: overrides.serviceMode ?? 'process',
@@ -256,6 +272,11 @@ export function normalizeConfig(input: unknown, overrides: ConfigOverrides = {})
       publicPaths: Array.isArray(authRaw['publicPaths'])
         ? authRaw['publicPaths'].filter((item): item is string => typeof item === 'string')
         : [...DEFAULT_PUBLIC_PATHS],
+      // 非法值一律回落到 closed：宁可拒绝注册，也不能因为拼错一个词
+      // 就把服务变成"谁都能建号"
+      registerMode: (['closed', 'open', 'admin-only'] as const).includes(authRaw['registerMode'] as never)
+        ? (authRaw['registerMode'] as RegisterMode)
+        : 'closed',
     },
     service: {
       mode: serviceRaw['mode'] === 'windows-service' ? 'windows-service' : 'process',
@@ -308,6 +329,22 @@ export function assertSafeConfig(config: ServerConfigFile): void {
   }
   if (config.auth.require && config.auth.token === '') {
     throw new ConfigError('已开启鉴权但 token 为空；请用 --token 指定或删除配置文件重新生成');
+  }
+  // 开放注册 + 监听非回环 = 暴露在网络上任何人都能建号（T10.3）。
+  //
+  // 这里**不拒绝**（需求 F1 明确要"可部署云服务器面向公网"，合法场景存在），
+  // 但必须让它在启动时被看见：配置面板会把这一项标红，日志也会有 warning。
+  // 拒绝启动会让"我就想做成公开社区服务"的用户彻底没路可走，
+  // 而我们真正要防的是"随手把 host 改成 0.0.0.0 调试，忘了 registerMode 是 open"。
+  if (config.auth.registerMode === 'open' && !isLoopbackHost(config.host)) {
+    // 只记录，不抛错。调用方（CLI / supervisor）会把这条打出来
+    process.emitWarning
+      ? process.emitWarning(
+          `已开启自助注册（auth.registerMode=open）且 API 监听 ${config.host}（非回环）：` +
+            '任何能访问该地址的人都可以创建账户。若非有意，请改为 closed 或 admin-only。',
+          'SecurityWarning',
+        )
+      : undefined;
   }
   if (config.port < 1 || config.port > 65535) {
     throw new ConfigError(`端口非法：${config.port}`);

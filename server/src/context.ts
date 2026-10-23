@@ -3,6 +3,7 @@
 import { join } from 'node:path';
 
 import { AuditService } from './audit/service.js';
+import { planMigration } from './auth/migrate.js';
 import { ensureDataDirs, type LoadedConfig, type ServerConfigFile } from './config.js';
 import { createLogger, type Logger } from './log.js';
 import { RuleRegistry } from './rules/registry.js';
@@ -59,6 +60,30 @@ export function createContext(loaded: LoadedConfig, options: { logDir?: string; 
   if (errors.platforms.length > 0) logger.warn('rules.platform.invalid', { errors: errors.platforms });
   if (errors.presets.length > 0) logger.warn('rules.preset.invalid', { errors: errors.presets });
 
+  // 账户迁移的提醒（T10.3）。
+  //
+  // **不自动迁移**：迁移要设首账户密码，而服务启动时没有交互可用；
+  // 自动生成一个随机密码写进日志，等于把"谁都能看的字符串"变成管理员口令。
+  // 所以这里是"检测 + 喊话"，实际动作交给 `tcs-server user migrate`。
+  try {
+    const plan = planMigration(db.handle);
+    if (plan.needed) {
+      logger.warn('auth.migration.pending', {
+        orphanCards: plan.orphanCards,
+        hint: '还没有任何账户：运行 `tcs-server user migrate <用户名>` 创建首账户并接管历史卡片（会先自动备份库）',
+      });
+    } else if (plan.orphanCards > 0) {
+      // 已有账户却还有无归属的卡 —— 说明某条写入路径漏了 owner_id，
+      // 是代码缺陷的信号，不只是脏数据
+      logger.warn('auth.cards.orphan', {
+        orphanCards: plan.orphanCards,
+        hint: '有卡片没有归属账户：运行 `tcs-server user adopt <用户名>` 划归，并检查上传路径',
+      });
+    }
+  } catch (error) {
+    logger.warn('auth.migration.check_failed', { message: error instanceof Error ? error.message : String(error) });
+  }
+
   return {
     config,
     configPath: loaded.path,
@@ -94,6 +119,9 @@ export function configSummary(config: ServerConfigFile): Record<string, unknown>
       // 面板里只显示掩码，避免截图/日志泄露；完整 token 用 `tcs-server token show`
       tokenMasked: config.auth.token ? `${config.auth.token.slice(0, 4)}…${config.auth.token.slice(-4)}` : '',
       publicPaths: [...config.auth.publicPaths],
+      // 面板要能显示并切换注册策略（需求 F1.1）；不带这个字段，
+      // 面板表单每次保存都会把它写成"未设置"→ 回落成 closed，用户以为改了其实没改
+      registerMode: config.auth.registerMode,
     },
     service: { ...config.service },
     createdAt: config.createdAt,
