@@ -192,35 +192,47 @@ const main = async () => {
     };
   })()`);
 
-  // ── ① 导入原版 ──────────────────────────────────────────
+  // ── ① 导入原版：v0.1.2 起应当被**拒绝** ─────────────────
+  //
+  // 行为在 v0.1.2 变了：以前是"导入成功但完全不上色"（点号让 CSS 选择器
+  // 永不匹配），现在是校验阶段直接拒绝并给出改名建议（决策 #43）。
+  // 所以这里的断言从"导入成功、但没上色"改成"导入失败、且当前方案不受影响"。
   const importBefore = await evaluate(`(async () => {
     const app = window.__tcs?.app;
+    const currentIdBefore = app.rules?.highlightId ?? null;
     const outcome = app.importHighlightText(${JSON.stringify(beforeText)});
-    await new Promise((r) => setTimeout(r, 500));
-    return { ok: !!outcome.ok, id: outcome.id ?? null, issues: (outcome.issues ?? []).map((i) => String(i.message ?? i)), warnings: (outcome.warnings ?? []).map((w) => String(w.message ?? w)) };
+    await new Promise((r) => setTimeout(r, 400));
+    return {
+      ok: !!outcome.ok,
+      id: outcome.id ?? null,
+      issues: (outcome.issues ?? []).map((i) => String(i.message ?? i)),
+      currentIdBefore,
+      currentIdAfter: app.rules?.highlightId ?? null,
+      families: (app.rules?.highlightFiles ?? []).map((f) => f.id),
+    };
   })()`);
-  check('① 原版导入成功（不是"导入失败"）', importBefore.ok === true, `id=${importBefore.id} issues=${importBefore.issues.length}`);
-  await sleep(600);
 
-  const before = await probeSpans();
-  check('① 方案里的 theme 已生效（--tcs-bg 被改写）', before.bodyBg !== '', before.bodyBg || '(空)');
-  check('② 生成的 CSS 选择器带未转义的点号', /\.tcs-hl-placeholder\.char\s*\{/.test(before.styleScopeRule ?? ''),
-    JSON.stringify(before.styleScopeRule));
-  check('③ 元素上的 class 是单个类名（含点号）', !!before.placeholder && before.placeholder.className.includes('tcs-hl-placeholder.char'),
-    before.placeholder?.className ?? '(无占位符 span)');
-  check('④ 点号选择器匹配不上 → computed color 不是方案里的 #4EC9B0',
-    !!before.placeholder && before.placeholder.color !== 'rgb(78, 201, 176)',
-    `computed=${before.placeholder?.color ?? '-'}，期望未命中`);
+  check('① 原版被拒绝（含点号的 scope id）', importBefore.ok === false, `ok=${String(importBefore.ok)}`);
+  const dotIssue = (importBefore.issues ?? []).find((m) => m.includes('不能包含 .'));
+  check('① 错误消息指明「scope id 不能包含 .」', !!dotIssue, JSON.stringify(importBefore.issues.slice(0, 2)));
+  check('① 错误消息给出改名建议（点号换连字符）', !!dotIssue && /placeholder-char/.test(dotIssue),
+    dotIssue ?? '(无)');
+  check('① 被拒绝后当前方案不变（不留半成品）', importBefore.currentIdAfter === importBefore.currentIdBefore,
+    `${importBefore.currentIdBefore} → ${importBefore.currentIdAfter}`);
+  check('① 被拒绝的方案没有进入方案列表', !importBefore.families.includes('universal-highlight'),
+    JSON.stringify(importBefore.families));
+
   await shot('hl-before', '#block-list');
 
-  // ── ⑤ 导入修正版 ────────────────────────────────────────
+  // ── ⑤ 导入修正版：应当成功并真正上色 ────────────────────
   const importAfter = await evaluate(`(async () => {
     const app = window.__tcs?.app;
     const outcome = app.importHighlightText(${JSON.stringify(afterText)});
     await new Promise((r) => setTimeout(r, 500));
     return { ok: !!outcome.ok, id: outcome.id ?? null, issues: (outcome.issues ?? []).map((i) => String(i.message ?? i)) };
   })()`);
-  check('⑤ 修正版导入成功', importAfter.ok === true, `id=${importAfter.id} issues=${importAfter.issues.length}`);
+  check('⑤ 修正版导入成功（9 个 scope 全部无点号）', importAfter.ok === true,
+    `id=${importAfter.id} issues=${importAfter.issues.length}`);
   await sleep(800);
 
   const after = await probeSpans();
@@ -236,7 +248,7 @@ const main = async () => {
     after.placeholder?.fontWeight ?? '-');
   await shot('hl-after', '#block-list');
 
-  writeFileSync(join(OUT, 'highlight-live.json'), `${JSON.stringify({ at: new Date().toISOString(), importBefore, before, importAfter, after, results }, null, 2)}\n`, 'utf8');
+  writeFileSync(join(OUT, 'highlight-live.json'), `${JSON.stringify({ at: new Date().toISOString(), importBefore, importAfter, after, results }, null, 2)}\n`, 'utf8');
 
   cdp.close();
   const failed = results.filter((r) => !r.ok);

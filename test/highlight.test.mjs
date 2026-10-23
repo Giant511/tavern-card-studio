@@ -114,6 +114,86 @@ test('T3.1 正则无法编译、scope 未定义、id 重复都会报错', () => 
   assert.ok(dupId.errors.some((message) => message.includes('id "a" 重复')), JSON.stringify(dupId.errors));
 });
 
+// ── v0.1.2：scope id 含点号必须被拒绝 ─────────────────────
+//
+// 背景（F6 附件诊断）：`applySchemeStyles` 把 scope id 直接拼进 CSS 类名，
+// 而点号在 CSS 选择器里是"类的连接符"。id = `placeholder.char` 会生成
+// `.tcs-hl-placeholder.char`，含义变成「同时具有两个类」，元素上却是单个类名
+// `tcs-hl-placeholder.char` —— 永不匹配。整份方案的规则一条都不上色，
+// 主题却照常生效，看起来像"导入成功但没反应"。
+//
+// 这组用例锁住三件事：报错（不是静默）、消息里有改名建议、合法 id 不受影响。
+
+test('v0.1.2 scope id 含点号被拒绝，且给出改名建议', () => {
+  const dotted = parseHighlightRule({
+    schemaVersion: 1,
+    id: 'dotted',
+    name: '点号方案',
+    version: '1.0.0',
+    theme: { foreground: '#D4D4D4', background: '#1E1E1E' },
+    scopes: [
+      { id: 'placeholder.char', label: '角色占位符', color: '#4EC9B0' },
+      { id: 'syntax.heading', label: '标题', color: '#C586C0' },
+    ],
+    rules: [],
+  });
+
+  assert.equal(dotted.file, null, '含点号的 scope id 必须让整份方案不被采用（避免半成品）');
+  const dottedErrors = dotted.errors.filter((message) => message.includes('不能包含 .'));
+  assert.equal(dottedErrors.length, 2, `两个含点号的 id 都要各报一条：${JSON.stringify(dotted.errors)}`);
+
+  // 消息必须说清「为什么」和「改成什么」，否则用户只会看到"id 不合法"然后去猜
+  assert.match(dottedErrors[0], /CSS 选择器/, '消息应解释点号为什么不行');
+  assert.match(dottedErrors[0], /placeholder-char/, '消息应直接给出改名结果');
+  assert.match(dottedErrors[1], /syntax-heading/, '第二条消息也要给出自己的改名结果');
+});
+
+test('v0.1.2 连字符/下划线/数字的 scope id 全部合法（不受收紧影响）', () => {
+  const ok = parseHighlightRule({
+    schemaVersion: 1,
+    id: 'fine',
+    name: '合法 id',
+    version: '1.0.0',
+    theme: { foreground: '#000', background: '#fff' },
+    scopes: [
+      { id: 'placeholder-char', label: 'A', color: '#f00' },
+      { id: 'syntax_heading', label: 'B', color: '#0f0' },
+      { id: 'level2', label: 'C', color: '#00f' },
+    ],
+    rules: [],
+  });
+  assert.deepEqual(ok.errors, [], `连字符/下划线/数字应当放行：${JSON.stringify(ok.errors)}`);
+  assert.equal(ok.file?.scopes.length, 3);
+});
+
+test('v0.1.2 内置三套方案的 scope id 均不含点号（收紧后无回归）', () => {
+  for (const rule of loadAll()) {
+    for (const scope of rule.scopes) {
+      assert.equal(
+        scope.id.includes('.'),
+        false,
+        `内置方案 ${rule.id} 的 scope "${scope.id}" 含点号，收紧校验后会失效`,
+      );
+    }
+  }
+});
+
+test('v0.1.2 其它非法 id 仍报"id 不合法"，不与点号错误混淆', () => {
+  const bad = parseHighlightRule({
+    schemaVersion: 1,
+    id: 'badshape',
+    name: 'x',
+    version: '1.0.0',
+    theme: { foreground: '#000', background: '#fff' },
+    scopes: [{ id: 'Has Space', label: 'A', color: '#f00' }],
+    rules: [],
+  });
+  assert.ok(
+    bad.errors.some((message) => message.includes('id 不合法') && !message.includes('不能包含 .')),
+    `大写与空格应当是"id 不合法"，不是点号那条：${JSON.stringify(bad.errors)}`,
+  );
+});
+
 test('T3.1 extends 合并：lineage、theme 覆盖、scopes 继承、rules 追加', () => {
   const resolved = resolveHighlightRule('dark', loadAll());
   assert.deepEqual(resolved.lineage, ['default', 'dark']);
