@@ -9,6 +9,7 @@
  */
 
 import { isSyncReady, type ProbeResult } from '../net/server-probe';
+import { syncGateMessage, type SyncGateState } from '../auth/entry-policy';
 import type { RepoSummary } from './repo-client';
 import { pickRepoId, toRepoOptions } from './repo-select';
 import { connectLocalService, describeLocalSuccess } from '../net/local-connect';
@@ -83,6 +84,16 @@ export interface SyncDialogCallbacks {
   onSelectRepo?: (repoId: string) => void;
   /** 打开「仓库与令牌」面板（T10.8） */
   onOpenRepos?: () => void;
+  /**
+   * 同步门槛（v0.1.2 追加任务）。
+   *
+   * 由 App 用 `resolveSyncGate` 算出：**有地址 + 有凭证 = ready**，
+   * 不再要求"探测到 token 有效" —— 后者会把未登录呈现成"未连接"。
+   * 没接这个回调时回落到旧的 `isSyncReady`（单测里构造 panel 时方便）。
+   */
+  getGate?: () => SyncGateState;
+  /** 未登录时的「登录…」入口 */
+  onLogin?: () => void;
   notify: (message: string, kind?: 'ok' | 'warn' | 'bad' | 'info') => void;
 }
 
@@ -101,6 +112,8 @@ export class SyncDialog {
   private readonly warningBar: HTMLElement;
   /** F6.1：同步面板的「连接本机服务端」入口（设置面板为主入口，这里给个快捷方式） */
   private readonly connectButton: HTMLButtonElement;
+  /** 未登录时的「登录…」——未登录不是错误，给一个就地解决的动作 */
+  private readonly loginButton: HTMLButtonElement;
   /** T10.8：上传仓库选择（未登录时整行隐藏） */
   private readonly repoRow: HTMLElement;
   private readonly repoSelect: HTMLSelectElement;
@@ -134,8 +147,13 @@ export class SyncDialog {
     this.connectButton = el('button', 'btn small', '连接本机服务端');
     this.connectButton.type = 'button';
     this.connectButton.addEventListener('click', () => void this.connectLocal());
+    this.loginButton = el('button', 'btn small primary', '登录…');
+    this.loginButton.type = 'button';
+    this.loginButton.dataset['role'] = 'sync-login';
+    this.loginButton.hidden = true;
+    this.loginButton.addEventListener('click', () => this.callbacks.onLogin?.());
     const statusRow = el('div', 'sync-status-row');
-    statusRow.append(this.statusLine, this.connectButton);
+    statusRow.append(this.statusLine, this.connectButton, this.loginButton);
 
     // 上传目标（只读）+ 上传
     const uploadSection = el('section', 'form-section');
@@ -335,25 +353,37 @@ export class SyncDialog {
     this.refreshButton.disabled = text !== null;
   }
 
-  /** 渲染连接状态；未就绪时禁用全部操作（不只靠入口置灰） */
+  /**
+   * 渲染状态；未就绪时禁用全部操作（不只靠入口置灰）。
+   *
+   * 三态而不是两态（v0.1.2 追加任务）：
+   *   · `no-server` → 「还没配置服务端地址」+ 一键连接按钮；
+   *   · `need-login` → **「登录后可同步。」** + 登录按钮。这一格是本轮的核心修正：
+   *     上一版把"没凭证"和"连不上"合并成了一句「同步未就绪」，
+   *     用户看到的是"未连接"，而其实只是还没登录。
+   *   · `ready` → 显示连接消息。
+   */
   private renderStatus(): boolean {
     const connection = this.callbacks.getConnection();
-    const ready = isSyncReady(connection);
+    const gate: SyncGateState =
+      this.callbacks.getGate?.() ?? (isSyncReady(connection) ? 'ready' : 'need-login');
+    const ready = gate === 'ready';
 
     this.statusLine.replaceChildren();
-    this.statusLine.className = `sync-status ${ready ? 'ok' : 'bad'}`;
+    // 未登录是"待办"不是"故障"，用中性色；只有按凭证发出的请求失败才用 bad
+    this.statusLine.className = `sync-status ${ready ? 'ok' : 'warn'}`;
     if (ready) {
-      this.statusLine.textContent = connection?.message ?? '已连接';
+      this.statusLine.textContent = connection?.reachable ? (connection.message ?? '已连接') : '已就绪';
     } else {
-      this.statusLine.textContent = connection
-        ? `同步未就绪：${connection.message}（请到「设置」检查地址与令牌）`
-        : '同步未就绪：尚未配置服务端（请到「设置」填写地址与令牌）';
+      this.statusLine.textContent = syncGateMessage(gate);
     }
 
     this.uploadButton.disabled = !ready;
     this.refreshButton.disabled = !ready;
     this.historySelect.disabled = !ready;
-    this.connectButton.hidden = ready;
+    this.loginButton.hidden = gate !== 'need-login' || this.callbacks.onLogin === undefined;
+    // 一键连接只在"连地址都没有/连不通"时才有意义；登录阶段摆着它只会分散注意力
+    this.connectButton.hidden = gate !== 'no-server';
     this.renderTarget();
     return ready;
   }
@@ -475,7 +505,15 @@ export class SyncDialog {
   private async reload(): Promise<void> {
     const ready = this.renderStatus();
     if (!ready) {
-      this.versionList.replaceChildren(el('p', 'issue-empty', '连接就绪后才能查看版本历史'));
+      this.versionList.replaceChildren(
+        el(
+          'p',
+          'issue-empty',
+          this.callbacks.getGate?.() === 'no-server'
+            ? '填好服务端地址后即可查看版本历史'
+            : '登录后可查看版本历史',
+        ),
+      );
       return;
     }
 
@@ -629,8 +667,11 @@ export class SyncDialog {
 
   private async upload(): Promise<void> {
     const config = this.callbacks.getConfig();
-    if (!config || !isSyncReady(this.callbacks.getConnection())) {
-      this.callbacks.notify('同步未就绪，无法上传', 'warn');
+    if (!config) {
+      this.callbacks.notify(
+        this.callbacks.getGate?.() === 'need-login' ? '请先登录账户再上传' : '请先在设置里填写服务端地址',
+        'warn',
+      );
       return;
     }
 

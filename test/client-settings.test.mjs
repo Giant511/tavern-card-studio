@@ -118,7 +118,7 @@ test('探测：health.status 不是 ok 时不认作已连接', async () => {
   assert.match(result.message, /状态异常/);
 });
 
-test('探测：要求鉴权但未填 token → 可达但同步不可用', async () => {
+test('探测：未填 token → 可达但未登录（不是失败）', async () => {
   const fetchImpl = makeFetch({
     'http://h:1/api/health': () => jsonResponse(HEALTH_OK),
   });
@@ -128,7 +128,10 @@ test('探测：要求鉴权但未填 token → 可达但同步不可用', async 
   assert.equal(result.authRequired, true);
   assert.equal(result.tokenValid, null);
   assert.equal(result.stage, 'auth');
-  assert.match(result.message, /未填写 token/);
+  // v0.1.2 追加任务：措辞从「要求鉴权：未填写 token」改成「未登录」——
+  // 前者把还没登录说成服务端在索要凭证，正是本次要修的错序表述
+  assert.match(result.message, /未登录/);
+  assert.doesNotMatch(result.message, /未填写 token/);
   assert.equal(isSyncReady(result), false);
 });
 

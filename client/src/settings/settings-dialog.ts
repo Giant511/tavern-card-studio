@@ -17,13 +17,11 @@ import {
   probeCardsDir,
 } from '../contract';
 import { decideCardsDir, resolveCardsDir } from '../session/cards-path';
-import {
-  isSyncReady,
-  normalizeServerUrl,
-  probeServer,
-  type ProbeResult,
-} from '../net/server-probe';
+import { isSyncReady, normalizeServerUrl, probeServer, type ProbeResult } from '../net/server-probe';
 import { connectLocalService, describeLocalSuccess, LOCAL_API_ORIGIN } from '../net/local-connect';
+import type { AuthPhase } from '../auth/session';
+import type { AuthUser } from '../auth/auth-client';
+import { identityLabel, resolveSyncGate, syncGateMessage } from '../auth/entry-policy';
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -41,12 +39,23 @@ export interface SettingsCallbacks {
   onConnectionChange: (result: ProbeResult | null) => void;
   /** 保存成功（便于外部提示） */
   onSaved?: () => void;
+  /** 当前登录态（决定「账户」那一行显示什么） */
+  getIdentity?: () => { phase: AuthPhase; user: AuthUser | null };
+  /** 点「登录…」：打开登录框（未登录时） */
+  onLogin?: () => void;
+  /** 点「退出登录」 */
+  onLogout?: () => Promise<void>;
 }
 
 export class SettingsDialog {
   private readonly overlay: HTMLDivElement;
   private readonly urlInput: HTMLInputElement;
   private readonly tokenInput: HTMLInputElement;
+  /** 账户那一行：已登录 / 未登录 + 动作按钮（登录… / 退出登录） */
+  private readonly identityText: HTMLElement;
+  private readonly identityButton: HTMLButtonElement;
+  /** 「高级 · 兼容模式」折叠区（legacy 全局令牌） */
+  private readonly advanced: HTMLDetailsElement;
   private readonly probeStatus: HTMLParagraphElement;
   private readonly syncNote: HTMLParagraphElement;
   private readonly testButton: HTMLButtonElement;
@@ -68,6 +77,7 @@ export class SettingsDialog {
     this.overlay.setAttribute('role', 'dialog');
     this.overlay.setAttribute('aria-modal', 'true');
     this.overlay.setAttribute('aria-labelledby', 'settings-title');
+    this.overlay.dataset['role'] = 'settings-dialog';
 
     const panel = el('div', 'modal');
 
@@ -100,14 +110,61 @@ export class SettingsDialog {
       ),
     );
 
+    /*
+     * 账户身份行（v0.1.2 追加任务）。
+     *
+     * 这里**原本是一个必填的「访问令牌」输入框**，那是本次要修的偏差：
+     * 令牌被当成了连接的前置条件，用户得先从 config.json / 面板里抄一个全局令牌
+     * 才能"连上"，然后登录界面才可用 —— 顺序整反了。
+     *
+     * 现在这一行只描述"我是谁"，不再要求"先证明你能连"：
+     *   · 未登录 → 「未登录」+「登录…」
+     *   · 已登录 → 「已登录：alice（账户令牌）」+「退出登录」
+     * 身份来自账户会话（`AuthSession`），令牌由它自己管，用户不需要看见。
+     */
+    const identityField = el('div', 'field');
+    identityField.dataset['role'] = 'settings-account';
+    identityField.append(el('span', 'field-label', '账户'));
+    const identityRow = el('div', 'field-row settings-identity-row');
+    this.identityText = el('span', 'settings-identity', '未登录');
+    this.identityText.dataset['role'] = 'settings-identity';
+    this.identityButton = el('button', 'btn small', '登录…');
+    this.identityButton.type = 'button';
+    this.identityButton.dataset['role'] = 'settings-identity-action';
+    this.identityButton.addEventListener('click', () => void this.actOnIdentity());
+    identityRow.append(this.identityText, this.identityButton);
+    identityField.append(
+      identityRow,
+      el(
+        'span',
+        'field-hint',
+        '登录后会用账户身份同步；令牌由客户端自动管理，不需要手工填写。',
+      ),
+    );
+
+    /*
+     * 兼容模式（≤v0.1.1 的服务端）收进「高级」折叠区，默认收起。
+     *
+     * 为什么默认收起而不是保留在主要位置：v0.1.1 的全局令牌在 0.1.2 里**已被降权**
+     * （只看未归属账户的卡片），把它摆在显眼处只会让新用户以为"这才是正常用法"。
+     * 但它不能删 —— 没升级的服务端只有这一种凭证。
+     */
+    this.advanced = document.createElement('details');
+    this.advanced.className = 'settings-advanced';
+    this.advanced.dataset['role'] = 'settings-advanced';
+    const summary = document.createElement('summary');
+    summary.textContent = '高级 · 兼容模式（旧版服务端 ≤v0.1.1）';
+    this.advanced.append(summary);
+
     const tokenField = el('label', 'field');
-    tokenField.append(el('span', 'field-label', '访问令牌'));
+    tokenField.append(el('span', 'field-label', '全局令牌（legacy）'));
     const tokenRow = el('div', 'field-row');
     this.tokenInput = el('input', 'input');
     this.tokenInput.type = 'password';
-    this.tokenInput.placeholder = '服务端 config.json 里的 auth.token';
+    this.tokenInput.placeholder = '仅用于未升级账户体系的服务端';
     this.tokenInput.spellcheck = false;
     this.tokenInput.autocomplete = 'off';
+    this.tokenInput.dataset['role'] = 'legacy-token';
     const toggleToken = el('button', 'btn ghost small', '显示');
     toggleToken.type = 'button';
     toggleToken.addEventListener('click', () => {
@@ -117,18 +174,17 @@ export class SettingsDialog {
     });
     tokenRow.append(this.tokenInput, toggleToken);
     tokenField.append(tokenRow);
-
-    const tokenHint = el(
-      'span',
-      'field-hint',
-      // 本机装有服务端时，"连接本机服务端"按钮会直接取回令牌，不用手抄。
-      // 这里只列手动获取的两条路：命令行与配置文件（面板也能看，但要先有令牌才能进，绕圈）。
-      '获取方式：点上面的「连接本机服务端」自动取回；或命令行 ' +
-        'node server/dist/index.js token show，或查看 C:\\ProgramData\\TavernCardStudio\\config.json。',
+    tokenField.append(
+      el(
+        'span',
+        'field-hint',
+        '仅用于未升级账户体系的服务端（≤v0.1.1）。0.1.2 及以后请用上面的账户登录；' +
+          '全局令牌在 0.1.2 里只能看到"尚未归属账户"的卡片。',
+      ),
     );
-    tokenField.append(tokenHint);
+    this.advanced.append(tokenField);
 
-    serverSection.append(urlField, tokenField);
+    serverSection.append(urlField, identityField, this.advanced);
 
     // ── 一键连接 + 打开后台（F6.1 / F6.3）───────────────
     //
@@ -234,7 +290,12 @@ export class SettingsDialog {
     this.probeStatus.className = 'probe-status info';
 
     if (prefill?.serverUrl !== undefined) this.urlInput.value = prefill.serverUrl;
-    if (prefill?.token !== undefined) this.tokenInput.value = prefill.token;
+    if (prefill?.token !== undefined) {
+      this.tokenInput.value = prefill.token;
+      // 只有真的带了令牌（调试参数 / 旧配置迁移）才把兼容模式展开 ——
+      // 否则折叠区一打开就是展开的，等于把 legacy 令牌又摆回显眼位置
+      if (prefill.token !== '') this.advanced.open = true;
+    }
 
     if (!isShellAvailable()) {
       // 浏览器模式：契约的 configGet 会失败，保留预填值（若有）让用户仍能测连接
@@ -245,7 +306,7 @@ export class SettingsDialog {
       this.cardsDirInput.disabled = true;
       this.chooseDirButton.disabled = true;
       this.setDirStatus('浏览器模式无法读写本地目录，此设置仅在桌面客户端生效。', 'info');
-      this.updateSyncNote();
+      this.refreshIdentity();
       this.urlInput.focus();
       return;
     }
@@ -273,12 +334,47 @@ export class SettingsDialog {
     } catch (error) {
       this.setProbeStatus(`读取配置失败：${errorText(error)}`, 'bad');
     }
-    this.updateSyncNote();
+    this.refreshIdentity();
     this.urlInput.focus();
   }
 
   close(): void {
     this.overlay.hidden = true;
+  }
+
+  /**
+   * 重画身份行。登录态在任何地方变化（登录成功、登出、静默过期、401 恢复）
+   * 都要调它 —— app.ts 的 `onPhaseChange` 里已经接上了。
+   */
+  refreshIdentity(): void {
+    const identity = this.callbacks.getIdentity?.() ?? { phase: 'anonymous' as AuthPhase, user: null };
+    this.identityText.textContent = identityLabel(identity.phase, identity.user);
+    this.identityText.dataset['phase'] = identity.phase;
+    const loggedIn = identity.phase === 'authenticated';
+    this.identityButton.textContent = loggedIn ? '退出登录' : '登录…';
+    this.identityButton.dataset['action'] = loggedIn ? 'logout' : 'login';
+    // 没有接回调时把按钮藏起来，而不是留一个点了没反应的按钮
+    this.identityButton.hidden =
+      loggedIn ? this.callbacks.onLogout === undefined : this.callbacks.onLogin === undefined;
+    this.updateSyncNote();
+  }
+
+  /** 身份行按钮：登录 → 打开登录框；已登录 → 退出 */
+  private async actOnIdentity(): Promise<void> {
+    const identity = this.callbacks.getIdentity?.() ?? { phase: 'anonymous' as AuthPhase, user: null };
+    if (identity.phase === 'authenticated') {
+      if (this.callbacks.onLogout === undefined) return;
+      this.identityButton.disabled = true;
+      try {
+        await this.callbacks.onLogout();
+      } finally {
+        this.identityButton.disabled = false;
+        // 登出后回到"未登录"，地址保留 —— 用户很可能马上换个账户登进来
+        this.refreshIdentity();
+      }
+      return;
+    }
+    this.callbacks.onLogin?.();
   }
 
   /**
@@ -298,6 +394,7 @@ export class SettingsDialog {
   private setBusy(busy: boolean): void {
     this.busy = busy;
     this.testButton.disabled = busy;
+    this.identityButton.disabled = busy;
     this.saveButton.disabled = busy;
     this.chooseDirButton.disabled = busy;
     this.cardsDirInput.disabled = busy;
@@ -563,28 +660,30 @@ export class SettingsDialog {
     }
   }
 
-  /** 动态说明"同步可用性"，把降级边界写清楚 */
+  /**
+   * 动态说明"同步可用性"。
+   *
+   * 判据从「探测是否通过」换成「有没有地址 + 有没有凭证」：
+   * 上一版用 `isSyncReady(result).tokenValid === true`，于是**没填令牌时这里写「鉴权未通过」**，
+   * 而那正是用户还没登录的时候 —— 把顺序说反了（不是"鉴权失败"，是"还没开始"）。
+   */
   private updateSyncNote(): void {
-    const result = this.lastResult;
-    if (!result) {
-      this.syncNote.textContent =
-        '同步未启用或未测试：上传 / 历史版本 / 回滚将不可用。编辑、审计、导出不受影响。';
-      this.syncNote.className = 'sync-note muted';
-      return;
-    }
-    if (isSyncReady(result)) {
+    const hasAccount = (this.callbacks.getIdentity?.() ?? { phase: 'anonymous' as AuthPhase }).phase === 'authenticated';
+    // legacy 兼容模式也算凭证：≤v0.1.1 的服务端只有它
+    const hasCredentials = hasAccount || this.tokenInput.value.trim() !== '';
+    const gate = resolveSyncGate(this.urlInput.value, hasCredentials);
+
+    if (gate === 'ready') {
       this.syncNote.textContent = '同步已就绪：可使用上传 / 历史版本 / 回滚。';
       this.syncNote.className = 'sync-note ok';
       return;
     }
-    if (!result.reachable) {
-      this.syncNote.textContent =
-        '无法连接服务端：同步功能不可用。编辑、审计、导出仍可正常使用。';
-      this.syncNote.className = 'sync-note warn';
+    if (gate === 'no-server') {
+      this.syncNote.textContent = '还没配置服务端地址：填好地址后即可登录并同步。编辑、审计、导出不受影响。';
+      this.syncNote.className = 'sync-note muted';
       return;
     }
-    this.syncNote.textContent =
-      '已连接但鉴权未通过：同步功能不可用。编辑、审计、导出仍可正常使用。';
+    this.syncNote.textContent = `${syncGateMessage(gate)}编辑、审计、导出不受影响。`;
     this.syncNote.className = 'sync-note warn';
   }
 }

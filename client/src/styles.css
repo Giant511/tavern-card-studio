@@ -26,6 +26,22 @@
   box-sizing: border-box;
 }
 
+/*
+ * `hidden` 属性的兜底（v0.1.2 追加任务）。
+ *
+ * HTML 的 `hidden` 只由 UA 样式表的 `[hidden] { display: none }` 生效，
+ * 优先级极低：任何作者写的 `display: flex/block/grid` 都会把它盖掉。
+ * 2026-10-23 截图验收时发现同步面板的「上传到仓库」整行在**未登录状态下仍然可见** ——
+ * `repoRow.hidden = true` 一直是 true（属性在、端到端断言也读的是属性），
+ * 但视觉上从没消失过，因为 `.field-row { display: flex }` 赢了。
+ *
+ * 这类"属性对了、像素没变"的故障靠断言读属性是抓不到的，只能靠截图。
+ * 加一条全局兜底，比在每个用了 display 的选择器旁边重复写 `[hidden]` 可靠。
+ */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   height: 100%;
@@ -756,6 +772,53 @@ body {
   color: var(--muted);
   font-size: 11px;
   line-height: 1.5;
+}
+
+/* 账户身份行（v0.1.2 追加任务）：只描述"我是谁"，不再要求填令牌 */
+.settings-identity-row {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.settings-identity {
+  font-size: 12.5px;
+  color: var(--tcs-fg);
+  padding: 5px 0;
+}
+
+.settings-identity[data-phase='authenticated'] {
+  color: #1c6b3c;
+  font-weight: 600;
+}
+
+.settings-identity[data-phase='expired'] {
+  color: #8a4b00;
+}
+
+/* 「高级 · 兼容模式」：默认收起，legacy 令牌不该出现在主要视野里 */
+.settings-advanced {
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 0 10px;
+  background: #fbfcfd;
+}
+
+.settings-advanced > summary {
+  cursor: pointer;
+  padding: 7px 0;
+  font-size: 12px;
+  color: var(--muted);
+  user-select: none;
+}
+
+.settings-advanced[open] > summary {
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+
+.settings-advanced .field {
+  padding-bottom: 10px;
 }
 
 .probe-row {

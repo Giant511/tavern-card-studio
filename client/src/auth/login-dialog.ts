@@ -31,6 +31,14 @@ export interface LoginDialogDeps {
   session: AuthSession;
   /** 打开时拉一次策略（免鉴权接口） */
   getPolicy: () => Promise<AuthPolicy | null>;
+  /**
+   * 当前服务端地址（空串 = 还没配置）。
+   *
+   * v0.1.2 追加任务：登录/注册只需要**地址**，不需要令牌；但地址都没有时
+   * 提交必然失败（`session.login` 会抛"尚未配置服务端地址"）。
+   * 那种情况在界面里先说清楚并禁用提交，比让用户填完两个框再看一句报错好。
+   */
+  getServerUrl?: () => string;
   notify: (message: string, kind?: 'ok' | 'warn' | 'bad' | 'info') => void;
   /** 登录成功（或注册后自动登录成功） */
   onAuthenticated?: (user: AuthUser | null) => void;
@@ -53,6 +61,8 @@ export class LoginDialog {
   private mode: Mode = 'login';
   private policy: AuthPolicy | null = null;
   private busy = false;
+  /** 非 null = 当前状态下提交没有意义（例如还没配服务端地址） */
+  private blockedReason: string | null = null;
 
   constructor(private readonly deps: LoginDialogDeps) {
     this.overlay = el('div', 'modal-overlay modal-overlay-top');
@@ -110,6 +120,16 @@ export class LoginDialog {
     this.registerButton = el('button', 'btn ghost', '注册新账户');
     this.registerButton.type = 'button';
     this.registerButton.dataset['role'] = 'auth-register';
+    /*
+     * **默认隐藏**（fail-closed）。
+     *
+     * 打开对话框时 `open()` 会先让遮罩可见、再去拉 `/api/auth/config`。
+     * 若这里默认可见，closed 的服务端上会先闪一下「注册新账户」再消失 ——
+     * 手快的人点得到，然后收到一句"未开放注册"。这与"closed 时界面根本不显示"
+     * 是两回事，而 `shouldShowRegister(null)` 早就把"策略未知"判成"不显示"，
+     * 默认值跟着它走才一致。
+     */
+    this.registerButton.hidden = true;
     this.registerButton.addEventListener('click', () => this.switchMode());
 
     this.submitButton = el('button', 'btn primary', '登录');
@@ -169,9 +189,20 @@ export class LoginDialog {
     this.usernameInput.value = this.deps.session.user?.username ?? '';
     this.passwordInput.value = '';
 
+    // 地址是唯一的硬前提（令牌不是）。没有地址时把话说清楚并禁用提交 ——
+    // 注意这里**不关掉对话框**：用户可能只是刚装完服务端，先看到这句话
+    // 再去设置里填地址，回来还是这个框。
+    const serverUrl = this.deps.getServerUrl?.() ?? '';
+    this.blockedReason =
+      serverUrl.trim() === ''
+        ? '还没有配置服务端地址：先在「设置」里填写（同机可直接点「连接本机服务端」），再回来登录。'
+        : null;
+    this.submitButton.disabled = this.blockedReason !== null;
+
     const policy = await this.deps.getPolicy();
     this.policy = policy;
-    this.hint.textContent = registerHint(policy?.registerMode ?? null);
+    this.hint.textContent =
+      this.blockedReason ?? registerHint(policy?.registerMode ?? null);
     this.registerButton.hidden = !shouldShowRegister(policy, this.deps.session.user);
 
     // 焦点给"该填的那个"：已记住用户名时直接进密码框
@@ -200,7 +231,7 @@ export class LoginDialog {
 
   private setBusy(busy: boolean): void {
     this.busy = busy;
-    this.submitButton.disabled = busy;
+    this.submitButton.disabled = busy || this.blockedReason !== null;
     this.registerButton.disabled = busy;
     this.cancelButton.disabled = busy;
   }
@@ -219,6 +250,10 @@ export class LoginDialog {
 
   private async submit(): Promise<void> {
     if (this.busy) return;
+    if (this.blockedReason !== null) {
+      this.showError(this.blockedReason);
+      return;
+    }
     const username = this.usernameInput.value.trim();
     const password = this.passwordInput.value;
     if (username === '' || password === '') {
