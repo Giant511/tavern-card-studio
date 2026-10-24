@@ -11,6 +11,7 @@
  *   service ...      Windows 服务注册 / 卸载 / 启停 / 状态（sc.exe）
  *   version          版本信息
  *   selfcheck        离线自检：真跑一遍运行时依赖，不读配置、不绑端口
+ *   cleanup          卸载清理：按白名单删安装目录里的运行期残留（卸载程序调用）
  */
 
 import { spawnSync } from 'node:child_process';
@@ -34,6 +35,7 @@ import { RepoStore } from './storage/repos.js';
 import { Db } from './storage/db.js';
 import { adoptOrphanCards, countOrphanCards, UserStore } from './storage/users.js';
 import { selfCheckCommand } from './selfcheck.js';
+import { cleanupCommand } from './uninstall-cleanup.js';
 import { startSupervisor } from './supervisor.js';
 import { startWorker } from './worker.js';
 
@@ -130,7 +132,8 @@ function printHelp(): void {
       `  token show|rotate     查看 / 轮换访问令牌\n` +
       `  service install|uninstall|start|stop|status [--dry-run]\n` +
       `  version               版本信息\n` +
-      `  selfcheck             离线自检：真跑一遍运行时依赖（argon2/x509/sqlite/git）\n\n` +
+      `  selfcheck             离线自检：真跑一遍运行时依赖（argon2/x509/sqlite/git）\n` +
+      `  cleanup [--dry-run]   卸载清理：按白名单删安装目录里的运行期残留（日志留痕）\n\n` +
       `选项：\n` +
       `  --config <路径>       配置文件（默认 ./data/config.json）\n` +
       `  --port <端口>         API 端口（默认 8730）\n` +
@@ -517,6 +520,23 @@ export async function main(argv: readonly string[]): Promise<number> {
     // 否则绿色包放在仓库里时会从仓库根的 node_modules 找到缺的包，给出假通过。
     const bundleRoot = options.flags['bundle-root'];
     return selfCheckCommand(typeof bundleRoot === 'string' ? { bundleRoot } : {});
+  }
+
+  // 与 selfcheck 同理放在 load() 之前：卸载清理**不该读配置文件**。
+  // 卸载时配置文件可能已经被 T10.22 的数据删除动作带走了，此时 load() 会
+  // "创建一个新配置 + 打印新令牌"，在卸载流程里凭空写回一个 ProgramData 目录 ——
+  // 正是这个任务要消灭的那种残留。
+  if (options.command === 'cleanup' || group === 'cleanup') {
+    const installDir = options.flags['install-dir'];
+    const dataDir = options.flags['data-dir'];
+    const logPath = options.flags['log'];
+    return cleanupCommand({
+      ...(typeof installDir === 'string' ? { installDir } : {}),
+      ...(typeof dataDir === 'string' ? { dataDir } : {}),
+      ...(typeof logPath === 'string' ? { fallbackLogPath: logPath } : {}),
+      eventLog: options.flags['event-log'] === true,
+      dryRun: options.flags['dry-run'] === true,
+    });
   }
 
   if (group === 'config') {

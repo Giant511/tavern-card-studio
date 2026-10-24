@@ -62,7 +62,14 @@ test('删除动作的条件与时序：只在卸载且勾选时执行，且在 R
     // 把整个 <Custom> 元素抓下来一起看，免得被写法差异绊住（同一条语义）。
     const seq = wxs.match(new RegExp(`<Custom Action="${action}"[\\s\\S]{0,400}?(?:</Custom>|/>)`));
     assert.ok(seq, `${label}: 执行序列里缺少 ${action}`);
-    assert.match(seq[0], /Before="RemoveFiles"/, `${label}: 必须在 RemoveFiles 之前（服务先停、数据先删）`);
+    // 时序：必须在 RemoveFiles 之前（服务先停、数据先删、再删文件）。
+    // 服务端把三者串成一条链：DeleteDataDir → CleanInstallResidue → RemoveFiles，
+    // 所以 DeleteDataDir 的直接锚点是 CleanInstallResidue；客户端没有清理动作，直接锚 RemoveFiles。
+    assert.match(
+      seq[0],
+      /Before="(RemoveFiles|CleanInstallResidue)"/,
+      `${label}: 必须在 RemoveFiles 之前（服务先停、数据先删）`,
+    );
     assert.match(seq[0], /REMOVE=/, `${label}: 条件必须限定 REMOVE`);
     assert.match(seq[0], /DELETEDATA=1/, `${label}: 条件必须要求 DELETEDATA=1`);
 
@@ -135,4 +142,28 @@ test('服务端 wiX UI 扩展入库且有版本与哈希记录', () => {
   const build = readFileSync(join(repo, 'installer', 'build-msi.ps1'), 'utf8');
   assert.match(build, /uiExtExpectedSha/);
   assert.match(build, /'-ext', \$wixExt/);
+});
+
+test('残留清理动作：调 CLI、不回滚、排成一条链', () => {
+  // 这一段是"装配层"的守卫：清理逻辑本身由 test/uninstall-cleanup.test.mjs 真跑真删，
+  // 这里只保证它被**正确挂进卸载流程**——挂错了同样不会报错（构建成功、
+  // 反编译也没有这一条时，卸载就是"看起来跑了但没清"）。
+  const action = serverWxs.match(/<CustomAction\s+Id="CleanInstallResidue"[\s\S]*?\/>/);
+  assert.ok(action, '缺少 CleanInstallResidue 动作');
+  assert.match(action[0], /Execute="deferred"/, '必须 deferred：要在脚本生成后执行');
+  assert.match(action[0], /Impersonate="yes"/, '必须 impersonate：%ProgramData%/%TEMP% 才指向该用户');
+  assert.match(action[0], /Return="ignore"/, '残留清不掉不能让卸载失败并回滚');
+  assert.match(action[0], /cleanup --data-dir/, '必须调用 tcs-server 的 cleanup 子命令（白名单只有一份）');
+  assert.match(action[0], /--event-log/, '数据被清时文件日志可能在 %TEMP%，事件日志是第二条线索');
+
+  // 顺序链：DeleteDataDir → CleanInstallResidue → RemoveFiles。
+  // WiX 不允许同一动作同时写 After+Before（WIX0035），所以只能靠链表达三元顺序。
+  const dataSeq = serverWxs.match(/<Custom Action="DeleteDataDir"([^>]*)>/);
+  assert.ok(dataSeq, '缺少 DeleteDataDir 序列行');
+  assert.match(dataSeq[1], /Before="CleanInstallResidue"/, 'DeleteDataDir 必须排在清理之前');
+  const residueSeq = serverWxs.match(/<Custom Action="CleanInstallResidue"([^>]*)>/);
+  assert.ok(residueSeq, '缺少 CleanInstallResidue 序列行');
+  assert.match(residueSeq[1], /Before="RemoveFiles"/, '清理必须在 RemoveFiles 之前');
+  assert.doesNotMatch(dataSeq[1] + residueSeq[1], /After=".*".*Before=/, '同一动作不能同时写 After 与 Before');
+  assert.match(residueSeq[1], /REMOVE=/, '清理只在卸载时跑（修复/升级不该动残留判定）');
 });
