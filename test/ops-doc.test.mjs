@@ -1,11 +1,12 @@
-// 运维命令手册（docs/server cmd.md）的守卫。
+// 运维命令手册（docs/server-cmd.md）的守卫。
 //
 // 为什么要有这个文件：
-//   1. `docs/server cmd.md` 是**唯一**随仓库上传的 docs 文件，它同时是用户的
-//      运维入口。命令面一变而它没跟着变，用户照着敲就会失败 —— 而没有任何
-//      编译/类型检查会因此报错（2026-10-23 已经因为同类原因连续踩过：
-//      说明页停在 v0.1.1、命令名写成产物里不存在的 `tcs-server`）。
-//   2. `.gitignore` 用 `docs/*` + `!docs/server cmd.md` 精确放行一个文件。
+//   1. `docs/server-cmd.md` 是随仓库上传的两份 docs 之一（另一份是
+//      `docs/server-developer.md`），它同时是用户的运维入口。命令面一变而它没跟着变，
+//      用户照着敲就会失败 —— 而没有任何编译/类型检查会因此报错
+//      （2026-10-23 已经因为同类原因连续踩过：说明页停在 v0.1.1、
+//      命令名写成产物里不存在的 `tcs-server`）。
+//   2. `.gitignore` 用 `docs/*` + `!docs/<文件名>` 精确放行指定文件。
 //      这条规则很脆：写回 `docs/`（目录）就会让例外失效，多写一个 `!` 就会
 //      把开发文档泄漏到公开仓库。
 //
@@ -18,9 +19,13 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 const ROOT = join(import.meta.dirname, '..');
-const DOC = join(ROOT, 'docs', 'server cmd.md');
+const DOC = join(ROOT, 'docs', 'server-cmd.md');
+const DEV_DOC = join(ROOT, 'docs', 'server-developer.md');
 const CLI = join(ROOT, 'server', 'src', 'cli.ts');
 const GITIGNORE = join(ROOT, '.gitignore');
+
+/** 允许随仓库上传的 docs 文件（相对仓库根，正斜杠）。新增上传项必须同时改这里。 */
+const PUBLISHED_DOCS = ['docs/server-cmd.md', 'docs/server-developer.md'];
 
 const doc = existsSync(DOC) ? readFileSync(DOC, 'utf8') : '';
 const cli = readFileSync(CLI, 'utf8');
@@ -66,7 +71,7 @@ function subActions(prefix) {
 }
 
 test('文件存在，且带"随版本更新"的维护约定', () => {
-  assert.ok(doc.length > 2000, 'docs/server cmd.md 缺失或过短');
+  assert.ok(doc.length > 2000, 'docs/server-cmd.md 缺失或过短');
   assert.match(doc, /维护约定/, '必须写明本文件随版本更新');
 });
 
@@ -124,7 +129,7 @@ test('安全须知：密码只从 stdin、令牌可轮换、--bundle-root 不能
   assert.match(doc, /按 Ctrl\+C 停止/, '必须说明前台 serve 不是卡住');
 });
 
-test('.gitignore：docs 只放行 server cmd.md 这一个文件', () => {
+test('.gitignore：docs 只放行名单内的文件，其余一律本地', () => {
   const lines = gitignore.split(/\r?\n/).map((line) => line.trim());
 
   // 目录级排除会让所有 `!` 失效 —— 必须排除"目录内容"
@@ -134,9 +139,15 @@ test('.gitignore：docs 只放行 server cmd.md 这一个文件', () => {
   const exceptions = lines.filter((line) => line.startsWith('!docs/'));
   assert.deepEqual(
     exceptions,
-    ['!docs/server cmd.md'],
-    'docs 下的放行清单只能有 server cmd.md；新增上传项需同时改本守卫',
+    PUBLISHED_DOCS.map((path) => `!${path}`),
+    'docs 下的放行清单与 PUBLISHED_DOCS 不一致；新增上传项需同时改两处',
   );
+});
+
+test('放行的 docs 文件都真实存在（写错名字会静默少传一份文档）', () => {
+  for (const path of PUBLISHED_DOCS) {
+    assert.ok(existsSync(join(ROOT, path)), `${path} 不存在 —— .gitignore 放行了一个不存在的文件`);
+  }
 });
 
 test('手册里提到的文件都真实存在（命令名写错就没有这份文档）', () => {
