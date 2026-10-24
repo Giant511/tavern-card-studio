@@ -29,6 +29,7 @@
     "gen:wix": "node scripts/gen-wix-fragment.mjs",
     "typecheck:client": "npm run typecheck --workspace @tcs/client",
     "build:ui": "npm run build:ui --workspace @tcs/client",
+    "build:client": "node scripts/build-client.mjs",
     "validate:client": "node client/scripts/validate-config.mjs",
     "check:decisions": "node scripts/check-decision-table.mjs",
     "check:readme": "node scripts/check-readme.mjs",

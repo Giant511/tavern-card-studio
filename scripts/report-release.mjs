@@ -21,6 +21,8 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { auditDist, auditMsiSize, auditShellAssets, findPriorMsi, mb as humanMb } from './lib/bundle-health.mjs';
+
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const versionArg = process.argv.indexOf('--version');
 const VERSION = versionArg > -1 ? (process.argv[versionArg + 1] ?? '') : JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version;
@@ -206,6 +208,76 @@ if (serverArtifact) {
 }
 say('');
 
+// ── 内嵌资源 / 体积回归 ──────────────────────────────────
+//
+// 这一段是 2026-10-24 生产故障（客户端白屏，`asset not found: index.html`）的产物。
+//
+// 那次的教训很具体：**时间链只保证「新」，不保证「有」**。上面第 2 节全部通过，
+// 发出去的客户端 MSI 里却一个前端文件都没有 —— exe 比 dist 晚，但 exe 是空的。
+// 所以这里补三条内容级判据（判据细节见 scripts/lib/bundle-health.mjs 顶部注释）：
+//   ① dist 本身健康：入口 html 在根、总量达标、引用的资源真实存在、无 0 字节文件；
+//   ② exe 真的内嵌了 dist 的**每一个**文件（Tauri 把资源键留成明文，可逐键 includes）；
+//   ③ 新 MSI 不得比上一版骤降（<70%）。
+//
+// 特别说明 ③ 单独不够：本次故障的客户端 MSI 是 1,998,848 / 2,703,360 = 73.9%，
+// 恰好从 70% 的网眼里漏过去 —— 真正拦住它的是 ②。别把 ③ 当成主判据。
+say('3. 客户端内嵌资源与 MSI 体积回归');
+
+const distAudit = auditDist(join(ROOT, 'client/dist'), { required: ['perf.html'] });
+if (distAudit.ok) {
+  say(`   OK ${`client/dist 健康：${distAudit.files.length} 个文件，${humanMb(distAudit.totalBytes)}`.padEnd(34)}`.padEnd(52));
+} else {
+  for (const problem of distAudit.problems) fail(`client/dist 不健康：${problem}`);
+}
+
+const embedAudit = auditShellAssets(shellExe, join(ROOT, 'client/dist'));
+if (embedAudit.ok) {
+  say(`   OK ${`exe 内嵌了全部 ${embedAudit.checked} 个 dist 文件`.padEnd(34)}`.padEnd(52));
+} else {
+  fail(
+    `exe 缺 ${embedAudit.missing.length}/${embedAudit.checked} 个内嵌资源键` +
+      `（例：${embedAudit.missing.slice(0, 3).join('、')}）—— 这个包装上去就是白屏`,
+  );
+}
+
+/** 体积回归断言，客户端与服务端共用 */
+function assertMsiRegression(family, artifact, label) {
+  if (artifact === null) {
+    fail(`${label}：产物缺失，无法做体积回归`);
+    return;
+  }
+  const prior = findPriorMsi(join(ROOT, 'release'), family, VERSION);
+  const result = auditMsiSize(artifact.path, prior?.path ?? null);
+  if (result.skipped) {
+    say(`   ·  ${`${label}：release/ 下没有其它版本，跳过体积回归`.padEnd(34)}`.padEnd(52));
+    return;
+  }
+  const ratioText = `${(result.ratio * 100).toFixed(1)}%（上一版 ${prior.version} ${humanMb(result.priorBytes)}）`;
+  if (result.ok) {
+    say(`   OK ${`${label} 体积 ${ratioText}`.padEnd(34)}`.padEnd(52));
+  } else {
+    fail(`${label} 体积只有上一版的 ${ratioText}，低于 70% 下限 —— 先查内嵌资源是否丢了`);
+  }
+}
+
+assertMsiRegression('client', clientArtifact, '客户端 MSI');
+
+// 服务端同批构建，防同类问题：包内必须有入口与面板，体积同样不许骤降。
+const bundleServerEntry = join(ROOT, 'release/server/app/server/dist/index.js');
+const bundleServerPanel = join(ROOT, 'release/server/app/server/public/index.html');
+for (const [path, what] of [
+  [bundleServerEntry, '包内服务端入口 index.js'],
+  [bundleServerPanel, '包内面板 public/index.html'],
+]) {
+  if (existsSync(path)) {
+    say(`   OK ${`${what} 存在（${statSync(path).size} 字节）`.padEnd(34)}`.padEnd(52));
+  } else {
+    fail(`${what} 不存在（${relative(ROOT, path)}）—— 包不完整`);
+  }
+}
+assertMsiRegression('server', serverArtifact, '服务端 MSI');
+say('');
+
 // ── 交叉说明 ─────────────────────────────────────────────
 // ── 打包产物可启动 ───────────────────────────────────────
 //
@@ -215,7 +287,7 @@ say('');
 // 靠人核对清单拦不住（实际同时漏了 argon2 与 @peculiar/x509 两个），
 // 所以改成让产物自己跑一遍：用**包内那份 node.exe** 执行 `selfcheck`，
 // 真算哈希、真签证书、真开库、真算 git 对象哈希。任一失败即红。
-say('3. 打包产物可启动（用包内 node.exe 真跑）');
+say('4. 打包产物可启动（用包内 node.exe 真跑）');
 
 const bundleNode = join(ROOT, 'release/server/node.exe');
 const bundleEntry = join(ROOT, 'release/server/app/server/dist/index.js');
@@ -283,11 +355,14 @@ if (!existsSync(bundleNode) || !existsSync(bundleEntry)) {
 }
 say('');
 
-say('4. 不做的断言（写在这里，免得下次又有人加）');
+say('5. 不做的断言（写在这里，免得下次又有人加）');
 say('   · 不断言「exe ≤ MSI」：Tauri 打完包会再 patch 一次 exe 写 bundle 类型，');
 say('     MSI 则是先临时生成再整体挪位（mtime 被保留），两者先后无意义。');
 say('   · 不用 sha256 比对历史构建：WiX 写入构建时间戳，MSI 不是逐字节可复现的，');
 say('     哈希只能「发布时记录、随包分发」，不能拿来校验新构建。');
+say('   · 不拿体积单独下结论：上一轮把 824,320 字节的差解释成「strip 掉 .debug 段」，');
+say('     实际是**内嵌资源整段缺失**（同一命令重建的正确产物是 4,879,360 字节，');
+say('     +849,408 正好是 brotli 后的前端体积）。体积只当粗网，逐键 includes 才是判据。');
 say('');
 
 if (failures.length > 0) {
