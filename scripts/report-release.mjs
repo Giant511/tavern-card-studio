@@ -215,7 +215,7 @@ say('');
 // 靠人核对清单拦不住（实际同时漏了 argon2 与 @peculiar/x509 两个），
 // 所以改成让产物自己跑一遍：用**包内那份 node.exe** 执行 `selfcheck`，
 // 真算哈希、真签证书、真开库、真算 git 对象哈希。任一失败即红。
-say('3. 打包产物可启动（用包内 node.exe 真跑一遍依赖）');
+say('3. 打包产物可启动（用包内 node.exe 真跑）');
 
 const bundleNode = join(ROOT, 'release/server/node.exe');
 const bundleEntry = join(ROOT, 'release/server/app/server/dist/index.js');
@@ -225,23 +225,51 @@ if (!existsSync(bundleNode) || !existsSync(bundleEntry)) {
   // 清掉 NODE_OPTIONS：某些宿主会注入 require 钩子，而这里要验的是**裸产物**能不能起
   const env = { ...process.env };
   delete env['NODE_OPTIONS'];
-  const started = Date.now();
-  let output = '';
-  let code = 0;
-  try {
-    // 关键：`--bundle-root` 约束"依赖只能从包里解析"。
-    // 不加的话，绿色包放在仓库里时会从**仓库根的 node_modules** 找到缺的包，
-    // 自检全绿而装到 C://Program Files 后立刻崩 —— 我实测过这个假通过。
-    output = execFileSync(bundleNode, [bundleEntry, 'selfcheck', '--bundle-root', join(ROOT, 'release/server/app')], {
-      env,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 60_000,
-    });
-  } catch (error) {
-    code = typeof error.status === 'number' ? error.status : 1;
-    output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+  const run = (args, timeout) => {
+    const started = Date.now();
+    let output = '';
+    let code = 0;
+    try {
+      output = execFileSync(bundleNode, args, {
+        env,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout,
+      });
+    } catch (error) {
+      code = typeof error.status === 'number' ? error.status : 1;
+      output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+    }
+    return { code, output, elapsed: ((Date.now() - started) / 1000).toFixed(1) };
+  };
+
+  // ── 第一道：--version（最快失败点，2 秒内）
+  //
+  // 它能证明的是：**产物能加载、入口能执行**（缺文件、坏包、node 位数不对、
+  // 静态 import 链断掉，都在这里立刻炸）。作为"打包产物可启动"的第一道信号足够便宜。
+  //
+  // 但它**抓不到 argon2 这类运行期依赖缺失** —— 实测过：把
+  // `release/server/app/node_modules/@node-rs` 整个移走后 `--version` 照样退出 0，
+  // 因为 `--version` 在 load() 之前就 return，压根没走到 auth/password 那条链。
+  // 所以别拿它替代第二道：1067 那次事故复现时，`--version` 是绿的。
+  const versionRun = run([bundleEntry, '--version'], 30_000);
+  const versionLine = versionRun.output.split(/\r?\n/).find((line) => /\d+\.\d+\.\d+/.test(line)) ?? '';
+  if (versionRun.code === 0 && versionLine.trim() !== '') {
+    say(`   OK --version 通过：${versionLine.trim()}（${versionRun.elapsed} 秒）`);
+  } else {
+    fail(
+      `打包产物跑不起来（--version 退出码 ${String(versionRun.code)}）：` +
+        `${(versionRun.output.split(/\r?\n/).find((line) => line.trim() !== '') ?? '(无输出)').trim()}`,
+    );
   }
+
+  // ── 第二道：selfcheck（真跑运行时依赖，抓"装到 Program Files 才崩"那一类）
+  const started = Date.now();
+  // 关键：`--bundle-root` 约束"依赖只能从包里解析"。
+  // 不加的话，绿色包放在仓库里时会从**仓库根的 node_modules** 找到缺的包，
+  // 自检全绿而装到 C://Program Files 后立刻崩 —— 我实测过这个假通过。
+  const checkRun = run([bundleEntry, 'selfcheck', '--bundle-root', join(ROOT, 'release/server/app')], 60_000);
+  const { code, output } = checkRun;
   const elapsed = ((Date.now() - started) / 1000).toFixed(1);
 
   for (const line of output.split(/\r?\n/)) {
