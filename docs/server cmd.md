@@ -85,6 +85,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 | `user repos add` | 给账户新建仓库 |
 | `version` | 版本信息 |
 | `selfcheck` | 离线自检：真跑一遍运行时依赖 |
+| `cleanup` | 卸载清理：按白名单删安装目录里的运行期残留（日志留痕） |
 | `help` | 打印内置帮助 |
 
 ---
@@ -322,6 +323,40 @@ Remove-Item -LiteralPath 'C:\ProgramData\TavernCardStudio' -Recurse -Force
 > 卸载动作本身返回 `ignore`：删不掉（例如某个日志文件仍被占用）**不会**让卸载失败
 > 回滚 —— 回滚会留下一个"卸不掉"的安装，比"留下一个目录"糟糕得多。
 > 真删不掉时手工执行上面两条命令即可。
+
+### 6c. `cleanup` —— 安装目录残留清理（卸载时自动跑，也可手工）
+
+Windows Installer 只删它自己装的文件，运行期生成的东西（`data\`、`logs\`、
+`cache\`、顶层 `*.log`）会让安装目录"删不干净"。卸载流程里已经有一步自动清理，
+也可以手工跑（先停服务）：
+
+```powershell
+# 先看会删什么，不真删、不写日志
+& $tcs cleanup --dry-run --config "C:\ProgramData\TavernCardStudio\config.json"
+
+# 真删（--event-log 会往「事件查看器 → Windows 日志 → 应用程序」写一行摘要）
+& $tcs cleanup --event-log --config "C:\ProgramData\TavernCardStudio\config.json"
+```
+
+**只删白名单，且只认安装目录顶层**：
+
+| 白名单 | 说明 |
+|---|---|
+| `data\` | 在安装目录里直接跑启动器时生成的库（绿色包布局的遗留） |
+| `logs\` | 安装目录里的运行日志 |
+| `cache\`、`.cache\` | 运行期缓存 |
+| `tmp\`、`temp\` | 运行期临时目录 |
+| 顶层 `*.log`、`*.tmp` | 前台运行时留下的文件 |
+
+其余一律**只记录不删**（日志里标 `KEPT`）。这是有意的：安装目录里可能放着
+用户自己的笔记、导出的卡，那不是"残留"。符号链接/目录联接只删链接本身，
+不递归进目标目录。
+
+日志写到 `C:\ProgramData\TavernCardStudio\logs\uninstall-cleanup.log`，记下每个条目的
+字节数、删没删掉、以及**删不掉的原因**（通常是 `EBUSY`：文件还被某个进程占着）。
+如果数据目录已经被删（勾了"同时删除数据"），日志改写到
+`%TEMP%\TavernCardStudio-uninstall-cleanup.log` —— 清理动作**不会**重建数据目录，
+否则"卸载后全清"就不成立了。
 
 ---
 
