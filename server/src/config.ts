@@ -144,6 +144,32 @@ export interface ServerConfigFile {
    * 而 `purge`（立即彻底清除）只留给管理员 —— 那才是真正不可逆的操作。
    */
   trash: TrashConfig;
+  /**
+   * **运行期写安装目录自检**（F14.3 / T10.24）。默认 `true`。
+   *
+   * 卸载删不干净的根因是运行期往安装目录（Program Files）写过东西 —— 早期
+   * `start-server.cmd` 把 `dataDir` 解析成 `cwd\data` 就是这么来的。开着它，
+   * 服务启动时会检查 `dataDir` 是否落在安装目录内、安装目录里是否已有
+   * 运行期残留，并在运行期定期比对安装目录快照，发现新增/改写就告警。
+   *
+   * **只告警、不阻断**：它是诊断工具，不是门卫。写入照常成功、服务照常启动，
+   * 痕迹落在启动日志（warn）与应用程序事件日志里。
+   *
+   * 测试环境可以关掉：自检会周期性遍历安装目录，在"安装目录里有几十万个文件"
+   * 的极端布局下（有人把 dataDir 指进去）这笔开销没有必要反复付。
+   */
+  installDirWriteCheck: boolean;
+  /**
+   * 允许写入安装目录的相对路径前缀（T10.24）。
+   *
+   * **故意不复用 T10.23 的删除白名单**：那份白名单列的是"卸载时该删的残留"，
+   * 而"往安装目录写 `data\`/`logs\`"正是本自检要抓的缺陷 —— 拿它当允许清单，
+   * 等于把唯一的检测目标排除掉。默认空数组。
+   *
+   * 只有**有意**把 `dataDir` 指到安装目录里时才需要在这里放行（那种配置本身
+   * 会先被 `dataDir 落在安装目录内` 告警一次，放行只是不再按文件刷屏）。
+   */
+  installDirWriteAllow: string[];
   auth: AuthConfig;
   /** TLS 三模式（T10.5），见 {@link TlsConfig} */
   tls: TlsConfig;
@@ -291,6 +317,9 @@ export function createDefaultConfig(overrides: ConfigOverrides = {}): ServerConf
     // 默认不信任任何代理头：见字段注释。空数组下有效 IP 恒等于 socket 地址。
     trustProxy: overrides.trustProxy ?? [],
     trash: { retentionDays: 30 },
+    // 默认开：这条自检的成本是一次目录遍历，收益是"卸载删不干净"这条链的早期预警。
+    installDirWriteCheck: true,
+    installDirWriteAllow: [],
     auth: {
       token: overrides.token ?? generateToken(),
       require: true,
@@ -359,6 +388,15 @@ export function normalizeConfig(input: unknown, overrides: ConfigOverrides = {})
       const days = Math.trunc(value);
       if (days < 0 || days > TRASH_MAX_RETENTION_DAYS) return { ...base.trash };
       return { retentionDays: days };
+    })(),
+    // 自检开关：只认布尔。手改配置写成 "true" 字符串时**回到默认开**（而不是关）——
+    // 走错方向的安全含义不同：误开只多一条告警，误关会让检测静默消失。
+    installDirWriteCheck: typeof raw['installDirWriteCheck'] === 'boolean' ? raw['installDirWriteCheck'] : base.installDirWriteCheck,
+    installDirWriteAllow: (() => {
+      const value = raw['installDirWriteAllow'];
+      if (!Array.isArray(value)) return [...base.installDirWriteAllow];
+      // 空串与纯空白会被 isAllowed 忽略，这里先滤掉，免得配置里留个"看起来放行了"的残条
+      return value.filter((item): item is string => typeof item === 'string' && item.trim() !== '');
     })(),
     trustProxy: (() => {
       const rawTrust = raw['trustProxy'];
