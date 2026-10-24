@@ -376,6 +376,7 @@ if ($decompiled -notmatch 'install-layout\.ini') { $missing += 'File:install-lay
 if ($decompiled -notmatch '<Dialog Id="DeleteDataDlg"') { $missing += 'Dialog:DeleteDataDlg' }
 if ($decompiled -notmatch 'Property="DELETEDATA"') { $missing += 'Control:DeleteDataCheck(Property=DELETEDATA)' }
 if ($decompiled -notmatch '<CustomAction[^>]*Id="DeleteDataDir"') { $missing += 'CustomAction:DeleteDataDir' }
+if ($decompiled -notmatch '<CustomAction[^>]*Id="CleanInstallResidue"') { $missing += 'CustomAction:CleanInstallResidue' }
 if ($decompiled -notmatch 'Data directory \(kept unless you delete it during uninstall\)') { $missing += 'UIText:ExitDialogDescription' }
 if ($missing.Count -gt 0) {
   throw ("MSI is missing expected entries: {0}. The build succeeded but the installer will not behave as expected." -f ($missing -join ', '))
@@ -396,6 +397,26 @@ if (-not $removeButtonBlock.Success) {
 }
 if ($removeButtonBlock.Value -notmatch 'Value="DeleteDataDlg"') {
   throw 'MaintenanceTypeDlg.RemoveButton 没有指向 DeleteDataDlg 的 NewDialog —— 卸载对话框不会出现（常见原因：Publish 的 Control 名写成了 Remove）。'
+}
+
+# 残留清理的时序断言：必须夹在"删数据"与"删安装目录"之间。
+#
+# WiX 不允许同一个 Custom 同时写 After 与 Before（WIX0035），所以顺序靠一条链：
+#     DeleteDataDir --Before--> CleanInstallResidue --Before--> RemoveFiles
+# 顺序有意义：清理要先看到"数据目录还在不在"，才知道日志写 ProgramData 还是 %TEMP%。
+$residueSeq = [regex]::Match($decompiled, '<Custom Action="CleanInstallResidue"[^>]*>')
+if (-not $residueSeq.Success) {
+  throw 'InstallExecuteSequence 里没有 CleanInstallResidue —— 卸载后安装目录残留不会被清理（构建成功不代表它进了表）。'
+}
+if ($residueSeq.Value -notmatch 'Before="RemoveFiles"') {
+  throw 'CleanInstallResidue 必须在 RemoveFiles 之前：之后执行时安装目录已被删，清理无处可跑。'
+}
+$dataSeq = [regex]::Match($decompiled, '<Custom Action="DeleteDataDir"[^>]*>')
+if (-not $dataSeq.Success) {
+  throw 'InstallExecuteSequence 里没有 DeleteDataDir。'
+}
+if ($dataSeq.Value -notmatch 'Before="CleanInstallResidue"') {
+  throw 'DeleteDataDir 必须排在 CleanInstallResidue 之前（两者都只锚 RemoveFiles 时相对顺序未定义）。'
 }
 
 Remove-Item -LiteralPath $decompDir -Recurse -Force

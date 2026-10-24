@@ -212,8 +212,39 @@
         回滚会得到一个"卸不掉"的安装，比"留下一个目录"糟糕得多；而数据保留的方向
         也是保守的（用户还可以手删）。失败痕迹由 T10.23 的清单式清理动作统一落日志。
       -->
-      <Custom Action="DeleteDataDir" Before="RemoveFiles"
+      <!--
+        删数据目录，然后清残留 —— 顺序靠"链"保证，不靠两个动作各自锚在 RemoveFiles 上。
+
+        WiX 不允许同一个 Custom 同时写 After 和 Before（WIX0035），而只写
+        Before="RemoveFiles" 的话两者相对顺序是未定义的。所以串成一条链：
+            DeleteDataDir →（Before）→ CleanInstallResidue →（Before）→ RemoveFiles
+        顺序在这里是**有意义**的：清理动作要先看到"数据目录还在不在"，才知道
+        日志该写 ProgramData 还是 %TEMP%（见 uninstall-cleanup.ts 文件头）。
+      -->
+      <Custom Action="DeleteDataDir" Before="CleanInstallResidue"
               Condition="REMOVE=&quot;ALL&quot; AND DELETEDATA=1" />
+
+      <!--
+        删除安装目录里的运行期残留（F14.2 / T10.23）。
+
+        为什么需要单独一步：Windows Installer 只删 File 表里的文件和自己创建过的
+        空目录。运行期生成的东西（`data\`、`logs\`、`cache\`、顶层 `*.log`）不在清单里，
+        于是卸载后安装目录整个留在 Program Files 里 —— 里面还可能有用户的数据库。
+
+        为什么调 CLI 而不是在这里写 cmd 命令：白名单判定、字节统计、"删不掉的原因"
+        这些逻辑需要被单元测试覆盖。本机 Node 无法 spawn 子进程，写成 .ps1 就只有
+        "读源文件 grep 字符串"这一种测试方式，那种测试咬不住逻辑。放进
+        `app\server\dist\`（`tcs-server cleanup`）就能真建目录、真删、真读日志来断言。
+
+        时序：`Before="RemoveFiles"`（与 DeleteDataDir 串成一条链，见上一条注释）。
+        必须在 RemoveFiles **之前**：之后安装目录已被删，清理无处可跑。
+
+        `Return="ignore"`：残留清不掉不该让卸载失败回滚。
+        `Impersonate="yes"`：以提权用户身份跑，`%ProgramData%` 与 `%TEMP%` 才指向
+        正确的位置（SYSTEM 会跑到 systemprofile 下）。
+      -->
+      <Custom Action="CleanInstallResidue" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot;" />
     </InstallExecuteSequence>
   </Package>
 
@@ -378,6 +409,26 @@
       Impersonate="yes"
       Return="ignore"
       ExeCommand="&quot;[SystemFolder]cmd.exe&quot; /c if exist &quot;[DATAFOLDER]&quot; rmdir /s /q &quot;[DATAFOLDER]&quot;" />
+  </Fragment>
+
+  <!--
+    安装目录残留清理（F14.2 / T10.23）。
+
+    没有专门的 PowerShell 脚本、没有第二份白名单：一律走 `tcs-server cleanup`，
+    于是"卸载时删什么"与"手工 dry-run 看到什么"用的是同一份代码。
+
+    data-dir 参数显式传（而不是让 CLI 去读 %ProgramData%）：卸载时如果用户勾了
+    "删除数据"，那个目录已经被上一步删掉，这里传的是一个不存在的路径 ——
+    正是我们想要的信号（日志改写到 %TEMP%，绝不重建数据目录）。
+  -->
+  <Fragment>
+    <CustomAction
+      Id="CleanInstallResidue"
+      Directory="INSTALLFOLDER"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="ignore"
+      ExeCommand="&quot;[INSTALLFOLDER]node.exe&quot; &quot;[INSTALLFOLDER]app\server\dist\index.js&quot; cleanup --data-dir &quot;[DATAFOLDER]&quot; --event-log" />
   </Fragment>
 
 </Wix>

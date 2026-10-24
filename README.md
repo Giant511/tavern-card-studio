@@ -126,6 +126,10 @@ msiexec /i "Tavern Card Studio_<版本>_x64_en-US.msi" /qn
 
 - 勾选后该目录被整棵删除；**不勾选则保留**，卸载完成页会再提示一次位置，想清理就自己删。
 - 客户端的角色卡（`Documents\TavernCardStudio\cards`）**永远不动** —— 那是你的文档，不是应用数据。
+- 卸载还会顺手清掉**安装目录里的运行期残留**（在安装目录里直接跑过启动器留下的
+  `data\`、`logs\`、缓存与顶层 `*.log`），删了什么、多少字节、哪些没删掉及原因都记在
+  `C:\ProgramData\TavernCardStudio\logs\uninstall-cleanup.log`。**只清这几类**：安装目录里
+  你自己放的文件一律保留（日志里标 `KEPT`），安装清单内的文件由 Windows Installer 删。
 - 静默卸载要连数据一起删，显式给属性：`msiexec /x <msi> /qn DELETEDATA=1`。
 
 ```bat

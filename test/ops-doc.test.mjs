@@ -34,7 +34,13 @@ function helpCommands() {
   const block = cli.slice(start, end);
   const commands = [];
   for (const line of block.split('\n')) {
-    const match = /^\s*`\s{2}([a-z]+(?: [a-z|]+)?)\s{2}/.exec(line);
+    // 末尾的 `[...]` 是可选的参数提示（如 `cleanup [--dry-run]`）。
+    //
+    // 漏掉这一段会让整行**静默逃过本守卫**：`cleanup [--dry-run]` 这种写法里，
+    // 命令名后面只有一个空格再接 `[`，原正则要求命令名后紧跟两个空格，
+    // 于是匹配失败、`continue` 掉 —— 命令没进清单，手册漏写也不会红。
+    // 2026-10-24 加 `cleanup` 时实测到这一点（当时手册里根本没有它，本用例却是绿的）。
+    const match = /^\s*`\s{2}([a-z]+(?: [a-z|]+)?)(?: \[[^\]]*\])?\s{2}/.exec(line);
     if (!match) continue;
     // `config show|path` → ['config show', 'config path']
     const [head, tail] = splitOnce(match[1].trim());
