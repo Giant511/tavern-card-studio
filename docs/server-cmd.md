@@ -447,13 +447,18 @@ tcs-server 0.1.2 (node v22.22.2, win32/x64)
 算一次 git 对象哈希。
 
 ```
-Tavern Card Studio Server 0.1.2 自检（node v22.22.2，win32/x64）
 要求依赖只从包内解析：C:\Program Files\Tavern Card Studio Server\app
-[OK] @node-rs/argon2 —— 哈希与校验通过（$argon2id$v=19$m=1…）
+Tavern Card Studio Server 0.1.2 自检（node v22.22.2，win32/x64）
+
+✔ @node-rs/argon2 —— 哈希与校验通过（$argon2id$v=19$m=1…）
     解析自 …\app\node_modules\@node-rs\argon2\index.js
-[OK] @peculiar/x509 —— 证书生成通过（-----BEGIN CERTIFICATE-----）
-[OK] better-sqlite3 —— 内存库读写通过（ok）
-[OK] isomorphic-git —— 对象哈希通过（0ba2153d4615…）
+✔ @peculiar/x509 —— 证书生成通过（-----BEGIN CERTIFICATE-----）
+    解析自 …\app\node_modules\@peculiar\x509\build\x509.cjs.js
+✔ better-sqlite3 —— 内存库读写通过（ok）
+    解析自 …\app\node_modules\better-sqlite3\lib\index.js
+✔ isomorphic-git —— 对象哈希通过（0ba2153d4615…）
+    解析自 …\app\node_modules\isomorphic-git\index.cjs
+
 结论：通过（全部运行时依赖可用）
 ```
 
@@ -485,6 +490,20 @@ Tavern Card Studio Server 0.1.2 自检（node v22.22.2，win32/x64）
 
 选项写在子命令**前后都可以**（解析器扫全部参数，不看位置）。**命令行参数在后
 则后生效** —— 这也是 `start-server.cmd` 把自己的默认值放在 `%*` 之前的原因。
+
+**拼错的选项会被拒绝，而不是被忽略。** 形如 `--verison` 的未知选项一律打印
+`未知选项：--verison` 并**退出码 2**，提示 `tcs-server help`。
+
+```
+> node.exe app\server\dist\index.js --verison
+未知选项：--verison
+运行 `tcs-server help` 查看可用选项。
+```
+
+这条是安全相关的：早期版本不认识 `--verison`、位置参数又为空，于是**落到 `serve`**
+—— 静默起了一个真服务，还在当前目录写出 `data\config.json`（含明文令牌）。
+现在不会了。另外 `--version` / `--help` 这两个惯例写法被正式支持
+（等价于 `version` / `help`），脚本里可以放心用。
 
 ### 8.1 环境变量
 
