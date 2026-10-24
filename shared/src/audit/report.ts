@@ -14,6 +14,7 @@ import type { UnifiedCard } from '../model/unified-card.js';
 import type { ResolvedPlatformRule } from '../rules/platform-rule.js';
 import { summarizeIssues, validateCard } from '../rules/platform-rule-engine.js';
 import type { TxtPreset } from '../format/preset.js';
+import type { WorldbookFormatParams } from '../format/worldbook-preset.js';
 import { AUDIT_REPORT_SCHEMA_VERSION } from './types.js';
 import type { AuditIssue, AuditReport, IssueCategory } from './types.js';
 import { checkFormat } from './format.js';
@@ -26,6 +27,8 @@ export interface AuditOptions {
   platformRule?: ResolvedPlatformRule | null;
   /** TXT 预设（不给则跳过「TXT 分块是否符合预设」这一路） */
   preset?: TxtPreset | null;
+  /** 世界书格式预设参数（T10.31）；不给则按 v1.0 冻结格式解析世界书 */
+  worldbookFormat?: WorldbookFormatParams;
   /** 原始 JSON 文本（给了就额外验证其可解析性） */
   rawJsonText?: string | null;
   /** 是否产出「有 ST 缺省值但未写出」的 info 提示，默认 true */
@@ -103,6 +106,10 @@ export function buildAuditReport(card: UnifiedCard, options: AuditOptions = {}):
   issues.push(
     ...checkFormat(card, {
       preset: options.preset ?? null,
+      // 世界书的语义检查由规则集驱动（T10.33）：没有当前规则就没有语义检查，
+      // 那比"用一套写死的口径"诚实 —— 后者会让自定义规则看起来生效了却毫无影响。
+      platformRule: options.platformRule ?? null,
+      ...(options.worldbookFormat ? { worldbookFormat: options.worldbookFormat } : {}),
       rawJsonText: options.rawJsonText ?? null,
       includeStDefaults: options.includeStDefaults,
     }),

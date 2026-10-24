@@ -4,7 +4,16 @@
   "title": "平台规则文件（Platform Rule）",
   "description": "描述某一平台（SillyTavern / CCV2 / CCV3 / JanitorAI / Chub / 自定义）对角色卡内容层的写法要求。文件格式本身固定，规则只约束内容，不改变角色卡 JSON 结构。",
   "type": "object",
-  "required": ["schemaVersion", "id", "name", "version", "target", "placeholders", "fields", "rules"],
+  "required": [
+    "schemaVersion",
+    "id",
+    "name",
+    "version",
+    "target",
+    "placeholders",
+    "fields",
+    "rules"
+  ],
   "additionalProperties": false,
   "properties": {
     "schemaVersion": {
@@ -14,8 +23,8 @@
     },
     "id": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$",
-      "description": "规则唯一标识，小写字母/数字/点/下划线/连字符。自定义规则不得与内置规则重名。"
+      "pattern": "^[a-z0-9][a-z0-9._:-]{1,79}$",
+      "description": "唯一标识。要覆盖/禁用内置世界书规则，必须沿用它的 id（如 builtin:worldbook-no-trigger），所以 id 允许冒号。"
     },
     "name": {
       "type": "string",
@@ -34,19 +43,29 @@
       "description": "规则说明：该平台的内容风格、常见限制、来源依据。"
     },
     "extends": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "继承的父规则 id。子规则会先应用父规则，再用自身同名 id 的规则覆盖；null 表示不继承。",
       "default": null
     },
     "target": {
       "type": "object",
       "description": "导出目标规范，决定保存/导出时写哪一版 SillyTavern JSON。",
-      "required": ["spec"],
+      "required": [
+        "spec"
+      ],
       "additionalProperties": false,
       "properties": {
         "spec": {
           "type": "string",
-          "enum": ["v1", "v2", "v3", "any"],
+          "enum": [
+            "v1",
+            "v2",
+            "v3",
+            "any"
+          ],
           "description": "v1=平铺字段；v2=chara_card_v2；v3=chara_card_v3；any=沿用卡片原有版本。"
         },
         "specVersion": {
@@ -58,31 +77,48 @@
     "placeholders": {
       "type": "object",
       "description": "占位符词表。规则中的 token 引用这里的键；第一个写法为主写法，平台间切换时用于自动替换。",
-      "required": ["char", "user"],
+      "required": [
+        "char",
+        "user"
+      ],
       "additionalProperties": false,
       "properties": {
         "char": {
           "type": "array",
           "minItems": 1,
           "maxItems": 12,
-          "items": { "type": "string", "minLength": 1, "maxLength": 32 },
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
           "description": "角色占位符的所有合法写法，按优先级排序，如 [\"{{char}}\", \"<BOT>\"]。"
         },
         "user": {
           "type": "array",
           "minItems": 1,
           "maxItems": 12,
-          "items": { "type": "string", "minLength": 1, "maxLength": 32 },
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
           "description": "用户占位符的所有合法写法，如 [\"{{user}}\", \"<USER>\"]。"
         },
         "custom": {
           "type": "object",
           "description": "其他占位符，键为自定义名（在规则中以 custom:键名 引用），值为写法数组。",
-          "propertyNames": { "pattern": "^[a-zA-Z][a-zA-Z0-9_]{0,31}$" },
+          "propertyNames": {
+            "pattern": "^[a-zA-Z][a-zA-Z0-9_]{0,31}$"
+          },
           "additionalProperties": {
             "type": "array",
             "minItems": 1,
-            "items": { "type": "string", "minLength": 1, "maxLength": 32 }
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            }
           }
         }
       }
@@ -90,19 +126,25 @@
     "fields": {
       "type": "array",
       "description": "字段完整性要求：必填、长度、正则约束。path 使用 ST 原生字段名或模型路径。",
-      "items": { "$ref": "#/definitions/fieldRequirement" },
+      "items": {
+        "$ref": "#/definitions/fieldRequirement"
+      },
       "default": []
     },
     "rules": {
       "type": "array",
       "description": "内容层规则：占位符、正则、长度、禁用词等。",
-      "items": { "$ref": "#/definitions/contentRule" },
+      "items": {
+        "$ref": "#/definitions/contentRule"
+      },
       "default": []
     },
     "autoFix": {
       "type": "array",
       "description": "切换平台时的自动适配操作（需用户确认后执行），例如把 <BOT> 替换为 {{char}}。",
-      "items": { "$ref": "#/definitions/autoFixOp" },
+      "items": {
+        "$ref": "#/definitions/autoFixOp"
+      },
       "default": []
     },
     "metadata": {
@@ -110,31 +152,51 @@
       "description": "作者、来源等元信息，不影响规则执行。",
       "additionalProperties": false,
       "properties": {
-        "author": { "type": "string", "maxLength": 64 },
-        "homepage": { "type": "string", "maxLength": 256 },
-        "license": { "type": "string", "maxLength": 64 },
-        "updatedAt": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}" }
+        "author": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "homepage": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "license": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "updatedAt": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}"
+        }
       }
     }
   },
   "definitions": {
     "severity": {
       "type": "string",
-      "enum": ["error", "warning", "info"],
+      "enum": [
+        "error",
+        "warning",
+        "info"
+      ],
       "description": "error=阻断导出（需确认）；warning=提醒；info=提示。"
     },
     "selector": {
       "type": "string",
-      "description": "\"*\" 全部文本板块；\"block:<id>\" 指定板块（basic/personality/settings/special/user/worldbook）；\"field:<ST字段名>\" 指定原生字段。",
-      "pattern": "^(\\*|block:(basic|personality|settings|special|user|worldbook)|field:[a-z_]+)$"
+      "description": "\"*\" 全部文本板块；\"block:<id>\" 指定板块；\"field:<ST字段名>\" 指定原生字段；\"worldbook:entries[].<字段>\" 世界书**每个条目**的某个字段（name/keys/secondary_keys/content/comment/position/insertion_order/priority/depth/constant/enabled/selective/case_sensitive）。",
+      "pattern": "^(\\*|block:(basic|personality|settings|special|user|worldbook)|field:[a-z_]+|worldbook:entries\\[\\]\\.(name|keys|secondary_keys|content|comment|position|insertion_order|priority|depth|constant|enabled|selective|case_sensitive))$"
     },
     "selectorList": {
       "oneOf": [
-        { "$ref": "#/definitions/selector" },
+        {
+          "$ref": "#/definitions/selector"
+        },
         {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/definitions/selector" }
+          "items": {
+            "$ref": "#/definitions/selector"
+          }
         }
       ]
     },
@@ -145,7 +207,11 @@
     },
     "fieldRequirement": {
       "type": "object",
-      "required": ["path", "label", "required"],
+      "required": [
+        "path",
+        "label",
+        "required"
+      ],
       "additionalProperties": false,
       "properties": {
         "path": {
@@ -153,14 +219,43 @@
           "description": "ST 原生字段名（name/description/personality/scenario/first_mes/mes_example/creator_notes/system_prompt/post_history_instructions/alternate_greetings/character_book）或模型路径（meta.name/meta.creator/meta.tags/meta.creatorNotes/meta.characterVersion）。",
           "pattern": "^(meta\\.[a-zA-Z]+|[a-z_]+)$"
         },
-        "label": { "type": "string", "minLength": 1, "maxLength": 64, "description": "展示名称，如「角色名」。" },
-        "required": { "type": "boolean", "description": "是否必填。" },
-        "minLength": { "type": "integer", "minimum": 0, "description": "最小字符数（不含空白）。" },
-        "maxLength": { "type": "integer", "minimum": 1, "description": "最大字符数（不含空白）。" },
-        "pattern": { "type": "string", "description": "必须命中的正则（ECMAScript 语法）。" },
-        "flags": { "type": "string", "pattern": "^[gimsuy]*$", "description": "正则标志，如 \"i\"。注意：校验时自动忽略 g/y。" },
-        "severity": { "$ref": "#/definitions/severity" },
-        "message": { "type": "string", "maxLength": 300, "description": "自定义问题文案，缺省使用内置模板。" },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "展示名称，如「角色名」。"
+        },
+        "required": {
+          "type": "boolean",
+          "description": "是否必填。"
+        },
+        "minLength": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "最小字符数（不含空白）。"
+        },
+        "maxLength": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "最大字符数（不含空白）。"
+        },
+        "pattern": {
+          "type": "string",
+          "description": "必须命中的正则（ECMAScript 语法）。"
+        },
+        "flags": {
+          "type": "string",
+          "pattern": "^[gimsuy]*$",
+          "description": "正则标志，如 \"i\"。注意：校验时自动忽略 g/y。"
+        },
+        "severity": {
+          "$ref": "#/definitions/severity"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "自定义问题文案，缺省使用内置模板。"
+        },
         "stDefault": {
           "type": "boolean",
           "default": false,
@@ -170,10 +265,20 @@
     },
     "contentRule": {
       "type": "object",
-      "required": ["id", "type", "message", "scope", "severity"],
+      "required": [
+        "id",
+        "type",
+        "message",
+        "scope",
+        "severity"
+      ],
       "additionalProperties": false,
       "properties": {
-        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$", "description": "规则 id，在同一文件内唯一；继承时同名覆盖。" },
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._:-]{1,79}$",
+          "description": "唯一标识。要覆盖/禁用内置世界书规则，必须沿用它的 id（如 builtin:worldbook-no-trigger），所以 id 允许冒号。"
+        },
         "type": {
           "type": "string",
           "enum": [
@@ -183,28 +288,120 @@
             "pattern-required",
             "length",
             "non-empty",
-            "forbidden-words"
+            "forbidden-words",
+            "number-range",
+            "list-count",
+            "list-no-blank-items"
           ],
-          "description": "规则类型，决定其余字段的语义。"
+          "description": "规则类型，决定其余字段的语义。number-range 看**数值**（insertion_order/priority/depth），list-count 看**列表项数**（keys/secondary_keys），list-no-blank-items 查列表里的空项。三者的判据与\"文本长度\"无关，所以不能拿 length 代替。"
         },
-        "message": { "type": "string", "minLength": 1, "maxLength": 300, "description": "问题描述文案，展示在问题列表。" },
-        "hint": { "type": "string", "maxLength": 300, "description": "修复建议。" },
-        "scope": { "$ref": "#/definitions/selectorList" },
-        "severity": { "$ref": "#/definitions/severity" },
-        "enabled": { "type": "boolean", "default": true, "description": "false 时该规则不参与校验，便于用户临时关闭。" },
-        "token": { "$ref": "#/definitions/placeholderKey" },
-        "min": { "type": "integer", "minimum": 0, "description": "最小出现次数 / 最小长度 / 最少匹配数（随 type 变化）。" },
-        "max": { "type": "integer", "minimum": 0, "description": "最大出现次数 / 最大长度（随 type 变化）。" },
-        "pattern": { "type": "string", "description": "type 为 pattern-forbid / pattern-required 时的正则。" },
-        "flags": { "type": "string", "pattern": "^[gimsuy]*$", "description": "正则标志。" },
-        "unit": { "type": "string", "enum": ["char", "word"], "default": "char", "description": "length 规则的计数单位。" },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "问题描述文案，展示在问题列表。"
+        },
+        "hint": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "修复建议。"
+        },
+        "scope": {
+          "$ref": "#/definitions/selectorList"
+        },
+        "severity": {
+          "$ref": "#/definitions/severity"
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "completeness",
+            "format",
+            "platform-rule",
+            "structure",
+            "worldbook"
+          ],
+          "description": "问题归属的审计类别。世界书条目规则写 worldbook，否则会显示在\"平台规则\"分组里。"
+        },
+        "when": {
+          "type": "object",
+          "description": "同一条目内的跨字段条件：如\"关键词为空且 constant 不为 true\"= list-count + when.constant.notEquals=true。",
+          "additionalProperties": false,
+          "properties": {
+            "field": {
+              "type": "string",
+              "description": "同一条目的字段名。"
+            },
+            "equals": {
+              "type": [
+                "string",
+                "number",
+                "boolean"
+              ]
+            },
+            "notEquals": {
+              "type": [
+                "string",
+                "number",
+                "boolean"
+              ]
+            },
+            "present": {
+              "type": "boolean"
+            }
+          }
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "false 时该规则不参与校验，便于用户临时关闭。"
+        },
+        "token": {
+          "$ref": "#/definitions/placeholderKey"
+        },
+        "min": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "最小出现次数 / 最小长度 / 最少匹配数（随 type 变化）。"
+        },
+        "max": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "最大出现次数 / 最大长度（随 type 变化）。"
+        },
+        "pattern": {
+          "type": "string",
+          "description": "type 为 pattern-forbid / pattern-required 时的正则。"
+        },
+        "flags": {
+          "type": "string",
+          "pattern": "^[gimsuy]*$",
+          "description": "正则标志。"
+        },
+        "unit": {
+          "type": "string",
+          "enum": [
+            "char",
+            "word"
+          ],
+          "default": "char",
+          "description": "length 规则的计数单位。"
+        },
         "words": {
           "type": "array",
           "minItems": 1,
-          "items": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
           "description": "forbidden-words 规则的词表。"
         },
-        "caseSensitive": { "type": "boolean", "default": false, "description": "forbidden-words 是否区分大小写。" },
+        "caseSensitive": {
+          "type": "boolean",
+          "default": false,
+          "description": "forbidden-words 是否区分大小写。"
+        },
         "aggregate": {
           "type": "boolean",
           "default": false,
@@ -213,54 +410,180 @@
       },
       "allOf": [
         {
-          "if": { "properties": { "type": { "const": "placeholder-min-count" } }, "required": ["type"] },
-          "then": { "required": ["token", "min"] }
+          "if": {
+            "properties": {
+              "type": {
+                "const": "placeholder-min-count"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "token",
+              "min"
+            ]
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "placeholder-forbid" } }, "required": ["type"] },
-          "then": { "required": ["token"] }
+          "if": {
+            "properties": {
+              "type": {
+                "const": "placeholder-forbid"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "token"
+            ]
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "pattern-forbid" } }, "required": ["type"] },
-          "then": { "required": ["pattern"] }
+          "if": {
+            "properties": {
+              "type": {
+                "const": "pattern-forbid"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "pattern"
+            ]
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "pattern-required" } }, "required": ["type"] },
-          "then": { "required": ["pattern"] }
+          "if": {
+            "properties": {
+              "type": {
+                "const": "pattern-required"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "pattern"
+            ]
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "forbidden-words" } }, "required": ["type"] },
-          "then": { "required": ["words"] }
+          "if": {
+            "properties": {
+              "type": {
+                "const": "forbidden-words"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "words"
+            ]
+          }
         }
       ]
     },
     "autoFixOp": {
       "type": "object",
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "additionalProperties": false,
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["replace-text", "replace-regex", "trim"],
+          "enum": [
+            "replace-text",
+            "replace-regex",
+            "trim"
+          ],
           "description": "替换字面量 / 正则替换 / 去除首尾空白。"
         },
-        "ruleId": { "type": "string", "description": "关联的规则 id，仅当该规则报错时才执行该修复。" },
-        "scope": { "$ref": "#/definitions/selectorList" },
-        "from": { "type": "string", "minLength": 1, "description": "replace-text 的查找文本（字面量）。" },
-        "to": { "type": "string", "description": "replace-text 的替换文本。" },
-        "caseSensitive": { "type": "boolean", "default": true, "description": "replace-text 是否区分大小写。" },
-        "pattern": { "type": "string", "description": "replace-regex 的查找正则。" },
-        "flags": { "type": "string", "pattern": "^[gimsuy]*$", "description": "replace-regex 的正则标志。" },
-        "replacement": { "type": "string", "description": "replace-regex 的替换文本，支持 $1 等捕获组引用。" }
+        "ruleId": {
+          "type": "string",
+          "description": "关联的规则 id，仅当该规则报错时才执行该修复。"
+        },
+        "scope": {
+          "$ref": "#/definitions/selectorList"
+        },
+        "from": {
+          "type": "string",
+          "minLength": 1,
+          "description": "replace-text 的查找文本（字面量）。"
+        },
+        "to": {
+          "type": "string",
+          "description": "replace-text 的替换文本。"
+        },
+        "caseSensitive": {
+          "type": "boolean",
+          "default": true,
+          "description": "replace-text 是否区分大小写。"
+        },
+        "pattern": {
+          "type": "string",
+          "description": "replace-regex 的查找正则。"
+        },
+        "flags": {
+          "type": "string",
+          "pattern": "^[gimsuy]*$",
+          "description": "replace-regex 的正则标志。"
+        },
+        "replacement": {
+          "type": "string",
+          "description": "replace-regex 的替换文本，支持 $1 等捕获组引用。"
+        }
       },
       "allOf": [
         {
-          "if": { "properties": { "type": { "const": "replace-text" } }, "required": ["type"] },
-          "then": { "required": ["from", "to"] }
+          "if": {
+            "properties": {
+              "type": {
+                "const": "replace-text"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "from",
+              "to"
+            ]
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "replace-regex" } }, "required": ["type"] },
-          "then": { "required": ["pattern", "replacement"] }
+          "if": {
+            "properties": {
+              "type": {
+                "const": "replace-regex"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "pattern",
+              "replacement"
+            ]
+          }
         }
       ]
     }

@@ -593,6 +593,46 @@ node.exe app\server\dist\index.js user add alice --config "C:\ProgramData\Tavern
 改标题文案是允许的：解析走别名表归一化，导出沿用你改后的标题；  
 「应用预设」只换装饰符、保留标题文字。
 
+预设可以**导入导出**：「规则与预设 → TXT 预设」有「导入预设文件… / 导出当前预设…」。
+导入走 schema 校验，坏文件不会动你现有的列表；同 `id` 会覆盖（含内置那份，但只在本次
+运行内生效）；导入后**不会**自动切换过去，要自己在下拉里选。
+
+### 4.3b 世界书预设（怎么写世界书 TXT）
+
+世界书的 TXT 格式也可以换。内置的「标准世界书」就是冻结的 v1.0
+（`@@ENTRY 0` / `@@CONTENT` / `@@END 0`），导出与它**逐字节一致**；
+你可以在「规则与预设 → 世界书预设」里导入自己的格式，把标记、字段标签、
+字段顺序、分隔符都改掉：
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "cn-kv",
+  "name": "中文键值世界书",
+  "version": "1.0.0",
+  "format": {
+    "entryOpen": "条目{id}：",
+    "contentMark": "内容：",
+    "entryClose": "条目{id}结束",
+    "fieldOrder": ["name", "keys", "insertion_order"],
+    "labelMap": { "name": "名称", "keys": "关键词", "insertion_order": "触发深度" },
+    "fieldSeparator": "：",
+    "listSeparator": "、",
+    "entrySeparator": "\n"
+  }
+}
+```
+
+- 三个标记都必须含 `{id}`（正文标记除外），且互不相同；
+- `labelMap` 把字段名换成你文件里的标签，解析时按它反查；
+- 世界书的**导出、导入、格式检查**都按当前选中的预设走 —— 三处必须同一份，
+  否则会出现"导出用 A 格式、检查按 B 格式"的错位；
+- 切换预设不会改你已有的世界书内容，只改变"下次导出/读取时按哪种格式解析"。
+
+**格式与内容是两条轨**：上面这套参数只管"怎么写"；"写什么"（条目名必填、
+关键词至少几个、触发深度范围）归平台规则管，见 [4.5](#45-给世界书条目加自己的校验规则)。
+内置只覆盖标准平台规范 —— 你自己的约定一律走导入，不会被内置成对所有用户生效。
+
 ### 4.4 TXT 导入的问题分级
 
 口径只有一条：**导入不因为「板块不全」而失败**。认出多少算多少，剩下的原文一律进
@@ -613,6 +653,37 @@ node.exe app\server\dist\index.js user add alice --config "C:\ProgramData\Tavern
 
 > 编辑器**保存**不走保全：我们自己渲染出来的 TXT 一定六标题齐全，若那里也套保全，
 > 你手删一个标题再保存就会被自动补一段分隔符进【其他设定】—— 那不是保全，是自作主张。
+
+### 4.5 给世界书条目加自己的校验规则
+
+平台规则的 `scope` 可以指到**世界书的每个条目**，写法是
+`worldbook:entries[].<字段>`（字段可选 `name` / `keys` / `secondary_keys` /
+`content` / `comment` / `position` / `insertion_order` / `priority` / `depth` /
+`constant` / `enabled` / `selective` / `case_sensitive`）。问题会落到具体条目上。
+
+内置已经有一组「默认世界书规则」（6 条，全部是 SillyTavern 规范层面的判据：
+关键词为空且非常驻、关键词含空项、`selective` 没次级键、`position` 取值、`insertion_order` 为负）。
+你自己的约定写进导入的规则里即可，**同 `id` 覆盖内置那条、`enabled: false` 关掉它、新 `id` 追加**：
+
+```json
+{
+  "id": "mine:keys-at-least-two",
+  "type": "list-count",
+  "min": 2,
+  "message": "{entry}的关键词少于 2 个，可能触发不到",
+  "scope": "worldbook:entries[].keys",
+  "severity": "warning",
+  "category": "worldbook"
+}
+```
+
+- `{entry}` 会替换成条目名（没有名字时是「第 N 条」），`{count}` / `{value}` 同理；
+- 三种类型专门为条目字段而设：`list-count`（项数）、`number-range`（数值范围）、
+  `list-no-blank-items`（列表里的空项）。别用 `length` —— 它量的是**文本长度**，
+  拿来判"关键词至少 2 个"会把 3 个单字关键词和 1 个长关键词判成一样；
+- `when` 表达同一条目内的跨字段条件，如"关键词为空**且**不是常驻"：
+  `"when": { "field": "constant", "notEquals": true }`；
+- 内置判据不会因为你加了自定义规则就消失；要关掉某条必须**用同一个 id 覆盖**它。
 
 ---
 

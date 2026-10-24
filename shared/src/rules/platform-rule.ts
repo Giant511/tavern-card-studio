@@ -8,14 +8,46 @@
  *   "field:first_mes"       → 指定 SillyTavern 原生字段（name/description/personality/
  *                             scenario/first_mes/mes_example/creator_notes/system_prompt/
  *                             post_history_instructions/alternate_greetings/character_book）
+ *   "worldbook:entries[].name" → 世界书**每个条目**的某个字段（T10.32 语义轨）
  * 数组表示「任一命中即生效」。
+ *
+ * 为什么世界书要用 `entries[].field` 这种看起来像代码的写法：
+ * 世界书的核心校验对象是**条目**，不是整段文本。「条目名必填」「关键词至少 2 个」
+ * 「触发深度在 0..10」都必须逐条判定并把问题定位到具体条目；`field:character_book`
+ * 只能拿到拼接后的整段 TXT，既算不出条目数，也没法告诉用户是第几条坏了。
+ *
+ * 可寻址的世界书字段见 `WORLDBOOK_SELECTABLE_FIELDS`（与 worldbook-preset 的字段表同源）。
  */
 
 import type { BlockId } from '../model/blocks.js';
+import type { IssueCategory } from '../audit/types.js';
 
 export type Severity = 'error' | 'warning' | 'info';
 
-export type Selector = '*' | `block:${BlockId}` | `field:${string}`;
+/** 世界书条目里可被规则寻址的字段 */
+export const WORLDBOOK_SELECTABLE_FIELDS = [
+  'name',
+  'keys',
+  'secondary_keys',
+  'content',
+  'comment',
+  'position',
+  'insertion_order',
+  'priority',
+  'depth',
+  'constant',
+  'enabled',
+  'selective',
+  'case_sensitive',
+] as const;
+
+export type WorldbookField = (typeof WORLDBOOK_SELECTABLE_FIELDS)[number];
+
+export type Selector =
+  | '*'
+  | `block:${BlockId}`
+  | `field:${string}`
+  | `worldbook:entries[].${WorldbookField}`;
 
 export type PlaceholderKey = 'char' | 'user' | `custom:${string}`;
 
@@ -41,15 +73,44 @@ export interface FieldRequirement {
   stDefault?: boolean;
 }
 
+/**
+ * 同一条目内跨字段的条件（T10.33）。
+ *
+ * 「关键词为空且不是常驻 → 永不触发」「开了 selective 却没有次级关键词」
+ * 这两条判据都跨两个字段。没有条件能力的话，只能给每种组合造一个专用规则类型；
+ * 有了它，`list-count` + `when` 就能表达，用户也能自己写出同样的组合。
+ */
+export interface RuleCondition {
+  /** 条目字段名（worldbook scope 用） */
+  field: string;
+  /** 字段值必须严格等于它 |
+   */
+  equals?: string | number | boolean;
+  /** 字段值必须不等于它（用于 constant 缺省 = false 的语义） */
+  notEquals?: string | number | boolean;
+  /** true = 字段必须存在；false = 字段必须不存在 */
+  present?: boolean;
+}
+
 interface BaseContentRule {
   id: string;
-  /** 人类可读说明，会出现在问题列表中 */
+  /** 人类可读说明，会出现在问题列表中；支持 {entry} / {count} / {value} 占位符 */
   message: string;
   scope: Selector | Selector[];
   severity: Severity;
   enabled?: boolean;
   /** 修复建议（展示给用户，不做自动替换） */
   hint?: string;
+  /**
+   * 问题归属的审计类别（T10.33）。
+   *
+   * 世界书条目校验必须显示在审计面板的「世界书」分组下，否则用户会在
+   * 「平台规则」里看到一堆「条目 3 没有关键词」，却不知道说的是世界书。
+   * 缺省按规则 id 推（`builtin:` 前缀 → completeness，其余 → platform-rule）。
+   */
+  category?: IssueCategory;
+  /** 同一 scope 内的跨字段条件（见 RuleCondition） */
+  when?: RuleCondition;
 }
 
 export interface PlaceholderCountRule extends BaseContentRule {
@@ -101,6 +162,48 @@ export interface ForbiddenWordsRule extends BaseContentRule {
   caseSensitive?: boolean;
 }
 
+/**
+ * 数值范围（T10.32）。作用于 `worldbook:entries[].insertion_order` / `.priority` /
+ * `.depth` 这类数值字段。
+ *
+ * 为什么不用现成的 `length`：那规则量的是**文本长度**，而触发深度是数字语义。
+ * 硬拿 length 套，用户得把「越界」写成"字数不够"，提示语必然对不上。
+ *
+ * `required: false`（默认）：字段缺失不报 —— 缺失该由 `non-empty` 或 fields 检查负责，
+ * 否则同一条目上会同时冒出「没有触发深度」和「触发深度越界」两个问题。
+ */
+export interface NumberRangeRule extends BaseContentRule {
+  type: 'number-range';
+  min?: number;
+  max?: number;
+  /** true 时字段缺失/非数值也报问题 */
+  required?: boolean;
+}
+
+/**
+ * 列表项数（T10.32）。作用于 `worldbook:entries[].keys` / `.secondary_keys`。
+ *
+ * 「关键词至少 2 个」用 `length` 量的是 `keys.join(', ')` 的字符数 ——
+ * 3 个单字关键词和 1 个长关键词可能长度相同，判据直接是错的。
+ */
+export interface ListCountRule extends BaseContentRule {
+  type: 'list-count';
+  min?: number;
+  max?: number;
+}
+
+/**
+ * 列表里不允许空项（T10.33）。
+ *
+ * 「空关键词」在世界书里是个隐蔽坑：`keys: ["", "银座"]` 中的空串会匹配**一切输入**，
+ * 等于让条目常驻，而 JSON 和导出结果都看不出异常。
+ * 用 `list-count` 表达不了（项数是 2，没错），用 `pattern-forbid` 也表达不了
+ * （拼接后的文本里空项表现为两个相邻逗号，正则会误伤合法值）。
+ */
+export interface ListNoBlankItemsRule extends BaseContentRule {
+  type: 'list-no-blank-items';
+}
+
 export type ContentRule =
   | PlaceholderCountRule
   | PlaceholderForbidRule
@@ -108,7 +211,10 @@ export type ContentRule =
   | PatternRequiredRule
   | LengthRule
   | NonEmptyRule
-  | ForbiddenWordsRule;
+  | ForbiddenWordsRule
+  | NumberRangeRule
+  | ListCountRule
+  | ListNoBlankItemsRule;
 
 export type ContentRuleType = ContentRule['type'];
 
