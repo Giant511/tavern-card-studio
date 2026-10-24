@@ -114,8 +114,8 @@ const clientDist = newestMtime(join(ROOT, 'client/dist'), ['.js', '.css', '.html
 const serverSrc = newestMtime(join(ROOT, 'server/src'), ['.ts']);
 const serverDist = newestMtime(join(ROOT, 'server/dist'), ['.js']);
 const serverPublic = newestMtime(join(ROOT, 'server/public'), ['.html', '.js', '.css']);
-// MSI 里内嵌的那份服务端副本（build-msi.ps1 从 release/server 取的）
-const bundleServerDist = newestMtime(join(ROOT, 'release/server/app/server/dist'), ['.js']);
+// MSI 里内嵌的那份服务端副本（build-msi.ps1 从 release/server 取的）——
+// 它的对错靠下面的内容比对判定，不看 mtime（理由见 compareTree 的注释）
 const rulesNewest = newestMtime(join(ROOT, 'rules'), ['.json']);
 
 /** 断言 `earlier ≤ later`，`what` 用于报错文案 */
@@ -145,8 +145,49 @@ if (existsSync(shellExe)) {
 }
 
 assertOrder(sharedSrc, sharedDist, 'shared/src ≤ shared/dist（服务端链路）');
-assertOrder(sharedDist, serverDist, 'shared/dist ≤ server/dist');
 assertOrder(serverSrc, serverDist, 'server/src ≤ server/dist');
+
+/**
+ * 目录内容比对：两份产物必须逐文件 sha256 相同。
+ *
+ * 为什么不能像其它环节那样只比 mtime：`tsc -b` 是**增量**构建，输入内容没变就
+ * 不重新 emit —— 于是"shared/dist 比 server/dist 新"可以完全正常地出现
+ * （shared 被重编了一次但字节没变，server 因此不重编，mtime 停在几小时前）。
+ * 2026-10-24 这条 mtime 断言就这么红过一次：查下来包内 `@tcs/shared/dist`
+ * 与源码产物 112 个文件逐字节相同，纯粹是假红。
+ *
+ * 它要防的真实故障仍然存在，只是判据换成内容：**改了 shared、`pack:server`
+ * 没重跑，包里还是旧的 shared**。那种情况下文件内容一定不同。
+ */
+function compareTree(expectedDir, actualDir, what) {
+  if (!existsSync(expectedDir) || !existsSync(actualDir)) {
+    fail(`${what}：一侧缺失（${existsSync(expectedDir) ? actualDir : expectedDir}）`);
+    return;
+  }
+  const files = [];
+  const walk = (current, base) => {
+    for (const name of readdirSync(current, { withFileTypes: true })) {
+      const full = join(current, name.name);
+      const rel = base === '' ? name.name : `${base}/${name.name}`;
+      if (name.isDirectory()) walk(full, rel);
+      else files.push(rel);
+    }
+  };
+  walk(expectedDir, '');
+  const differing = [];
+  for (const rel of files) {
+    const a = join(expectedDir, rel);
+    const b = join(actualDir, rel);
+    if (!existsSync(b) || sha256(a) !== sha256(b)) differing.push(rel);
+  }
+  if (differing.length > 0) {
+    fail(`${what}：${differing.length}/${files.length} 个文件内容不同（例：${differing.slice(0, 3).join('、')}）`);
+    return;
+  }
+  say(`   OK ${`${what} ${files.length} 个文件逐字节相同`.padEnd(34)}`.padEnd(52));
+}
+
+compareTree(join(ROOT, 'shared/dist'), join(ROOT, 'release/server/app/node_modules/@tcs/shared/dist'), 'shared/dist = 包内 @tcs/shared');
 // `server/public` 是**静态资源**，不经过 tsc 编译，所以不能断言它 ≤ server/dist
 // （昨天那条断言本身就是错的：改了 index.html 只会让 public 比 dist 新，而根本不
 //  需要重新编译 —— 它会稳定地报红，逼人去改一条假规则）。
@@ -156,9 +197,9 @@ assertOrder(serverSrc, serverDist, 'server/src ≤ server/dist');
 const bundleServerPublic = newestMtime(join(ROOT, 'release/server/app/server/public'), ['.html', '.js', '.css']);
 assertOrder(serverPublic, { mtime: bundleServerPublic.mtime }, 'server/public ≤ 包内副本（release/server）');
 if (serverArtifact) {
-  // MSI 内嵌的是 release/server 里的副本，先断言"副本不旧于刚编的 dist"，
-  // 再断言"副本 ≤ MSI"。两级都要，否则"打了包但没重新 pack:server"仍会漏过。
-  assertOrder(serverDist, { mtime: bundleServerDist.mtime }, 'server/dist ≤ 包内副本（release/server）');
+  // MSI 内嵌的是 release/server 里的副本。这里同样用**内容**比对而不是 mtime：
+  // pack:server 保留源文件时间戳，mtime 断言永远通过，等于没断言。
+  compareTree(join(ROOT, 'server/dist'), join(ROOT, 'release/server/app/server/dist'), 'server/dist = 包内副本');
   assertOrder(serverDist, { mtime: serverArtifact.mtime }, 'server/dist ≤ 服务端 MSI');
   assertOrder(serverPublic, { mtime: serverArtifact.mtime }, 'server/public ≤ 服务端 MSI');
   assertOrder({ mtime: rulesNewest.mtime }, { mtime: serverArtifact.mtime }, 'rules ≤ 服务端 MSI');
