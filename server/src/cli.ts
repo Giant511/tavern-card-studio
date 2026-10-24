@@ -164,6 +164,8 @@ function printConfig(config: ServerConfigFile, path: string): void {
         defaultPreset: config.defaultPreset,
         maxUploadBytes: config.maxUploadBytes,
         logLevel: config.logLevel,
+        installDirWriteCheck: config.installDirWriteCheck,
+        installDirWriteAllow: config.installDirWriteAllow,
         auth: { require: config.auth.require, token: masked, publicPaths: config.auth.publicPaths },
         service: config.service,
         panel: `http://${config.controlHost}:${config.controlPort}/`,
