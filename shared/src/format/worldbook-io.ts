@@ -28,7 +28,8 @@
 
 import type { StCharacterBook, StWorldbookEntry } from '../model/sillytavern.js';
 import { offsetToLineColumn } from '../text/count.js';
-import { parseWorldbookText, renderWorldbookText } from './worldbook.js';
+import { parseWorldbookTextWith, renderWorldbookTextWith } from './worldbook.js';
+import { DEFAULT_WORLDBOOK_FORMAT, type WorldbookFormatParams } from './worldbook-preset.js';
 
 /** 复述一遍形状，供本文件内部的 `location` 变量使用（列号按码点，见 text/count） */
 type Location = { line?: number; column?: number };
@@ -646,7 +647,11 @@ export function detectWorldbookFormat(text: string): WorldbookFormat | null {
  *
  * `ok === false` 时调用方**不得**写回卡片：残缺结果会把"没导入的条目"当成"用户删除"。
  */
-export function importWorldbook(text: string): WorldbookImportResult {
+export function importWorldbook(
+  text: string,
+  /** 世界书格式预设的参数（T10.31）；缺省 = v1.0 冻结格式 */
+  preset: WorldbookFormatParams = DEFAULT_WORLDBOOK_FORMAT,
+): WorldbookImportResult {
   const stripped = text.replace(/^\uFEFF/, '');
   const format = detectWorldbookFormat(stripped);
 
@@ -666,7 +671,7 @@ export function importWorldbook(text: string): WorldbookImportResult {
     return { format, entries: result.entries, meta: result.meta, issues: result.issues, ok: result.ok, rawText: stripped };
   }
 
-  const parsed = parseWorldbookText(stripped);
+  const parsed = parseWorldbookTextWith(stripped, preset);
   const issues: WorldbookIoIssue[] = parsed.issues.map((issue) => ({
     severity: issue.severity,
     code: `txt-${issue.code}`,
@@ -676,13 +681,15 @@ export function importWorldbook(text: string): WorldbookImportResult {
   }));
 
   // 纯文字文件（没有任何 @@ENTRY）：不能静默导成空世界书 —— 那样用户会以为导进去了
-  if (parsed.entries.length === 0 && /^\s*$/.test(stripped) === false && !/^@@ENTRY[ \t]/m.test(stripped)) {
+  // 条目开标记按**当前预设**判定：写死 @@ENTRY 会让自定义预设的合法文件被拒
+  const entryMarkPrefix = preset.entryOpen.split('{id}')[0]!.trimEnd();
+  if (parsed.entries.length === 0 && /^\s*$/.test(stripped) === false && !stripped.includes(entryMarkPrefix)) {
     issues.push({
       severity: 'error',
       code: 'txt-no-entries',
-      message: '没有找到任何 @@ENTRY 条目，无法识别为世界书 TXT',
+      message: `没有找到任何条目（当前预设的开标记是「${preset.entryOpen}」），无法识别为世界书 TXT`,
       line: 1,
-      hint: '条目格式：@@ENTRY 0 / 头部字段 / @@CONTENT / 正文 / @@END 0（见 docs/04）',
+      hint: `条目格式：${preset.entryOpen.replace('{id}', '0')} / 字段行 / ${preset.contentMark} / 正文 / ${preset.entryClose.replace('{id}', '0')}（见 docs/04）`,
     });
   }
 
@@ -696,6 +703,8 @@ export interface WorldbookExportInput {
   entries: readonly StWorldbookEntry[];
   meta?: Record<string, unknown>;
   format: WorldbookFormat;
+  /** 世界书格式预设的参数（T10.31）；缺省 = v1.0 冻结格式 */
+  preset?: WorldbookFormatParams;
   /** 导入结果（提供时可按"未改动"走原文写回） */
   source?: WorldbookImportResult | null;
 }
@@ -735,7 +744,11 @@ function sameEntries(a: readonly StWorldbookEntry[], b: readonly StWorldbookEntr
  */
 export function exportWorldbook(input: WorldbookExportInput): WorldbookExportResult {
   if (input.format === 'txt') {
-    return { text: renderWorldbookText(input.entries), verbatim: false, reason: 'TXT 按冻结格式重新渲染' };
+    return {
+      text: renderWorldbookTextWith(input.entries, input.preset ?? DEFAULT_WORLDBOOK_FORMAT),
+      verbatim: false,
+      reason: 'TXT 按当前世界书预设重新渲染',
+    };
   }
 
   const source = input.source;

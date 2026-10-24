@@ -16,7 +16,10 @@ import {
   buildAuditReport,
   compileHighlightRule,
   createEmptyCard,
+  DEFAULT_WORLDBOOK_PRESET,
+  importWorldbook,
   parseStCard,
+  renderWorldbookTextWith,
   resolveHighlightRule,
   resolvePlatformRule,
   type AuditIssue,
@@ -25,6 +28,7 @@ import {
   type AuditReport,
   type BlockId,
   type UnifiedCard,
+  type WorldbookPreset,
 } from '@tcs/shared';
 
 import {
@@ -90,6 +94,12 @@ import { NewCardDialog } from '../session/new-card-dialog';
 import { decideShortcut } from './shortcuts';
 import { ImportDialog } from './import-dialog';
 import { applyWorldbookImport, exportWorldbookText, suggestWorldbookFileName } from './import-flow';
+import {
+  importTxtPreset,
+  importWorldbookPreset,
+  serializePreset,
+  type PresetImportOutcome,
+} from '../rules/preset-library';
 import { deriveCardNameFromFile } from './open-name';
 import { browserHintStore, dismissNameHint, resetNameHint, shouldShowNameHint } from './name-hint';
 import {
@@ -198,6 +208,9 @@ class EditorApp {
    * 而"探测失败"与"不能登录"不是一回事 —— 用户可能只是令牌还没填。
    */
   private authServerUrl = '';
+  /** 世界书格式预设（T10.31）：内置 default + 用户导入项，只存在运行期 */
+  private worldbookPresets: WorldbookPreset[] = [DEFAULT_WORLDBOOK_PRESET];
+  private worldbookPreset: WorldbookPreset = DEFAULT_WORLDBOOK_PRESET;
   private validateTimer: number | null = null;
   private activeIssueId: string | null = null;
 
@@ -376,9 +389,14 @@ class EditorApp {
 
       importPlatformText: (text) => this.importPlatformText(text),
       importHighlightText: (text) => this.importHighlightText(text),
+      importTxtPresetText: (text) => this.importTxtPresetText(text),
+      importWorldbookPresetText: (text) => this.importWorldbookPresetText(text),
+      onWorldbookPresetSelect: (id) => this.selectWorldbookPreset(id),
 
       exportPlatformRule: (id) => this.rules?.platformSourceText[id] ?? null,
       exportHighlightScheme: (id) => this.rules?.highlightSourceText[id] ?? null,
+      exportTxtPreset: (id) => this.exportTxtPresetById(id),
+      exportWorldbookPreset: (id) => this.exportWorldbookPresetById(id),
     });
   }
 
@@ -785,6 +803,13 @@ class EditorApp {
         const preset = rules?.presets.find((item) => item.id === presetId);
         return preset ? decideApplyPreset(this.card, preset) : null;
       },
+      worldbookPresetId: this.worldbookPreset.id,
+      worldbookPresets: this.worldbookPresets.map((preset) => ({
+        id: preset.id,
+        name: preset.name,
+        builtin: preset.builtin === true,
+        summary: `${preset.format.entryOpen.replace('{id}', 'N')} / ${preset.format.contentMark} / ${preset.format.entryClose.replace('{id}', 'N')}`,
+      })),
     };
   }
 
@@ -858,9 +883,53 @@ class EditorApp {
     this.refreshRulesLabel();
   }
 
-  /** 选择预设（不重排）：只影响导出装配参数 + 格式检查口径 */
-  private selectPresetById(id: string): void {
+  /** 导入 TXT 预设（T10.30）：原子回退 + 同 id 覆盖 + 不自动切换 */
+  private importTxtPresetText(text: string): PresetImportOutcome<TxtPreset[]> {
+    if (!this.rules) {
+      return { ok: false, value: [], issues: [], warnings: [], id: null, name: null, replaced: false, renameHint: '' };
+    }
+    const outcome = importTxtPreset(this.rules.presets, text);
+    if (!outcome.ok) return outcome;
+
+    this.rules = { ...this.rules, presets: outcome.value };
+    // 导入后**不切换**当前预设：导入是"加入候选"，切换是"改变导出格式"，
+    // 两件事合在一起时，用户正在看的内容会突然按另一种格式重排，很难归因。
+    this.refreshRulesLabel();
+    return outcome;
+  }
+
+  /** 导入世界书预设（T10.31） */
+  private importWorldbookPresetText(text: string): PresetImportOutcome<WorldbookPreset[]> {
+    const outcome = importWorldbookPreset(this.worldbookPresets, text);
+    if (!outcome.ok) return outcome;
+    this.worldbookPresets = outcome.value;
+    return outcome;
+  }
+
+  private selectWorldbookPreset(id: string): void {
+    const preset = this.worldbookPresets.find((item) => item.id === id);
+    if (!preset) return;
+    this.worldbookPreset = preset;
+    // 世界书预设参与解析与格式检查，切换后必须重检 —— 否则面板停在旧口径上
+    this.validate();
+    this.refreshRulesLabel();
+  }
+
+  private exportTxtPresetById(id: string): string | null {
     const preset = this.rules?.presets.find((item) => item.id === id);
+    if (!preset) return null;
+    // 导出的是**当前生效的参数**（不是当初导入的原文）：用户可能只想知道
+    // "我现在用的到底是什么格式"，而原始文本里可能有不生效的未知键。
+    return serializePreset(preset);
+  }
+
+  private exportWorldbookPresetById(id: string): string | null {
+    const preset = this.worldbookPresets.find((item) => item.id === id);
+    return preset ? serializePreset(preset) : null;
+  }
+
+  /** 选择预设（不重排）：只影响导出装配参数 + 格式检查口径 */
+  private selectPresetById(id: string): void {    const preset = this.rules?.presets.find((item) => item.id === id);
     if (!preset || !this.rules) return;
     this.rules = { ...this.rules, preset };
 
@@ -1379,6 +1448,8 @@ class EditorApp {
     // T6.5：一次审计产出完整报告，面板与编辑器标记共用同一份数据，
     // 避免"面板显示 3 条、编辑器画 5 条"这类两处各算一次导致的不一致。
     const report = buildAuditReport(this.card, {
+      // 世界书格式按当前预设解析：自定义预设下的文件不该被报"标记不闭合"
+      worldbookFormat: this.worldbookPreset.format,
       platformRule: this.rules.platform,
       preset: this.rules.preset,
     });
@@ -2345,7 +2416,7 @@ class EditorApp {
       this.setStatus('先打开或新建一张卡，再导入世界书', 'warn');
       return;
     }
-    const decision = await this.importDialog?.openWorldbook(fileName, text);
+    const decision = await this.importDialog?.openWorldbook(fileName, text, this.worldbookPreset.format);
     if (!decision || !('preview' in decision)) return;
 
     const next = applyWorldbookImport(this.card, decision.preview);
@@ -2371,7 +2442,7 @@ class EditorApp {
   private async exportWorldbookFile(format: 'json' | 'txt'): Promise<void> {
     if (!this.hasSession) return;
     try {
-      const result = exportWorldbookText(this.card, format, this.session.worldbookSource);
+      const result = exportWorldbookText(this.card, format, this.session.worldbookSource, this.worldbookPreset.format);
       const suggested = suggestWorldbookFileName(this.card, format);
       const dir = await effectiveCardsDir();
       const path = await pickSavePath(suggested, format, dir === '' ? undefined : dir);
@@ -2459,6 +2530,126 @@ class EditorApp {
 
   openRulesDialogForDemo(): void {
     this.rulesDialog?.open();
+  }
+
+  /**
+   * T10.34 验收演示：一份「条目4：爱好」数据走**自定义路径**（截图用）。
+   *
+   * 走的是真实链路，没有伪造状态：
+   *   · 自定义 TXT 预设 → 经 importTxtPresetText（同一套原子回退/同 id 覆盖）；
+   *   · 中文世界书预设 → preset-library；
+   *   · 自定义平台规则 → 经 importPlatformText（schema 校验 + 继承解析）；
+   *   · 世界书条目 → importWorldbook 按自定义格式解析出来，再回写成 TXT。
+   */
+  applyCustomTrackDemo(mode: 'rules' | 'audit' | 'warn'): void {
+    // 零标签时先建一张卡：this.card 只在有活动会话时可用，
+    // 直接写卡片状态会抛「当前没有活动会话」而整段演示静默中断。
+    if (!this.hasSession) this.createSessionFromFile('自定义路径演示.txt');
+    // warn 模式：删掉「关键词」行 + 触发深度写 88（越界），用来展示自定义规则的
+    // 与内置默认规则集各自报什么（验收第 ③④ 条）。
+    const sample =
+      mode === 'warn'
+        ? ['条目4：', '名称：爱好', '触发深度：88', '内容：', '主角喜欢读书和看电影。', '条目4结束', ''].join('\n')
+        : [
+            '条目4：',
+            '名称：爱好',
+            '关键词：读书、电影',
+            '触发深度：5',
+            '内容：',
+            '主角喜欢读书和看电影。',
+            '条目4结束',
+            '',
+          ].join('\n');
+
+    const customWb = {
+      schemaVersion: 1 as const,
+      id: 'cn-kv',
+      name: '中文键值世界书',
+      version: '1.0.0',
+      description: '条目{id}：/ 名称：/ 关键词：/ 触发深度：/ 内容：',
+      format: {
+        entryOpen: '条目{id}：',
+        contentMark: '内容：',
+        entryClose: '条目{id}结束',
+        fieldOrder: ['name', 'keys', 'insertion_order'],
+        labelMap: { name: '名称', keys: '关键词', insertion_order: '触发深度' },
+        fieldSeparator: '：',
+        listSeparator: '、',
+        entrySeparator: '\n',
+      },
+    };
+
+    // 1) 自定义 TXT 预设（复制内置那份并改 id，模拟"导入用户自己的格式"）
+    const basePreset = this.rules?.presets.find((item) => item.id === 'default');
+    if (basePreset) {
+      this.importTxtPresetText(
+        JSON.stringify({ ...basePreset, id: 'my-format', name: '我的格式', builtin: false }),
+      );
+    }
+
+    // 2) 自定义世界书预设并选中
+    const wbOutcome = this.importWorldbookPresetText(JSON.stringify(customWb));
+    if (wbOutcome.ok && wbOutcome.id !== null) this.selectWorldbookPreset(wbOutcome.id);
+
+    // 3) 解析样本 → 写入卡片的世界书（按自定义格式回写 TXT，结构检查才不会误报）
+    const format = this.worldbookPreset.format;
+    const parsed = importWorldbook(sample, format);
+    if (parsed.entries.length > 0) {
+      this.card.worldbook = {
+        entries: parsed.entries,
+        text: renderWorldbookTextWith(parsed.entries, format),
+        dirty: false,
+        raw: null,
+      };
+      this.reloadBlocksFromCard();
+    }
+
+    // 4) 自定义平台规则（经真实导入路径）
+    this.importPlatformText(
+      JSON.stringify({
+        schemaVersion: 1,
+        id: 'my-worldbook-policy',
+        name: '我的世界书规范',
+        version: '1.0.0',
+        target: { spec: 'any' },
+        placeholders: { char: ['{{char}}'], user: ['{{user}}'] },
+        fields: [],
+        rules: [
+          {
+            id: 'mine:entry-name-required',
+            type: 'non-empty',
+            message: '条目名不能为空（{entry}）',
+            scope: 'worldbook:entries[].name',
+            severity: 'error',
+            category: 'worldbook',
+          },
+          {
+            id: 'mine:keys-not-empty',
+            type: 'list-count',
+            min: 1,
+            message: '{entry}没有关键词，永远不会被触发',
+            scope: 'worldbook:entries[].keys',
+            severity: 'warning',
+            category: 'worldbook',
+          },
+          {
+            id: 'mine:depth-range',
+            type: 'number-range',
+            min: 0,
+            max: 10,
+            message: '触发深度必须在 0..10',
+            scope: 'worldbook:entries[].insertion_order',
+            severity: 'warning',
+            category: 'worldbook',
+          },
+        ],
+      }),
+    );
+    this.switchPlatform('my-worldbook-policy');
+    this.validate();
+
+    if (mode === 'rules') this.rulesDialog?.open();
+    this.setStatus('演示：已导入自定义 TXT 预设 / 世界书预设 / 平台规则（走真实导入链路）', 'ok');
   }
 
   /**
@@ -2735,6 +2926,11 @@ async function boot(): Promise<void> {
   const highlightParam = params.get('highlight');
   if (highlightParam) app.switchHighlightForDemo(highlightParam);
   if (params.get('rules') === '1') app.openRulesDialogForDemo();
+  // T10.34：自定义路径演示（截图用）——custom=rules 开面板，custom=audit 看审计
+  const customParam = params.get('custom');
+  if (customParam === 'rules' || customParam === 'audit' || customParam === 'warn') {
+    app.applyCustomTrackDemo(customParam);
+  }
   if (params.get('badImport') === '1') app.importBadRuleForDemo();
   // ?export=1           打开导出面板（正常路径）
   // ?export=1&forceError=1  先注入一个 error 级问题，用于展示拦截弹窗

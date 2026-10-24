@@ -15,7 +15,14 @@
  *     等于让用户在不知道覆盖了多少的情况下去覆盖。
  */
 
-import type { PreservedInfo, TxtPreset, UnifiedCard, WorldbookFormat, WorldbookImportResult } from '@tcs/shared';
+import type {
+  PreservedInfo,
+  TxtPreset,
+  UnifiedCard,
+  WorldbookFormat,
+  WorldbookFormatParams,
+  WorldbookImportResult,
+} from '@tcs/shared';
 
 import {
   previewCardText,
@@ -79,6 +86,7 @@ export class ImportDialog {
   private mode: ImportMode = 'lenient';
   private cardPreview: CardTextPreview | null = null;
   private worldbookPreview: WorldbookPreview | null = null;
+  private worldbookFormat: WorldbookFormatParams | undefined;
   private resolve: ((decision: CardTextImportDecision | WorldbookImportDecision | null) => void) | null = null;
 
   constructor(private readonly deps: ImportDialogDeps) {
@@ -173,8 +181,14 @@ export class ImportDialog {
   }
 
   /** 打开世界书导入 */
-  openWorldbook(fileName: string, text: string): Promise<WorldbookImportDecision | null> {
+  openWorldbook(
+    fileName: string,
+    text: string,
+    /** 当前世界书格式预设（T10.31）：预览必须按它解析，否则自定义格式的文件会显示成"没有条目" */
+    format?: WorldbookFormatParams,
+  ): Promise<WorldbookImportDecision | null> {
     this.kind = 'worldbook';
+    this.worldbookFormat = format;
     this.rawText = text;
     this.fileName = fileName;
     this.title.textContent = '导入世界书';
@@ -202,7 +216,7 @@ export class ImportDialog {
     this.subtitle.textContent = `${this.fileName} · ${String(this.rawText.length)} 字符`;
 
     if (this.kind === 'worldbook') {
-      this.worldbookPreview = previewWorldbook(this.rawText);
+      this.worldbookPreview = previewWorldbook(this.rawText, this.worldbookFormat);
       this.cardPreview = null;
       this.strictRadio.checked = false;
       this.lenientRadio.checked = false;

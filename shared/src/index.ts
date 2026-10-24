@@ -14,16 +14,19 @@ export * from './format/description.js';
 export * from './format/preset.js';
 export * from './format/sillytavern-io.js';
 export * from './format/worldbook.js';
+export * from './format/worldbook-preset.js';
 export * from './format/worldbook-io.js';
 export * from './format/card-txt.js';
 
 export * from './rules/platform-rule.js';
 export * from './rules/highlight-rule.js';
 export * from './rules/unknown-keys.js';
+export * from './rules/rule-issue.js';
 export * from './rules/platform-rule-parser.js';
 export * from './rules/highlight-rule-parser.js';
 export * from './rules/scopes.js';
 export * from './rules/platform-rule-engine.js';
+export * from './rules/worldbook-checks.js';
 export * from './rules/platform-switch.js';
 
 export * from './highlight/highlight-engine.js';

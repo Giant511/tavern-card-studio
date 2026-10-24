@@ -13,6 +13,7 @@
 import { BLOCK_DEFINITION_MAP, BLOCK_IDS, type BlockId } from '../model/blocks.js';
 import type { UnifiedCard } from '../model/unified-card.js';
 import { buildAliasTable, normalizeHeading, parseDescription } from './description.js';
+import { suggestSimilarKey } from './worldbook-preset.js';
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]{1,63}$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
@@ -50,6 +51,49 @@ export interface TxtPreset {
 export interface PresetParseResult {
   preset: TxtPreset | null;
   errors: string[];
+  /**
+   * 未知键（多半是拼错）。T10.30 起与平台规则共用同一套 F4 口径：
+   * **不阻断导入**（前向兼容），但必须点名并给出"是不是想写 xxx"。
+   */
+  warnings: string[];
+}
+
+/** 预设顶层允许的键（白名单，与 preset.schema.json 同步） */
+const PRESET_KEYS = [
+  '$schema',
+  'schemaVersion',
+  'id',
+  'name',
+  'version',
+  'description',
+  'builtin',
+  'blockOrder',
+  'headings',
+  'separator',
+  'worldbook',
+  'meta',
+] as const;
+
+const HEADING_KEYS = ['pattern', 'aliases'] as const;
+const WORLDBOOK_OPTION_KEYS = ['includeHeading'] as const;
+const META_KEYS = ['author', 'updatedAt'] as const;
+
+function collectUnknownKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  where: string,
+  warnings: string[],
+): void {
+  for (const key of Object.keys(value)) {
+    if ((allowed as readonly string[]).includes(key)) continue;
+    const suggestion = suggestSimilarKey(key, allowed);
+    const prefix = where === '' ? '' : `${where}.`;
+    warnings.push(
+      suggestion === null
+        ? `未知字段 ${prefix}${key}（不在规范内，已忽略）`
+        : `未知字段 ${prefix}${key}（已忽略）—— 是不是想写 ${prefix}${suggestion}？`,
+    );
+  }
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -93,8 +137,10 @@ export function presetAssembleOptions(preset: TxtPreset): {
 
 export function parsePreset(input: unknown): PresetParseResult {
   const errors: string[] = [];
+  const warnings: string[] = [];
 
-  if (!isObject(input)) return { preset: null, errors: ['预设文件顶层必须是对象'] };
+  if (!isObject(input)) return { preset: null, errors: ['预设文件顶层必须是对象'], warnings };
+  collectUnknownKeys(input, PRESET_KEYS, '', warnings);
   if (input['schemaVersion'] !== 1) errors.push('schemaVersion 必须为 1');
   if (typeof input['id'] !== 'string' || !ID_PATTERN.test(input['id'])) errors.push('id 不合法（小写字母/数字/._-，2-64 位）');
   if (typeof input['name'] !== 'string' || input['name'].trim() === '') errors.push('name 不能为空');
@@ -138,6 +184,7 @@ export function parsePreset(input: unknown): PresetParseResult {
       if (typeof pattern !== 'string' || !pattern.includes(TITLE_TOKEN)) {
         errors.push(`headings.${blockId}.pattern 必须是含 ${TITLE_TOKEN} 的字符串`);
       }
+      collectUnknownKeys(heading, HEADING_KEYS, `headings.${blockId}`, warnings);
       const aliases = heading['aliases'];
       if (!isStringArray(aliases)) {
         errors.push(`headings.${blockId}.aliases 必须是非空字符串数组`);
@@ -168,28 +215,38 @@ export function parsePreset(input: unknown): PresetParseResult {
 
   const worldbook = input['worldbook'];
   if (worldbook !== undefined) {
-    if (!isObject(worldbook)) errors.push('worldbook 必须是对象');
-    else if (worldbook['includeHeading'] !== undefined && typeof worldbook['includeHeading'] !== 'boolean') {
-      errors.push('worldbook.includeHeading 必须是布尔值');
+    if (!isObject(worldbook)) {
+      errors.push('worldbook 必须是对象');
+    } else {
+      collectUnknownKeys(worldbook, WORLDBOOK_OPTION_KEYS, 'worldbook', warnings);
+      if (worldbook['includeHeading'] !== undefined && typeof worldbook['includeHeading'] !== 'boolean') {
+        errors.push('worldbook.includeHeading 必须是布尔值');
+      }
     }
   }
 
-  if (errors.length > 0) return { preset: null, errors };
-  return { preset: input as unknown as TxtPreset, errors: [] };
+  if (isObject(input['meta'])) collectUnknownKeys(input['meta'], META_KEYS, 'meta', warnings);
+
+  if (errors.length > 0) return { preset: null, errors, warnings };
+  return { preset: input as unknown as TxtPreset, errors: [], warnings };
 }
 
 export function loadPresets(inputs: readonly unknown[]): {
   presets: TxtPreset[];
   errors: { index: number; id: string | null; errors: string[] }[];
+  warnings: { index: number; id: string | null; warnings: string[] }[];
 } {
   const presets: TxtPreset[] = [];
   const errors: { index: number; id: string | null; errors: string[] }[] = [];
+  const warnings: { index: number; id: string | null; warnings: string[] }[] = [];
   inputs.forEach((input, index) => {
     const result = parsePreset(input);
+    const id = isObject(input) && typeof input['id'] === 'string' ? input['id'] : null;
     if (result.preset) presets.push(result.preset);
-    else errors.push({ index, id: isObject(input) && typeof input['id'] === 'string' ? input['id'] : null, errors: result.errors });
+    else errors.push({ index, id, errors: result.errors });
+    if (result.warnings.length > 0) warnings.push({ index, id, warnings: result.warnings });
   });
-  return { presets, errors };
+  return { presets, errors, warnings };
 }
 
 export function findPreset(presets: readonly TxtPreset[], id: string): TxtPreset | null {

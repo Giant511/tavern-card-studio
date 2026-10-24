@@ -42,6 +42,11 @@ export interface IssueLocation {
   lineText?: string;
   /** 世界书条目 id；非世界书问题为 null */
   entryId?: number | null;
+  /**
+   * 世界书条目序号（0-based）。只在条目**没有 id** 时用来定位 ——
+   * 没有它，"第 2 条没 id"这条问题就完全无法在界面上指出来。
+   */
+  entryIndex?: number | null;
 }
 
 export interface AuditIssue {
