@@ -91,7 +91,13 @@ ID 不可改是刻意的：允许改 ID 等于允许把两个角色的历史混�
 
 建账户、看/换令牌、注册服务、离线自检这些**运维命令**都在命令行完成（面板只做
 查看与配置）：逐条说明与常见故障对照见
-[`docs/server cmd.md`](docs/server%20cmd.md)。
+[`docs/server-cmd.md`](docs/server-cmd.md)。
+
+**想自己写程序对接服务端**（做插件、接 CI、用自己的编辑器），见
+[`docs/server-developer.md`](docs/server-developer.md)：端口与绑定、四种凭证与
+`Authorization` 头格式、逐端点的请求/响应/错误码与 curl 示例、`cardId` 语义、
+错误码总表与 404/403 约定、限速规则、TLS 与反向代理的 `trustProxy` 配置、
+角色卡与世界书的数据格式。
 
 **两个地址是分开配置的**：只把 API 开给局域网时，管理面板仍然只听本机回环，  
 不会跟着暴露出去。想把面板也开出去，需要同时开启鉴权，否则服务拒绝启动 ——  

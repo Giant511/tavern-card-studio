@@ -62,13 +62,16 @@ installer.zip
 # 真机排障记录与未定型的评估结论，对使用者没有价值，公开仓库里只会变成噪音。
 # 本地照常读写；对外的界面截图放 assets/。
 #
-# 例外（唯一一个）：docs/server cmd.md —— 面向用户的运维命令手册，随仓库上传。
+# 例外（面向用户/开发者，随仓库上传）：
+#   docs/server-cmd.md        —— 服务端运维命令手册
+#   docs/server-developer.md  —— 服务端 API 对接文档（第三方开发者自包含）
 #
 # 必须写成 `docs/*` 而不是 `docs/`：Git 不会进入被忽略的**目录**，
-# 目录一旦被排除，里面的 `!` 全部失效（docs/server cmd.md 仍然上传不了）。
-# 排除"目录内容"才能单独放行其中一个文件。
-# `docs/` 下若还有别的文件要上传，加一行 `!docs/<文件名>`，并同步
-# test/ops-doc.test.mjs 的允许清单 —— 它只认这一个例外。
+# 目录一旦被排除，里面的 `!` 全部失效（放行的文件仍然上传不了）。
+# 排除"目录内容"才能单独放行其中某几个文件。
+# 新增上传项要加一行 `!docs/<文件名>`，并同步
+# test/ops-doc.test.mjs 的允许清单 —— 它认的就是下面这个列表。
 docs/*
-!docs/server cmd.md
+!docs/server-cmd.md
+!docs/server-developer.md
 PLAN.md
