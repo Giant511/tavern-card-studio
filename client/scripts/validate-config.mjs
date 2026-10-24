@@ -117,6 +117,17 @@ const frontendDist = config?.build?.frontendDist;
 if (frontendDist) {
   const distPath = join(tauriDir, frontendDist);
   check(`frontendDist 目录存在（${frontendDist}）`, existsSync(distPath), existsSync(distPath) ? '' : '先跑 npm run build:ui');
+
+  // 光有目录不够：2026-10-24 的白屏事故就是「目录存在、里面没有入口」。
+  // Tauri 对缺失的目录会在编译期 panic，但**对存在却是空的目录不会** ——
+  // 它会内嵌一个空映射，运行期才炸成 `asset not found: index.html`。
+  // 这里只做最便宜的一道：入口 html 必须在产物根上。
+  const entry = join(distPath, 'index.html');
+  check(
+    `frontendDist 根上有 index.html（${frontendDist}）`,
+    existsSync(entry),
+    existsSync(distPath) ? '空的产物目录，Tauri 会内嵌空映射（白屏）' : '',
+  );
 }
 
 // ── 4. resources ──────────────────────────────────────────
