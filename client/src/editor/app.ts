@@ -28,12 +28,14 @@ import {
 } from '@tcs/shared';
 
 import {
+  appendClientErrorLog,
   configGet,
   configPatch,
   isShellAvailable,
   pickCardFile,
   pickSavePath,
   readTextExact,
+  shellInfo,
   writeFileAtomic,
   type ShellError,
 } from '../contract';
@@ -88,6 +90,17 @@ import { NewCardDialog } from '../session/new-card-dialog';
 import { decideShortcut } from './shortcuts';
 import { ImportDialog } from './import-dialog';
 import { applyWorldbookImport, exportWorldbookText, suggestWorldbookFileName } from './import-flow';
+import { deriveCardNameFromFile } from './open-name';
+import { browserHintStore, dismissNameHint, resetNameHint, shouldShowNameHint } from './name-hint';
+import {
+  buildDiagnosticsText,
+  createCrashLogger,
+  installGlobalErrorHandlers,
+  suggestDiagnosticsFileName,
+  type CrashLogger,
+} from '../diagnostics/crash-log';
+// 版本号从 package.json 内联（Vite 构建期处理），不硬编码 —— 见 appVersion()
+import clientPackage from '../../package.json';
 import { CardSession } from '../session/card-session';
 import { effectiveCardsDir, suggestCardFileName } from '../session/cards-dir';
 import { TabBar, type TabItem } from '../session/tab-bar';
@@ -187,6 +200,16 @@ class EditorApp {
   private authServerUrl = '';
   private validateTimer: number | null = null;
   private activeIssueId: string | null = null;
+
+  /**
+   * 异常日志（T10.26）。
+   *
+   * `lastErrorLogPath` 是**契约返回的**路径 —— 渲染层不自己拼"应用配置目录在哪"
+   * （那属于壳的知识）。第一次落盘成功后才有值；导出诊断日志时用它去读文件。
+   */
+  private crashLogger: CrashLogger | null = null;
+  private crashUninstall: (() => void) | null = null;
+  private lastErrorLogPath: string | null = null;
 
   private readonly toolbarStats = byId('stats');
   private readonly blockList = byId('block-list');
@@ -942,6 +965,8 @@ class EditorApp {
   private wireSettings(): void {
     this.settings = new SettingsDialog({
       onConnectionChange: (result) => this.applyConnection(result),
+      // T10.26：诊断导出由 app 实现（它知道版本、连接状态、会话摘要与日志路径）
+      onExportDiagnostics: () => this.exportDiagnostics(),
       onSaved: () => {
         void this.refreshTokenAfterSave();
         this.setStatus('设置已保存', 'ok');
@@ -1480,6 +1505,8 @@ class EditorApp {
     let original = '';
 
     const begin = (): void => {
+      // 进编辑就算"用户已经知道这里能改"——不必等他真的改成功
+      this.hideNameHint();
       original = this.card.meta.name;
       input.value = original;
       display.hidden = true;
@@ -1510,6 +1537,15 @@ class EditorApp {
     };
 
     display.addEventListener('click', begin);
+
+    // T10.29：点提示文字等同于点角色名 —— 提示是"可点的路标"，点它没反应比没有提示更差。
+    // 两条路径都要把"用户已经知道这里能改"记下来（进入编辑就算知道了，不必等改成功）。
+    const hint = byId<HTMLElement>('card-name-hint');
+    hint.addEventListener('click', () => {
+      this.hideNameHint();
+      begin();
+    });
+
     // 失焦即确认：这是这类就地编辑的通行行为，用户点别处就是不打算改了
     input.addEventListener('blur', commit);
     input.addEventListener('keydown', (event) => {
@@ -1521,6 +1557,146 @@ class EditorApp {
         cancel();
       }
     });
+  }
+
+  /**
+   * 刷新「← 点这里改角色名」提示（v0.1.2 反馈项四 / T10.29）。
+   *
+   * 三个条件同时成立才显示：**有一张卡**（零标签时角色名显示的是"未打开角色卡"，
+   * 点它没有意义）、**用户还没点过**（localStorage 记录）、**不在编辑态**。
+   * 第一次判定在启动时做，切换会话/新建打开后也调一次 —— 否则从零标签进入一张卡
+   * 之后提示永远不出现（零标签那次被第一条挡住了）。
+   */
+  private refreshNameHint(): void {
+    const hint = byId<HTMLElement>('card-name-hint');
+    const inputVisible = !byId<HTMLInputElement>('card-name-input').hidden;
+    const show = this.hasSession && !inputVisible && shouldShowNameHint(browserHintStore());
+    hint.hidden = !show;
+  }
+
+  /** 用户点了角色名（或提示本身）→ 永久隐藏。写失败也先隐藏本次会话。 */
+  private hideNameHint(): void {
+    const hint = byId<HTMLElement>('card-name-hint');
+    if (hint.hidden) {
+      // 已经隐藏时也要落一次存储：用户可能在启动瞬间就点了，而那时 refresh 还没跑
+      dismissNameHint(browserHintStore());
+      return;
+    }
+    hint.hidden = true;
+    dismissNameHint(browserHintStore());
+  }
+
+  /** 设置里「重置」之后让提示重新出现（不然这个功能只对新用户有效） */
+  resetNameHintForDemo(): void {
+    resetNameHint(browserHintStore());
+    this.refreshNameHint();
+  }
+
+  // ── 异常日志（T10.26）──────────────────────────────────────
+
+  /**
+   * 装全局 `error` / `unhandledrejection` 捕获。
+   *
+   * 会话摘要现取现拼（而不是缓存在某个字段里）：异常可能发生在会话重建的中间态，
+   * 缓存值那时一定是过期的，而"过期值"会让人按错的卡去排查。
+   */
+  installCrashLogging(): void {
+    this.crashLogger = createCrashLogger({
+      write: (entry) => {
+        // 契约调用；壳里同步落盘（open + write + sync_all）。
+        // 浏览器直开时 isShellAvailable() 为 false，这里什么都不做 ——
+        // 硬调 invoke 会抛，而它抛出来的错误会再进一次日志，形成回声。
+        if (!isShellAvailable()) return;
+        return appendClientErrorLog(entry).then(
+          (path) => {
+            this.lastErrorLogPath = path;
+          },
+          () => {
+            // 落盘失败不能反过来变成新异常（见 crash-log.ts 文件头第 2 条）
+          },
+        );
+      },
+      userAgent: navigator.userAgent,
+    });
+
+    this.crashUninstall = installGlobalErrorHandlers(this.crashLogger, () => this.sessionSummary());
+  }
+
+  /** 会话摘要。**只给数量与 ID，绝不含卡片正文**（日志会被导出并发给别人）。 */
+  sessionSummary(): { openCards: number; activeCardId: string | null } {
+    return {
+      openCards: this.sessions.length,
+      activeCardId: this.hasSession ? this.session.cardId : null,
+    };
+  }
+
+  /**
+   * 导出诊断日志（T10.26）：client-error.log + 版本号 + 连接状态 → 单个 txt。
+   *
+   * 三个契约能力串起来：读日志（C1）→ 选保存路径（C6）→ 原子写（C2）。
+   * 失败要在返回的那句话里说清是哪一步，否则用户只知道"没导出成功"。
+   */
+  async exportDiagnostics(): Promise<string> {
+    const now = new Date();
+    let logText: string | null = null;
+    let logError: string | undefined;
+    const logPath = this.lastErrorLogPath;
+
+    if (logPath !== null) {
+      try {
+        // 用户可能在两次运行之间删过日志文件 —— 读不到不算失败，导出文件里写明
+        logText = (await readTextExact(logPath)).text;
+      } catch (error) {
+        logError = describe(error);
+      }
+    } else {
+      logError = '本次会话还没有写入过错误日志（没有捕获到异常，或日志落盘失败）';
+    }
+
+    const info = await shellInfo().catch(() => null);
+    const text = buildDiagnosticsText({
+      logText,
+      ...(logError === undefined ? {} : { logError }),
+      appVersion: this.appVersion(),
+      shellVersion: info?.version ?? '(不可用)',
+      shellMode: info?.mode ?? '(不可用)',
+      connection: this.connectionChipText(),
+      authPhase: this.authSession?.currentPhase ?? 'anonymous',
+      session: this.sessionSummary(),
+      now,
+      userAgent: navigator.userAgent,
+    });
+
+    const target = await pickSavePath(suggestDiagnosticsFileName(now), 'txt');
+    if (!target) return '已取消导出诊断日志';
+
+    try {
+      await writeFileAtomic(target, text);
+    } catch (error) {
+      return `导出失败：写入被拒绝（${describe(error)}）`;
+    }
+    return `诊断日志已导出：${target}（${String(text.length)} 字符）`;
+  }
+
+  /**
+   * 应用版本。
+   *
+   * 从 `client/package.json` 读（Vite 在构建期把它内联进来），**不硬编码**——
+   * 硬编码的版本号一定会漂，而诊断日志里版本错了等于白导。
+   *
+   * 为什么不用 `<html data-version>`：那需要在构建期改写 index.html，
+   * 而内联脚本会被 CSP 的 `script-src 'self'` 拦掉（本项目刻意不开 unsafe-inline）。
+   * 走 import 就没有这个约束，也不引入新的构建期插件。
+   */
+  private appVersion(): string {
+    const version = (clientPackage as { version?: unknown }).version;
+    return typeof version === 'string' && version !== '' ? version : '未知';
+  }
+
+  /** 顶栏状态胶囊当前那句话（诊断日志里要的是用户看到的那句，不是另造一套） */
+  private connectionChipText(): string {
+    const text = byId('conn-text').textContent ?? '';
+    return text === '' ? '未知' : text;
   }
 
   /**
@@ -1620,6 +1796,9 @@ class EditorApp {
   private renderCardName(): void {
     // 用 textContent 而不是 innerHTML：角色名来自用户/导入文件，是纯文本
     byId('card-name').textContent = this.card.meta.name || '(未命名)';
+    // 提示跟着"当前有没有卡"走：零标签时角色名显示"未打开角色卡"，
+    // 那时提示"点这里改角色名"是假的（点了也没有可改的名字）。
+    this.refreshNameHint();
   }
 
   /**
@@ -1802,6 +1981,8 @@ class EditorApp {
     // 顶栏与统计清空，避免残留上一张卡的信息
     byId('card-name').textContent = '未打开角色卡';
     byId('stats').textContent = '';
+    // 零标签没有可改的名字，"点这里改角色名"必须收起来（T10.29）
+    this.refreshNameHint();
     this.issueSummary.replaceChildren();
     this.auditPanel?.clear();
     this.setStatus('空白工作台：新建或打开一张角色卡开始', 'info');
@@ -1990,8 +2171,15 @@ class EditorApp {
       // 按扩展名分流，而不是「先试 JSON、失败再退回 TXT」：后者会把一个语法错误的
       // JSON 悄悄当成纯文本再解析一次，用户看到的是一份莫名其妙的板块缺失列表，
       // 而真正的原因（JSON 少了个逗号）被完全掩盖。
+      //
+      // 零标签（v0.1.2 反馈项三）：**先建会话再导入**。以前这里直接
+      // `importCardTextFile` / `replaceCard`，两者都要求"当前有一张卡"，
+      // 于是零标签下点「打开…」选 TXT 只会得到一句"先打开或新建一张卡" ——
+      // 而用户想做的就是打开这一份。名字只能从文件名推导（见 open-name.ts）。
+      const created = this.hasSession ? null : this.createSessionFromFile(path);
+
       if (/\.txt$/i.test(path)) {
-        await this.importCardTextFile(file.pathDisplay ?? path, file.text);
+        await this.importCardTextFile(file.pathDisplay ?? path, file.text, created);
         return;
       }
 
@@ -1999,14 +2187,56 @@ class EditorApp {
       this.replaceCard(parsed.card);
       // 打开的文件不在 cardsDir 里时说一句：用户会以为"打开过的卡都在那个目录"
       const outside = dir !== '' && !path.toLowerCase().startsWith(dir.toLowerCase());
+      const opened = `已打开：${file.pathDisplay ?? '(非 UTF-8 路径)'}（${file.bytesLen} 字节）`;
       this.setStatus(
-        `已打开：${file.pathDisplay ?? '(非 UTF-8 路径)'}（${file.bytesLen} 字节）` +
-          (outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${dir}` : ''),
-        outside ? 'warn' : 'info',
+        created === null
+          ? opened + (outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${dir}` : '')
+          : `已新建「${created}」并打开：${file.pathDisplay ?? '(非 UTF-8 路径)'}（${file.bytesLen} 字节）${
+              outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${dir}` : ''
+            }`,
+        outside ? 'warn' : created === null ? 'info' : 'ok',
       );
     } catch (error) {
       this.setStatus(`打开失败：${describe(error)}`, 'bad');
     }
+  }
+
+  /**
+   * 零标签时按文件名建一个空会话（v0.1.2 反馈项三）。
+   *
+   * 为什么名字要从文件名推：零标签下没有"当前卡"可参照，而 `meta.name` 会写进
+   * 导出的 JSON，也是标签栏唯一能显示的东西。用文件名至少让人认得出这是哪个文件。
+   *
+   * 返回新卡的名字（调用方要放进状态栏 —— "我建了一张卡"这件事必须说出来，
+   * 否则用户会以为只是打开了文件，不知道标签栏为什么多了一个）。
+   */
+  private createSessionFromFile(path: string): string {
+    const name = deriveCardNameFromFile(path, this.sessions.map((item) => item.card.meta.name));
+    const preset = this.rules?.preset ?? null;
+    const blank = createEmptyCard(name);
+    const cardId = generateCardId(name);
+    const card = withCardId(blank, cardId);
+
+    const session = new CardSession({
+      card,
+      cardId,
+      platformId: this.rules?.platformId,
+      highlightId: this.rules?.highlightId,
+      presetId: preset?.id ?? null,
+      filePath: null,
+    });
+    this.sessions.push(session);
+    this.activeId = session.id;
+
+    // 与 newCard() 一样：旧 UI 拆掉，按新会话重建
+    for (const runtime of this.blocks) {
+      this.collapse(runtime);
+      runtime.section.remove();
+    }
+    this.blocks = [];
+    this.mountActiveSession();
+    this.refreshTabs();
+    return name;
   }
 
   /**
@@ -2050,33 +2280,56 @@ class EditorApp {
    *
    * 严格模式下用户还可以就地切到宽松 —— docs/06 的两模式语义靠这个切换实现，
    * 而不是"严格失败就报个错结束"。
+   *
+   * `createdSession`（v0.1.2 反馈项三）：零标签打开时由调用方先建好会话，
+   * 传进来是为了在状态栏那句里带上"新建了哪张卡"——否则用户只看到"已导入"，
+   * 不知道标签栏那个新标签是哪来的。
    */
-  private async importCardTextFile(fileName: string, text: string): Promise<void> {
+  private async importCardTextFile(
+    fileName: string,
+    text: string,
+    createdSession: string | null = null,
+    autoConfirm = false,
+  ): Promise<void> {
     if (!this.hasSession) {
       this.setStatus('先打开或新建一张卡，再导入 TXT（导入会替换当前卡的板块内容）', 'warn');
       return;
     }
-    const decision = await this.importDialog?.openCardText(fileName, text);
-    if (!decision || !('card' in decision)) return;
+    // 不 await：对话框要等用户点确认/取消。自动确认（截图与端到端用）时
+    // 先让渲染跑一帧再点按钮 —— 否则 querySelector 拿到的还是上一轮隐藏的节点。
+    const pending = this.importDialog?.openCardText(fileName, text);
+    if (autoConfirm) {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+      document.querySelector<HTMLButtonElement>('[data-role="import-confirm"]')?.click();
+    }
+    const decision = await pending;
+    if (!decision || !('card' in decision)) {
+      // 用户取消：零标签下刚建的那张卡**留着**（它是用户点「打开…」的直接结果，
+      // 而且里面还是空卡，没有需要回滚的内容）。状态栏说明这一点，避免"我点了取消
+      // 怎么多了一张卡"的困惑。
+      if (createdSession !== null) {
+        this.setStatus(`已新建「${createdSession}」（空卡）；TXT 导入已取消，未写入任何内容`, 'info');
+      }
+      return;
+    }
 
     this.session.replaceCard(decision.card);
     this.reloadBlocksFromCard();
     this.scheduleValidate(0);
 
-    const missing = decision.issues.filter(
-      (issue) => issue.code === 'missing-block' && decision.mode === 'lenient',
-    );
-    if (missing.length > 0) {
-      this.setStatus(
-        `已按宽松模式导入：${String(missing.length)} 个板块缺失、已按空处理（${missing
-          .map((issue) => issue.message.match(/「(.+?)」/)?.[1] ?? '')
-          .filter((name) => name !== '')
-          .join('、')}）`,
-        'warn',
-      );
+    const prefix = createdSession === null ? `已导入 TXT：${fileName}` : `已新建「${createdSession}」并导入：${fileName}`;
+
+    // 保全机制（v0.1.2 反馈项二）之后，导入结果的说明重心从"缺了几个板块"
+    // 变成"多少原文被放到了哪里" —— 后者才是用户需要知道的事。
+    // 措辞由 import-flow.preservedNoteOf 统一给出，对话框里显示的是同一句。
+    if (decision.preservedNote !== '') {
+      const tone = decision.preserved?.wholeText === true ? 'warn' : 'info';
+      this.setStatus(`${prefix} —— ${decision.preservedNote}`, tone);
       return;
     }
-    this.setStatus(`已导入 TXT：${fileName}（${decision.mode === 'strict' ? '严格' : '宽松'}模式）`, 'ok');
+    this.setStatus(`${prefix}（原文全部识别，无未识别内容）`, 'ok');
   }
 
   /**
@@ -2297,6 +2550,112 @@ class EditorApp {
       'warn',
     );
   }
+
+  /**
+   * 演示/截图/端到端入口：用内置样本文本走**真实的导入对话框**（T10.27）。
+   *
+   * 为什么要这类入口：浏览器直开（截图与 headless 验证就是这么跑的）没有壳能力，
+   * 点「打开…」弹不出文件选择器。这里注入的只是**输入文本**，之后的分流、预览、
+   * 保全装配、状态栏文案全是生产代码 —— 与 `?demo=lenient` 同一个套路。
+   *
+   * @param sample 'zero'（0 命中）/ 'mixed'（混合）/ 'clean'（全部标准板块）
+   */
+  async importSampleForDemo(sample: string): Promise<void> {
+    const texts: Record<string, string> = {
+      zero: [
+        '条目1：这是一段完全自由的设定文本',
+        '它没有使用任何【】或 ## 标题，所以整篇都不会被切分。',
+        '',
+        '条目2：第二段',
+        '  缩进与空行都是原文的一部分',
+        '',
+        '条目3：结尾',
+      ].join('\n'),
+      mixed: [
+        '【基本信息】',
+        '姓名：林晚照',
+        '年龄：27',
+        '',
+        '【性格】',
+        '冷静，话少。',
+        '',
+        '## 战斗系统',
+        '条目1：先攻按敏捷排序',
+        '条目2：暴击倍率 1.5',
+        '',
+        '【其他设定】',
+        '这是已识别到的其他设定内容。',
+        '',
+        '## 招式表',
+        '条目甲：斩击',
+        '条目乙：突刺',
+      ].join('\n'),
+      clean: [
+        '【基本信息】',
+        '姓名：林晚照',
+        '年龄：27',
+        '',
+        '【性格】',
+        '冷静，话少。',
+        '',
+        '【其他设定】',
+        '普通设定。',
+        '',
+        '【特殊设定】',
+        '无。',
+        '',
+        '【用户相关设定】',
+        '{{user}} 是常客。',
+      ].join('\n'),
+    };
+    const text = texts[sample];
+    if (text === undefined) return;
+    // 零标签时先按文件名建会话 —— 与「打开…」走同一条路径（T10.28）
+    if (!this.hasSession) this.createSessionFromFile(`演示-${sample}.txt`);
+    await this.importCardTextFile(`演示-${sample}.txt`, text, null, true);
+  }
+
+  /** 演示/截图入口：只打开导入对话框（不确认），用于截"导入前"那两张图 */
+  async previewSampleForDemo(sample: string): Promise<void> {
+    if (!this.hasSession) this.createSessionFromFile(`演示-${sample}.txt`);
+    const texts: Record<string, string> = {
+      zero: '条目1：这是一段完全自由的设定文本\n它没有使用任何【】或 ## 标题，所以整篇都不会被切分。\n\n条目2：第二段\n  缩进与空行都是原文的一部分\n\n条目3：结尾',
+      mixed: '【基本信息】\n姓名：林晚照\n年龄：27\n\n【性格】\n冷静，话少。\n\n## 战斗系统\n条目1：先攻按敏捷排序\n条目2：暴击倍率 1.5\n\n【其他设定】\n这是已识别到的其他设定内容。\n\n## 招式表\n条目甲：斩击\n条目乙：突刺',
+    };
+    const text = texts[sample];
+    if (text === undefined) return;
+    await this.importDialog?.openCardText(`演示-${sample}.txt`, text);
+  }
+
+  /**
+   * 演示/截图入口：注入一个真实的渲染层异常（T10.26）。
+   *
+   * 用 `window.dispatchEvent(new ErrorEvent(...))` 而不是 `setTimeout(() => { throw })`：
+   * 前者走的就是全局 `error` 钩子，且不会让 headless Chrome 因为未捕获异常
+   * 而提前退出（那样 `--dump-dom` 拿不到任何东西）。
+   * 落盘在浏览器模式下是 no-op（`isShellAvailable()` 为 false），
+   * 所以"日志文件里有记录"这条必须到壳里验 —— 见 scripts/verify-t1026-crash.mjs。
+   */
+  injectCrashForDemo(): void {
+    window.dispatchEvent(
+      new ErrorEvent('error', {
+        message: '演示注入：Uncaught TypeError: demo is not a function',
+        error: new TypeError('demo is not a function'),
+      }),
+    );
+  }
+
+  /** 演示/截图入口：改名提示（T10.29）。`state` = 'show' 显示 / 'hide' 模拟已点过 */
+  setNameHintForDemo(state: 'show' | 'hide'): void {
+    if (state === 'hide') {
+      dismissNameHint(browserHintStore());
+      const hint = byId<HTMLElement>('card-name-hint');
+      hint.hidden = true;
+      return;
+    }
+    resetNameHint(browserHintStore());
+    this.refreshNameHint();
+  }
 }
 
 function describe(error: unknown): string {
@@ -2333,6 +2692,12 @@ async function boot(): Promise<void> {
   byId('card-name-input').hidden = true;
 
   const app = new EditorApp(card);
+
+  // 全局异常捕获（T10.26）。必须在 start() **之前**装上：启动过程本身
+  // 就是最容易出错的一段（读配置、载规则、恢复登录态），漏掉它就等于
+  // "崩溃日志里永远没有启动崩的那次"。
+  app.installCrashLogging();
+
   await app.start();
 
   // 调试/截图入口：?demo=lenient 用「只有基本信息」的 TXT 走一次**真实的宽松导入**，
@@ -2340,6 +2705,21 @@ async function boot(): Promise<void> {
   if (params.get('demo') === 'lenient') {
     app.applyDemoLenientText();
   }
+
+  // T10.27：三种样本的真实导入（0 命中 / 混合 / 全部标准），用于截图与端到端。
+  //   ?import=zero|mixed|clean   走真实导入流程（会确认）
+  //   ?importPreview=zero|mixed  只打开导入对话框（截"导入前"）
+  const importSample = params.get('import');
+  if (importSample !== null) await app.importSampleForDemo(importSample);
+  const importPreview = params.get('importPreview');
+  if (importPreview !== null) await app.previewSampleForDemo(importPreview);
+
+  // T10.26：注入一个真实渲染层异常（走全局 error 钩子）
+  if (params.get('crashInject') === '1') app.injectCrashForDemo();
+
+  // T10.29：改名提示的两态（show = 未点过 / hide = 已点过）
+  const hintParam = params.get('nameHint');
+  if (hintParam === 'show' || hintParam === 'hide') app.setNameHintForDemo(hintParam);
 
   // 调试/截图入口（T6.2/T6.3）：
   //   ?rules=1&preset=divider     打开规则面板并把预设选为 divider（不重排）

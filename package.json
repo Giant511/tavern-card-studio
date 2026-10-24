@@ -59,7 +59,9 @@
     "smoke:t106": "node scripts/smoke-t106.mjs",
     "smoke:t110-ca": "node scripts/smoke-t110-custom-ca.mjs",
     "smoke:t110-deploy": "node scripts/smoke-t110-deploy.mjs",
-    "report:release": "node scripts/report-release.mjs"
+    "report:release": "node scripts/report-release.mjs",
+    "capture:t10x": "bash scripts/capture-t10x.sh",
+    "verify:t10x": "node scripts/verify-t10x.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

@@ -63,27 +63,34 @@ keys: 咖啡馆
 二楼是仓库。
 @@END 0`;
 
-test('T10.9 TXT 严格模式：缺板块 → 拒绝导入，且报出缺哪些', () => {
-  const preview = previewCardText(baseCard, PARTIAL_TXT, preset, 'strict');
-  assert.equal(preview.canImport, false);
-  assert.equal(preview.card, null);
-  const missing = preview.issues.filter((issue) => issue.code === 'missing-block');
-  assert.ok(missing.length >= 4, `应报出多个缺失板块，实际 ${JSON.stringify(preview.issues)}`);
-  for (const issue of missing) assert.equal(issue.severity, 'error');
+// v0.1.2 反馈项二改变了这两条语义：保全机制优先于"缺板块"语义，
+// 严格/宽松不再影响能不能导入（docs/06 §7）。原来那两条"严格拒绝 / 宽松补空"
+// 的断言被替换成"两种模式都能导、内容都进【其他设定】"，而不是删掉 ——
+// 删掉就等于这段行为没有守卫了。
+test('T10.27 保全：缺板块不再拒绝导入（严格与宽松一致）', () => {
+  for (const mode of ['strict', 'lenient']) {
+    const preview = previewCardText(baseCard, PARTIAL_TXT, preset, mode);
+    assert.equal(preview.canImport, true, `${mode} 模式下保全机制应允许导入`);
+    assert.ok(preview.card);
+    // 不再产出 missing-block（内容没丢，"缺失"在这里是错的）
+    assert.equal(
+      preview.issues.filter((issue) => issue.code === 'missing-block').length,
+      0,
+      `${mode} 模式不该再报 missing-block`,
+    );
+    // 但空板块仍要如实点名，让用户知道这份文件没写这些板块
+    assert.ok(preview.missingBlocks.length >= 4, JSON.stringify(preview.missingBlocks));
+  }
 });
 
-test('T10.9 TXT 宽松模式：同一份文本可导入，缺失板块以 warning + 空块标记体现', () => {
-  const preview = previewCardText(baseCard, PARTIAL_TXT, preset, 'lenient');
-  assert.equal(preview.canImport, true);
-  assert.ok(preview.card);
-  // 缺失的板块必须被点名（不能只说"已按空处理"）
-  assert.ok(preview.missingBlocks.length >= 4, JSON.stringify(preview.missingBlocks));
-  const missingIssues = preview.issues.filter((issue) => issue.code === 'missing-block');
-  assert.ok(missingIssues.length >= 4);
-  for (const issue of missingIssues) assert.equal(issue.severity, 'warning');
-  // 被填空的板块要带 missing 标记，与"用户清空"区分
-  const flagged = preview.card.blocks.filter((block) => block.missing === true);
-  assert.ok(flagged.length >= 4);
+test('T10.27 保全：未识别内容进【其他设定】，两种模式结果相同', () => {
+  const strict = previewCardText(baseCard, PARTIAL_TXT, preset, 'strict');
+  const lenient = previewCardText(baseCard, PARTIAL_TXT, preset, 'lenient');
+  const settingsOf = (preview) => preview.card.blocks.find((block) => block.id === 'settings').text;
+  assert.equal(settingsOf(strict), settingsOf(lenient), '两种模式的 settings 结果必须相同');
+  assert.ok(strict.preserved, '预览要带保全结论');
+  // PARTIAL_TXT 只有【基本信息】一个板块，其余的行都该被保全进 settings 或已识别板块
+  assert.match(strict.preservedNote, /【其他设定】|识别到/);
 });
 
 test('T10.9 TXT 完整文本：两种模式都能导入，且不带缺失标记', () => {

@@ -45,6 +45,15 @@ export interface SettingsCallbacks {
   onLogin?: () => void;
   /** 点「退出登录」 */
   onLogout?: () => Promise<void>;
+  /**
+   * 点「导出诊断日志」（T10.26）。由 app 提供：它知道版本、连接状态、会话摘要，
+   * 也知道日志文件在哪（契约返回的路径）。
+   *
+   * 返回一句话给状态栏（成功/失败都要说清）。放回调而不是在这里实现，是因为
+   * 「导出」要串起三个契约能力（读日志 → 选保存路径 → 原子写），
+   * 而这三个都已经在 app 侧有既有实现，重写一份必然漂移。
+   */
+  onExportDiagnostics?: () => Promise<string>;
 }
 
 export class SettingsDialog {
@@ -54,6 +63,9 @@ export class SettingsDialog {
   /** 账户那一行：已登录 / 未登录 + 动作按钮（登录… / 退出登录） */
   private readonly identityText: HTMLElement;
   private readonly identityButton: HTMLButtonElement;
+  /** 「导出诊断日志」按钮与它那一行结果（T10.26） */
+  private readonly diagnosticsButton: HTMLButtonElement;
+  private readonly diagnosticsStatus: HTMLElement;
   /** 「高级 · 兼容模式」折叠区（legacy 全局令牌） */
   private readonly advanced: HTMLDetailsElement;
   private readonly probeStatus: HTMLParagraphElement;
@@ -252,6 +264,32 @@ export class SettingsDialog {
 
     dirSection.append(dirField, this.cardsDirStatus);
 
+    // ── 诊断（T10.26）────────────────────────────────────
+    //
+    // 放在设置里而不是顶栏：它是"出问题时才用"的功能，顶栏每多一个按钮，
+    // 常用按钮就被稀释一次。位置紧邻「角色卡目录」—— 两者都是"文件去哪了"类问题。
+    const diagSection = el('section', 'form-section');
+    diagSection.append(el('h3', 'form-title', '诊断'));
+    const diagRow = el('div', 'field-row');
+    this.diagnosticsButton = el('button', 'btn', '导出诊断日志…');
+    this.diagnosticsButton.type = 'button';
+    this.diagnosticsButton.dataset['role'] = 'export-diagnostics';
+    this.diagnosticsButton.title = '把渲染层错误日志、版本号与连接状态打包成一个 txt';
+    this.diagnosticsButton.addEventListener('click', () => void this.exportDiagnostics());
+    diagRow.append(this.diagnosticsButton);
+    diagSection.append(
+      diagRow,
+      el(
+        'span',
+        'field-hint',
+        '渲染层的报错会自动记到应用配置目录的 logs/client-error.log。导出后可以直接发给维护者；' +
+          '文件里只有版本、连接状态与错误堆栈，不含角色卡正文。',
+      ),
+    );
+    this.diagnosticsStatus = el('p', 'probe-status info', '');
+    this.diagnosticsStatus.hidden = true;
+    diagSection.append(this.diagnosticsStatus);
+
     // ── 底部按钮 ────────────────────────────────────────
     const foot = el('div', 'modal-foot');
     const browserWarn = el(
@@ -267,7 +305,7 @@ export class SettingsDialog {
     cancel.addEventListener('click', () => this.close());
     foot.append(browserWarn, cancel, this.saveButton);
 
-    panel.append(head, serverSection, dirSection, foot);
+    panel.append(head, serverSection, dirSection, diagSection, foot);
     this.overlay.append(panel);
 
     // 点遮罩关闭
@@ -570,6 +608,42 @@ export class SettingsDialog {
    * 探测失败（建不出来）就**不写进输入框** —— 让用户看到"这个路径不行"，
    * 而不是改完输入框再在保存时报错。这是"先验证再记录"的顺序。
    */
+  /**
+   * 「导出诊断日志」（T10.26）。
+   *
+   * 为什么这里只调回调、自己不做：导出要串三个契约能力（读日志、选路径、原子写），
+   * app 侧已经有这些实现与错误文案。这里再写一遍，两份迟早不一致 ——
+   * 而不一致的表现是"从设置里导出坏了，从别处导出好的"，最难查。
+   *
+   * 结果**同时**显示在面板内与状态栏（回调返回的一句话由调用方自己 setStatus）：
+   * 用户点完按钮眼睛还在面板上，只写状态栏等于没反馈。
+   */
+  private async exportDiagnostics(): Promise<void> {
+    if (this.busy) return;
+    if (!this.callbacks.onExportDiagnostics) {
+      this.setDiagnosticsStatus('导出诊断日志不可用（当前环境没有壳）', 'warn');
+      return;
+    }
+    this.setBusy(true);
+    this.setDiagnosticsStatus('正在收集…', 'info');
+    try {
+      const message = await this.callbacks.onExportDiagnostics();
+      // 以"已导出/已取消/失败"判断色调：回调返回的是人话，这里只按关键字上色
+      const tone = /失败|不可用/.test(message) ? 'bad' : /取消/.test(message) ? 'warn' : 'ok';
+      this.setDiagnosticsStatus(message, tone);
+    } catch (error) {
+      this.setDiagnosticsStatus(`导出失败：${errorText(error)}`, 'bad');
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
+  private setDiagnosticsStatus(text: string, kind: 'ok' | 'warn' | 'bad' | 'info'): void {
+    this.diagnosticsStatus.textContent = text;
+    this.diagnosticsStatus.className = `probe-status ${kind}`;
+    this.diagnosticsStatus.hidden = text === '';
+  }
+
   private async chooseCardsDir(): Promise<void> {
     if (this.busy) return;
     try {

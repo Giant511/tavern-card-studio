@@ -17,6 +17,7 @@ import {
   serializeStCard,
   type BlockId,
   type CardBlock,
+  type PreservedInfo,
   type TxtPreset,
   type UnifiedCard,
 } from '@tcs/shared';
@@ -189,22 +190,28 @@ export function totalLength(blocks: readonly EditorBlockSnapshot[]): number {
  *   · 导入结果会影响 worldbook 的 entries 合并，属于文档模型变更，必须可单测；
  *   · 宽松模式会产出 `missing` 标记，这个语义是面板要显示的，不能在上层临时拼。
  *
- * 返回 null 表示导入被拒绝（严格模式下缺板块/别名冲突等），调用方应展示 issues。
+ * **全量保全默认开启**（v0.1.2 反馈项二，docs/06 §7）：无论认出几个板块，
+ * 原文零丢失 —— 未识别部分整体进【其他设定】。因此这里不再有"被拒绝"的
+ * 因缺板块路径；`card` 为 null 只剩世界书结构错误这一类。
  */
 export function importCardText(
   card: UnifiedCard,
   text: string,
   preset: TxtPreset,
   mode: 'strict' | 'lenient' = 'lenient',
-): { card: UnifiedCard | null; issues: Array<{ code: string; message: string; line?: number }> } {
-  const result = applyCardText(card, text, preset, { mode });
+): {
+  card: UnifiedCard | null;
+  issues: Array<{ code: string; message: string; line?: number }>;
+  preserved: PreservedInfo | null;
+} {
+  const result = applyCardText(card, text, preset, { mode, preserveUnrecognized: true });
   const issues = result.issues.map((issue) => ({
     code: issue.code,
     message: issue.message,
     ...(issue.line === undefined ? {} : { line: issue.line }),
   }));
   if (!result.ok || !result.card) {
-    return { card: null, issues };
+    return { card: null, issues, preserved: result.preserved };
   }
-  return { card: result.card, issues };
+  return { card: result.card, issues, preserved: result.preserved };
 }

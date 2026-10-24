@@ -571,6 +571,100 @@ pub fn scan_cards_dir(path: String, limit: Option<usize>) -> ShellResult<CardsDi
 }
 
 // ─────────────────────────────────────────────────────────────
+// 客户端错误日志（T10.26）
+// ─────────────────────────────────────────────────────────────
+
+/// 单条日志的字节上限（8 KiB）。
+///
+/// 为什么要截：一条 `window.onerror` 的堆栈可以很长（压缩后的 bundle 路径、
+/// 递归调用链），而日志是**追加**写的 —— 一次失控的循环报错能把磁盘写满。
+/// 8 KiB 足够放下真实堆栈（实测一屏 20 层左右约 2 KiB）。
+pub const ERROR_LOG_MAX_ENTRY_BYTES: usize = 8 * 1024;
+
+/// 日志文件轮转阈值（1 MiB）。超过就把当前文件改名成 `.1`（旧的 `.1` 直接覆盖）。
+///
+/// 为什么只留一份备份而不是按天分文件：这是**诊断**日志，用户平时不看它，
+/// 只在出问题时要"最近那次崩溃"。留太多份的结果是谁也不会去清理，
+/// 最后变成一个没人知道该不该删的目录。
+pub const ERROR_LOG_ROTATE_BYTES: u64 = 1024 * 1024;
+
+/// 客户端错误日志落点：`<应用配置目录>/logs/client-error.log`。
+///
+/// **由 Rust 解析，渲染层无权指定路径** —— 契约里第 2 条规则：只暴露语义化能力，
+/// 不给"给我一个路径，随便写"。渲染层拿到的只有回执里的路径（用于展示）。
+fn error_log_path(app: &AppHandle) -> Result<PathBuf, ShellError> {
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| ShellError::Io {
+            path: "<app_config_dir>".to_string(),
+            message: error.to_string(),
+        })?;
+    Ok(config_dir.join("logs").join("client-error.log"))
+}
+
+/// 把一条日志整理成可以落盘的形态：CRLF → LF、超长按**字符边界**截断、结尾补一个换行。
+///
+/// 单独抽出来是为了能测：按字节截断是最容易写错的那一步 ——
+/// `text.truncate(n)` 在 n 落在多字节字符中间时会 **panic**（Rust 的 String
+/// 要求始终是合法 UTF-8），而不是"截短一点"。真实堆栈里中文、emoji 都很常见，
+/// 一次 panic 会让整个日志器失效。
+fn normalize_error_log_entry(entry: &str) -> String {
+    let mut text = entry.replace("\r\n", "\n");
+    if text.len() > ERROR_LOG_MAX_ENTRY_BYTES {
+        let mut cut = ERROR_LOG_MAX_ENTRY_BYTES;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("\n... [entry truncated]");
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// 追加一条客户端错误日志，返回文件路径（供「导出诊断日志」显示）。
+///
+/// 两个和"崩溃"直接相关的实现细节：
+///
+///   1. **每次 open + write + sync_all**，不留缓冲。渲染层在崩溃前调用本命令，
+///      若走 BufWriter 或只 write 不 sync，最后那条恰恰是最需要的那条会丢。
+///   2. **写入发生在命令返回之前**（同步 fs API）。异步排队等于把"崩溃前能不能
+///      落盘"交给调度器决定。
+#[tauri::command]
+pub fn append_client_error_log(app: AppHandle, entry: String) -> ShellResult<String> {
+    let target = error_log_path(&app)?;
+    let text = normalize_error_log_entry(&entry);
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| ShellError::io(parent, error))?;
+    }
+
+    // 轮转：先量再写，避免"写超了才发现"
+    if let Ok(meta) = fs::metadata(&target) {
+        if meta.len() > ERROR_LOG_ROTATE_BYTES {
+            let backup = target.with_extension("log.1");
+            // 覆盖旧备份失败不该拦住这次写入 —— 日志写不进去比留两份更糟
+            let _ = fs::rename(&target, &backup);
+        }
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&target)
+        .map_err(|error| ShellError::io(&target, error))?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| ShellError::io(&target, error))?;
+    // 落到磁盘再看返回值：崩溃场景下"我写了但没刷盘"等于没写
+    file.sync_all().map_err(|error| ShellError::io(&target, error))?;
+
+    Ok(paths::display_path(&target).unwrap_or_else(|| "<非 UTF-8 路径>".to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────
 // 单元测试（只覆盖不依赖 AppHandle 的目录能力）
 // ─────────────────────────────────────────────────────────────
 
@@ -676,6 +770,32 @@ mod tests {
         assert!(!scan.truncated);
     }
 
+    #[test]
+    fn error_log_entry_normalizes_newlines_and_trailing_newline() {
+        // CRLF 统一成 LF：同一条日志在 Windows 与其它平台上应当逐字节相同，
+        // 否则用户发回来的文件里会混着两种换行
+        assert_eq!(normalize_error_log_entry("a\r\nb"), "a\nb\n");
+        // 已经以换行结尾时不再补一个（补了就会在文件里出现空行）
+        assert_eq!(normalize_error_log_entry("a\n"), "a\n");
+    }
+
+    #[test]
+    fn error_log_entry_truncates_on_char_boundary() {
+        // 每个汉字 3 字节：8 KiB 除不尽 3，硬截会在字符中间切。
+        // 用超过上限的中文串触发截断，重点断言**不 panic 且仍是合法 UTF-8**。
+        let long = "\u{9519}".repeat(ERROR_LOG_MAX_ENTRY_BYTES);
+        let result = normalize_error_log_entry(&long);
+        assert!(result.ends_with('\n'));
+        assert!(result.contains("[entry truncated]"), "超长必须留可辨识的截断标记");
+        assert!(result.trim_end().chars().count() > 0);
+        assert!(result.len() <= ERROR_LOG_MAX_ENTRY_BYTES + 32, "截断后不该超过上限太多");
+    }
+
+    #[test]
+    fn error_log_entry_keeps_short_text_intact() {
+        let text = "[2026-10-24T00:00:00Z] ERROR boom\n  at foo";
+        assert_eq!(normalize_error_log_entry(text), format!("{text}\n"));
+    }
     #[test]
     fn scan_respects_limit() {
         let dir = temp_dir("scan-limit");
