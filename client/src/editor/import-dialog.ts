@@ -15,7 +15,7 @@
  *     等于让用户在不知道覆盖了多少的情况下去覆盖。
  */
 
-import type { TxtPreset, UnifiedCard, WorldbookFormat, WorldbookImportResult } from '@tcs/shared';
+import type { PreservedInfo, TxtPreset, UnifiedCard, WorldbookFormat, WorldbookImportResult } from '@tcs/shared';
 
 import {
   previewCardText,
@@ -41,6 +41,10 @@ export interface CardTextImportDecision {
   card: UnifiedCard;
   mode: ImportMode;
   issues: ImportIssueView[];
+  /** 保全结论（v0.1.2）：调用方据此在状态栏说明"多少段原文进了【其他设定】" */
+  preserved: PreservedInfo | null;
+  /** 与对话框里显示的是同一句，避免两处措辞漂移 */
+  preservedNote: string;
 }
 
 export interface WorldbookImportDecision {
@@ -62,6 +66,7 @@ export class ImportDialog {
   private readonly summaryEl: HTMLElement;
   private readonly issuesEl: HTMLElement;
   private readonly modeRow: HTMLElement;
+  private readonly modeNote: HTMLElement;
   private readonly strictRadio: HTMLInputElement;
   private readonly lenientRadio: HTMLInputElement;
   private readonly confirmButton: HTMLButtonElement;
@@ -122,10 +127,15 @@ export class ImportDialog {
 
     this.modeRow.append(modeLabel, strictLabel, lenientLabel);
 
+    // 保全机制启用后两种模式行为一致，这件事必须在界面上说出来（见 render()）
+    this.modeNote = el('p', 'import-mode-note', '');
+    this.modeNote.dataset['role'] = 'import-mode-note';
+    this.modeNote.hidden = true;
+
     this.issuesEl = el('div', 'import-issues');
     this.issuesEl.dataset['role'] = 'import-issues';
 
-    body.append(this.subtitle, this.modeRow, this.summaryEl, this.issuesEl);
+    body.append(this.subtitle, this.modeRow, this.modeNote, this.summaryEl, this.issuesEl);
 
     const foot = el('div', 'modal-foot');
     this.cancelButton = el('button', 'btn', '取消');
@@ -196,6 +206,7 @@ export class ImportDialog {
       this.cardPreview = null;
       this.strictRadio.checked = false;
       this.lenientRadio.checked = false;
+      this.modeNote.hidden = true;
       this.renderWorldbookSummary(this.worldbookPreview);
       this.renderIssues(this.worldbookPreview.issues);
       this.setConfirm(this.worldbookPreview.canImport, '导入世界书');
@@ -218,21 +229,40 @@ export class ImportDialog {
     const lines: string[] = [];
     lines.push(`预设：${preset.id}`);
     if (this.cardPreview.canImport) {
-      const blockCount = this.cardPreview.card?.blocks.filter((block) => block.text.trim() !== '').length ?? 0;
-      lines.push(`识别到 ${String(blockCount)} 个非空板块`);
+      // 板块计数分两种口径，不能混用：
+      //   · 有保全结论时用 `preserved.blockCount`（= 认出的**标题**数）；
+      //   · 否则用"非空板块数"（旧口径）。
+      // 混用的后果实测过：0 命中样本里【其他设定】装着全文，于是"非空板块"数是 1，
+      // 而下一行又说"未识别到任何板块" —— 同一屏两句话互相矛盾。
+      if (this.cardPreview.preserved !== null) {
+        lines.push(`识别到 ${String(this.cardPreview.preserved.blockCount)} 个板块（按标题判定，含世界书）`);
+      } else {
+        const blockCount = this.cardPreview.card?.blocks.filter((block) => block.text.trim() !== '').length ?? 0;
+        lines.push(`识别到 ${String(blockCount)} 个非空板块`);
+      }
       if (this.cardPreview.worldbookEntries > 0) {
         lines.push(`世界书 ${String(this.cardPreview.worldbookEntries)} 个条目`);
       }
+      // 保全结论放在最显眼的位置：它决定了"我的原文到底去哪了"，
+      // 比"识别到几个板块"更该被读到（v0.1.2 反馈项二）。
+      if (this.cardPreview.preservedNote !== '') {
+        lines.push(this.cardPreview.preservedNote);
+      }
       if (this.cardPreview.missingBlocks.length > 0) {
-        // 宽松模式下这些板块会被填成空 —— 必须显式点名，不能只说"已按空处理"
-        lines.push(`将按空块处理：${this.cardPreview.missingBlocks.join('、')}`);
+        // 这些板块确实是空的 —— 必须显式点名，不能只说"已按空处理"
+        lines.push(`这些板块为空：${this.cardPreview.missingBlocks.join('、')}`);
       }
     } else {
-      lines.push('严格模式拒绝导入（见下面的问题列表）');
+      lines.push('无法导入（见下面的问题列表）');
     }
     for (const line of lines) {
       this.summaryEl.append(el('p', 'import-summary-line', line));
     }
+
+    // 保全机制让"严格/宽松"在 TXT 导入上不再改变结果，界面上要说明这一点，
+    // 否则用户会以为切了模式没生效（两个选项看起来可用、行为却一样）。
+    this.modeNote.hidden = !(this.cardPreview.preserved !== null);
+    this.modeNote.textContent = '提示：原文保全已启用 —— 缺板块不再中止导入，未识别内容一律放进【其他设定】。';
 
     this.renderIssues(this.cardPreview.issues);
     this.setConfirm(this.cardPreview.canImport, '导入');
@@ -305,7 +335,13 @@ export class ImportDialog {
 
     const preview = this.cardPreview;
     if (!preview || !preview.card) return;
-    this.finish({ card: preview.card, mode: this.mode, issues: preview.issues });
+    this.finish({
+      card: preview.card,
+      mode: this.mode,
+      issues: preview.issues,
+      preserved: preview.preserved,
+      preservedNote: preview.preservedNote,
+    });
   }
 
   private finish(decision: CardTextImportDecision | WorldbookImportDecision | null): void {

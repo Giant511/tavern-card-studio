@@ -16,7 +16,24 @@
             button 而不是 div：#card-name 现在可点、可聚焦，用 div 会让键盘用户无法到达，
             也会丢掉回车/空格的默认激活行为。样式里把 button 的外观压成纯文本。
           -->
-          <button id="card-name" class="card-name" type="button" title="点击修改角色名">加载中…</button>
+          <!--
+            T10.29：角色名与它的提示要**同一行**。
+            外层加这个 flex 行是因为 `.card-name` 是 display:block、宽度吃满 ——
+            直接把提示放在它后面会掉到下一行（第一版就是这样，截图里提示跑到了
+            角色名下方，而需求写的是"旁"）。行内布局只在有提示时改变观感。
+          -->
+          <div class="card-name-row">
+            <button id="card-name" class="card-name" type="button" title="点击修改角色名">加载中…</button>
+            <!--
+              T10.29：改名入口的可发现性提示。
+              「角色名能点」这件事以前只写在 title 里 —— 要悬停才看得到，而多数人
+              根本不会去悬停一个看起来像标题的文字。这里给一行常驻浅灰小字，
+              点过一次角色名（或改过一次名）后永久隐藏，由 localStorage 记录；
+              设置里的「重置」会清掉这个记录，提示重新出现。
+              aria-hidden：它是装饰性引导，不该被读屏软件当成正文念一遍。
+            -->
+            <span id="card-name-hint" class="card-name-hint" aria-hidden="true" hidden>← 点这里改角色名</span>
+          </div>
           <input id="card-name-input" class="card-name-input" type="text" hidden
                  maxlength="120" aria-label="角色名" />
           <div id="stats" class="stats"></div>

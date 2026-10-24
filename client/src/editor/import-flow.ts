@@ -23,6 +23,7 @@ import {
   type WorldbookExportResult,
   type WorldbookFormat,
   type WorldbookImportResult,
+  type PreservedInfo,
   type TxtPreset,
 } from '@tcs/shared';
 
@@ -42,21 +43,26 @@ export interface ImportIssueView {
 export interface CardTextPreview {
   kind: 'card-text';
   mode: ImportMode;
-  /** 结果为 null 表示严格模式下被拒绝（缺板块等） */
+  /** 结果为 null 表示导入被拒绝（现在只剩世界书结构错误这一类） */
   card: UnifiedCard | null;
   canImport: boolean;
   issues: ImportIssueView[];
-  /** 宽松模式下被填为空的板块（要明确告诉用户"这些是空的"） */
+  /** 被填为空的板块（要明确告诉用户"这些是空的"） */
   missingBlocks: string[];
   /** 识别到的世界书条目数（TXT 里可能带世界书段） */
   worldbookEntries: number;
+  /** 保全结论（v0.1.2 反馈项二）：认出几个板块、搬了几段原文进【其他设定】 */
+  preserved: PreservedInfo | null;
+  /** 状态栏用的一句话（对话框与导入完成都要展示同一句，避免两处措辞漂移） */
+  preservedNote: string;
 }
 
 /**
  * 预览 TXT 角色卡导入。
  *
- * `mode` 由界面切换：严格失败时用户可以切到宽松再试 —— 这正是 docs/06 的
- * 两模式语义，不是"严格失败就报错结束"。
+ * `mode` 保留在签名里是为了兼容调用方与"严格/宽松"的界面控件，但**保全机制
+ * 生效后两者行为一致**（docs/06 §7）：缺板块不再中止导入，原文进【其他设定】。
+ * 也就是说这个参数现在只影响 issue 的严重级别标注，不影响能不能导。
  */
 export function previewCardText(
   card: UnifiedCard,
@@ -68,6 +74,7 @@ export function previewCardText(
   const issues: ImportIssueView[] = result.issues.map((issue) => ({
     // 只有「缺板块」这一条会随模式改变级别：严格是 error（导入中止），
     // 宽松是 warning（按空块处理）。其它问题（重复标题、未知标题）与模式无关。
+    // 保全开启后 missing-block 根本不会产出，这段映射保留是为了兼容旧调用。
     severity: issue.code === 'missing-block' ? (mode === 'strict' ? 'error' : 'warning') : 'warning',
     code: issue.code,
     message: issue.message,
@@ -86,7 +93,28 @@ export function previewCardText(
     issues,
     missingBlocks,
     worldbookEntries: result.card?.worldbook.entries.length ?? 0,
+    preserved: result.preserved,
+    preservedNote: preservedNoteOf(result.preserved),
   };
+}
+
+/**
+ * 保全结论 → 一句话（状态栏与导入对话框共用）。
+ *
+ * 0 命中的措辞是需求逐字指定的，不要改写；其余两种是新写的，
+ * 但都遵循同一条：**说清"有多少内容被放到了哪里"**，而不是"导入成功"。
+ */
+export function preservedNoteOf(preserved: PreservedInfo | null): string {
+  if (preserved === null || !preserved.applied) return '';
+  if (preserved.wholeText) {
+    return '未识别到任何板块，原文已整体放入【其他设定】，请自行分块';
+  }
+  if (preserved.fragments > 0) {
+    return `识别到 ${String(preserved.blockCount)} 个板块，另有 ${String(
+      preserved.fragments,
+    )} 段未识别内容已按原序放入【其他设定】（分隔符下方）`;
+  }
+  return `识别到 ${String(preserved.blockCount)} 个板块`;
 }
 
 export interface WorldbookPreview {

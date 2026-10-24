@@ -128,6 +128,59 @@ body {
   display: none;
 }
 
+/* T10.29：角色名 + 提示同一行。
+ *
+ * 为什么需要这个包装层：`.card-name` 是 display:block 且 width 吃满
+ * （F10 就地编辑要它撑满，点哪儿都能进编辑），所以提示放在它后面会掉到下一行 ——
+ * 第一版就是这样，截图里提示跑到了角色名下方，而需求写的是"旁"。
+ *
+ * `min-width: 0` + `flex: 0 1 auto` 是必须的：角色名可以很长，
+ * 没有 min-width:0 的话 flex 子项不肯收缩，长名字会把提示挤出可视区。
+ */
+.card-name-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.card-name-row .card-name {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+/* T10.29：改名入口的常驻提示。
+ *
+ * 三个约束都写在样式里：
+ *   · 浅灰小字、不抢焦点 —— 它是引导，不是标题；用户改过名之后它就永久消失，
+ *     所以不该在视觉上被当成"页面的一部分"记住；
+ *   · 与角色名同一行（由 .card-name-row 保证），点它也能改名 —— 提示本身就该是可点的，
+ *     否则会出现"看到提示、点提示、没反应"这种更差的手感；
+ *   · `[hidden]` 要显式处理：display 被下面的规则改写后，UA 的
+ *     `[hidden] { display: none }` 会失效（这个坑 F10 的输入框踩过一次）。
+ *   · `flex: 0 0 auto`：提示不换行、不被压缩（压成"← 点这里…"就没信息量了）。
+ */
+.card-name-hint {
+  display: inline-block;
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted, #6b7280);
+  opacity: 0.85;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.card-name-hint[hidden] {
+  display: none;
+}
+
+.card-name-hint:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+
 .card-name:hover {
   border-color: var(--border);
   background: #fff;
