@@ -86,7 +86,12 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 | `version` | 版本信息 |
 | `selfcheck` | 离线自检：真跑一遍运行时依赖 |
 | `cleanup` | 卸载清理：按白名单删安装目录里的运行期残留（日志留痕） |
-| `help` | 打印内置帮助 |
+| `help` | 打印内置帮助（也可写 `--help`） |
+
+> `--version` 与 `version` 等价。**拼错的选项会被拒绝**（退出码 2）并提示
+> `tcs-server help` —— 不会被当成"没有子命令，启动服务"。
+> 这条不是洁癖：以前 `--verison` 会静默起一个真服务，还在当前目录写出
+> `data/config.json`（含明文令牌）。
 
 ---
 

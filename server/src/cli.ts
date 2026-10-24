@@ -46,7 +46,46 @@ export interface CliOptions {
   configPath: string;
   overrides: ConfigOverrides;
   flags: Record<string, string | boolean>;
+  /**
+   * 无法识别的 `--xxx`（拼错、或旧脚本传了已废弃的选项）。
+   *
+   * 为什么必须记下来而不是忽略：2026-10-24 实测 `node index.js --version` ——
+   * `--version` 不被识别、位置参数为空，于是**静默落到 serve**：
+   * 起了一个真服务、还在仓库根创建了 `data/config.json` 并打印明文令牌。
+   * 一个拼错的 flag 变成"启动生产服务"，这是最难排查的一类失败。
+   */
+  unknownFlags: string[];
+  /**
+   * 任一位置出现 `--help`。
+   *
+   * 单独成一个字段而不是把 `help` 塞进 positional：后者会让 `config show --help`
+   * 变成"看总帮助" —— 命令被顶掉，用户想查的那个子命令反而没执行。
+   * 现在它只是"请求帮助"，由分发处最前面处理，子命令不受影响。
+   */
+  helpRequested: boolean;
 }
+
+/** 认识的全部选项。新增 flag 必须同步这里，否则会被当成拼错而拒绝。 */
+const KNOWN_FLAGS = new Set([
+  'config',
+  'port',
+  'control-port',
+  'host',
+  'control-host',
+  'data-dir',
+  'rules-dir',
+  'token',
+  'log-level',
+  'trust-proxy',
+  'bundle-root',
+  'install-dir',
+  'log',
+  'event-log',
+  'dry-run',
+  'no-worker',
+  'role',
+  'service-mode',
+]);
 
 function defaultConfigPath(): string {
   return process.env['TCS_CONFIG'] ?? resolve(process.cwd(), 'data', 'config.json');
@@ -78,6 +117,18 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     }
   }
 
+  // `--help` / `--version` 是惯例写法。不加这条时它们是未知 flag，
+  // 位置参数为空 → 静默落到 serve（2026-10-24 实测：起了服务还打印了明文令牌）。
+  const helpRequested = flags['help'] === true;
+  delete flags['help'];
+  if (flags['version'] === true && positional.length === 0) {
+    // `--version` 只在没有子命令时才当命令；`config show --version` 这种写法
+    // 保留了 `--version` 会被当成未知选项拒绝 —— 那比静默打印版本再退出更不容易误判。
+    positional.unshift('version');
+    delete flags['version'];
+  }
+
+  const unknownFlags = Object.keys(flags).filter((name) => !KNOWN_FLAGS.has(name));
   const command = positional[0] ?? 'serve';
   const configPath = resolve(String(flags['config'] ?? defaultConfigPath()));
 
@@ -105,7 +156,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     overrides.serviceMode = flags['service-mode'] === 'windows-service' ? 'windows-service' : 'process';
   }
 
-  return { command, positional, configPath, overrides, flags };
+  return { command, positional, configPath, overrides, flags, unknownFlags, helpRequested };
 }
 
 function load(configPath: string, overrides: ConfigOverrides): LoadedConfig {
@@ -144,7 +195,11 @@ function printHelp(): void {
       `  --rules-dir <路径>    规则目录（默认 ./rules）\n` +
       `  --token <token>       指定访问令牌\n` +
       `  --trust-proxy <列表>  可信反向代理，逗号分隔的 IP 或 CIDR（默认空＝不信任任何代理头）\n` +
-      `  --no-worker           只起控制面（serve）\n`,
+      `  --no-worker           只起控制面（serve）\n` +
+      `  --version             版本信息（等价于 version 命令）\n` +
+      `  --help                打印本帮助（等价于 help 命令）\n\n` +
+      `未知选项会被拒绝（退出码 2）—— 不会被当成"启动服务"，\n` +
+      `因为那会让一个拼写错误变成后台起了一个真服务并写出配置文件。\n`,
   );
 }
 
@@ -505,7 +560,23 @@ export async function main(argv: readonly string[]): Promise<number> {
   const group = options.positional[0] ?? 'serve';
   const action = options.positional[1];
 
-  if (options.command === 'help' || options.command === '--help') {
+  // `--help` 优先于一切：它是"我想知道怎么用"，不该因为选项拼错而看不到帮助。
+  if (options.helpRequested) {
+    printHelp();
+    return 0;
+  }
+
+  // 未知选项在**任何子命令**之前就拒绝：拼错的 flag 落进各子命令里只会被静默忽略，
+  // 而 --version/--config 这类拼错会直接改变行为（起服务 / 读错配置）。
+  if (options.unknownFlags.length > 0) {
+    process.stderr.write(
+      `未知选项：${options.unknownFlags.map((name) => `--${name}`).join('、')}\n` +
+        `运行 \`tcs-server help\` 查看可用选项。\n`,
+    );
+    return 2;
+  }
+
+  if (options.command === 'help') {
     printHelp();
     return 0;
   }
