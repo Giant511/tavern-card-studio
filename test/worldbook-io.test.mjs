@@ -289,7 +289,9 @@ test('T10.9 TXT 导出按冻结格式规范化，且内容无损', () => {
   const imported = importWorldbook(MESSY_JSON);
   const exported = exportWorldbook({ entries: imported.entries, meta: imported.meta, format: 'txt' });
   assert.equal(exported.verbatim, false);
-  assert.match(String(exported.reason), /冻结格式/);
+  // T10.31 起文案改成"按当前世界书预设"（默认预设就是 v1.0 冻结格式）；
+  // 断言判据改为"说明了按当前预设渲染"，不动格式本身
+  assert.match(String(exported.reason), /世界书预设/);
   const reparsed = parseWorldbookText(exported.text);
   assert.equal(reparsed.ok, true);
   assert.equal(reparsed.entries.length, 2);

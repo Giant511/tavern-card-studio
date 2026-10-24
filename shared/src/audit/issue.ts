@@ -62,6 +62,8 @@ export interface MakeAuditIssueParams {
   column?: number | null;
   excerpt?: string;
   entryId?: number | null;
+  /** 世界书条目序号（条目没有 id 时的定位手段） */
+  entryIndex?: number | null;
   aggregate?: boolean;
   selector?: string;
 }
@@ -94,9 +96,18 @@ export function makeAuditIssue(params: MakeAuditIssueParams): AuditIssue {
   if (params.excerpt !== undefined) location.excerpt = params.excerpt;
   else if (start !== null && end !== null && end > start) location.excerpt = text.slice(start, Math.min(end, start + 80));
   if (params.entryId !== undefined) location.entryId = params.entryId;
+  if (params.entryIndex !== undefined && params.entryIndex !== null) location.entryIndex = params.entryIndex;
 
   const issue: AuditIssue = {
-    id: `${params.ruleId}|${blockId ?? field ?? '-'}|${start ?? -1}`,
+    // 世界书问题必须把条目定位拼进 id：同一条规则在同一板块上对多个条目产出问题时，
+    // 只有 ruleId|blockId|start 会让它们撞成同一个 id，客户端做「差量更新」时会互相顶掉。
+    id: `${params.ruleId}|${blockId ?? field ?? '-'}|${start ?? -1}${
+      location.entryId !== undefined && location.entryId !== null
+        ? `|e${String(location.entryId)}`
+        : location.entryIndex !== undefined && location.entryIndex !== null
+          ? `|i${String(location.entryIndex)}`
+          : ''
+    }`,
     ruleId: params.ruleId,
     category: params.category,
     severity: params.severity,

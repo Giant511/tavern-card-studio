@@ -139,6 +139,9 @@ export const PLATFORM_RULE_ELEMENT_KEYS = [
   'severity',
   'enabled',
   'hint',
+  // T10.33：世界书条目规则用（category 决定审计分组，when 表达跨字段条件）
+  'category',
+  'when',
   // placeholder-min-count / placeholder-forbid / pattern-required
   'token',
   'min',
@@ -152,7 +155,12 @@ export const PLATFORM_RULE_ELEMENT_KEYS = [
   // forbidden-words
   'words',
   'caseSensitive',
+  // number-range
+  'required',
 ] as const;
+
+/** 平台规则 rule.when 段（T10.33，同一条目内的跨字段条件） */
+export const PLATFORM_RULE_WHEN_KEYS = ['field', 'equals', 'notEquals', 'present'] as const;
 
 /** 平台规则 autoFix[] 元素 */
 export const PLATFORM_AUTOFIX_KEYS = [

@@ -24,9 +24,14 @@ import {
   checkUnknownKeys,
 } from './unknown-keys.js';
 
-const ID_PATTERN = /^[a-z0-9][a-z0-9._-]{1,63}$/;
+// T10.33：允许 `:` —— 内置规则集用 `builtin:worldbook-no-trigger` 这样的 id，
+// 而"同 id 覆盖"是用户改内置判据的唯一手段。不容冒号等于让这条能力无法使用。
+const ID_PATTERN = /^[a-z0-9][a-z0-9._:-]{1,79}$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
-const SELECTOR_PATTERN = /^(\*|block:(basic|personality|settings|special|user|worldbook)|field:[a-z_]+)$/;
+// T10.32：世界书条目级选择器。字段白名单与 WORLDBOOK_SELECTABLE_FIELDS 同源 ——
+// 放行任意名字会让拼错的 selector 静默不命中，而"规则没生效"最难排查。
+const SELECTOR_PATTERN =
+  /^(\*|block:(basic|personality|settings|special|user|worldbook)|field:[a-z_]+|worldbook:entries\[\]\.(name|keys|secondary_keys|content|comment|position|insertion_order|priority|depth|constant|enabled|selective|case_sensitive))$/;
 const TOKEN_PATTERN = /^(char|user|custom:[a-zA-Z][a-zA-Z0-9_]{0,31})$/;
 const SEVERITIES = new Set(['error', 'warning', 'info']);
 const RULE_TYPES = new Set([
@@ -37,6 +42,10 @@ const RULE_TYPES = new Set([
   'length',
   'non-empty',
   'forbidden-words',
+  // T10.32：世界书条目语义（数值范围 / 列表项数 / 列表空项）
+  'number-range',
+  'list-count',
+  'list-no-blank-items',
 ]);
 
 export interface RuleParseResult {
@@ -67,7 +76,7 @@ function checkSelector(errors: string[], where: string, scope: unknown): void {
   }
   for (const item of list) {
     if (typeof item !== 'string' || !SELECTOR_PATTERN.test(item)) {
-      errors.push(`${where}: 选择器 "${String(item)}" 不合法（应为 *、block:<id> 或 field:<字段名>）`);
+      errors.push(`${where}: 选择器 "${String(item)}" 不合法（应为 *、block:<id>、field:<字段名> 或 worldbook:entries[].<字段>）`);
     }
   }
 }

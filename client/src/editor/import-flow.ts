@@ -21,6 +21,7 @@ import {
   renderWorldbookText,
   type UnifiedCard,
   type WorldbookExportResult,
+  type WorldbookFormatParams,
   type WorldbookFormat,
   type WorldbookImportResult,
   type PreservedInfo,
@@ -127,8 +128,8 @@ export interface WorldbookPreview {
   issues: ImportIssueView[];
 }
 
-export function previewWorldbook(text: string): WorldbookPreview {
-  const result = importWorldbook(text);
+export function previewWorldbook(text: string, preset?: WorldbookFormatParams): WorldbookPreview {
+  const result = importWorldbook(text, preset);
   return {
     kind: 'worldbook',
     format: result.format,
@@ -186,6 +187,8 @@ export function exportWorldbookText(
   card: UnifiedCard,
   format: WorldbookFormat,
   source: WorldbookImportResult | null,
+  /** 世界书格式预设参数（T10.31）；缺省 = v1.0 冻结格式 */
+  preset?: WorldbookFormatParams,
 ): WorldbookExportResult {
   const raw = card.worldbook.raw;
   const meta: Record<string, unknown> = {};
@@ -195,7 +198,7 @@ export function exportWorldbookText(
       meta[key] = value;
     }
   }
-  return exportWorldbook({ entries: card.worldbook.entries, meta, format, source });
+  return exportWorldbook({ entries: card.worldbook.entries, meta, format, source, ...(preset ? { preset } : {}) });
 }
 
 /** 导出建议文件名：角色名 + 后缀（非法字符替换掉，避免 Windows 上存不下来） */

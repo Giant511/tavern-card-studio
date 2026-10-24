@@ -137,13 +137,15 @@ test('结构错误：缺 @@CONTENT / 缺 @@END / @@END id 不匹配 均报 error
   assert.equal(mismatched.entryId, 2);
 });
 
-test('告警：未知字段、空 keys 且非常驻、@@ENTRY 前说明文字', () => {
+test('告警：未知字段、@@ENTRY 前说明文字（空 keys 已归规则集，解析器不再报）', () => {
   const text = ['说明文字一行', '@@ENTRY 0', 'keys:', 'ext_note: 看不见', '@@CONTENT', 'A', '@@END 0'].join('\n');
   const parsed = parseWorldbookText(text);
   const codes = parsed.issues.map((issue) => issue.code);
   assert.ok(codes.includes('leading-text'));
   assert.ok(codes.includes('unknown-field'));
-  assert.ok(codes.includes('no-keys'));
+  // T10.33 去重：`no-keys` 由默认规则集 `builtin:worldbook-no-trigger` 判定，
+  // 解析器只负责"能不能读成条目"。这里断言它**没有**重复报。
+  assert.equal(codes.includes('no-keys'), false, '解析器不该再报语义问题');
   assert.ok(parsed.issues.every((issue) => issue.severity === 'warning'));
   assert.equal(parsed.ok, true);
   assert.deepEqual(parsed.entries[0].keys, []);

@@ -17,12 +17,15 @@
 import type { TxtPreset } from '../format/preset.js';
 import { descriptionOrderOf, headingTextFor } from '../format/preset.js';
 import { assembleDescription } from '../format/description.js';
-import { parseWorldbookText } from '../format/worldbook.js';
+import { parseWorldbookTextWith } from '../format/worldbook.js';
+import { DEFAULT_WORLDBOOK_FORMAT, type WorldbookFormatParams } from '../format/worldbook-preset.js';
 import { stringifyStCard } from '../format/sillytavern-io.js';
 import { BLOCK_IDS } from '../model/blocks.js';
 import type { BlockId } from '../model/blocks.js';
 import type { UnifiedCard } from '../model/unified-card.js';
 import { lineTextAt } from '../text/count.js';
+import { validateWorldbookRules } from '../rules/platform-rule-engine.js';
+import type { ResolvedPlatformRule } from '../rules/platform-rule.js';
 import { makeAuditIssue } from './issue.js';
 import { collectOmittedDefaults } from './st-defaults.js';
 import type { AuditIssue } from './types.js';
@@ -235,19 +238,33 @@ function labelOf(blockId: BlockId): string {
 
 // ---------------------------------------------------------------- 3. 世界书
 //
-// T10.9 起这一路单独成类别（`worldbook`）。三组检查，对应需求说的
-// 「条目结构 / id / 触发键」：
-//   · 结构：正文与关键词的类型、position 取值；
-//   · id：重复 / 非整数 / 缺失（重复是 error——条目按 id 合并，重复会让
-//     extensions 归属不确定；缺失只是 warning，导出时自动补号）；
-//   · 触发键：没有 keys 又非常驻 → 永远不会被触发（这是最容易犯、也最难自查的错）。
+// T10.9 起这一路单独成类别（`worldbook`）。T10.33 起它分成两半，**职责不重叠**：
+//
+//   ① **结构**（本文件）：TXT 解析问题（标记不闭合、重复 id、未知字段……）、
+//      条目 id 的完整性与唯一性、字段**类型**（content 必须是字符串、keys 必须是数组）。
+//      这些是"数据坏了"，规则引擎表达不了，也不该表达 —— 它们与平台规范无关。
+//
+//   ② **语义**（`rules/worldbook-checks.ts` 的默认规则集，由规则引擎求值）：
+//      触发键、空关键词、selective 与次级键、position 取值、insertion_order 非负。
+//      这些是"SillyTavern 的规范要求"，用户要能覆盖、追加、禁用其中单条。
+//
+// **去重铁律**：同一判据只能出现在一边。T10.9 的硬编码语义检查已整段删除
+// （不是注释掉、不是保留成"参考实现"）—— 留着它就会变成两套口径，
+// 而"同一违规报两遍"和"各报一半"都是不可接受的失败。
 
-export function checkWorldbookFormat(card: UnifiedCard): AuditIssue[] {
+export function checkWorldbookFormat(
+  card: UnifiedCard,
+  options: {
+    platformRule?: ResolvedPlatformRule | null;
+    /** 世界书格式预设（T10.31）：格式**解析**按它走，否则自定义预设的文件会被误报语法错误 */
+    worldbookFormat?: WorldbookFormatParams;
+  } = {},
+): AuditIssue[] {
   const issues: AuditIssue[] = [];
   const text = card.worldbook?.text ?? '';
 
   if (text.trim() !== '') {
-    const parsed = parseWorldbookText(text);
+    const parsed = parseWorldbookTextWith(text, options.worldbookFormat ?? DEFAULT_WORLDBOOK_FORMAT);
     for (const problem of parsed.issues) {
       // 世界书 TXT 就是用户编辑的文本，按行号换算成偏移，客户端可直接选中整行
       const offset = problem.line ? offsetOfLine(text, problem.line) : null;
@@ -295,16 +312,18 @@ export function checkWorldbookFormat(card: UnifiedCard): AuditIssue[] {
   }
 
   issues.push(...checkWorldbookStructure(card));
+
+  // 语义：默认规则集 + 当前平台规则里的世界书规则，走同一个引擎
+  if (options.platformRule) issues.push(...validateWorldbookRules(card, options.platformRule));
+
   return issues;
 }
 
 /**
- * 条目结构与触发键（T10.9）。
+ * 条目 id 与**字段类型**（T10.9 的"结构"部分，T10.33 后只剩这些）。
  *
- * 为什么值得单独检查「触发键」：世界书条目的作用是"被关键词触发"，
- * `keys: []` 且 `constant !== true` 的条目**永远不会出现在对话里**。
- * 这不影响导出、不报错、在 JSON 里也看不出异常 —— 只有审计能发现，
- * 所以它必须是 warning 而不是 info。
+ * 语义判据（触发键 / 空关键词 / selective / position / insertion_order）已迁到
+ * `rules/worldbook-checks.ts` 的规则集 —— 见文件上方"去重铁律"。
  */
 export function checkWorldbookStructure(card: UnifiedCard): AuditIssue[] {
   const issues: AuditIssue[] = [];
@@ -314,7 +333,7 @@ export function checkWorldbookStructure(card: UnifiedCard): AuditIssue[] {
     ruleId: string,
     severity: 'error' | 'warning' | 'info',
     message: string,
-    extra: { entryId?: number | null; hint?: string } = {},
+    extra: { entryId?: number | null; entryIndex?: number | null; hint?: string } = {},
   ): void => {
     issues.push(
       makeAuditIssue({
@@ -326,76 +345,48 @@ export function checkWorldbookStructure(card: UnifiedCard): AuditIssue[] {
         blockId: 'worldbook',
         field: 'character_book',
         entryId: extra.entryId ?? null,
+        // 没有 id 的条目只能靠序号定位，否则"第 2 条没有 id"这条问题无处可指
+        entryIndex: extra.entryId === undefined || extra.entryId === null ? (extra.entryIndex ?? null) : null,
       }),
     );
   };
 
   entries.forEach((entry, index) => {
+    // 所有单条目问题都带序号：没有 id 的条目（或 id 本身不合法）只能靠序号定位，
+    // 否则同一条规则在多条目上会产出相同的问题 id，客户端差量更新会互相顶掉。
+    const bumpAt = (ruleId: string, severity: 'error' | 'warning' | 'info', message: string, extra: { entryId?: number | null; hint?: string } = {}): void =>
+      bump(ruleId, severity, message, { ...extra, entryIndex: index });
     const label = entry.name?.trim() ? `「${entry.name.trim()}」` : `第 ${String(index + 1)} 条`;
     const entryId = typeof entry.id === 'number' ? entry.id : null;
 
     // ── id ──
     if (entry.id === undefined) {
-      bump('builtin:worldbook-entry-missing-id', 'warning', `世界书${label}没有 id，导出时会自动补号`, {
+      bumpAt('builtin:worldbook-entry-missing-id', 'warning', `世界书${label}没有 id，导出时会自动补号`, {
         hint: '补号会写入文件；若要固定编号，请在导入的 JSON 里显式给出 id',
       });
     } else if (typeof entry.id !== 'number' || !Number.isInteger(entry.id) || entry.id < 0) {
-      bump('builtin:worldbook-entry-bad-id', 'error', `世界书${label}的 id 不是非负整数：${JSON.stringify(entry.id)}`, {
+      bumpAt('builtin:worldbook-entry-bad-id', 'error', `世界书${label}的 id 不是非负整数：${JSON.stringify(entry.id)}`, {
         entryId,
         hint: 'id 是合并锚点，必须是 0、1、2…… 这样的整数',
       });
     }
 
-    // ── 结构：正文 ──
+    // ── 类型：正文 ──
     if (typeof entry.content !== 'string') {
-      bump('builtin:worldbook-entry-bad-content', 'error', `世界书${label}的正文不是字符串`, { entryId });
-    } else if (entry.content.trim() === '') {
-      bump('builtin:worldbook-entry-empty-content', 'warning', `世界书${label}的正文是空的`, {
-        entryId,
-        hint: '空条目不会给对话提供任何信息，通常应该删除或补内容',
-      });
+      bumpAt('builtin:worldbook-entry-bad-content', 'error', `世界书${label}的正文不是字符串`, { entryId });
     }
 
-    // ── 结构：关键词类型 ──
+    // ── 类型：关键词 ──
     if (!Array.isArray(entry.keys)) {
-      bump('builtin:worldbook-entry-bad-keys', 'error', `世界书${label}的 keys 不是数组`, {
+      bumpAt('builtin:worldbook-entry-bad-keys', 'error', `世界书${label}的 keys 不是数组`, {
         entryId,
         hint: '单关键词也要写成数组： "keys": ["银座"]',
       });
-      return; // keys 形状不对时，下面的触发键检查没有意义
-    }
-
-    // ── 触发键 ──
-    const keys = entry.keys.filter((key): key is string => typeof key === 'string');
-    const blankKeys = keys.filter((key) => key.trim() === '');
-    if (blankKeys.length > 0) {
-      bump('builtin:worldbook-blank-key', 'warning', `世界书${label}的关键词里有 ${String(blankKeys.length)} 个空项`, {
-        entryId,
-        hint: '空关键词会匹配一切，等于让条目常驻；要常驻请用 constant: true',
-      });
-    }
-
-    const isConstant = entry.constant === true;
-    if (keys.length === 0 && !isConstant) {
-      bump(
-        'builtin:worldbook-no-trigger',
-        'warning',
-        `世界书${label}没有任何关键词，也不是常驻（constant: false）——永远不会被触发`,
-        { entryId, hint: '补关键词，或把 constant 设为 true 让它常驻' },
-      );
-    }
-
-    if (entry.selective === true && !Array.isArray(entry.secondary_keys)) {
-      bump(
-        'builtin:worldbook-selective-without-secondary',
-        'warning',
-        `世界书${label}开启了 selective，但没有 secondary_keys`,
-        { entryId, hint: 'selective 要求次级关键词同时命中；没有次级关键词时该设置不起作用' },
-      );
     }
   });
 
   // ── 世界书整体：条目数上限（ST 运行时按 token 预算扫描，条目过多会拖慢生成）──
+  // 这条不是单条目语义，规则引擎的"逐条目求值"表达不了，留在结构侧。
   if (entries.length > 200) {
     bump('builtin:worldbook-too-many-entries', 'info', `世界书共有 ${String(entries.length)} 个条目`, {
       hint: '条目越多扫描越慢；建议把长期用不到的分到别的世界书',
@@ -452,6 +443,16 @@ export function checkStDefaults(card: UnifiedCard): AuditIssue[] {
 
 export interface FormatCheckOptions {
   preset?: TxtPreset | null;
+  /** 世界书格式预设参数（T10.31）；缺省 = v1.0 冻结格式 */
+  worldbookFormat?: WorldbookFormatParams;
+  /**
+   * 当前平台规则（T10.33）。
+   *
+   * 传了它，世界书的**语义**检查才跑（默认规则集 + 用户声明的世界书规则）；
+   * 不传则只有结构检查 —— 这是刻意的：拿不到规则时凭空造一套语义，
+   * 会让"审计通过"与"编辑器实时校验通过"两处判据不一致。
+   */
+  platformRule?: ResolvedPlatformRule | null;
   /** 原始 JSON 文本（有则先验证其可解析性） */
   rawJsonText?: string | null;
   /** 是否产出缺省字段提示，默认 true */
@@ -459,7 +460,13 @@ export interface FormatCheckOptions {
 }
 
 export function checkFormat(card: UnifiedCard, options: FormatCheckOptions = {}): AuditIssue[] {
-  const issues = [...checkJsonValidity(card, options.rawJsonText), ...checkWorldbookFormat(card)];
+  const issues = [
+    ...checkJsonValidity(card, options.rawJsonText),
+    ...checkWorldbookFormat(card, {
+      platformRule: options.platformRule ?? null,
+      ...(options.worldbookFormat ? { worldbookFormat: options.worldbookFormat } : {}),
+    }),
+  ];
   if (options.includeStDefaults !== false) issues.push(...checkStDefaults(card));
   if (options.preset) issues.push(...checkPresetConformance(card, options.preset));
   return issues;

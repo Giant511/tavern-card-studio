@@ -8,20 +8,29 @@
 import type { BlockId } from '../model/blocks.js';
 import { BLOCK_IDS } from '../model/blocks.js';
 import type { UnifiedCard } from '../model/unified-card.js';
-import type { Selector } from './platform-rule.js';
+import { WORLDBOOK_SELECTABLE_FIELDS, type Selector } from './platform-rule.js';
 
 export type ParsedSelector =
   | { kind: 'all'; raw: string }
   | { kind: 'block'; blockId: BlockId; raw: string }
-  | { kind: 'field'; field: string; raw: string };
+  | { kind: 'field'; field: string; raw: string }
+  | { kind: 'worldbook-field'; field: string; raw: string };
 
 const BLOCK_SELECTOR = /^block:(basic|personality|settings|special|user|worldbook)$/;
 const FIELD_SELECTOR = /^field:([a-z_]+)$/;
+const WB_FIELD_SELECTOR = /^worldbook:entries\[\]\.([a-z_]+)$/;
 
 export function parseSelector(selector: string): ParsedSelector | null {
   if (selector === '*') return { kind: 'all', raw: selector };
   const block = BLOCK_SELECTOR.exec(selector);
   if (block) return { kind: 'block', blockId: block[1] as BlockId, raw: selector };
+  const wbField = WB_FIELD_SELECTOR.exec(selector);
+  if (wbField) {
+    const field = wbField[1]!;
+    // 字段名必须真的可寻址：放行任意名字会让拼错的 selector 静默不生效
+    if (!(WORLDBOOK_SELECTABLE_FIELDS as readonly string[]).includes(field)) return null;
+    return { kind: 'worldbook-field', field, raw: selector };
+  }
   const field = FIELD_SELECTOR.exec(selector);
   if (field) return { kind: 'field', field: field[1] as string, raw: selector };
   return null;
@@ -34,6 +43,27 @@ export interface ScopedText {
   field: string | null;
   text: string;
   selector: string;
+  /** 世界书条目的 id / 序号（非世界书选择器为 null） */
+  entryId?: number | null;
+  entryIndex?: number | null;
+  /** 条目在问题文案里的称呼：「银座」或「第 3 条」 */
+  entryLabel?: string | null;
+  /** 条目原始对象（`when` 条件要读同一条目的其它字段） */
+  entry?: Record<string, unknown> | null;
+  /** 数值字段的数值（`number-range` 用）；非数值字段为 null */
+  numberValue?: number | null;
+  /** 列表字段的项数（`list-count` 用）；非列表字段为 null */
+  listCount?: number | null;
+  /** 列表字段的原始项（`list-no-blank-items` 用）；非列表字段为 null */
+  listValues?: readonly unknown[] | null;
+  /**
+   * 字段值的类型分类。
+   *
+   * `'other'` 表示类型本身就不对（如 `content: 42`、`keys: "银座"`）——
+   * 那是**结构问题**，由审计的结构检查报，规则求值要跳过它，
+   * 否则同一处会同时冒出「正文不是字符串」和「正文是空的」两条（去重铁律）。
+   */
+  valueType?: 'string' | 'number' | 'boolean' | 'list' | 'missing' | 'other';
 }
 
 export const SELECTABLE_FIELDS = [
@@ -61,6 +91,71 @@ const RESIDUAL_FIELD_MAP: Readonly<Record<string, keyof UnifiedCard['residual']>
 
 export function normalizeSelectorList(scope: Selector | Selector[]): string[] {
   return Array.isArray(scope) ? scope : [scope];
+}
+
+const LIST_VALUES = new Set(['keys', 'secondary_keys']);
+const NUMBER_VALUES = new Set(['insertion_order', 'priority', 'depth']);
+const BOOL_VALUES = new Set(['constant', 'enabled', 'selective', 'case_sensitive']);
+
+/**
+ * 世界书条目字段 → 规则引擎能吃的三样东西：可读文本、数值、列表项数。
+ *
+ * 为什么三样都要：同一个字段会被不同规则类型使用 ——
+ * `pattern-required` 看文本、`number-range` 看数值、`list-count` 看项数。
+ * 只给文本的话，"关键词至少 2 个"就只能退化成字符数判断（那是错的判据）。
+ */
+export function describeWorldbookValue(
+  field: string,
+  value: unknown,
+): {
+  text: string;
+  numberValue: number | null;
+  listCount: number | null;
+  listValues: readonly unknown[] | null;
+  valueType: 'string' | 'number' | 'boolean' | 'list' | 'missing' | 'other';
+} {
+  if (value === undefined || value === null) {
+    return { text: '', numberValue: null, listCount: null, listValues: null, valueType: 'missing' };
+  }
+  if (LIST_VALUES.has(field)) {
+    if (!Array.isArray(value)) {
+      return { text: '', numberValue: null, listCount: null, listValues: null, valueType: 'other' };
+    }
+    const list = value.filter((item): item is string => typeof item === 'string');
+    // 列表字段的"文本"是给人看/给正则用的拼接形态；判项数请用 listCount
+    return { text: list.join(', '), numberValue: null, listCount: value.length, listValues: value, valueType: 'list' };
+  }
+  if (NUMBER_VALUES.has(field)) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return { text: '', numberValue: null, listCount: null, listValues: null, valueType: 'other' };
+    }
+    return { text: String(value), numberValue: value, listCount: null, listValues: null, valueType: 'number' };
+  }
+  if (field === 'position') {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return {
+        text: value === 0 ? 'before_char' : value === 1 ? 'after_char' : String(value),
+        numberValue: value,
+        listCount: null,
+        listValues: null,
+        valueType: 'number',
+      };
+    }
+    if (typeof value !== 'string') {
+      return { text: '', numberValue: null, listCount: null, listValues: null, valueType: 'other' };
+    }
+    return { text: value.trim(), numberValue: null, listCount: null, listValues: null, valueType: 'string' };
+  }
+  if (BOOL_VALUES.has(field)) {
+    if (typeof value !== 'boolean') {
+      return { text: '', numberValue: null, listCount: null, listValues: null, valueType: 'other' };
+    }
+    return { text: value ? 'true' : 'false', numberValue: null, listCount: null, listValues: null, valueType: 'boolean' };
+  }
+  if (typeof value !== 'string') {
+    return { text: '', numberValue: null, listCount: null, listValues: null, valueType: 'other' };
+  }
+  return { text: value, numberValue: null, listCount: null, listValues: null, valueType: 'string' };
 }
 
 export function collectScopedTexts(card: UnifiedCard, scope: Selector | Selector[]): ScopedText[] {
@@ -108,6 +203,33 @@ export function collectScopedTexts(card: UnifiedCard, scope: Selector | Selector
         field: block.id === 'personality' ? 'personality' : 'description',
         text: block.text,
         selector: raw,
+      });
+      continue;
+    }
+
+    if (parsed.kind === 'worldbook-field') {
+      // 每条目一项，而不是整段文本：世界书的校验对象是条目。
+      // key 带 entryIndex，这样同一条规则对多个条目会产出多个问题（正是想要的）。
+      (card.worldbook?.entries ?? []).forEach((entry, index) => {
+        const id = typeof entry.id === 'number' && Number.isFinite(entry.id) ? entry.id : null;
+        const value = (entry as Record<string, unknown>)[parsed.field];
+        const { text, numberValue, listCount, listValues, valueType } = describeWorldbookValue(parsed.field, value);
+        const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+        push({
+          key: `worldbook:${String(index)}:${parsed.field}`,
+          blockId: 'worldbook',
+          field: 'character_book',
+          text,
+          selector: raw,
+          entryId: id,
+          entryIndex: index,
+          entryLabel: name === '' ? `第 ${String(index + 1)} 条` : `「${name}」`,
+          entry: entry as unknown as Record<string, unknown>,
+          numberValue,
+          listCount,
+          listValues,
+          valueType,
+        });
       });
       continue;
     }

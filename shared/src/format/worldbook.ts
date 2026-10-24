@@ -14,8 +14,15 @@
  */
 
 import type { StWorldbookEntry } from '../model/sillytavern.js';
+import {
+  DEFAULT_WORLDBOOK_FORMAT,
+  labelForField,
+  reverseLabelMap,
+  WORLDBOOK_KNOWN_FIELDS,
+  type WorldbookFormatParams,
+} from './worldbook-preset.js';
 
-/** 会出现在 TXT 头部中的字段（写出顺序即此顺序） */
+/** 会出现在 TXT 头部中的字段（v1.0 写出顺序；实际顺序由格式预设的 fieldOrder 决定） */
 export const WORLDBOOK_HEADER_ORDER = [
   'name',
   'keys',
@@ -36,13 +43,58 @@ export const WORLDBOOK_VISIBLE_KEYS = [...WORLDBOOK_HEADER_ORDER, 'content'] as 
 const BOOL_FIELDS = new Set<string>(['constant', 'enabled', 'case_sensitive', 'selective']);
 const NUMBER_FIELDS = new Set<string>(['insertion_order', 'priority']);
 const LIST_FIELDS = new Set<string>(['keys', 'secondary_keys']);
-
-const ENTRY_START = /^@@ENTRY[ \t]+(\S+)[ \t]*$/;
-const CONTENT_MARK = /^@@CONTENT[ \t]*$/;
-const ENTRY_END = /^@@END[ \t]+(\S+)[ \t]*$/;
-const HEADER_LINE = /^([A-Za-z_][A-Za-z0-9_]*)[ \t]*:[ \t]?(.*)$/;
 /** 行首可能有 0 个或多个反斜杠，紧跟 `@@`：写出/解析的统一判定式 */
 const ESCAPE_TARGET = /^\\*@@/;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * 标记模板 → 整行正则。`{id}` 处匹配非空白串，其余部分按字面。
+ *
+ * 空白规则看**模板本身**：
+ *   · `@@ENTRY {id}`（占位符前有空格）→ 要求至少一个空白，`@@ENTRY0` 不算条目；
+ *   · `条目{id}：`（占位符紧贴文字）→ 允许零个空白，中文格式里"条目4："才是常态。
+ *
+ * 写死 `[ \t]+` 会让所有中文风格的开标记都必须写成"条目 4："，
+ * 而用户的文件从来不是那样写的。
+ */
+function markerPattern(template: string): RegExp {
+  const at = template.indexOf('{id}');
+  const prefixRaw = at < 0 ? template : template.slice(0, at);
+  const suffix = at < 0 ? '' : template.slice(at + 4);
+  const requiresSpace = /\s$/.test(prefixRaw);
+  const prefix = prefixRaw.trimEnd();
+  const gap = requiresSpace ? '[ \\t]+' : '[ \\t]*';
+  return new RegExp(`^${escapeRegExp(prefix)}${gap}(\\S+)${escapeRegExp(suffix)}[ \\t]*$`);
+}
+
+/** 无 `{id}` 的标记（正文标记）→ 整行正则 */
+function exactLinePattern(mark: string): RegExp {
+  return new RegExp(`^${escapeRegExp(mark.trimEnd())}[ \\t]*$`);
+}
+
+interface CompiledFormat {
+  entryStart: RegExp;
+  contentMark: RegExp;
+  entryEnd: RegExp;
+  labels: Map<string, string>;
+  fieldCore: string;
+}
+
+/** 预编译一次，避免在逐行循环里反复构造正则与反查表 */
+function compileFormat(params: WorldbookFormatParams): CompiledFormat {
+  const core = params.fieldSeparator.trim() === '' ? ':' : params.fieldSeparator.trim();
+  return {
+    entryStart: markerPattern(params.entryOpen),
+    contentMark: exactLinePattern(params.contentMark),
+    entryEnd: markerPattern(params.entryClose),
+    labels: reverseLabelMap(params),
+    fieldCore: core,
+  };
+}
+
 
 export type WorldbookIssueCode =
   | 'invalid-id'
@@ -55,7 +107,8 @@ export type WorldbookIssueCode =
   | 'bad-value'
   | 'unexpected-line'
   | 'leading-text'
-  | 'no-keys';
+  // 注意：没有 'no-keys' —— 见 closeDraft 里的注释（语义判据归规则集）
+  ;
 
 export interface WorldbookParseIssue {
   severity: 'error' | 'warning';
@@ -115,17 +168,26 @@ export function unescapeContentLine(line: string): string {
   return ESCAPE_TARGET.test(line) && line.startsWith('\\') ? line.slice(1) : line;
 }
 
-function formatCsvList(items: readonly string[]): string {
+function formatCsvList(items: readonly string[], separator: string): string {
+  const needle = separator.trim() === '' ? separator : separator.trim();
   return items
-    .map((item) => (item.includes(',') || item.includes('"') ? `"${item.split('"').join('\\"')}"` : item))
-    .join(', ');
+    .map((item) => (item.includes(needle) || item.includes('"') ? `"${item.split('"').join('\\"')}"` : item))
+    .join(separator);
 }
 
-function parseCsvList(value: string): string[] {
+/**
+ * 列表字段解析。
+ *
+ * 分隔符可配置（`listSeparator`），但**引号与转义规则固定** —— 那是 CSV 的语法，
+ * 不是格式偏好：允许用户把分隔符改成 `、` 却又要自己发明转义规则，只会让文件不可移植。
+ */
+function parseCsvList(value: string, separator: string): string[] {
   if (value.trim() === '') return [];
+  const sep = separator.trim() === '' ? separator : separator.trim();
   const items: string[] = [];
   let current = '';
   let quoted = false;
+  const sepLength = Math.max(1, sep.length);
   for (let index = 0; index < value.length; index += 1) {
     const char = value[index]!;
     if (quoted) {
@@ -145,9 +207,10 @@ function parseCsvList(value: string): string[] {
       quoted = true;
       continue;
     }
-    if (char === ',') {
+    if (value.startsWith(sep, index)) {
       items.push(current.trim());
       current = '';
+      index += sepLength - 1;
       continue;
     }
     current += char;
@@ -155,6 +218,7 @@ function parseCsvList(value: string): string[] {
   items.push(current.trim());
   return items;
 }
+
 
 function formatPosition(value: unknown): string | null {
   if (typeof value === 'string') return value.trim() === '' ? null : value.trim();
@@ -206,56 +270,72 @@ export function ensureEntryIds(entries: readonly StWorldbookEntry[]): {
 // ---------------------------------------------------------------- 写出
 
 /** 头部行：空值时不留尾随空格（`secondary_keys:` 而不是 `secondary_keys: `） */
-function header(key: string, value: string): string {
-  return value === '' ? `${key}:` : `${key}: ${value}`;
+function header(label: string, value: string, fieldSeparator: string): string {
+  // v1.0 的 fieldSeparator 是 ": "，空值时要退化成 ":"（不含尾随空格）。
+  // 所以空值取 separator 去掉尾部空白后的形态，而不是直接拼 separator。
+  return value === '' ? `${label}${fieldSeparator.trimEnd()}` : `${label}${fieldSeparator}${value}`;
 }
 
-function renderEntry(entry: StWorldbookEntry, index: number): string {
+function renderEntry(entry: StWorldbookEntry, index: number, params: WorldbookFormatParams): string {
   const id = typeof entry.id === 'number' && Number.isFinite(entry.id) ? entry.id : index;
-  const lines: string[] = [`@@ENTRY ${id}`];
+  const idText = String(id);
+  const lines: string[] = [params.entryOpen.split('{id}').join(idText)];
 
-  for (const key of WORLDBOOK_HEADER_ORDER) {
+  for (const key of params.fieldOrder) {
     const value = (entry as Record<string, unknown>)[key];
     if (value === undefined || value === null) continue;
+    const label = labelForField(params, key);
     if (LIST_FIELDS.has(key)) {
-      if (Array.isArray(value)) lines.push(header(key, formatCsvList(value.filter((item): item is string => typeof item === 'string'))));
+      if (Array.isArray(value)) {
+        lines.push(header(label, formatCsvList(value.filter((item): item is string => typeof item === 'string'), params.listSeparator), params.fieldSeparator));
+      }
       continue;
     }
     if (BOOL_FIELDS.has(key)) {
-      if (typeof value === 'boolean') lines.push(header(key, value ? 'true' : 'false'));
+      if (typeof value === 'boolean') lines.push(header(label, value ? 'true' : 'false', params.fieldSeparator));
       continue;
     }
     if (NUMBER_FIELDS.has(key)) {
-      if (typeof value === 'number' && Number.isFinite(value)) lines.push(header(key, String(value)));
+      if (typeof value === 'number' && Number.isFinite(value)) lines.push(header(label, String(value), params.fieldSeparator));
       continue;
     }
     if (key === 'position') {
       const text = formatPosition(value);
-      if (text !== null) lines.push(header(key, text));
+      if (text !== null) lines.push(header(label, text, params.fieldSeparator));
       continue;
     }
-    if (typeof value === 'string') lines.push(header(key, value));
+    if (typeof value === 'string') lines.push(header(label, value, params.fieldSeparator));
   }
 
   const content = typeof entry.content === 'string' ? entry.content : '';
-  if (content === '') return `${lines.join('\n')}\n@@CONTENT\n@@END ${id}`;
+  const close = params.entryClose.split('{id}').join(idText);
+  if (content === '') return `${lines.join('\n')}\n${params.contentMark}\n${close}`;
 
   let body = '';
   for (const rawLine of splitKeepEol(content)) {
     const { content: text, eol } = splitLineEol(rawLine);
     body += `${escapeContentLine(text)}${eol}`;
   }
-  // 正文与 @@END 之间固定补一个换行（解析端正好去掉这一个），
-  // 因此正文自带尾换行时会写成「空行 + @@END」，逐字节可还原。
-  return `${lines.join('\n')}\n@@CONTENT\n${body}\n@@END ${id}`;
+  // 正文与闭标记之间固定补一个换行（解析端正好去掉这一个），
+  // 因此正文自带尾换行时会写成「空行 + 闭标记」，逐字节可还原。
+  return `${lines.join('\n')}\n${params.contentMark}\n${body}\n${close}`;
 }
 
-/** entries → 世界书 TXT（v1.0）。空数组返回空串。 */
-export function renderWorldbookText(entries: readonly StWorldbookEntry[]): string {
+/** entries → 世界书 TXT（按格式预设；空数组返回空串） */
+export function renderWorldbookTextWith(
+  entries: readonly StWorldbookEntry[],
+  params: WorldbookFormatParams,
+): string {
   if (entries.length === 0) return '';
   const { entries: normalized } = ensureEntryIds(entries);
-  return normalized.map((entry, index) => renderEntry(entry, index)).join('\n\n');
+  return normalized.map((entry, index) => renderEntry(entry, index, params)).join(params.entrySeparator);
 }
+
+/** entries → 世界书 TXT（v1.0 冻结格式）。空数组返回空串。 */
+export function renderWorldbookText(entries: readonly StWorldbookEntry[]): string {
+  return renderWorldbookTextWith(entries, DEFAULT_WORLDBOOK_FORMAT);
+}
+
 
 // ---------------------------------------------------------------- 解析
 
@@ -268,17 +348,43 @@ interface DraftEntry {
 }
 
 /**
- * 世界书 TXT → entries。
+ * 字段行 → `{ field, value }`。
+ *
+ * `field` 为 null 表示标签不认识（调用方据此报 unknown-field）。
+ * 反解顺序：**先按预设的标签映射**，再按字段名本身 —— 这样自定义预设既可以
+ * 把 `keys` 写成「关键词」，也可以不改标签直接沿用字段名。
+ */
+function parseFieldLine(
+  line: string,
+  fmt: CompiledFormat,
+): { field: string | null; label: string; value: string } | null {
+  const at = line.indexOf(fmt.fieldCore);
+  if (at <= 0) return null;
+  const label = line.slice(0, at).trim();
+  if (label === '') return null;
+  let value = line.slice(at + fmt.fieldCore.length);
+  // 与 v1.0 的 `[ \t]?` 一致：吃掉紧跟的一个空白字符，多的留给值本身
+  if (value.startsWith(' ') || value.startsWith('\t')) value = value.slice(1);
+  const mapped = fmt.labels.get(label);
+  const field =
+    mapped ?? ((WORLDBOOK_KNOWN_FIELDS as readonly string[]).includes(label) ? label : null);
+  return { field, label, value };
+}
+
+/**
+ * 世界书 TXT → entries（按格式预设）。
  * 所有结构问题都带行号返回；error 级问题意味着「不要拿结果去做合并」。
  */
-export function parseWorldbookText(text: string): ParseWorldbookResult {
+export function parseWorldbookTextWith(text: string, params: WorldbookFormatParams): ParseWorldbookResult {
+  const fmt = compileFormat(params);
   const issues: WorldbookParseIssue[] = [];
   const entries: StWorldbookEntry[] = [];
   const seenIds = new Set<number>();
   let draft: DraftEntry | null = null;
   let leadingText = false;
-  /** 缺 @@CONTENT 被整块剔除的条目（id + 起始行） */
+  /** 缺正文标记被整块剔除的条目（id + 起始行） */
   const droppedMissingContent: { id: number; line: number }[] = [];
+  const contentMarkText = params.contentMark;
 
   const closeDraft = (endLine: number): void => {
     if (!draft) return;
@@ -294,15 +400,10 @@ export function parseWorldbookText(text: string): ParseWorldbookResult {
     const entry: Record<string, unknown> = { ...draft.fields, id: draft.id, content };
     if (!('keys' in entry)) entry['keys'] = [];
     entries.push(entry as unknown as StWorldbookEntry);
-    if ((entry['keys'] as unknown[]).length === 0 && entry['constant'] !== true) {
-      issues.push({
-        severity: 'warning',
-        code: 'no-keys',
-        entryId: draft.id,
-        line: endLine,
-        message: `条目 ${draft.id} 的 keys 为空且未开启常驻，该条目永远不会被触发`,
-      });
-    }
+    // 「keys 为空且非常驻 → 永不触发」**不在这里报**（T10.33 去重铁律）：
+    // 它已由 `rules/worldbook-checks.ts` 的默认规则集 `builtin:worldbook-no-trigger` 判定。
+    // 解析器只管"这段文本能不能读成条目"，判语义是规则引擎的职责 ——
+    // 两处都报会让同一条违规在审计面板里出现两遍。
     draft = null;
   };
 
@@ -312,25 +413,25 @@ export function parseWorldbookText(text: string): ParseWorldbookResult {
     const lineNumber = index + 1;
     const { content: line } = splitLineEol(rawLine);
 
-    if (ENTRY_START.test(line)) {
+    if (fmt.entryStart.test(line)) {
       if (draft) {
         issues.push({
           severity: 'error',
           code: 'missing-end',
           entryId: draft.id,
           line: lineNumber,
-          message: `条目 ${draft.id} 缺少 @@END ${draft.id}（在第 ${lineNumber} 行遇到下一个 @@ENTRY）`,
+          message: `条目 ${draft.id} 缺少闭标记（在第 ${lineNumber} 行遇到下一个开标记）`,
         });
         closeDraft(lineNumber - 1);
       }
-      const raw = ENTRY_START.exec(line)?.[1] ?? '';
+      const raw = fmt.entryStart.exec(line)?.[1] ?? '';
       const id = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
       if (!Number.isFinite(id)) {
         issues.push({
           severity: 'error',
           code: 'invalid-id',
           line: lineNumber,
-          message: `@@ENTRY 的 id 必须是非负整数，实际为 "${raw}"`,
+          message: `条目开标记的 id 必须是非负整数，实际为 "${raw}"`,
         });
         continue;
       }
@@ -348,31 +449,31 @@ export function parseWorldbookText(text: string): ParseWorldbookResult {
       continue;
     }
 
-    if (CONTENT_MARK.test(line)) {
+    if (fmt.contentMark.test(line)) {
       if (!draft) {
-        issues.push({ severity: 'error', code: 'orphan-marker', line: lineNumber, message: `第 ${lineNumber} 行的 @@CONTENT 出现在任何 @@ENTRY 之前` });
+        issues.push({ severity: 'error', code: 'orphan-marker', line: lineNumber, message: `第 ${lineNumber} 行的正文标记出现在任何条目之前` });
         continue;
       }
       draft.sawContent = true;
       continue;
     }
 
-    const endMatch = ENTRY_END.exec(line);
+    const endMatch = fmt.entryEnd.exec(line);
     if (endMatch) {
       const rawId = endMatch[1] ?? '';
       const id = /^\d+$/.test(rawId) ? Number(rawId) : Number.NaN;
       if (!draft) {
-        issues.push({ severity: 'error', code: 'orphan-marker', line: lineNumber, message: `第 ${lineNumber} 行的 @@END ${rawId} 没有对应的 @@ENTRY` });
+        issues.push({ severity: 'error', code: 'orphan-marker', line: lineNumber, message: `第 ${lineNumber} 行的闭标记 ${rawId} 没有对应的开标记` });
         continue;
       }
       if (id !== draft.id) {
-        // 以 @@ENTRY 配对为准：该行原样留在正文里，继续等待匹配的 @@END
+        // 以开标记配对为准：该行原样留在正文里，继续等待匹配的闭标记
         issues.push({
           severity: 'error',
           code: 'mismatched-end',
           entryId: draft.id,
           line: lineNumber,
-          message: `@@END ${rawId} 与 @@ENTRY ${draft.id} 的 id 不一致（以 @@ENTRY 为准）`,
+          message: `闭标记 ${rawId} 与条目标记 ${draft.id} 的 id 不一致（以开标记为准）`,
         });
         draft.bodyRaw.push(`${line}\n`);
         continue;
@@ -388,38 +489,39 @@ export function parseWorldbookText(text: string): ParseWorldbookResult {
           severity: 'warning',
           code: 'leading-text',
           line: lineNumber,
-          message: `第 ${lineNumber} 行位于第一个 @@ENTRY 之前，已作为世界书说明文字忽略`,
+          message: `第 ${lineNumber} 行位于第一个条目标记之前，已作为世界书说明文字忽略`,
         });
       }
       continue;
     }
 
     if (!draft.sawContent) {
-      const header = HEADER_LINE.exec(line);
+      const header = parseFieldLine(line, fmt);
       if (!header) {
         issues.push({
           severity: 'warning',
           code: 'unexpected-line',
           entryId: draft.id,
           line: lineNumber,
-          message: `条目 ${draft.id} 在 @@CONTENT 之前出现非字段行，已忽略：${line.slice(0, 30)}`,
+          message: `条目 ${draft.id} 在正文标记之前出现非字段行，已忽略：${line.slice(0, 30)}`,
         });
         continue;
       }
-      const key = header[1]!;
-      const value = header[2] ?? '';
-      if (!(WORLDBOOK_HEADER_ORDER as readonly string[]).includes(key)) {
+      const key = header.field;
+      const label = header.label;
+      const value = header.value;
+      if (key === null) {
         issues.push({
           severity: 'warning',
           code: 'unknown-field',
           entryId: draft.id,
           line: lineNumber,
-          message: `条目 ${draft.id} 的字段 "${key}" 不支持在 TXT 中编辑，已忽略（请在世界书面板或 JSON 中修改）`,
+          message: `条目 ${draft.id} 的字段 "${label}" 不是已知字段，已忽略（如果是标签写法不同，请在当前世界书预设的 labelMap 里登记）`,
         });
         continue;
       }
       if (LIST_FIELDS.has(key)) {
-        draft.fields[key] = parseCsvList(value);
+        draft.fields[key] = parseCsvList(value, params.listSeparator);
         continue;
       }
       if (BOOL_FIELDS.has(key)) {
@@ -463,23 +565,28 @@ export function parseWorldbookText(text: string): ParseWorldbookResult {
       code: 'missing-end',
       entryId: draft.id,
       line: lines.length,
-      message: `条目 ${draft.id} 缺少 @@END ${draft.id}（文件结束仍未闭合）`,
+      message: `条目 ${draft.id} 缺少闭标记（文件结束仍未闭合）`,
     });
     closeDraft(lines.length);
   }
 
-  // 缺 @@CONTENT 的条目已在 closeDraft 中整块剔除，这里补 error
+  // 缺正文标记的条目已在 closeDraft 中整块剔除，这里补 error
   for (const dropped of droppedMissingContent) {
     issues.push({
       severity: 'error',
       code: 'missing-content',
       entryId: dropped.id,
       line: dropped.line,
-      message: `条目 ${dropped.id} 缺少 @@CONTENT（第 ${dropped.line} 行），整块未参与解析，原条目保持不变`,
+      message: `条目 ${dropped.id} 缺少正文标记（第 ${dropped.line} 行），整块未参与解析，原条目保持不变`,
     });
   }
 
   return { entries, issues, ok: issues.every((issue) => issue.severity !== 'error') };
+}
+
+/** 世界书 TXT → entries（v1.0 冻结格式）。自定义格式用 `parseWorldbookTextWith`。 */
+export function parseWorldbookText(text: string): ParseWorldbookResult {
+  return parseWorldbookTextWith(text, DEFAULT_WORLDBOOK_FORMAT);
 }
 
 // ---------------------------------------------------------------- 合并

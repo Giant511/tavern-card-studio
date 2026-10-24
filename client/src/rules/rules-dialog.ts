@@ -12,7 +12,7 @@
  *   · UI 不自行重排文本——「应用预设」只调用 shared 的 plan → 确认 → apply。
  */
 
-import type { PresetApplyPlan } from '@tcs/shared';
+import type { PresetApplyPlan, TxtPreset, WorldbookPreset } from '@tcs/shared';
 
 import {
   pickRuleFile,
@@ -30,6 +30,7 @@ import {
   type ImportOutcome,
   type RuleIssue,
 } from './rule-library';
+import type { PresetImportOutcome } from './preset-library';
 import {
   decideApplyPreset,
   describePresets,
@@ -71,6 +72,12 @@ export interface RulesDialogCallbacks {
     id: string | null;
     name: string | null;
   };
+  /** 导入 TXT 预设（T10.30）：原子回退、同 id 覆盖、不自动切换 */
+  importTxtPresetText: (text: string) => PresetImportOutcome<TxtPreset[]>;
+  /** 导入世界书预设（T10.31） */
+  importWorldbookPresetText: (text: string) => PresetImportOutcome<WorldbookPreset[]>;
+  /** 选中世界书预设（只改导出/解析格式） */
+  onWorldbookPresetSelect: (id: string) => void;
 
   /** 当前状态快照 */
   getState: () => DialogState;
@@ -79,6 +86,9 @@ export interface RulesDialogCallbacks {
   /** 导出时取当前规则原文（null = 无原文可导出） */
   exportPlatformRule: (id: string) => string | null;
   exportHighlightScheme: (id: string) => string | null;
+  /** 导出当前预设（T10.30/31）：返回完整 JSON，含用户自定义项 */
+  exportTxtPreset: (id: string) => string | null;
+  exportWorldbookPreset: (id: string) => string | null;
 }
 
 export interface DialogState {
@@ -90,6 +100,8 @@ export interface DialogState {
   presets: PresetChoice[];
   previewFor: (presetId: string) => ReturnType<typeof previewPresetSelection> | null;
   decideFor: (presetId: string) => ReturnType<typeof decideApplyPreset> | null;
+  worldbookPresetId: string | null;
+  worldbookPresets: Array<{ id: string; name: string; builtin: boolean; summary: string }>;
 }
 
 export class RulesDialog {
@@ -98,6 +110,8 @@ export class RulesDialog {
   private readonly highlightSelect: HTMLSelectElement;
   private readonly presetSelect: HTMLSelectElement;
   private readonly presetPreview: HTMLElement;
+  private readonly worldbookSelect: HTMLSelectElement;
+  private readonly worldbookSummary: HTMLElement;
   private readonly errorBox: HTMLElement;
   private readonly applyButton: HTMLButtonElement;
 
@@ -190,12 +204,16 @@ export class RulesDialog {
     const presetActions = el('div', 'field-row');
     this.applyButton = this.actionButton('应用预设（重排原文）…', () => this.applyPreset());
     this.applyButton.classList.add('primary');
-    presetActions.append(this.applyButton);
+    presetActions.append(
+      this.applyButton,
+      this.actionButton('导入预设文件…', () => void this.importTxtPreset()),
+      this.actionButton('导出当前预设…', () => void this.exportTxtPreset()),
+    );
 
     const presetHint = el(
       'p',
       'field-hint',
-      '「选择预设」只改变导出时的标题与顺序；只有「应用预设」会重排原文，且会先列出变更让你确认。',
+      '「选择预设」只改变导出时的标题与顺序；只有「应用预设」会重排原文，且会先列出变更让你确认。导入预设不会自动切换到它。',
     );
     presetSection.append(
       presetTitle,
@@ -204,6 +222,34 @@ export class RulesDialog {
       presetActions,
       presetHint,
     );
+
+    // ── ④ 世界书预设（格式轨，T10.31）────────────────────
+    const wbSection = el('section', 'form-section');
+    const wbTitle = el('h3', 'form-title', '世界书预设');
+    const wbHint = el(
+      'p',
+      'field-hint',
+      '决定世界书 TXT 怎么写：条目开闭标记、字段标签、字段顺序、分隔符。切换后世界书的导出/导入与格式检查都按它走；内置「标准世界书」等价于 v1.0 冻结格式。',
+    );
+
+    this.worldbookSelect = el('select', 'select wide') as HTMLSelectElement;
+    this.worldbookSelect.dataset['role'] = 'worldbook-preset-select';
+    this.worldbookSelect.addEventListener('change', () => {
+      const id = this.worldbookSelect.value;
+      this.callbacks.onWorldbookPresetSelect(id);
+      this.callbacks.notify(`已切换世界书预设：${this.labelOf(this.worldbookSelect)}`, 'ok');
+      this.renderWorldbookSummary();
+    });
+
+    this.worldbookSummary = el('div', 'preset-preview');
+    this.worldbookSummary.dataset['role'] = 'worldbook-preset-summary';
+
+    const wbActions = el('div', 'field-row');
+    wbActions.append(
+      this.actionButton('导入世界书预设…', () => void this.importWorldbookPreset()),
+      this.actionButton('导出当前世界书预设…', () => void this.exportWorldbookPreset()),
+    );
+    wbSection.append(wbTitle, this.worldbookSelect, this.worldbookSummary, wbActions, wbHint);
 
     // ── 错误区（导入失败时显示，含字段位置）──────────────
     this.errorBox = el('div', 'rule-errors');
@@ -221,7 +267,7 @@ export class RulesDialog {
     done.addEventListener('click', () => this.close());
     foot.append(note, done);
 
-    panel.append(head, platformSection, highlightSection, presetSection, this.errorBox, foot);
+    panel.append(head, platformSection, highlightSection, presetSection, wbSection, this.errorBox, foot);
     this.overlay.append(panel);
     this.overlay.addEventListener('click', (event) => {
       if (event.target === this.overlay) this.close();
@@ -278,9 +324,45 @@ export class RulesDialog {
     }
     if (state.presetId) this.presetSelect.value = state.presetId;
 
+    this.worldbookSelect.replaceChildren();
+    for (const preset of state.worldbookPresets) {
+      const option = el('option');
+      option.value = preset.id;
+      option.textContent = `${preset.name}${preset.builtin ? '' : '（自定义）'}`;
+      this.worldbookSelect.append(option);
+    }
+    if (state.worldbookPresetId) this.worldbookSelect.value = state.worldbookPresetId;
+
     this.hideErrors();
     this.renderPresetPreview();
+    this.renderWorldbookSummary();
     this.overlay.hidden = false;
+  }
+
+  /**
+   * 世界书预设摘要。
+   *
+   * 为什么不画示例：格式参数有 8 个，画出来只会变成一堵墙。
+   * 用户真正要确认的是「条目开标记长什么样、字段标签是不是中文」——
+   * 给出这两行就够判断选对没选对。
+   */
+  private renderWorldbookSummary(): void {
+    const state = this.callbacks.getState();
+    const id = this.worldbookSelect.value;
+    const preset = state.worldbookPresets.find((item) => item.id === id);
+    this.worldbookSummary.replaceChildren();
+    if (!preset) {
+      this.worldbookSummary.append(el('p', 'field-hint', '未选择世界书预设'));
+      return;
+    }
+    for (const [key, value] of [
+      ['格式', preset.summary],
+      ['字段标签', preset.builtin ? '与字段名相同（name / keys / …）' : '见预设的 labelMap'],
+    ] as Array<[string, string]>) {
+      const row = el('div', 'preview-row');
+      row.append(el('span', 'preview-key', key), el('code', 'preview-value', value));
+      this.worldbookSummary.append(row);
+    }
   }
 
   close(): void {
@@ -310,6 +392,8 @@ export class RulesDialog {
     this.platformSelect.value = state.platformId;
     this.highlightSelect.value = state.highlightId;
     if (state.presetId) this.presetSelect.value = state.presetId;
+    if (state.worldbookPresetId) this.worldbookSelect.value = state.worldbookPresetId;
+    this.renderWorldbookSummary();
   }
 
   // ── 预设预览 ─────────────────────────────────────────────
@@ -542,6 +626,86 @@ export class RulesDialog {
       return;
     }
     await this.saveAs(`${state.highlightId}.json`, text);
+  }
+
+  private async importTxtPreset(): Promise<void> {
+    await this.importPreset('txt');
+  }
+
+  private async importWorldbookPreset(): Promise<void> {
+    await this.importPreset('worldbook');
+  }
+
+  /**
+   * 预设导入（T10.30/31）。
+   *
+   * 与平台规则的导入共用同一套展示：失败列字段、成功但有 warning 也列出来。
+   * 「不自动切换」是刻意的 —— 导入是往候选列表里加东西，不是"立刻改用"。
+   * 用户正在看一份按当前预设排版的内容，格式被悄悄换掉会让人以为文件坏了。
+   */
+  private async importPreset(kind: 'txt' | 'worldbook'): Promise<void> {
+    this.hideErrors();
+    let text: string;
+    try {
+      const path = await pickRuleFile();
+      if (!path) return;
+      const file = await readTextExact(path);
+      text = file.text;
+    } catch (error) {
+      this.showErrors('读取文件失败', [
+        { where: '', message: error instanceof Error ? error.message : String(error), group: '', index: null },
+      ]);
+      return;
+    }
+
+    const label = kind === 'txt' ? '预设' : '世界书预设';
+    const outcome =
+      kind === 'txt' ? this.callbacks.importTxtPresetText(text) : this.callbacks.importWorldbookPresetText(text);
+
+    if (!outcome.ok) {
+      this.showErrors(`导入失败，已保留原有${label}列表（未做任何修改）`, outcome.issues);
+      this.callbacks.notify(`导入失败：${outcome.issues.length} 处问题，原${label}未变`, 'bad');
+      return;
+    }
+
+    const notes = [...outcome.warnings];
+    if (outcome.renameHint !== '') notes.push(outcome.renameHint);
+    if (notes.length > 0) {
+      this.showWarnings(`导入成功（${outcome.name ?? outcome.id}），但有以下需要注意的问题`, notes);
+      this.callbacks.notify(
+        `导入成功${outcome.replaced ? '（覆盖同 id 预设）' : ''}：${outcome.name ?? outcome.id}，${notes.length} 条提示`,
+        'warn',
+      );
+    } else {
+      this.hideErrors();
+      this.callbacks.notify(
+        `导入成功${outcome.replaced ? '（覆盖同 id 预设）' : ''}：${outcome.name ?? outcome.id}`,
+        'ok',
+      );
+    }
+    this.refresh();
+    this.renderPresetPreview();
+  }
+
+  private async exportTxtPreset(): Promise<void> {
+    const state = this.callbacks.getState();
+    const id = this.presetSelect.value;
+    const text = this.callbacks.exportTxtPreset(id);
+    if (!text) {
+      this.callbacks.notify('当前预设无法导出', 'warn');
+      return;
+    }
+    await this.saveAs(`${id || 'preset'}.preset.json`, text);
+  }
+
+  private async exportWorldbookPreset(): Promise<void> {
+    const id = this.worldbookSelect.value;
+    const text = this.callbacks.exportWorldbookPreset(id);
+    if (!text) {
+      this.callbacks.notify('当前世界书预设无法导出', 'warn');
+      return;
+    }
+    await this.saveAs(`${id || 'worldbook-preset'}.worldbook.json`, text);
   }
 
   private async saveAs(name: string, text: string): Promise<void> {
