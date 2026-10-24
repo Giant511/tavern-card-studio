@@ -31,6 +31,13 @@ import {
 import { API_VERSION, SERVER_VERSION, configSummary } from './context.js';
 import { isRegisterMode } from './config-live.js';
 import { AppError, toAppError } from './errors.js';
+import { writeApplicationEvent } from './eventlog.js';
+import {
+  checkInstallDirAtStartup,
+  installDirFromExecPath,
+  startInstallDirWatch,
+  type InstallDirWatch,
+} from './install-dir-watch.js';
 import { TokenGate } from './http/auth.js';
 import { methodNotAllowed, sendError, sendJson } from './http/responses.js';
 import { Router, type RouteContext } from './http/router.js';
@@ -649,10 +656,60 @@ export async function startSupervisor(loaded: LoadedConfig, options: SupervisorO
     await controller.start();
   }
 
+  // 运行期写安装目录自检（F14.3 / T10.24）。
+  //
+  // 挂在 supervisor 而不是 worker：supervisor 是服务启动的那个进程（WinSW 的
+  // arguments 是 `index.js serve`），生命周期最长；而且它做的是**快照比对**，
+  // 看见的是文件系统的结果 —— worker 子进程往安装目录写的东西同样会出现在
+  // 它的快照里，不需要在子进程里再装一份（装两份只会让同一条告警打两遍）。
+  //
+  // 任何异常都不能影响启动：这里是诊断，不是门卫。
+  let installDirWatch: InstallDirWatch | null = null;
+  if (config.installDirWriteCheck) {
+    try {
+      const installDir = installDirFromExecPath();
+      const issues = checkInstallDirAtStartup({ installDir, dataDir: config.dataDir });
+      for (const issue of issues) {
+        logger.warn('installDir.writeDetected', {
+          kind: issue.kind,
+          path: issue.path,
+          detail: issue.detail,
+          hint: issue.hint,
+        });
+        try {
+          writeApplicationEvent(`install-dir check: ${issue.detail}`);
+        } catch {
+          // eventcreate 需要管理员；没写进去只意味着少一条线索
+        }
+      }
+      if (issues.length === 0) {
+        logger.debug('installDir.checkOk', { installDir });
+      }
+      installDirWatch = startInstallDirWatch({
+        installDir,
+        allow: config.installDirWriteAllow,
+        onIssue: (issue) => {
+          logger.warn('installDir.writeDetected', {
+            kind: issue.kind,
+            path: issue.path,
+            detail: issue.detail,
+            hint: issue.hint,
+          });
+        },
+      });
+    } catch (error) {
+      // 连安装目录都读不到（权限/路径异常）时不该拦着服务起来
+      logger.warn('installDir.checkFailed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   let closing = false;
   const close = async (): Promise<void> => {
     if (closing) return;
     closing = true;
+    installDirWatch?.stop();
     controller.stopPolling();
     await controller.stop();
     await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));

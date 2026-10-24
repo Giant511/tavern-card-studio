@@ -35,10 +35,11 @@
  * 让"卸载后全清"变成谎言。所以 dataDir 不存在时改写到 `%TEMP%`。
  */
 
-import { spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+
+import { writeApplicationEvent } from './eventlog.js';
 
 // ────────────────────────────────────────────── 白名单（唯一来源）
 //
@@ -303,15 +304,8 @@ function defaultRemove(absPath: string, isDirectory: boolean): void {
 
 /** 事件日志一行摘要：数据被清掉时文件日志可能在 %TEMP%，事件日志是第二条线索 */
 function defaultEventLogWriter(message: string): void {
-  const result = spawnSync(
-    'eventcreate.exe',
-    ['/T', 'INFORMATION', '/ID', '100', '/L', 'APPLICATION', '/SO', 'TavernCardStudio', '/D', message],
-    { encoding: 'utf8', windowsHide: true },
-  );
-  if (result.error) throw result.error;
-  if ((result.status ?? 1) !== 0) {
-    throw new Error((result.stderr || result.stdout || `eventcreate exited ${result.status}`).trim());
-  }
+  // 实现已抽到 eventlog.ts（服务端自检也要用，两处各写一份迟早会漂）
+  writeApplicationEvent(message);
 }
 
 /** 只扫描与清理，不写日志（干跑与正式流程共用，保证分类逻辑只有一份） */

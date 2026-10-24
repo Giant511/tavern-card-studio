@@ -259,10 +259,36 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 ```
 
 输出 JSON：`configPath`、`port`、`controlPort`、`host`、`controlHost`、`dataDir`、
-`rulesDir`、`maxUploadBytes`、`logLevel`、`auth.token`（形如 `tcs_…a1b2`）、
+`rulesDir`、`maxUploadBytes`、`logLevel`、`installDirWriteCheck`、`auth.token`（形如 `tcs_…a1b2`）、
 `service`、以及拼好的 `panel` / `api` 地址。
 
 需要明文令牌时用 `token show`。
+
+### 5.3 写安装目录自检（`installDirWriteCheck`）
+
+默认开。服务启动时会做三件事，**只告警、不阻断启动**：
+
+1. 检查 `dataDir` 是否落在安装目录内（那会让库、日志、仓库在卸载时残留）；
+2. 扫安装目录顶层有没有 `data\`、`logs\`、`cache\`、`tmp\`、`*.log` 这类运行期生成物；
+3. 运行期每 60 秒比对一次安装目录快照，发现新增或改写就告警。
+
+告警落在启动日志（`server.log` 里 `installDir.writeDetected`）与应用程序事件日志
+（来源 `TavernCardStudio`）。查证据：
+
+```powershell
+Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCardStudio' } -MaxEvents 10 |
+  Format-List TimeCreated, Message
+```
+
+`dataDir` 故意放在安装目录里（不推荐）时，把那个相对路径加进 `installDirWriteAllow`
+就不再按文件刷屏 —— 但配置检查那一条仍会告警一次：
+
+```json
+{ "installDirWriteCheck": true, "installDirWriteAllow": ["data"] }
+```
+
+测试环境想彻底关掉：`"installDirWriteCheck": false`。注意它**默认开**，
+所以"没有告警"有两种可能 —— 真的没问题，或者被关了。`config show` 会直接显示这个值。
 
 ---
 

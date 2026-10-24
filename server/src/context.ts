@@ -161,6 +161,11 @@ export function configSummary(config: ServerConfigFile): Record<string, unknown>
     // 回收站保留期（F13.2）。面板要能显示"删掉的卡多久后彻底消失" ——
     // 不给的话管理员只能翻配置文件才知道，而这直接关系到磁盘占用。
     trash: { ...config.trash },
+    // 写安装目录自检（F14.3）。面板要能显示"开着没开" —— 这条自检的结论
+    // （告警）只出现在日志里，如果面板连开关状态都不显示，管理员无从判断
+    // "没告警"到底是"没问题"还是"被关掉了"。
+    installDirWriteCheck: config.installDirWriteCheck,
+    installDirWriteAllow: [...config.installDirWriteAllow],
     auth: {
       require: config.auth.require,
       // 面板里只显示掩码，避免截图/日志泄露；完整 token 用 `tcs-server token show`
