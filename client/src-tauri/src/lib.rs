@@ -35,6 +35,7 @@ pub fn run() {
             commands::default_cards_dir,
             commands::probe_cards_dir,
             commands::scan_cards_dir,
+            commands::append_client_error_log,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败：请检查 tauri.conf.json 与 icons");
