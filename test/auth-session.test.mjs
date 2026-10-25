@@ -244,16 +244,32 @@ test('T10.7 401 恢复：非 401 错误不触发续期（避免无谓刷新）',
   assert.equal(api.calls.refresh.length, 0);
 });
 
-test('T10.7 登录成功：落盘四个键，进入 authenticated', async () => {
+test('T10.7 登录成功：落盘账户四键 + 清空仓库令牌五键，进入 authenticated', async () => {
   const { session, store, phases } = makeSession();
   const result = await session.login('alice', 'pw');
   assert.equal(result.user.username, 'alice');
   assert.equal(session.currentPhase, 'authenticated');
+  /*
+   * v0.1.3 / F5 后半追加了 5 个 repo-token 键。
+   *
+   * 这是**有意为之**：两条凭证路径互斥（决策 #132），账户登录成功必须把
+   * 仓库令牌清掉 —— 否则 `accessToken` getter 仍会优先返回旧令牌，
+   * 表现为"刚登录成功，却还在按旧令牌寻址，看不到自己的卡"。
+   *
+   * 断言从"只有四个键"改成"这九个键"，并列写死而不是用 includes 之类宽松判据：
+   * 它防的是"登录去碰卡片会话状态"（sessions/closeSession/markSaved），
+   * 而不是"多写了一个认证相关的键"。
+   */
   assert.deepEqual(Object.keys(store.sink.saved.at(-1)).sort(), [
     'accessExpiresAt',
     'accessToken',
     'authUser',
     'refreshToken',
+    'repoToken',
+    'repoTokenExpiresAt',
+    'repoTokenRepoId',
+    'repoTokenRepoName',
+    'repoTokenScopes',
   ]);
   assert.deepEqual(phases, ['authenticated']);
 });
@@ -289,14 +305,32 @@ test('T10.7 登出：服务端失败也清本地（不把用户困在"登出失�
   assert.deepEqual(Object.keys(last).sort(), ['accessExpiresAt', 'accessToken', 'authUser', 'refreshToken']);
 });
 
-test('T10.7 登录态只写自己的键：整个过程不会出现第五个键', async () => {
+test('T10.7 登录态只写自己的键：整个过程不会出现越界字段（不去碰卡片会话）', async () => {
   const { session, store } = makeSession();
   await session.login('alice', 'pw');
   await session.logout();
+  /*
+   * 白名单含 9 个键：账户 4 个 + 仓库令牌 5 个（v0.1.3 / F5 后半）。
+   *
+   * 这条断言真正防的是 `sessions` / `closeSession` / `markSaved` 那类
+   * **本地卡片会话**字段被登录态顺手改掉 —— 不是"认证自己的键只能有四个"。
+   * 两条凭证路径互斥（决策 #132），所以登录时清 repo-token 那 5 个键是正确行为。
+   */
+  const ALLOWED = [
+    'accessToken',
+    'refreshToken',
+    'accessExpiresAt',
+    'authUser',
+    'repoToken',
+    'repoTokenRepoId',
+    'repoTokenRepoName',
+    'repoTokenScopes',
+    'repoTokenExpiresAt',
+  ];
   for (const patch of store.sink.saved) {
     for (const key of Object.keys(patch)) {
       assert.ok(
-        ['accessToken', 'refreshToken', 'accessExpiresAt', 'authUser'].includes(key),
+        ALLOWED.includes(key),
         `出现越界字段 ${key}：登录态不该碰配置里的其它键`,
       );
     }

@@ -21,7 +21,9 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { auditDist, auditMsiSize, auditShellAssets, findPriorMsi, mb as humanMb } from './lib/bundle-health.mjs';
+import { auditDist, auditMsiSize, auditMsiShellAssets, auditShellAssets, findPriorMsi, mb as humanMb } from './lib/bundle-health.mjs';
+import { checkStamp } from './lib/dist-stamp.mjs';
+import { checkSentinels } from './lib/feature-sentinels.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const versionArg = process.argv.indexOf('--version');
@@ -113,7 +115,6 @@ const sharedSrc = newestMtime(join(ROOT, 'shared/src'), ['.ts']);
 const sharedDist = newestMtime(join(ROOT, 'shared/dist'), ['.js']);
 const clientSrc = newestMtime(join(ROOT, 'client/src'), ['.ts', '.css', '.html']);
 const clientDist = newestMtime(join(ROOT, 'client/dist'), ['.js', '.css', '.html']);
-const serverSrc = newestMtime(join(ROOT, 'server/src'), ['.ts']);
 const serverDist = newestMtime(join(ROOT, 'server/dist'), ['.js']);
 const serverPublic = newestMtime(join(ROOT, 'server/public'), ['.html', '.js', '.css']);
 // MSI 里内嵌的那份服务端副本（build-msi.ps1 从 release/server 取的）——
@@ -147,7 +148,26 @@ if (existsSync(shellExe)) {
 }
 
 assertOrder(sharedSrc, sharedDist, 'shared/src ≤ shared/dist（服务端链路）');
-assertOrder(serverSrc, serverDist, 'server/src ≤ server/dist');
+
+// `server/src ≤ server/dist` 这条 mtime 断言在 v0.1.3 / 6d 被**换掉**了。
+//
+// 起因是一次误报：做静态判据的负向验证时往 `server/src/context.ts` 追加了一行注释，
+// 验证完用 `git checkout` 还原 —— **内容一字不差，但 mtime 变成现在**。
+// 于是这条断言红着说"打包用了旧产物"，而 `check:dist` 的内容指纹明明通过。
+//
+// 这就是 mtime 证明不了内容的又一个实例（决策 #113）：`tsc -b` 是增量的，
+// 内容没变就不会重新 emit，dist 的 mtime 自然停在旧时间。用 mtime 判"是否最新"，
+// 在"改过又改回"和"改了但产出没变"两种情况下都会误报。
+//
+// 现在改用内容指纹（与 `npm run check:dist` 同一判据、同一实现）：
+// 构建时把 src 的相对路径与字节混进 sha256 存进 `dist/.build-stamp.json`，
+// 这里重算一遍比对。判据更严格（真的能抓"没重编"），也不会被 mtime 骗。
+const serverStamp = checkStamp('server');
+if (serverStamp.ok) {
+  say(`   OK ${`server/dist 与 server/src 内容一致（${serverStamp.current.hash.slice(0, 12)}…）`.padEnd(34)}`.padEnd(52));
+} else {
+  for (const reason of serverStamp.reasons) fail(reason.trim());
+}
 
 /**
  * 目录内容比对：两份产物必须逐文件 sha256 相同。
@@ -205,6 +225,13 @@ if (serverArtifact) {
   assertOrder(serverDist, { mtime: serverArtifact.mtime }, 'server/dist ≤ 服务端 MSI');
   assertOrder(serverPublic, { mtime: serverArtifact.mtime }, 'server/public ≤ 服务端 MSI');
   assertOrder({ mtime: rulesNewest.mtime }, { mtime: serverArtifact.mtime }, 'rules ≤ 服务端 MSI');
+  // 包内规则必须与仓库**逐字节相同**（v0.1.3 / 6d）。
+  //
+  // 为什么这条不能只靠上面的 mtime 断言：`pack:server` 保留源文件时间戳，
+  // mtime 断言在"改了源码但没重新 pack"时依然通过 —— 那正是 mtime 骗人的老坑。
+  // 而规则是**数据**，两份拷贝一旦漂移，服务端审计与客户端预览会得出不同结论
+  // （八板块改造时包内那份还是六板块，实测过）。
+  compareTree(join(ROOT, 'rules'), join(ROOT, 'release/server/app/rules'), 'rules = 包内规则');
 }
 say('');
 
@@ -230,6 +257,24 @@ if (distAudit.ok) {
   for (const problem of distAudit.problems) fail(`client/dist 不健康：${problem}`);
 }
 
+// ── 功能哨兵（v0.1.3 生产反馈「MSI 缺 F5 界面」的防线）────────────────
+//
+// 上面那条 `client/dist 健康` 只保证产物**有内容**，不保证是**这一版**：
+// 一个两天前的 dist 结构完整、引用齐全，照样全绿。哨兵补的就是这个空档。
+//
+// 它必须落在明文窗口里：Tauri 把前端 brotli 压缩后内嵌，进 exe 之后任何界面文案
+// 都是 0 命中 —— 用 `strings MSI | grep 兼容模式` 得出的"缺功能"是假阴性。
+// 所以哨兵查的是 dist，不是 exe。
+const sentinelAudit = checkSentinels(join(ROOT, 'client/dist'));
+if (sentinelAudit.ok) {
+  say(`   OK ${`功能哨兵 ${sentinelAudit.results.length} 项全部命中（扫 ${sentinelAudit.scanned.files} 个产物）`.padEnd(34)}`.padEnd(52));
+  for (const result of sentinelAudit.results) {
+    say(`      ·  [${result.feature}] 「${result.text}」${result.hits} 处 → ${result.file}`);
+  }
+} else {
+  for (const problem of sentinelAudit.problems) fail(problem);
+}
+
 const embedAudit = auditShellAssets(shellExe, join(ROOT, 'client/dist'));
 if (embedAudit.ok) {
   say(`   OK ${`exe 内嵌了全部 ${embedAudit.checked} 个 dist 文件`.padEnd(34)}`.padEnd(52));
@@ -238,6 +283,26 @@ if (embedAudit.ok) {
     `exe 缺 ${embedAudit.missing.length}/${embedAudit.checked} 个内嵌资源键` +
       `（例：${embedAudit.missing.slice(0, 3).join('、')}）—— 这个包装上去就是白屏`,
   );
+}
+
+// 出厂件审计：审计**MSI 里那个** exe，而不是构建树里的那个。
+//
+// 原因见 bundle-health.mjs 的 auditMsiShellAssets 注释：Tauri 打完包会再 patch 一次
+// exe 写 bundle 类型，于是 `target/release/tcs-shell.exe` 与出厂件不是同一个二进制
+// （实测差 3 字节，mtime 反而更晚）。只审计构建树 = 审计了一个没发出去的文件。
+if (clientArtifact !== null) {
+  const shipped = auditMsiShellAssets(clientArtifact.path, join(ROOT, 'client/dist'));
+  if (shipped.skipped) {
+    say(`   ·  ${`出厂件审计跳过：${shipped.reason}`.padEnd(34)}`.padEnd(52));
+  } else if (shipped.ok) {
+    say(`   OK ${`MSI 内的 exe 内嵌了全部 ${shipped.checked} 个资源键`.padEnd(34)}`.padEnd(52));
+    say(`      出厂件 exe ${shipped.exeBytes} 字节 sha256 ${shipped.exeSha256.slice(0, 16)}…`);
+  } else {
+    fail(
+      `MSI 内的 exe 缺 ${shipped.missing.length}/${shipped.checked} 个资源键` +
+        `（例：${shipped.missing.slice(0, 3).join('、')}）—— 出厂件里的前端不是当前这一版`,
+    );
+  }
 }
 
 /** 体积回归断言，客户端与服务端共用 */

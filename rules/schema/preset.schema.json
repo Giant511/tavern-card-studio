@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://ebyte.local/tcs/preset.schema.json",
   "title": "TXT 分块预设格式（preset.json）",
-  "description": "定义标题样式、板块顺序与板块分隔符。blockOrder 必须是六个板块的完整排列；解析始终按标题位置，导出不重排，只有「应用预设」才按 blockOrder 排序。",
+  "description": "定义标题样式、板块顺序、板块分隔符与开场白多条分隔格式。blockOrder 可以是部分排列（缺的板块按内置顺序补齐并给 info 提示，v0.1.3 起不再硬报错）；解析始终按标题位置，导出不重排，只有「应用预设」才按 blockOrder 排序。",
   "type": "object",
   "required": ["schemaVersion", "id", "name", "version", "blockOrder", "headings", "separator"],
   "properties": {
@@ -23,16 +23,15 @@
     },
     "blockOrder": {
       "type": "array",
-      "minItems": 6,
-      "maxItems": 6,
+      "minItems": 1,
+      "maxItems": 8,
       "uniqueItems": true,
-      "description": "六个板块的排列。默认预设为 基本信息→性格→其他设定→特殊设定→用户相关设定→世界书。worldbook 不参与 description 拼装，但必须在排列中出现，保证顺序概念完整。",
+      "description": "八个板块的排列。默认预设为 基本信息→性格→其他设定→特殊设定→用户相关设定→对话示例→初始场景→世界书。缺项会被自动补齐（info 提示）；出现未知 id 或重复项仍判为错误。worldbook 不参与 description 拼装，但必须在排列中出现，保证顺序概念完整。",
       "items": { "$ref": "#/definitions/blockId" }
     },
     "headings": {
       "type": "object",
-      "description": "六个板块的标题模板与别名。别名必须覆盖全部六个板块，且不同板块之间不得共用同一条别名（否则解析二义）。",
-      "required": ["basic", "personality", "settings", "special", "user", "worldbook"],
+      "description": "八个板块的标题模板与别名。缺项用内置默认表补齐（info 提示）；不同板块之间不得共用同一条别名（否则解析二义）。",
       "additionalProperties": false,
       "properties": {
         "basic": { "$ref": "#/definitions/heading" },
@@ -40,6 +39,8 @@
         "settings": { "$ref": "#/definitions/heading" },
         "special": { "$ref": "#/definitions/heading" },
         "user": { "$ref": "#/definitions/heading" },
+        "chat-examples": { "$ref": "#/definitions/heading" },
+        "initial-scene": { "$ref": "#/definitions/heading" },
         "worldbook": { "$ref": "#/definitions/heading" }
       }
     },
@@ -62,6 +63,20 @@
         }
       }
     },
+    "greeting": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "初始场景板块里多条开场白的分隔格式（v0.1.3）。缺省用冻结默认值（空行 + --- + 空行）。第一条回 first_mes，其余按序回 alternate_greetings；板块内没有分隔行时视为单条开场白。",
+      "properties": {
+        "separator": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\n",
+          "description": "多条开场白之间的分隔串，必须含换行，且必须有一行非空文字作为识别标记。",
+          "examples": ["\\n\\n---\\n\\n"]
+        }
+      }
+    },
     "meta": {
       "type": "object",
       "additionalProperties": false,
@@ -73,7 +88,7 @@
   },
   "definitions": {
     "blockId": {
-      "enum": ["basic", "personality", "settings", "special", "user", "worldbook"]
+      "enum": ["basic", "personality", "settings", "special", "user", "chat-examples", "initial-scene", "worldbook"]
     },
     "heading": {
       "type": "object",

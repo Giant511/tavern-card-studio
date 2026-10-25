@@ -185,6 +185,72 @@
               </label>
             </article>
           </div>
+          <!-- ── 传输安全（v0.1.3 / F4）────────────────────────────
+               这一段全部由 /control/tls/status 驱动：
+                 · banners   —— 服务端算好的常驻警告（含"非回环 + 明文 = 公网暴露"的升级）
+                 · runtime   —— 实际在用的证书与端口（来自 worker 的 /api/stats）
+                 · config    —— 用户想用的配置（含证书全路径，仅控制面下发）
+               判据只在服务端写一次，前端只负责渲染 —— 两边各写一套就会出现
+               "日志说公网暴露、面板说仅限内网"这种自相矛盾。 -->
+          <article class="card" id="tls-card">
+            <div class="card-head">
+              <h3>传输安全</h3>
+              <span class="pill" id="tls-mode-pill">—</span>
+            </div>
+            <div class="tls-banners" id="tls-banners" hidden></div>
+
+            <div class="radio-row" id="cfg-tls-mode">
+              <label class="check"><input type="radio" name="cfg-tls-mode" value="off" /> 关闭（HTTP 明文）</label>
+              <label class="check"><input type="radio" name="cfg-tls-mode" value="selfsigned" /> 自签证书（selfsigned）</label>
+              <label class="check"><input type="radio" name="cfg-tls-mode" value="custom" /> 自定义证书（custom）</label>
+            </div>
+            <p class="hint" id="tls-mode-hint">
+              HTTP 与 HTTPS <strong>同时监听</strong>：先让客户端改到 https 地址验证通了，再考虑只留一个。
+              切换模式与更换证书<strong>不需要重启服务</strong>（监听层热重载，失败会自动回滚）。
+            </p>
+
+            <label class="field tls-port-field">
+              <span>HTTPS 端口</span>
+              <input id="cfg-tls-httpsPort" type="number" min="1" max="65535" />
+              <small class="hint">不能与 API 端口相同（两个协议各占一个端口）。</small>
+            </label>
+
+            <div id="tls-selfsigned-box" hidden>
+              <div class="tls-fingerprint">
+                <div class="tls-fingerprint-label">当前证书 SHA-256 指纹（拿去和客户端提示的核对）</div>
+                <code id="tls-fingerprint">—</code>
+              </div>
+              <div class="tls-meta">
+                <span>剩余 <strong id="tls-days">—</strong> 天</span>
+                <span>到期：<span id="tls-notafter">—</span></span>
+                <span id="tls-cert-subject"></span>
+              </div>
+              <div class="tls-regenerate">
+                <button class="btn btn-small" id="tls-regenerate" type="button">重新生成证书</button>
+                <span class="hint" id="tls-regenerate-msg"></span>
+              </div>
+              <p class="hint" id="tls-backup-hint"></p>
+            </div>
+
+            <div id="tls-custom-box" hidden>
+              <label class="field">
+                <span>证书文件（PEM）</span>
+                <input id="cfg-tls-certPath" type="text" spellcheck="false" placeholder="绝对路径，或相对数据目录的路径" />
+              </label>
+              <label class="field">
+                <span>私钥文件（PEM）</span>
+                <input id="cfg-tls-keyPath" type="text" spellcheck="false" placeholder="绝对路径，或相对数据目录的路径" />
+              </label>
+              <div class="tls-check" id="tls-check">—</div>
+              <p class="hint">
+                证书与私钥必须是<strong>同一对</strong>：不匹配时保存会被拒绝（与"启动时拒绝"同一条判据）。
+                服务端<strong>不会</strong>因为证书有问题而退回明文模式。
+              </p>
+            </div>
+
+            <div class="tls-listen" id="tls-listen">—</div>
+          </article>
+
           <article class="card">
             <div class="card-head">
               <h3>注册策略</h3>
@@ -331,15 +397,16 @@
             <article class="card">
               <h3>账户</h3>
               <table class="data-table">
-                <thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>注册时间</th><th>最后登录</th><th></th></tr></thead>
-                <tbody id="gov-accounts"><tr><td colspan="6" class="muted">读取中…</td></tr></tbody>
+                <thead><tr><th>用户名</th><th>uid</th><th>角色</th><th>状态</th><th>注册时间</th><th>最后登录</th><th></th></tr></thead>
+                <tbody id="gov-accounts"><tr><td colspan="7" class="muted">读取中…</td></tr></tbody>
               </table>
+              <p class="hint">uid 是注册时生成、此后不变的对外标识：用户名可以改，uid 不会变，审计里以它为准。</p>
             </article>
 
             <article class="card">
               <h3>仓库（全部账户）</h3>
               <table class="data-table">
-                <thead><tr><th>仓库</th><th>账户</th><th>卡片</th><th>默认</th><th>操作</th></tr></thead>
+                <thead><tr><th>仓库</th><th>归属（用户名 / uid）</th><th>卡片</th><th>默认</th><th>操作</th></tr></thead>
                 <tbody id="gov-repos"><tr><td colspan="5" class="muted">读取中…</td></tr></tbody>
               </table>
               <p class="hint">删除非空仓库需要先选择转移目标；默认仓库不能删，先转移默认。</p>
@@ -356,6 +423,32 @@
                 只想让它消失一段时间请用账户自己在客户端里「删除」（进回收站，可恢复）。
               </p>
             </article>
+
+            <!--
+              注销审计（v0.1.3 / F3，需求 3）。
+
+              为什么注销后还能看到记录：审计**不能跟着数据一起消失** ——
+              否则"谁在什么时候把某个账户删了"就无从追溯，而这正是审计要回答的问题。
+              事件表没有外键，owner_id 仍指向已删账户的内 id，uid 存在 detail 里。
+              保留期 90 天，由 worker 定时清理（保留期数字从服务端取，不在这里写死）。
+            -->
+            <article class="card">
+              <div class="card-head">
+                <h3>账户注销审计</h3>
+                <div class="btn-group">
+                  <button class="btn btn-small" id="gov-audit-refresh" type="button">刷新</button>
+                </div>
+              </div>
+              <table class="data-table">
+                <thead>
+                  <tr><th>时间</th><th>操作者</th><th>目标</th><th>路径</th><th>来源 IP</th><th>清理内容</th></tr>
+                </thead>
+                <tbody id="gov-audit"><tr><td colspan="6" class="muted">读取中…</td></tr></tbody>
+              </table>
+              <p class="hint" id="gov-audit-hint">
+                审计事件保留 90 天；账户注销后这些记录仍然保留，用于追溯"谁在什么时候注销了谁"。
+              </p>
+            </article>
           </div>
         </section>
 
@@ -368,6 +461,45 @@
     </div>
 
     <div class="toast" id="toast" hidden></div>
+
+    <!--
+      注销账户的二次确认弹窗（v0.1.3 / F3）。
+
+      为什么用自建弹窗而不是 window.confirm / prompt：
+        ① 需求要求「二次确认」，而 confirm 只有一个"确定"按钮 —— 手滑即毁；
+        ② prompt 虽然能要输入，但它是**原生对话框**，无头截图截不到，
+           而这一批的验收要求"确认弹窗含输入确认"的截图。
+      所以这里自己画一个，与客户端的同名弹窗保持同一套交互。
+    -->
+    <div class="modal-overlay" id="gov-purge-overlay" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="gov-purge-title">
+        <div class="modal-head">
+          <h3 id="gov-purge-title">注销账户</h3>
+          <button class="btn btn-small" id="gov-purge-close" type="button">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="purge-warning">
+            <p class="purge-warning-title">这是不可恢复的操作</p>
+            <p class="purge-warning-text">
+              会把该账户连同它的全部数据从磁盘上删除：账户行、全部仓库、卡片（含历史版本与回收站残留）、
+              仓库令牌、登录会话。没有任何回收站。注销动作会写入审计日志并保留 90 天。
+            </p>
+          </div>
+          <p class="muted" id="gov-purge-summary">正在统计该账户下的数据…</p>
+          <label class="field">
+            <span>输入用户名 <code id="gov-purge-expect"></code> 以确认</span>
+            <input id="gov-purge-confirm-username" type="text" autocomplete="off" spellcheck="false" />
+          </label>
+          <p class="hint" id="gov-purge-msg"></p>
+        </div>
+        <div class="modal-foot">
+          <span class="hint">操作者、目标 uid、时间与来源 IP 都会记入审计</span>
+          <button class="btn" id="gov-purge-cancel" type="button">取消</button>
+          <button class="btn btn-danger" id="gov-purge-submit" type="button" disabled>永久注销</button>
+        </div>
+      </div>
+    </div>
+
     <script src="/app.js"></script>
   </body>
 </html>

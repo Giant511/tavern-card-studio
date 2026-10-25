@@ -12,6 +12,9 @@
  * 这三条与服务端响应里的 `note` 是同一句话的两种呈现。
  */
 
+import { validateRepoName } from '@tcs/shared';
+
+import { askConfirm } from '../contract';
 import {
   RepoClientError,
   createRepo,
@@ -59,6 +62,13 @@ export class RepoDialog {
   private readonly bodyEl: HTMLElement;
   private readonly repoListEl: HTMLElement;
   private readonly tokenListEl: HTMLElement;
+  /**
+   * 本次打开面板期间签发过的令牌原文（按展示前缀索引）。
+   *
+   * 服务端只存 sha256，原文只在签发响应里出现一次；这个 Map 让"刚签发的那一把"
+   * 在列表里也能复制全文。close() 时清空 —— 一次性凭证不该长期驻留内存。
+   */
+  private readonly liveRawByPrefix = new Map<string, string>();
   private readonly noteEl: HTMLElement;
   private readonly newRepoInput: HTMLInputElement;
   private readonly scopeInputs: HTMLInputElement[] = [];
@@ -172,6 +182,25 @@ export class RepoDialog {
     issuedNote.dataset['role'] = 'token-issued-note';
     this.issuedBox.append(issuedTitle, issuedWarn, issuedRow, issuedNote);
 
+    /*
+     * 签发成功时的使用指引（v0.1.3 / F5 后半）。
+     *
+     * 这是本次反馈的直接来源：令牌签出来了，但客户端的任何地方都不能粘它 ——
+     * 用户拿着字符串不知道往哪儿放。所以在**唯一能看到原文的那一刻**
+     * 就把下一步写成可照抄的一句话，而不是让人去翻文档。
+     *
+     * 文案里的路径要与真实界面逐字一致（登录 → 使用仓库令牌连接），
+     * 否则用户按字面找不到（这类"文档指向不存在的入口"是本仓库踩过的坑）。
+     */
+    const issuedGuide = el(
+      'p',
+      'field-hint token-guide',
+      '在另一台设备的客户端：打开「登录」→ 点「使用仓库令牌连接」→ 粘贴此令牌 → 连接。' +
+        '之后那台设备只能访问本仓库，不能管理仓库与令牌。',
+    );
+    issuedGuide.dataset['role'] = 'token-issued-guide';
+    this.issuedBox.append(issuedGuide);
+
     const tokenListHead = el('div', 'form-title-row');
     tokenListHead.append(el('h3', 'form-title', '已签发的令牌'));
     this.tokenListEl = el('div', 'token-list');
@@ -211,6 +240,8 @@ export class RepoDialog {
     // 关闭时清空原文：留在 DOM 里，截屏/远程协助时会被看见
     this.issuedValue.value = '';
     this.issuedBox.hidden = true;
+    // 内存里的原文也一起清 —— 一次性凭证不该长期驻留
+    this.liveRawByPrefix.clear();
   }
 
   private async reload(): Promise<void> {
@@ -316,8 +347,17 @@ export class RepoDialog {
     if (!config) return;
     const input = window.prompt(`「${repo.name}」的新名字：`, repo.name);
     if (input === null) return;
-    const name = input.trim();
-    if (name === '' || name === repo.name) return;
+
+    // 与新建同一套校验（`@tcs/shared` 的 validateRepoName）：先本地判，别等往返一次才知道不合法。
+    // 注意传**原始输入**而不是 trim 后的：首尾空白是明确拒绝项，静默 trim 会让
+    // "存进去的名字"和"用户以为的名字"不一致。
+    const check = validateRepoName(input);
+    if (!check.ok) {
+      this.deps.notify(check.message ?? '仓库名不合法', 'warn');
+      return;
+    }
+    if (check.name === repo.name) return;
+    const name = check.name;
     try {
       await renameRepo(config, repo.id, { name });
       this.deps.notify(`已改名为「${name}」`, 'ok');
@@ -330,10 +370,11 @@ export class RepoDialog {
   private async setDefault(repo: RepoSummary): Promise<void> {
     const config = this.deps.getConfig();
     if (!config) return;
-    const ok = window.confirm(
+    const ok = await askConfirm(
       `把「${repo.name}」设为默认仓库？\n\n` +
         '默认仓库是上传时的预选目标，也是唯一不能删除的那个。\n' +
         '原来的默认仓库会变成普通仓库（之后才可以删）。',
+      '设为默认仓库',
     );
     if (!ok) return;
     try {
@@ -377,14 +418,15 @@ export class RepoDialog {
         this.deps.notify('没有选中有效的目标仓库，已取消', 'warn');
         return;
       }
-      const confirm = window.confirm(
+      const confirm = await askConfirm(
         `把 ${String(repo.cardCount)} 张卡片转入「${target.name}」，然后删除「${repo.name}」？\n\n` +
           '这个操作会同时吊销该仓库的令牌。',
+        '删除仓库',
       );
       if (!confirm) return;
       transferTo = target.id;
     } else {
-      if (!window.confirm(`删除空仓库「${repo.name}」？`)) return;
+      if (!(await askConfirm(`删除空仓库「${repo.name}」？`, '删除仓库'))) return;
     }
 
     try {
@@ -445,18 +487,86 @@ export class RepoDialog {
         revoke.addEventListener('click', () => void this.revoke(token.id, token.name));
         head.append(revoke);
       }
-      row.append(head);
+
+      /*
+       * 每条的复制按钮（v0.1.3 / F5 后半，需求第 4 条）。
+       *
+       * **这里有个不能糊弄的事实**：服务端只存 sha256，原文只在签发响应里出现一次。
+       * 所以"已签发列表里的复制"分两种情况，必须如实区分 —— 假装能复制全文，
+       * 用户会粘一把前缀到登录框里，然后得到"格式不对"，却以为是自己复制错了：
+       *
+       *   · 令牌是**本次面板里刚签发**的 → 原文还在内存（`liveRawByPrefix`），复制全文；
+       *   · 更早签发的 → 只能复制前缀，按钮直接写「复制前缀」并说明原因。
+       *
+       * 与其给一个"看起来一样、实际粘不过去"的按钮，不如把两种状态在按钮文字上分开。
+       */
+      const liveRaw = this.liveRawByPrefix.get(token.tokenPrefix);
+      const copyLabel = liveRaw === undefined ? '复制前缀' : '复制';
+      const copy = el('button', 'btn small ghost', copyLabel) as HTMLButtonElement;
+      copy.type = 'button';
+      copy.dataset['role'] = 'token-copy-prefix';
+      copy.dataset['tokenPrefix'] = token.tokenPrefix;
+      copy.title =
+        liveRaw === undefined
+          ? '原文只在签发时显示一次，这里无法再取回；已丢失请吊销后重新签发'
+          : '复制完整令牌（本次打开面板时签发，原文仍在内存里）';
+      copy.addEventListener('click', () => void this.copyRowToken(token.tokenPrefix, liveRaw));
+      head.append(copy);
+
+      // 使用指引：每条都带，因为用户是"看到这一行才想起要给别人用"
+      const guide = el(
+        'p',
+        'field-hint token-row-guide',
+        liveRaw === undefined
+          ? '用法（另需原文）：在另一台设备的客户端：登录 → 使用仓库令牌连接 → 粘贴令牌。' +
+            '原文已不在本机，如需给别人用请吊销后重新签发。'
+          : '在另一台设备的客户端：登录 → 使用仓库令牌连接 → 粘贴此令牌。',
+      );
+      guide.dataset['role'] = 'token-row-guide';
+      row.append(head, guide);
       this.tokenListEl.append(row);
+    }
+  }
+
+  /**
+   * 复制某一行的令牌。
+   *
+   * `liveRaw` 为 undefined 时复制前缀，并**明确告知这不是可用凭证** ——
+   * 静默复制一个前缀是最坏的结果（用户以为拿到了令牌）。
+   */
+  private async copyRowToken(prefix: string, liveRaw: string | undefined): Promise<void> {
+    const value = liveRaw ?? prefix;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('剪贴板不可用');
+      await navigator.clipboard.writeText(value);
+      if (liveRaw === undefined) {
+        this.deps.notify(
+          `已复制前缀 ${prefix}…（不是完整令牌，黏不过去；原文只在签发时显示一次）`,
+          'warn',
+        );
+      } else {
+        this.deps.notify('已复制完整令牌到剪贴板', 'ok');
+      }
+    } catch {
+      this.deps.notify(
+        liveRaw === undefined
+          ? `无法访问剪贴板；前缀是 ${prefix}（不是完整令牌）`
+          : '无法访问剪贴板：请用「签发」区里的复制按钮，或手动选中复制',
+        'warn',
+      );
     }
   }
 
   private async createNewRepo(): Promise<void> {
     const config = this.deps.getConfig();
-    const name = this.newRepoInput.value.trim();
-    if (!config || name === '') {
-      this.deps.notify('仓库名不能为空', 'warn');
+    if (!config) return;
+    // 传原始输入：首尾空白是拒绝项，不静默 trim（与改名字同一条规则）
+    const check = validateRepoName(this.newRepoInput.value);
+    if (!check.ok) {
+      this.deps.notify(check.message ?? '仓库名不合法', 'warn');
       return;
     }
+    const name = check.name;
     this.setBusy(true, '新建仓库…');
     try {
       await createRepo(config, { name });
@@ -502,6 +612,13 @@ export class RepoDialog {
   private showIssued(issued: IssuedRepoToken): void {
     this.issuedValue.value = issued.token;
     this.issuedBox.hidden = false;
+    /*
+     * 把原文按前缀记进内存，供"已签发列表"那一行的复制按钮使用。
+     *
+     * 只活在这个面板的打开期内（close() 里清空）：服务端拿不回原文，
+     * 我们也不该把它留在内存里更久 —— 那是把"一次性凭证"变成"长期驻留的密钥"。
+     */
+    if (issued.tokenPrefix !== '') this.liveRawByPrefix.set(issued.tokenPrefix, issued.token);
     const noteEl = this.issuedBox.querySelector<HTMLElement>('[data-role="token-issued-note"]');
     if (noteEl) {
       const parts = [`仓库：${issued.repoName}`, `范围：${describeScopes(issued.scopes)}`, `有效期：${describeExpiry(issued.expiresAt)}`];

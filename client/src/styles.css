@@ -1,14 +1,21 @@
 /* T6.1 六板块编辑器样式。
-   配色变量 --tcs-fg/--tcs-bg/--tcs-caret/--tcs-selection 由高亮方案（规则资产）
-   在运行时写入 :root（highlight.ts::applySchemeStyles），这里只给兜底值。 */
+   配色分两层（v0.1.3 / F7）：
+
+   ① **应用界面**用 --app-* / --panel / --border 这些设计令牌，**永远不受高亮方案影响**；
+   ② **内容区**（CM6 编辑器与渲染预览）用 --tcs-fg/--tcs-bg/--tcs-caret/--tcs-selection，
+      由高亮方案（规则资产）在运行时写入这两个容器，见
+      highlight.ts::applySchemeStyles。
+
+   为什么必须分开：v0.1.2 之前 applySchemeStyles 把 --tcs-* 写到 `:root`，
+   而界面元素又直接读 --tcs-fg/--tcs-bg —— 于是一套深色高亮方案会把**顶栏、
+   对话框、审计面板**一起染黑，界面像是换了主题。高亮方案只该决定"文字怎么着色"，
+   不该决定应用外壳长什么样。 */
 
 :root {
   color-scheme: light;
-  --tcs-fg: #2b2b2b;
-  --tcs-bg: #fbf9f4;
-  --tcs-caret: #b45309;
-  --tcs-selection: #f2e3c6;
 
+  /* 应用界面令牌（与高亮方案完全解耦） */
+  --app-fg: #2b2b2b;
   --app-bg: #f4f5f7;
   --panel: #ffffff;
   --border: #e2e5ea;
@@ -50,7 +57,7 @@ body {
 body {
   margin: 0;
   background: var(--app-bg);
-  color: var(--tcs-fg);
+  color: var(--app-fg);
   font: 13px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   display: grid;
   /*
@@ -267,6 +274,20 @@ body {
   cursor: not-allowed;
 }
 
+/*
+ * 主按钮禁用时要**真的变灰**，不能只是半透明。
+ *
+ * 起因：仓库令牌只有 read 时，「上传当前内容」的 `disabled` 已经正确置位
+ * （dump 里能读到 `disabled=""` 与 title 说明），但它底色仍是 accent 蓝，
+ * 半透明之后只是"淡一点的蓝"—— 用户看到的是一个看起来能点的按钮。
+ * 需求写的是"按 scope 置灰"，视觉上不像置灰就等于没做到。
+ */
+.btn.primary:disabled {
+  background: var(--muted);
+  border-color: var(--muted);
+  color: #fff;
+}
+
 .btn.small {
   padding: 3px 10px;
   font-size: 12px;
@@ -479,6 +500,11 @@ body {
 
 /* ── CodeMirror 容器 ────────────────────────────────── */
 .cm-host {
+  /* 内容区兜底配色：高亮方案会在这两个容器上覆盖它们（见文件头 ②） */
+  --tcs-fg: #2b2b2b;
+  --tcs-bg: #fbf9f4;
+  --tcs-caret: #b45309;
+  --tcs-selection: #f2e3c6;
   max-height: 46vh;
   overflow: auto;
   background: var(--tcs-bg);
@@ -528,6 +554,12 @@ body {
 
 /* ── 渲染预览（renderInlineHtml 产物）────────────────── */
 .preview {
+  /* 渲染预览也是内容区：跟随高亮方案的底色，否则深色方案下编辑器是深色、
+     预览却是浅色，同一个板块的两半看起来像两个东西。 */
+  --tcs-fg: #2b2b2b;
+  --tcs-bg: #fbf9f4;
+  --tcs-caret: #b45309;
+  --tcs-selection: #f2e3c6;
   padding: 10px 12px;
   border-top: 1px dashed var(--border);
   background: var(--tcs-bg);
@@ -644,7 +676,7 @@ body {
 
 .issue-block {
   font-weight: 600;
-  color: var(--tcs-fg);
+  color: var(--app-fg);
 }
 
 .issue-msg {
@@ -767,7 +799,7 @@ body {
 
 .icon-btn:hover {
   background: #f2f4f7;
-  color: var(--tcs-fg);
+  color: var(--app-fg);
 }
 
 .form-section {
@@ -811,7 +843,7 @@ body {
   font: inherit;
   font-family: ui-monospace, Consolas, monospace;
   font-size: 12px;
-  color: var(--tcs-fg);
+  color: var(--app-fg);
   background: #fff;
 }
 
@@ -835,7 +867,7 @@ body {
 
 .settings-identity {
   font-size: 12.5px;
-  color: var(--tcs-fg);
+  color: var(--app-fg);
   padding: 5px 0;
 }
 
@@ -1356,7 +1388,7 @@ body {
 }
 
 .preview-value {
-  color: var(--tcs-fg);
+  color: var(--app-fg);
   font-family: ui-monospace, Consolas, monospace;
   font-size: 11px;
   word-break: break-all;
@@ -1630,7 +1662,7 @@ body {
   font-family: ui-monospace, Consolas, monospace;
   font-size: 11px;
   word-break: break-all;
-  color: var(--tcs-fg);
+  color: var(--app-fg);
 }
 
 .receipt-notes {
@@ -2120,6 +2152,35 @@ body {
   white-space: pre-wrap;
 }
 
+/* ── 仓库令牌连接（v0.1.3 / F5 后半）────────────────────── */
+/*
+ * 令牌输入用等宽字体：47 个字符要能一眼看出"粘全了没有"，
+ * 而比例字体下 tcr_ 后面的 base64url 长度很难凭肉眼判断。
+ * 不遮挡（不 -webkit-text-security）：它是授权凭证不是密码，
+ * 遮住只会让人发现不了自己粘进了多余空格。
+ */
+.auth-token-input {
+  font-family: var(--mono, ui-monospace, 'Cascadia Mono', Consolas, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+  word-break: break-all;
+}
+
+.auth-token-note {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+/* 当前处于令牌模式的那个入口按钮：与普通 ghost 区分开，避免"点了没反应"的错觉 */
+.btn.ghost[data-active='1'] {
+  border-color: var(--accent, #6c8cff);
+  color: var(--accent, #6c8cff);
+}
+
+
 /* ── 账户：我的卡片列表（T10.7）────────────────────────── */
 .cards-modal {
   width: min(860px, 100%);
@@ -2236,6 +2297,110 @@ body {
   background: #fdf1f0;
 }
 
+/*
+ * 实心危险按钮（v0.1.3 / F3「永久注销」）。
+ *
+ * 只给**不可恢复**的动作用。`.btn.danger.small` 是描边样式（用于行内操作），
+ * 而弹窗底部那个是最终确认，重量必须压过旁边的「取消」——
+ * 两个看起来一样的按钮并排，是最容易点错的一种布局。
+ */
+.btn.danger:not(.small) {
+  background: #b42318;
+  border-color: #b42318;
+  color: #fff;
+}
+
+.btn.danger:not(.small):hover:not(:disabled) {
+  background: #93190f;
+  border-color: #93190f;
+}
+
+.btn.danger:not(.small):disabled {
+  /* 用户名没打对之前是禁用态：必须明显"按不下去"，而不是淡红色 */
+  background: var(--muted);
+  border-color: var(--muted);
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── 注销账户确认弹窗（v0.1.3 / F3）────────────────────── */
+.account-delete-modal {
+  width: min(560px, 100%);
+}
+
+/*
+ * 内边距与行距必须显式给。
+ *
+ * 上一轮只写了 `.account-delete-modal { width }`，于是它拿不到下面
+ * `.auth-modal .modal-body` 那条（选择器不匹配），`.modal-body` 基类本身
+ * **既没有 padding 也没有 gap** —— 结果警告块、统计列表、提示句、输入框
+ * 全部贴在一起，视觉上分不清哪些字属于哪一段（截图验收时看到）。
+ *
+ * 这是"共用基类 + 按对话框逐个加样式"这种做法的固有陷阱：
+ * 新增一个对话框时最容易忘的就是这两条。教训记在决策表 #142。
+ */
+.account-delete-modal .modal-body {
+  padding: 22px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.account-delete-warning {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #fdf1f0;
+  border: 1px solid #f1b5ae;
+  border-left: 3px solid #b42318;
+}
+
+.account-delete-warning-title {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #b42318;
+}
+
+.account-delete-warning-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #7a2e26;
+}
+
+.account-delete-stats {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--muted);
+}
+
+.account-delete-stats[data-state='unknown'] {
+  /* 读不到统计时不能显示成普通的灰字 —— 那会被当成"没什么可删的" */
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #fff8e6;
+  border: 1px solid #f0d38a;
+  color: #7a5a10;
+}
+
+.account-delete-stats-title {
+  margin: 0 0 2px;
+  font-weight: 600;
+  color: var(--text, inherit);
+}
+
+.account-delete-stats-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.account-delete-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .cards-row.deleted .cards-row-name {
   text-decoration: line-through;
   opacity: 0.7;
@@ -2309,6 +2474,36 @@ body {
   font-size: 11px;
   color: var(--muted);
 }
+
+/*
+ * 仓库令牌模式的说明条（v0.1.3 / F5 后半）。
+ *
+ * 与 `.sync-repo-row` 互斥出现：下拉隐藏时这一行顶上来，把
+ * 「为什么只有一个仓库」讲清楚。加左边框做出"这是一条状态说明"的视觉重量，
+ * 免得被当成普通小字忽略 —— 用户最容易困惑的正是"我的其他仓库去哪了"。
+ */
+.sync-repo-token-row {
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border-left: 3px solid var(--accent, #6c8cff);
+  background: var(--panel-alt, rgba(108, 140, 255, 0.08));
+}
+
+.sync-repo-token-label {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sync-repo-token-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
 
 .sync-target-repo {
   font-size: 11px;
@@ -2501,6 +2696,45 @@ body {
   font-size: 11px;
   color: var(--muted);
 }
+
+/* 每条令牌下面的使用指引（v0.1.3 / F5 后半）：小字、不与主行争视觉重量 */
+.token-row-guide {
+  margin: 4px 0 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+/* 签发成功区里的那条指引：比列表里的更显眼一点，因为这是唯一能看到原文的时刻 */
+.token-guide {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--panel-alt, rgba(108, 140, 255, 0.08));
+  border-left: 3px solid var(--accent, #6c8cff);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+/* 设置页「两条凭证路径」说明：分行显示，不要挤成一坨 */
+.settings-path-hint {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  line-height: 1.6;
+}
+
+.settings-path-hint strong {
+  font-size: 11px;
+  color: var(--text, inherit);
+}
+
+.settings-path-line {
+  font-size: 11px;
+  color: var(--muted);
+}
+
 
 .token-row-badge {
   font-size: 11px;

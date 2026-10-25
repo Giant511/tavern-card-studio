@@ -13,6 +13,7 @@ import { dirname } from 'node:path';
 import type { AuditSummary } from '@tcs/shared';
 
 import { ALL_CARDS, scopeSql, type CardScope } from './card-scope.js';
+import { backfillUserUids } from './user-uid.js';
 
 export type VersionKind = 'upload' | 'update' | 'rollback' | 'import';
 
@@ -125,6 +126,7 @@ export interface EventRow {
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
+  uid TEXT NOT NULL DEFAULT '',
   username TEXT NOT NULL,
   username_key TEXT NOT NULL,
   password_hash TEXT NOT NULL,
@@ -347,6 +349,22 @@ export class Db {
      */
     ensureColumn(this.handle, 'events', 'owner_id', 'owner_id TEXT');
     this.handle.exec('CREATE INDEX IF NOT EXISTS idx_events_owner ON events(owner_id, id DESC)');
+
+    /*
+     * v0.1.3（F2）：用户对外标识 `uid`。
+     *
+     * 为什么不能继续只用 `id`：`id` 是内部主键（uuid），而且用户名可改、可重名
+     * （见下面补号的注释），治理与审计需要一个**稳定锚点**来回指"同一个人"。
+     *
+     * 默认值给空串是刻意的：`ALTER TABLE ... ADD COLUMN` 不能带非常量默认值，
+     * 而既有行必须在同一次启动里补齐 —— 所以补号在下面显式做，并断言不留空串。
+     * 不给"看起来像 uid"的假默认（如 'usr_unknown'）：那会让补号逻辑误以为
+     * 已处理过，所有老账户从此共用一个 uid。
+     */
+    ensureColumn(this.handle, 'users', 'uid', "uid TEXT NOT NULL DEFAULT ''");
+    backfillUserUids(this.handle);
+    // 唯一索引必须在补号之后建：先建会因为多行空串直接失败。
+    this.handle.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_uid ON users(uid)');
   }
 
   close(): void {

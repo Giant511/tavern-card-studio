@@ -43,6 +43,8 @@ import { methodNotAllowed, sendError, sendJson } from './http/responses.js';
 import { Router, type RouteContext } from './http/router.js';
 import { createLogger, type Logger } from './log.js';
 import { Db } from './storage/db.js';
+import { certsBackupDir, ensureSelfSigned } from './tls/certificate.js';
+import { inspectTlsInputs, resolveTlsPath, tlsSecurityBanners, type TlsInputCheck } from './tls/panel.js';
 import { UserStore } from './storage/users.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
@@ -418,6 +420,15 @@ export async function startSupervisor(loaded: LoadedConfig, options: SupervisorO
         .map((row) => ({
           id: row.id,
           username: row.username,
+          /*
+           * uid 必须返回（v0.1.3 / F3 补）。
+           *
+           * 治理页的账户表有 uid 一列，前端写的是 `item.uid || '—'` ——
+           * 而这里一直没返回它，于是那一列**永远是"—"**，看起来像"老账户没有 uid"。
+           * 治理页要靠 uid 辨认人（用户名可改），注销审计里也以 uid 为准，
+           * 所以这一列必须真的有值。
+           */
+          uid: row.uid,
           role: row.role,
           status: row.status,
           createdAt: row.created_at,
@@ -456,6 +467,179 @@ export async function startSupervisor(loaded: LoadedConfig, options: SupervisorO
     }
   });
 
+  /**
+   * 传输安全状态（v0.1.3 / F4 需求第 1 条最后一项）。
+   *
+   * 三件事必须一起给，否则面板只能各猜一半：
+   *   ① **配置**（用户想用什么）—— mode / httpsPort / 证书路径；
+   *   ② **运行时**（实际在用什么）—— 来自 worker 的 `/api/stats`，含指纹与剩余天数；
+   *   ③ **采样时间**—— 需求明确要求"标注数据来源时间"。
+   *
+   * 为什么要有采样时间：面板是**快照式**的，用户可能开着页面去改配置文件、
+   * 去点重启，回来看到的还是十分钟前的状态。没有时间戳，"HTTPS 未监听"
+   * 到底是"现在没监听"还是"十分钟前没监听"分不清。
+   *
+   * 证书路径**在这里下发全路径**（`configSummary` 不下发）：控制面只有持令牌的
+   * 管理员能访问，而 `/api/stats` 会把配置下发给任何已鉴权客户端。
+   */
+  router.get('/control/tls/status', async (_ctx) => {
+    const sampledAt = new Date().toISOString();
+    const stats = await fetchWorkerStats(config);
+    const runtime = (stats?.['tls'] ?? null) as Record<string, unknown> | null;
+
+    const httpsPort = typeof runtime?.['httpsPort'] === 'number' ? (runtime['httpsPort'] as number) : null;
+    const days = typeof runtime?.['daysUntilExpiry'] === 'number' ? (runtime['daysUntilExpiry'] as number) : null;
+    const notAfter = typeof runtime?.['notAfter'] === 'string' ? (runtime['notAfter'] as string) : null;
+
+    sendJson(_ctx.res, 200, {
+      sampledAt,
+      /** 数据来源，面板原样显示（需求要"标注数据来源"） */
+      source: stats === null ? 'none' : 'GET /api/stats',
+      workerRunning: stats !== null,
+      config: {
+        mode: config.tls.mode,
+        httpsPort: config.tls.httpsPort,
+        certPath: config.tls.certPath,
+        keyPath: config.tls.keyPath,
+        // 解析后的绝对路径：面板回显"实际读的是哪个文件"，避免相对路径歧义
+        resolvedCertPath: resolveTlsPath(config.dataDir, config.tls.certPath),
+        resolvedKeyPath: resolveTlsPath(config.dataDir, config.tls.keyPath),
+        /** 重新生成时旧证书的去处（面板要写清楚，用户才知道去哪找回） */
+        backupDir: certsBackupDir(config.dataDir),
+        dataDir: config.dataDir,
+        /** API 监听地址：决定"off 模式是否算公网暴露" */
+        host: config.host,
+      },
+      runtime,
+      listening: {
+        // worker 能应答 stats 就说明 HTTP 在监听；否则状态未知（null ≠ 没监听）
+        http: stats === null ? null : { host: config.host, port: config.port },
+        https: httpsPort === null ? null : { host: config.host, port: httpsPort },
+      },
+      banners: tlsSecurityBanners({
+        mode: config.tls.mode,
+        host: config.host,
+        httpsPort,
+        expiry: days !== null && notAfter !== null ? { daysUntilExpiry: days, notAfter } : null,
+        extra: [],
+      }),
+      note:
+        stats === null
+          ? '数据面（worker）未运行：HTTPS 监听状态未知。此时保存的传输安全配置会在下次启动时生效。'
+          : null,
+    });
+  });
+
+  /**
+   * custom 模式的即时校验（需求第 1 条：存在性检查 + 公私钥匹配，即时显示结果）。
+   *
+   * 只**检查**不写盘，所以可以随便调（面板在输入框里 debounce 调用）。
+   * 保存时 `PUT /control/config` 会用同一段实现再拦一次 —— 前端禁用按钮是
+   * UX，服务端拒绝才是判据；只做前者等于把安全交给浏览器。
+   */
+  router.post('/control/tls/inspect', async (_ctx) => {
+    const body = JSON.parse(_ctx.body.toString('utf8') || '{}') as Record<string, unknown>;
+    const rawMode = body['mode'];
+    const mode =
+      rawMode === 'off' || rawMode === 'selfsigned' || rawMode === 'custom' ? rawMode : config.tls.mode;
+    const certPath = typeof body['certPath'] === 'string' ? body['certPath'] : config.tls.certPath;
+    const keyPath = typeof body['keyPath'] === 'string' ? body['keyPath'] : config.tls.keyPath;
+
+    let check: TlsInputCheck;
+    try {
+      check = await inspectTlsInputs({ mode, dataDir: config.dataDir, certPath, keyPath });
+    } catch (error) {
+      // inspectTlsInputs 已把常见问题转成 problems；走到这里说明是意外错误
+      // （比如权限不足读不了文件），如实报出来而不是 500 一片空白
+      throw new AppError(400, 'TLS_CERT_INVALID', `检查证书失败：${(error as Error).message}`);
+    }
+    sendJson(_ctx.res, 200, check);
+  });
+
+  /**
+   * 重新生成自签证书（需求第 1 条：selfsigned 的「重新生成」按钮）。
+   *
+   * 旧证书会被 `ensureSelfSigned` 移到 `data/certs-backup/<时间戳>-server.crt`。
+   * 生成完**立刻触发一次热更**：否则面板显示新指纹、实际监听还在用旧证书，
+   * 用户拿面板上的指纹去核对客户端会得出"证书不对"的错误结论。
+   */
+  router.post('/control/tls/regenerate', async (_ctx) => {
+    let result: Awaited<ReturnType<typeof ensureSelfSigned>>;
+    try {
+      result = await ensureSelfSigned({
+        dataDir: config.dataDir,
+        force: true,
+        commonName: 'Tavern Card Studio Server',
+      });
+    } catch (error) {
+      /*
+       * 面板只该看到**结构化原因**，不该看到 `Command failed: icacls …` 这种
+       * 原始 exec 消息 —— 它带着内部路径，而且 stderr 按控制台代码页编码、
+       * 经 Node 按 UTF-8 解码后就是一堆 ◆。真机事故里用户截图里那些 ◆ 正是它。
+       * 完整错误进日志，面板拿一句话。
+       */
+      logger.error('supervisor.tls.regenerate_failed', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      throw new AppError(
+        500,
+        'TLS_REGENERATE_FAILED',
+        `生成自签证书失败：${sanitizeTlsError(error)}`,
+        { hint: '完整原因已写入服务端日志（logs 目录）；证书与私钥仍是上一份，HTTPS 未受影响。' },
+      );
+    }
+
+    /*
+     * ACL 收紧失败的降级处理（v0.1.3 真机事故）。
+     *
+     * 证书已经可用，所以这里是 **warn 而不是 error**：
+     * 日志 + 应用事件日志各留一条，面板回执里也带出去。
+     * 需求明确：ACL 是纵深防御，不是门禁，不能因为它让证书功能不可用。
+     */
+    for (const problem of result.aclProblems) {
+      logger.warn('tls.acl.warn', { message: problem });
+      try {
+        writeApplicationEvent(`TavernCardStudio: 私钥 ACL 未能收紧（${problem.slice(0, 120)}）`);
+      } catch {
+        // 事件日志不可用（非 Windows / 无权限）不该反过来影响主流程
+      }
+    }
+
+    let reload: { attempted: boolean; ok: boolean; error: string | null } = {
+      attempted: false,
+      ok: false,
+      error: null,
+    };
+    if (config.tls.mode === 'selfsigned') {
+      const reply = await callWorkerTlsReload(config);
+      reload = { attempted: true, ok: reply.ok, error: reply.error };
+    }
+
+    logger.info('supervisor.tls.regenerated', {
+      fingerprint: result.info.fingerprint,
+      notAfter: result.info.notAfter,
+      backupPath: result.backupPath,
+      reloaded: reload.ok,
+      aclWarnings: result.aclProblems.length,
+    });
+
+    sendJson(_ctx.res, 200, {
+      info: result.info,
+      /** 旧证书备份到哪（null = 之前没有证书，也就没有备份） */
+      backupPath: result.backupPath,
+      backupDir: certsBackupDir(config.dataDir),
+      reload,
+      /** ACL 未能收紧的原因（空数组 = 一切正常）；面板据此显示黄色提示 */
+      warnings: result.aclProblems,
+      note:
+        config.tls.mode === 'selfsigned'
+          ? reload.ok
+            ? '已重新生成并热更：客户端下次连接会看到新的证书指纹'
+            : `新证书已生成，但热更失败：${reload.error ?? ''}`
+          : '当前不是 selfsigned 模式，新证书会在切换到该模式时生效',
+    });
+  });
+
   router.put('/control/config', async (_ctx) => {
     const patch = JSON.parse(_ctx.body.toString('utf8') || '{}') as Record<string, unknown>;
     let candidate: ServerConfigFile;
@@ -465,7 +649,43 @@ export async function startSupervisor(loaded: LoadedConfig, options: SupervisorO
     } catch (error) {
       throw new AppError(400, 'BAD_REQUEST', (error as Error).message);
     }
+
+    /*
+     * ── 传输安全的前置拦截（v0.1.3 / F4 需求第 1 条尾部）───────────
+     *
+     * custom 模式在写盘**之前**就校验证书：存在性 + 公私钥匹配。
+     * 需求明确"不匹配禁止保存并回显原因 —— 与拒绝启动语义对齐"。
+     *
+     * 为什么不能"先存再靠热更报错"：那样配置里就留了一份起不来的 tls 段，
+     * 下次重启服务直接死在启动路径上；而用户看到的是"保存成功了"，
+     * 直到重启才发现。前置拦截把这件事变成一次可读的拒绝。
+     */
+    if (candidate.tls.mode === 'custom') {
+      const check = await inspectTlsInputs({
+        mode: 'custom',
+        dataDir: candidate.dataDir,
+        certPath: candidate.tls.certPath,
+        keyPath: candidate.tls.keyPath,
+      });
+      if (!check.canSave) {
+        throw new AppError(400, 'TLS_CERT_INVALID', `自定义证书不可用：${check.message}`, {
+          problems: check.problems,
+          certPath: check.certPath,
+          keyPath: check.keyPath,
+          hint: '证书与私钥必须是同一对（PEM）；服务端不会因为证书不匹配而退回明文模式。',
+        });
+      }
+    }
+
     candidate.updatedAt = new Date().toISOString();
+
+    const previousTls = { ...config.tls };
+    const tlsChanged =
+      candidate.tls.mode !== config.tls.mode ||
+      candidate.tls.httpsPort !== config.tls.httpsPort ||
+      candidate.tls.certPath !== config.tls.certPath ||
+      candidate.tls.keyPath !== config.tls.keyPath;
+
     writeConfig(loaded.path, candidate);
 
     const workerRestartRequired =
@@ -498,18 +718,89 @@ export async function startSupervisor(loaded: LoadedConfig, options: SupervisorO
       }
     }
 
+    /*
+     * ── TLS 热更（v0.1.3 / F4 需求第 2 条）───────────────────────
+     *
+     * 只在"进程级参数没变"时才走热更：worker 已经因为端口/目录变化重启的话，
+     * 新进程启动时自然按新配置装配 TLS，再调一次重载是多余动作
+     * （而且会和刚起来的监听抢同一个端口）。
+     */
+    let tlsReload: { attempted: boolean; ok: boolean; rolledBack: boolean; error: string | null } = {
+      attempted: false,
+      ok: false,
+      rolledBack: false,
+      error: null,
+    };
+
+    if (tlsChanged && !workerRestartRequired) {
+      const reply = await callWorkerTlsReload(candidate);
+      tlsReload = {
+        attempted: true,
+        ok: reply.ok,
+        rolledBack: reply.reachable && !reply.ok,
+        error: reply.error,
+      };
+
+      if (!reply.reachable) {
+        /*
+         * worker 没在跑：配置本身没问题，只是没人执行热更。
+         * **不回滚**：下次启动会按新配置装配，回滚反而会让用户的修改凭空消失。
+         */
+        logger.warn('supervisor.tls.reload_unreachable', { message: reply.error });
+        tlsReload.ok = false;
+        tlsReload.rolledBack = false;
+      } else if (!reply.ok) {
+        /*
+         * 热更失败（端口占用 / 证书不匹配）：
+         *   ① worker 内部已经把**监听**回滚到旧配置（runtime.ts 负责）；
+         *   ② 这里再把**配置文件**回滚 —— 否则这份起不来的 tls 段会留在盘上，
+         *      下次重启服务直接死在启动路径，而用户以为"保存失败了，什么都没变"。
+         *
+         * 顺序很重要：先写回旧配置，再让 worker 重新读一次。
+         * 反过来的话 worker 会先读到坏配置又失败一次。
+         */
+        const rolledBackCandidate: ServerConfigFile = { ...candidate, tls: previousTls };
+        writeConfig(loaded.path, rolledBackCandidate);
+        Object.assign(config, rolledBackCandidate);
+        loaded.config = rolledBackCandidate;
+        // 旧配置与 worker 当前生效的一致 → 这一步是空操作，只是让状态回正
+        await callWorkerTlsReload(rolledBackCandidate);
+        logger.error('supervisor.tls.reload_failed', {
+          message: reply.error,
+          rolledBackTo: previousTls.mode,
+        });
+        throw new AppError(
+          409,
+          'TLS_RELOAD_FAILED',
+          `传输安全设置未生效，已回滚到 ${previousTls.mode} 模式：${reply.error ?? '热更失败'}`,
+          {
+            rolledBack: true,
+            previousMode: previousTls.mode,
+            hint:
+              '配置已恢复为修改前的值，服务仍在按旧设置运行。' +
+              '请修正原因（端口被占用 / 证书与私钥不匹配 / 文件不可读）后重新保存。',
+          },
+        );
+      }
+    }
+
     sendJson(_ctx.res, 200, {
       config: configSummary(candidate),
       workerRestartRequired,
       supervisorRestartRequired,
       restarted,
+      tlsReload,
       note: supervisorRestartRequired
         ? '控制面端口修改需要重启 supervisor（Windows 服务：sc.exe stop/start <服务名>）'
         : workerRestartRequired
           ? restarted
             ? '数据面已按新配置重启'
             : '配置已保存，但自动重启失败；请查看日志后手动点「重启」'
-          : '已生效',
+          : tlsReload.attempted && tlsReload.ok
+            ? '已热更：HTTPS 监听已按新配置重建，服务进程未重启'
+            : tlsReload.attempted && !tlsReload.ok && !tlsReload.rolledBack
+              ? '配置已保存；数据面未运行，将在下次启动时生效'
+              : '已生效',
     });
   });
 
@@ -804,6 +1095,89 @@ function withUsers<T>(dataDir: string, run: (users: UserStore) => T): T {
   }
 }
 
+/**
+ * 把内部错误翻成面板能看的一句话。
+ *
+ * 两条硬要求（真机事故后加的）：
+ *   · 去掉 `Command failed:` 这类 exec 包装前缀 —— 它只说明"跑了个命令"；
+ *   · 抹掉 `C:\…` / `D:\…` 绝对路径 —— 面板可能被远程访问，内部路径不该出现在
+ *     错误框里；而且用户拿路径也没法处理。
+ *
+ * 完整错误（含 stderr）一律进日志，不进界面。
+ */
+function sanitizeTlsError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const firstLine = raw.split(/\r?\n/)[0] ?? '';
+  const cleaned = firstLine
+    .replace(/^Command failed:\s*/i, '')
+    .replace(/[A-Za-z]:\\[^\s'"]+/g, '<路径>')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned === '' ? '未知错误（详见服务端日志）' : cleaned.slice(0, 180);
+}
+
+/**
+ * worker（数据面）的可访问基址。
+ *
+ * 必须用 `reachableHost`：配置里 `host=0.0.0.0` 是**监听**地址，
+ * 拿它拼 URL 在部分平台会连不上；`::` 还必须要方括号。
+ */
+function workerBaseUrl(config: ServerConfigFile): string {
+  return `http://${reachableHost(config.host)}:${String(config.port)}`;
+}
+
+/** 读 worker 的 `/api/stats`；worker 没起来或鉴权失败都返回 null（调用方按"状态未知"处理） */
+async function fetchWorkerStats(config: ServerConfigFile): Promise<Record<string, unknown> | null> {
+  try {
+    const response = await fetch(`${workerBaseUrl(config)}/api/stats`, {
+      headers: config.auth.token === '' ? {} : { Authorization: `Bearer ${config.auth.token}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) return null;
+    return (await response.json()) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+interface WorkerTlsReply {
+  /** worker 是否应答了（false = 没在跑 / 连不上） */
+  reachable: boolean;
+  ok: boolean;
+  error: string | null;
+}
+
+/**
+ * 让 worker 重载 TLS。
+ *
+ * `reachable=false` 与 `reachable=true, ok=false` 必须分开：
+ *   · 前者是"没人接收这次热更"（worker 停着）—— 配置该保留，等启动生效；
+ *   · 后者是"试过了但失败"（端口占用 / 证书不匹配）—— 配置该回滚。
+ * 混成一种会把"服务没开"当成"配置有错"，用户改半天也改不好。
+ */
+async function callWorkerTlsReload(config: ServerConfigFile): Promise<WorkerTlsReply> {
+  try {
+    const response = await fetch(`${workerBaseUrl(config)}/api/tls/reload`, {
+      method: 'POST',
+      headers: config.auth.token === '' ? {} : { Authorization: `Bearer ${config.auth.token}` },
+      // 热更要读证书、关开监听，给足时间（但也不能无限等：面板在同步等这个结果）
+      signal: AbortSignal.timeout(20_000),
+    });
+    const body = (await response.json().catch(() => ({}))) as { ok?: unknown; error?: unknown };
+    return {
+      reachable: true,
+      ok: response.ok && body.ok === true,
+      error: typeof body.error === 'string' && body.error !== '' ? body.error : null,
+    };
+  } catch (error) {
+    return {
+      reachable: false,
+      ok: false,
+      error: `数据面（worker）没有应答：${(error as Error).message}`,
+    };
+  }
+}
+
 export function applyConfigPatch(current: ServerConfigFile, patch: Record<string, unknown>): ServerConfigFile {
   const num = (value: unknown, fallback: number): number =>
     typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : fallback;
@@ -812,6 +1186,23 @@ export function applyConfigPatch(current: ServerConfigFile, patch: Record<string
 
   const service = (patch['service'] ?? {}) as Record<string, unknown>;
   const auth = (patch['auth'] ?? {}) as Record<string, unknown>;
+  const tls = (patch['tls'] ?? {}) as Record<string, unknown>;
+
+  /*
+   * TLS 四字段（v0.1.3 / F4）。
+   *
+   * 语义与 trustProxy 一致：**字段缺席＝保持原值**。这一点对本批特别关键 ——
+   * 面板的「传输安全」在 off / selfsigned 模式下不发 certPath / keyPath（那两个
+   * 输入框是隐藏的），若按"缺席即清空"处理，用户从 custom 切到 selfsigned
+   * 再切回 custom 时路径就没了；更糟的是"只改 httpsPort"的一次保存会把
+   * 用户配好的证书路径一起抹掉。
+   *
+   * `mode` 不合法时保持原值而**不回落 off**：这是安全开关，一个拼写错误
+   * 把 HTTPS 关掉，是这个模块最不该发生的事。
+   */
+  const tlsMode = ['off', 'selfsigned', 'custom'].includes(String(tls['mode']))
+    ? (tls['mode'] as ServerConfigFile['tls']['mode'])
+    : current.tls.mode;
 
   return normalizeConfig(
     {
@@ -848,6 +1239,13 @@ export function applyConfigPatch(current: ServerConfigFile, patch: Record<string
         name: str(service['name'], current.service.name),
         displayName: str(service['displayName'], current.service.displayName),
         autoStart: bool(service['autoStart'], current.service.autoStart),
+      },
+      tls: {
+        mode: tlsMode,
+        httpsPort: num(tls['httpsPort'], current.tls.httpsPort),
+        // 路径单独处理：允许显式空串（用户想清掉），但不能因为缺席就清空
+        certPath: typeof tls['certPath'] === 'string' ? tls['certPath'].trim() : current.tls.certPath,
+        keyPath: typeof tls['keyPath'] === 'string' ? tls['keyPath'].trim() : current.tls.keyPath,
       },
     },
     {},

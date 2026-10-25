@@ -205,8 +205,16 @@ test('T3.1 extends 合并：lineage、theme 覆盖、scopes 继承、rules 追�
   assert.equal(resolved.scopes.find((scope) => scope.id === 'placeholder').color, '#ff9f7a');
   assert.equal(resolved.scopes.find((scope) => scope.id === 'heading').color, '#8ec7ff');
   assert.equal(resolved.scopes.find((scope) => scope.id === 'comment').color, '#8b8b8b'); // 未被覆盖
-  // 父级 14 条 + 子级 1 条
-  assert.equal(resolved.rules.length, 15);
+  /*
+   * 父级规则数 + 子级 1 条。
+   *
+   * **不写死具体数字**：`default` 方案会随版本增删规则（v0.1.3 追加项二就
+   * 为三个板块加了 7 条），写死 15 会让"加了一条合理规则"也变成测试红 ——
+   * 那种红没人会去分辨"是真的坏了还是数字过时"，最后就是随手改数字。
+   * 这里要证明的是**继承是追加**，所以取父级自身条数为基数。
+   */
+  const parentRules = loadAll().find((item) => item.id === 'default').rules.length;
+  assert.equal(resolved.rules.length, parentRules + 1);
   assert.ok(resolved.rules.some((rule) => rule.id === 'todo-marker'));
   assert.ok(resolved.rules.some((rule) => rule.id === 'block-heading'));
 });

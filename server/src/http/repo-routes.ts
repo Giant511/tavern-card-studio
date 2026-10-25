@@ -39,6 +39,14 @@ export interface RepoRouteDeps {
   identify: (ctx: RouteContext) => AuthContext | null;
   now?: () => Date;
   /**
+   * 按账户 id 取"归属显示"（v0.1.3 / F2）。
+   *
+   * 治理页要把归属显示成「用户名（uid）」而不是截断的 uuid —— 但仓库路由
+   * 不持有 UserStore（它只管仓库与令牌），所以由装配处注入一个只读查询。
+   * 返回 null 表示账户已不存在（历史仓库的 owner 被删过），调用方显示占位符。
+   */
+  describeOwner?: (ownerId: string) => { username: string; uid: string } | null;
+  /**
    * 审计回调（T10.19）。仓库层的跨账户操作需要落到 `events` 表，
    * 但仓库路由不持有 Db —— 由装配处注入，和卡片服务共用同一个事件流。
    */
@@ -154,7 +162,17 @@ export function registerRepoRoutes(router: Registrar, deps: RepoRouteDeps): void
       }
       const rows = deps.repos.listAll();
       sendJson(ctx.res, 200, {
-        items: rows.map((row) => ({ ...deps.repos.toPublic(row), ownerId: row.owner_id })),
+        items: rows.map((row) => {
+          // 归属双维度（v0.1.3 / F2）：治理页要能按人辨认，而 ownerId 是内部 uuid，
+          // 截断显示既不可读也无法口头核对。username 可能重名/被改，所以后面跟 uid。
+          const owner = deps.describeOwner ? deps.describeOwner(row.owner_id) : null;
+          return {
+            ...deps.repos.toPublic(row),
+            ownerId: row.owner_id,
+            ownerUsername: owner?.username ?? null,
+            ownerUid: owner?.uid ?? null,
+          };
+        }),
       });
       return;
     }

@@ -7,9 +7,10 @@
  *   POST /api/auth/refresh    用 refresh 换新的 access（并轮换 refresh）
  *   POST /api/auth/logout     吊销当前会话
  *   GET  /api/auth/me         当前身份
+ *   POST /api/auth/repo-token 校验仓库令牌（tcr_…），用于「使用仓库令牌连接」
  *
- * login / register / refresh 是**免鉴权**的（调用方此时必然还没有令牌），
- * 与 `/api/token` 一样写死在 app.ts 的豁免列表里，而不是加进用户可改的
+ * login / register / refresh / repo-token 是**免鉴权**的（调用方此时必然还没有
+ * 令牌），与 `/api/token` 一样写死在 app.ts 的豁免列表里，而不是加进用户可改的
  * `auth.publicPaths` —— 那条豁免是安全模型的一部分，不该被误删或误加宽。
  *
  * 状态码约定：
@@ -26,11 +27,24 @@ import type { AuthService } from '../auth/service.js';
 import type { AuthContext } from './auth.js';
 import { toPublicUser, type PublicUser } from '../storage/users.js';
 import { sendJson } from './responses.js';
+import { verifyRepoTokenEntry } from '../auth/repo-token-entry.js';
+import type { RepoStore, TokenStore } from '../storage/repos.js';
 
 export interface AuthRouteDeps {
   auth: AuthService;
   /** 解析当前请求身份（用于 admin-only 注册判定与 /me） */
   identify: (ctx: RouteContext) => AuthContext | null;
+  /**
+   * 仓库令牌存储与仓库存储（v0.1.3 / F5 后半）。
+   *
+   * 不给就不注册 `/api/auth/repo-token`（老装配不崩，只是没有这个入口）。
+   * 之所以放在认证路由里而不是仓库路由里：它判的是**身份**，
+   * 与仓库路由那套「已经登录之后管理仓库」是两件事。
+   */
+  repoTokens?: TokenStore;
+  repos?: RepoStore;
+  users?: { findById(id: string): { id: string; username: string; status: string } | null };
+  now?: () => Date;
   /**
    * 取客户端 IP。
    *
@@ -182,6 +196,53 @@ export function registerAuthRoutes(router: Registrar, deps: AuthRouteDeps): void
     sendJson(ctx.res, 200, { ok: true });
   });
 
+  /**
+   * 校验仓库令牌（v0.1.3 / F5 后半）—— 登录界面的第三个入口用它。
+   *
+   * **免鉴权**：调用方此时正拿着一把还没被认可的令牌，没有别的凭证可用。
+   * 它自己就是鉴权入口，所以不能过 TokenGate。
+   *
+   * 四类失败原因与「不存在 ≡ 无效」的原因，见 `auth/repo-token-entry.ts` 文件头。
+   * 这里只负责把结论翻成 HTTP：格式错误 400，其余 401。
+   *
+   * 成功时**不回令牌原文**（调用方本来就有），只回"这把令牌能干什么"：
+   * 仓库 id/名字、scope、到期时间。客户端据此决定单仓库模式里的按钮可用性。
+   */
+  if (deps.repoTokens && deps.repos && deps.users) {
+    const tokens = deps.repoTokens;
+    const repos = deps.repos;
+    const users = deps.users;
+
+    router.post('/api/auth/repo-token', (ctx) => {
+      const body = bodyJson(ctx);
+      const raw = str(body, 'token').trim();
+      const result = verifyRepoTokenEntry(raw, { tokens, repos, users, now: deps.now });
+
+      if (!result.ok) {
+        throw new AppError(result.status, result.code, result.message, result.hint === undefined ? {} : { hint: result.hint });
+      }
+
+      // 记一次使用时间：界面靠它显示「这把令牌是不是第一次被用」
+      try {
+        tokens.touch(result.tokenId, new Date().toISOString());
+      } catch {
+        // touch 失败不影响本次校验结论 —— 不要因为记一笔日志就让用户连不上
+      }
+
+      sendJson(ctx.res, 200, {
+        ok: true,
+        repo: { id: result.repoId, name: result.repoName },
+        scopes: result.scopes,
+        username: result.username,
+        expiresAt: result.expiresAt,
+        lastUsedAt: result.lastUsedAt,
+        // 明确告诉客户端"这不是账户会话"：后续请求按 scope 判权限，
+        // 不存在续期、也没有 refresh 令牌可拿
+        tokenType: 'RepoToken',
+      });
+    });
+  }
+
   router.get('/api/auth/me', (ctx) => {
     const caller = deps.identify(ctx);
     if (!caller) throw new AppError(401, 'UNAUTHORIZED', '需要登录');
@@ -192,6 +253,25 @@ export function registerAuthRoutes(router: Registrar, deps: AuthRouteDeps): void
     }
     const user = caller.userId ? auth.me(caller.userId) : null;
     if (!user) throw new AppError(401, 'UNAUTHORIZED', '账户不存在或已删除');
+    /*
+     * 仓库令牌也要如实报 `via`（v0.1.3 / F5 后半修）。
+     *
+     * 上一版这里无条件写 `via: 'jwt'` —— 于是用仓库令牌连上的客户端调 /me
+     * 会得到"你是 jwt 会话"，进而去找 refresh 令牌续期，而仓库令牌根本没有
+     * refresh。那条路径上不会报错，只会表现为"过一会儿所有请求都 401"。
+     * 这正是本次反馈里"两套凭证路径说不清"的一个具体来源。
+     */
+    if (caller.via === 'repo-token' && caller.repoToken !== null) {
+      const repo = deps.repos?.findById(caller.repoToken.repoId) ?? null;
+      sendJson(ctx.res, 200, {
+        via: 'repo-token',
+        role: caller.role,
+        user: toPublicUser(user),
+        repo: { id: caller.repoToken.repoId, name: repo?.name ?? '' },
+        scopes: caller.repoToken.scopes,
+      });
+      return;
+    }
     sendJson(ctx.res, 200, { via: 'jwt', role: caller.role, user: toPublicUser(user) });
   });
 }

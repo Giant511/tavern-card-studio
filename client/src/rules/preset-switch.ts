@@ -37,12 +37,16 @@ export interface PresetChoice {
   orderLabel: string;
 }
 
+// 列表里用的短名（比板块定义里的全名更适合一行显示）。顺序取自 BLOCK_IDS，
+// 新增板块时若这里没写，会自动退化成长名而不是 undefined。
 const BLOCK_LABELS: Record<BlockId, string> = {
   basic: '基本',
   personality: '性格',
   settings: '其他',
   special: '特殊',
   user: '用户',
+  'chat-examples': '对话示例',
+  'initial-scene': '初始场景',
   worldbook: '世界书',
 };
 

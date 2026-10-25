@@ -119,6 +119,57 @@
       "scope": "comment",
       "priority": 10,
       "match": { "type": "regex", "pattern": "^//.*$", "flags": "gm", "wholeLine": true }
+    },
+
+    {
+      "id": "worldbook-entry-open",
+      "scope": "heading",
+      "priority": 100,
+      "appliesTo": ["block:worldbook"],
+      "match": { "type": "regex", "pattern": "^@@ENTRY\\s+\\d+\\s*$", "flags": "gm", "wholeLine": true }
+    },
+    {
+      "id": "worldbook-content-mark",
+      "scope": "subheading",
+      "priority": 98,
+      "appliesTo": ["block:worldbook"],
+      "match": { "type": "regex", "pattern": "^@@CONTENT\\s*$", "flags": "gm", "wholeLine": true }
+    },
+    {
+      "id": "worldbook-entry-close",
+      "scope": "separator",
+      "priority": 96,
+      "appliesTo": ["block:worldbook"],
+      "match": { "type": "regex", "pattern": "^@@END\\s+\\d+\\s*$", "flags": "gm", "wholeLine": true }
+    },
+    {
+      "id": "worldbook-trigger-keys",
+      "scope": "attribute",
+      "priority": 88,
+      "appliesTo": ["block:worldbook"],
+      "match": { "type": "regex", "pattern": "^keys\\s*:.*$", "flags": "gm", "wholeLine": true }
+    },
+    {
+      "id": "worldbook-entry-name",
+      "scope": "subheading",
+      "priority": 86,
+      "appliesTo": ["block:worldbook"],
+      "match": { "type": "regex", "pattern": "^name\\s*:.*$", "flags": "gm", "wholeLine": true }
+    },
+
+    {
+      "id": "example-start-marker",
+      "scope": "subheading",
+      "priority": 94,
+      "appliesTo": ["block:chat-examples"],
+      "match": { "type": "regex", "pattern": "^<START>\\s*$", "flags": "gm", "wholeLine": true }
+    },
+    {
+      "id": "scene-divider",
+      "scope": "separator",
+      "priority": 78,
+      "appliesTo": ["block:initial-scene"],
+      "match": { "type": "regex", "pattern": "^\\s*(?:-{3,}|={3,}|\\*{3,}|~{3,})\\s*$", "flags": "gm", "wholeLine": true }
     }
   ],
   "metadata": {

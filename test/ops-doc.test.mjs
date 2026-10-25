@@ -1,17 +1,16 @@
-// 运维命令手册（docs/server-cmd.md）的守卫。
+// 运维/部署文档的守卫。
 //
 // 为什么要有这个文件：
-//   1. `docs/server-cmd.md` 是随仓库上传的两份 docs 之一（另一份是
-//      `docs/server-developer.md`），它同时是用户的运维入口。命令面一变而它没跟着变，
-//      用户照着敲就会失败 —— 而没有任何编译/类型检查会因此报错
+//   1. `docs/server-cmd.md` 等是随仓库上传的少数几份 docs，它们同时是用户的入口。
+//      命令面一变而它没跟着变，用户照着敲就会失败 —— 而没有任何编译/类型检查会因此报错
 //      （2026-10-23 已经因为同类原因连续踩过：说明页停在 v0.1.1、
 //      命令名写成产物里不存在的 `tcs-server`）。
 //   2. `.gitignore` 用 `docs/*` + `!docs/<文件名>` 精确放行指定文件。
 //      这条规则很脆：写回 `docs/`（目录）就会让例外失效，多写一个 `!` 就会
 //      把开发文档泄漏到公开仓库。
 //
-// 判据全部基于**文件内容**，不调用 git —— 本机 Node 无法 spawn 任何子进程
-// （实测 `execFileSync('git', …)` 返回 EBUSY），靠 git 的断言在这里跑不起来。
+// 判据全部基于**文件内容**，不调用 git —— 本机 `execFileSync('git', …)` 返回 EBUSY
+// （`spawnSync` 的同步路径走不通；**异步 `spawn` 是可用的**，端到端脚本靠它起服务端）。
 
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
@@ -21,11 +20,16 @@ import { test } from 'node:test';
 const ROOT = join(import.meta.dirname, '..');
 const DOC = join(ROOT, 'docs', 'server-cmd.md');
 const DEV_DOC = join(ROOT, 'docs', 'server-developer.md');
+const CLOUD_DOC = join(ROOT, 'docs', 'Cloud Deployment Manual.md');
 const CLI = join(ROOT, 'server', 'src', 'cli.ts');
 const GITIGNORE = join(ROOT, '.gitignore');
 
 /** 允许随仓库上传的 docs 文件（相对仓库根，正斜杠）。新增上传项必须同时改这里。 */
-const PUBLISHED_DOCS = ['docs/server-cmd.md', 'docs/server-developer.md'];
+const PUBLISHED_DOCS = [
+  'docs/server-cmd.md',
+  'docs/server-developer.md',
+  'docs/Cloud Deployment Manual.md',
+];
 
 const doc = existsSync(DOC) ? readFileSync(DOC, 'utf8') : '';
 const cli = readFileSync(CLI, 'utf8');
@@ -148,6 +152,85 @@ test('放行的 docs 文件都真实存在（写错名字会静默少传一份�
   for (const path of PUBLISHED_DOCS) {
     assert.ok(existsSync(join(ROOT, path)), `${path} 不存在 —— .gitignore 放行了一个不存在的文件`);
   }
+});
+
+/**
+ * 云部署手册的守卫（v0.1.3 新增，随仓库发布）。
+ *
+ * 这份文件的特殊性：它**教用户配反代**，而反代配错的症状全是"能用但行为诡异"
+ * （限速全局化、令牌从公网取走）。所以判据不是"文件存在"，而是"关键内容在不在"：
+ * 三种代理是否并列、Apache 是不是真的双 vhost、`trustProxy` 的两个事故有没有写、
+ * 以及那条已知文案问题有没有登记成 v0.1.4 需求。
+ */
+test('云部署手册：必备章节齐全', () => {
+  const cloud = existsSync(CLOUD_DOC) ? readFileSync(CLOUD_DOC, 'utf8') : '';
+  assert.ok(cloud.length > 4000, '云部署手册缺失或过短');
+  assert.match(cloud, /维护约定/, '必须写明维护约定：影响部署行为的改动要同步本文件');
+
+  // 三选一，且三种代理并列（章节号固定，便于交叉引用）
+  assert.match(cloud, /三选一即可/, '必须明说三种反代任选其一');
+  for (const heading of ['### 2.1 Caddy', '### 2.2 nginx', '### 2.3 Apache']) {
+    assert.ok(cloud.includes(heading), `缺少章节：${heading}`);
+  }
+
+  // Apache 必须是"双 vhost 完整配置"，不是片段
+  assert.ok(
+    cloud.includes('<VirtualHost *:80>') && cloud.includes('<VirtualHost *:443>'),
+    'Apache 章节必须给完整的两个 vhost（80 + 443），只给 ProxyPass 片段等于没给',
+  );
+
+  // trustProxy：两个事故场景都要在（这是"不配会怎样"的判据）
+  assert.match(cloud, /事故一/, '缺少 trustProxy 事故一');
+  assert.match(cloud, /事故二/, '缺少 trustProxy 事故二');
+  assert.match(cloud, /锁定|限速/, '事故一必须说清"限速按 IP 分桶"的机制');
+  assert.match(cloud, /\/api\/token/, '事故二必须点名 /api/token');
+  assert.ok(
+    cloud.includes('Require all denied') || cloud.includes('return 403') || cloud.includes('respond @token 403'),
+    '三份代理配置都必须显式挡掉 /api/token（纵深防御）',
+  );
+
+  // 已知交互 + v0.1.4 需求
+  assert.match(cloud, /TLS 由反代终止/, '必须写明"反代终止 TLS"的应有文案');
+  assert.match(cloud, /v0\.1\.4/, '未实现的部分必须登记为 v0.1.4 需求');
+});
+
+test('云部署手册：代码围栏外不出现会被当成 HTML 的尖括号', () => {
+  /*
+   * 这份文档会发布到 GitHub。围栏外写 `host=<地址>` 这类内容时，GitHub 会把
+   * `<地址>` 当 HTML 标签**直接吃掉** —— 本地用编辑器预览、或用只看纯文本的
+   * 工具检查，都发现不了；只有真在网页上看才缺一块内容。
+   * 判据：去掉行内代码与围栏后，不应再出现 `<` + 标签名。
+   */
+  const cloud = existsSync(CLOUD_DOC) ? readFileSync(CLOUD_DOC, 'utf8') : '';
+  let inFence = false;
+  const offenders = [];
+  cloud.split(/\r?\n/).forEach((line, index) => {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      return;
+    }
+    if (inFence) return;
+    const withoutInlineCode = line.replace(/`[^`]*`/g, '');
+    if (/<\/?[a-zA-Z]/.test(withoutInlineCode)) offenders.push(`第 ${index + 1} 行：${line.trim().slice(0, 60)}`);
+  });
+  assert.deepEqual(offenders, [], `这些行会被 GitHub 当成 HTML 吞掉：\n${offenders.join('\n')}`);
+});
+
+test('云部署手册不得含本机路径 / 内网地址（它是要公开的）', () => {
+  const cloud = existsSync(CLOUD_DOC) ? readFileSync(CLOUD_DOC, 'utf8') : '';
+  const offenders = [];
+  for (const [pattern, why] of [
+    [/192\.168\.\d+\.\d+/g, '内网地址'],
+    [/D:[\\/]Claw/gi, '本机工作目录'],
+    [/C:[\\/]Users[\\/]/gi, '本机用户目录'],
+    [/\.workbuddy/gi, '本机工具目录'],
+    [/tcr_[A-Za-z0-9]{20,}/g, '疑似真实仓库令牌'],
+    [/[0-9a-f]{64}/g, '疑似 64 位十六进制密钥'],
+  ]) {
+    const found = cloud.match(pattern);
+    if (found) offenders.push(`${why}: ${found.slice(0, 3).join('、')}`);
+  }
+  assert.deepEqual(offenders, [], `公开文档里出现了本机信息：\n${offenders.join('\n')}`);
 });
 
 test('手册里提到的文件都真实存在（命令名写错就没有这份文档）', () => {

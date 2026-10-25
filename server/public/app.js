@@ -77,6 +77,22 @@
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
   }
 
+  /**
+   * 归属显示：`用户名（uid）`（v0.1.3 / F2）。
+   *
+   * 为什么不是只显示用户名：**用户名可改、可重名**，治理页要按人辨认、
+   * 审计要能回指"同一个人"，都需要一个不变的锚点 —— 那就是 uid。
+   * 为什么不是只显示 uid：光看 `usr_ab12cd34` 认不出是谁。
+   *
+   * 查不到账户（历史仓库的 owner 被删过）时显示占位符，不回退到截断的内部 id ——
+   * 那个 id 对管理员没有任何意义。
+   */
+  function formatOwner(item) {
+    if (!item || !item.ownerId) return '—';
+    if (!item.ownerUsername) return '（账户已不存在）';
+    return item.ownerUid ? `${item.ownerUsername}（${item.ownerUid}）` : item.ownerUsername;
+  }
+
   const STATE_TEXT = {
     stopped: '已停止',
     starting: '启动中',
@@ -426,6 +442,19 @@
     // 每行一条：与输入框的提示文案一致，用户按回车换行不会被悄悄当成一个字符串
     $('cfg-trustProxy').value = (config.trustProxy ?? []).join('\n');
     updateTrustProxyWarning();
+
+    /*
+     * 传输安全的**兜底回显**（v0.1.3 / F4）。
+     *
+     * 正常路径是 `/control/tls/status` 回填（它多带证书路径与运行时指纹），
+     * 但那个端点如果失败，单选框会一个都不选中 —— 而"没选中"在保存时
+     * 会变成"不改 mode"（见 tlsModeValue 的注释）。这里用 configSummary 里
+     * 的 tls 再兜一层，保证表单至少有值。
+     */
+    if (config.tls) {
+      setTlsMode(config.tls.mode || 'off');
+      $('cfg-tls-httpsPort').value = config.tls.httpsPort ?? 8443;
+    }
   }
 
   /**
@@ -460,6 +489,295 @@
     }
   }
 
+  // ── 传输安全（v0.1.3 / F4）────────────────────────────────
+  //
+  // 前端在这里只做三件事：**回显**服务端状态、**调用**服务端校验、**门控**保存按钮。
+  // 所有判据（什么算公网暴露、什么算证书不可用）都在服务端 —— 面板重写一遍
+  // 就会出现"日志说公网暴露、面板说仅限内网"这种自相矛盾。
+
+  const TLS_MODE_LABEL = { off: '明文（HTTP）', selfsigned: '自签证书', custom: '自定义证书' };
+
+  /** /control/tls/status 的最近一次结果（面板上多处要用） */
+  let tlsStatus = null;
+  /** custom 的即时校验是否通过 —— 决定保存按钮能不能点 */
+  let tlsCustomOk = true;
+  let tlsCheckTimer = null;
+  /** 保存请求进行中：期间一律禁用保存按钮，别让门控把它误解锁 */
+  let savingConfig = false;
+
+  /**
+   * 当前选中的模式；**一个都没选中时返回空串**。
+   *
+   * 返回 'off' 会让"表单没回显成功"变成"保存时把 HTTPS 关掉" —— 一次读取失败
+   * 就静默降级到明文，是这个模块最不该有的失败方式。空串在服务端等于
+   * "mode 不合法 → 保持原值"，也就是什么都不改。
+   */
+  function tlsModeValue() {
+    const picked = document.querySelector('input[name="cfg-tls-mode"]:checked');
+    return picked === null ? '' : picked.value;
+  }
+
+  function setTlsMode(mode) {
+    for (const input of document.querySelectorAll('input[name="cfg-tls-mode"]')) {
+      input.checked = input.value === mode;
+    }
+    applyTlsModeUi();
+  }
+
+  function applyTlsModeUi() {
+    const mode = tlsModeValue();
+    $('tls-selfsigned-box').hidden = mode !== 'selfsigned';
+    $('tls-custom-box').hidden = mode !== 'custom';
+    updateTlsSaveGate();
+  }
+
+  /**
+   * 保存按钮的门控。
+   *
+   * 需求第 1 条：不匹配**禁止保存**。前端禁用只是 UX，真正的判据在
+   * `PUT /control/config` 里（同一段 inspect 实现再拦一次）——
+   * 只做前端等于把安全交给浏览器。
+   */
+  function updateTlsSaveGate() {
+    const blocked = savingConfig || (tlsModeValue() === 'custom' && tlsCustomOk !== true);
+    $('cfg-save').disabled = blocked;
+    if (!savingConfig && tlsModeValue() === 'custom' && tlsCustomOk !== true) {
+      $('cfg-save').title = '自定义证书未通过校验：请先修正证书与私钥（下方有具体原因）';
+    } else {
+      $('cfg-save').removeAttribute('title');
+    }
+  }
+
+  function renderTlsBanners(banners) {
+    const box = $('tls-banners');
+    box.replaceChildren();
+    const list = Array.isArray(banners) ? banners : [];
+    box.hidden = list.length === 0;
+    for (const banner of list) {
+      const wrap = document.createElement('div');
+      wrap.className = `tls-banner ${banner.level === 'danger' ? 'is-danger' : 'is-warn'}`;
+      wrap.dataset.code = banner.code;
+      const title = document.createElement('p');
+      title.className = 'tls-banner-title';
+      title.textContent = banner.level === 'danger' ? `⚠ ${banner.title}` : banner.title;
+      const body = document.createElement('p');
+      body.className = 'tls-banner-body';
+      body.textContent = banner.body;
+      wrap.append(title, body);
+      box.append(wrap);
+    }
+  }
+
+  /**
+   * 监听状态行。
+   *
+   * 必须带"数据来源 + 采样时间"（需求第 1 条明确要求）：面板是快照，
+   * 用户可能开着页面去改配置、去点重启，回来看到的还是十分钟前的状态。
+   * 没有时间戳，"HTTPS 未监听"分不清是现在还是十分钟前。
+   */
+  function renderTlsListen(status) {
+    const box = $('tls-listen');
+    box.replaceChildren();
+    const row = (label, value, tone) => {
+      const line = document.createElement('div');
+      line.className = 'tls-listen-row';
+      const tag = document.createElement('span');
+      tag.className = 'tls-listen-label';
+      tag.textContent = label;
+      const text = document.createElement('span');
+      text.className = tone ? `tls-listen-value is-${tone}` : 'tls-listen-value';
+      text.textContent = value;
+      line.append(tag, text);
+      box.append(line);
+    };
+
+    const listening = status.listening || {};
+    const http = listening.http || null;
+    const https = listening.https || null;
+    row('HTTP', http ? `监听中 ${http.host}:${http.port}` : '状态未知（数据面未运行）', http ? 'ok' : 'bad');
+    row('HTTPS', https ? `监听中 ${https.host}:${https.port}` : '未监听', https ? 'ok' : 'idle');
+    row(
+      '数据来源',
+      `${status.source === 'none' ? '无（数据面未运行）' : status.source} · 采样时间 ${fmtTime(status.sampledAt)}`,
+    );
+    if (status.note) row('说明', status.note, 'idle');
+  }
+
+  function renderTlsSelfSigned(status) {
+    const runtime = status.runtime || null;
+    const fingerprint = runtime && runtime.fingerprint ? runtime.fingerprint : '';
+    $('tls-fingerprint').textContent = fingerprint === '' ? '—（还没有证书）' : fingerprint;
+    $('tls-days').textContent =
+      runtime && typeof runtime.daysUntilExpiry === 'number' ? String(runtime.daysUntilExpiry) : '—';
+    $('tls-notafter').textContent = runtime && runtime.notAfter ? fmtTime(runtime.notAfter) : '—';
+    $('tls-cert-subject').textContent = runtime && runtime.subject ? runtime.subject : '';
+    $('tls-backup-hint').textContent = status.config && status.config.backupDir
+      ? `重新生成时，旧证书与私钥会自动备份到 ${status.config.backupDir}（文件名含时间戳）。`
+      : '';
+  }
+
+  /**
+   * 把服务端状态刷到面板上。
+   *
+   * `overwriteForm=false` 用于"保存后刷新"以外的场景：用户可能正在输入路径，
+   * 无条件回填会把他刚敲的字符冲掉（体验上与"点了没反应"一样糟）。
+   */
+  function applyTlsStatus(status, overwriteForm) {
+    tlsStatus = status;
+    const config = status.config || {};
+    $('tls-mode-pill').textContent = TLS_MODE_LABEL[config.mode] || config.mode || '—';
+    $('tls-mode-pill').dataset.mode = config.mode || '';
+    renderTlsBanners(status.banners);
+    renderTlsListen(status);
+    renderTlsSelfSigned(status);
+
+    if (overwriteForm === true) {
+      setTlsMode(config.mode || 'off');
+      $('cfg-tls-httpsPort').value = config.httpsPort ?? 8443;
+      $('cfg-tls-certPath').value = config.certPath || '';
+      $('cfg-tls-keyPath').value = config.keyPath || '';
+      // 已经是 custom 且服务端认这份证书：不要一上电就显示"未通过校验"
+      tlsCustomOk = config.mode !== 'custom' || config.customConfigured === true;
+      if (config.mode === 'custom') {
+        void checkTlsCustom();
+      } else {
+        $('tls-check').className = 'tls-check';
+        $('tls-check').textContent = '—';
+        updateTlsSaveGate();
+      }
+    }
+  }
+
+  async function loadTlsStatus(overwriteForm) {
+    try {
+      const status = await api('/control/tls/status');
+      applyTlsStatus(status, overwriteForm === true);
+    } catch (error) {
+      $('tls-listen').textContent = `读取传输安全状态失败：${error.message}`;
+    }
+  }
+
+  async function checkTlsCustom() {
+    const box = $('tls-check');
+    box.className = 'tls-check is-checking';
+    box.textContent = '正在检查证书与私钥是否匹配…';
+    try {
+      const check = await api('/control/tls/inspect', {
+        method: 'POST',
+        body: JSON.stringify({
+          mode: 'custom',
+          certPath: $('cfg-tls-certPath').value.trim(),
+          keyPath: $('cfg-tls-keyPath').value.trim(),
+        }),
+      });
+      tlsCustomOk = check.canSave === true;
+      box.className = `tls-check is-${check.level}`;
+      box.replaceChildren();
+      const head = document.createElement('p');
+      head.className = 'tls-check-title';
+      head.textContent = `${check.canSave ? '✔' : '✘'} ${check.message}`;
+      box.append(head);
+      if (Array.isArray(check.problems) && check.problems.length > 0) {
+        const list = document.createElement('ul');
+        list.className = 'bullets';
+        for (const line of check.problems) {
+          const item = document.createElement('li');
+          item.textContent = line;
+          list.append(item);
+        }
+        box.append(list);
+      }
+      if (check.canSave && check.certPath) {
+        const pathLine = document.createElement('p');
+        pathLine.className = 'hint';
+        pathLine.textContent = `实际读取：${check.certPath}`;
+        box.append(pathLine);
+      }
+    } catch (error) {
+      tlsCustomOk = false;
+      const details = error.payload && error.payload.error ? error.payload.error.details : null;
+      box.className = 'tls-check is-bad';
+      box.textContent = `检查失败：${error.message}${
+        details && Array.isArray(details.problems) ? `（${details.problems.join('；')}）` : ''
+      }`;
+    }
+    updateTlsSaveGate();
+  }
+
+  /** 输入路径时 debounce 检查：每敲一个字就发一次请求既没用也吵 */
+  function scheduleTlsCheck() {
+    tlsCustomOk = false;
+    updateTlsSaveGate();
+    clearTimeout(tlsCheckTimer);
+    tlsCheckTimer = setTimeout(() => void checkTlsCustom(), 400);
+  }
+
+  for (const input of document.querySelectorAll('input[name="cfg-tls-mode"]')) {
+    input.addEventListener('change', () => {
+      applyTlsModeUi();
+      if (tlsModeValue() === 'custom') void checkTlsCustom();
+    });
+  }
+  $('cfg-tls-certPath').addEventListener('input', scheduleTlsCheck);
+  $('cfg-tls-keyPath').addEventListener('input', scheduleTlsCheck);
+
+  /*
+   * 重新生成：**两步确认**，不用 `window.confirm`。
+   *
+   * 换证书会让所有客户端下次连接看到"证书变了"，属于不可轻率的操作；
+   * 而原生 confirm 在无头截图里完全看不见（F3 决策 #143 已经踩过）。
+   * 第一次点把按钮变成"确认"，6 秒内不点就自动收回。
+   */
+  let regenTimer = null;
+  function resetRegenerateButton() {
+    const button = $('tls-regenerate');
+    button.dataset.armed = '0';
+    button.textContent = '重新生成证书';
+  }
+  $('tls-regenerate').addEventListener('click', async () => {
+    const button = $('tls-regenerate');
+    if (button.dataset.armed !== '1') {
+      button.dataset.armed = '1';
+      button.textContent = '确认：立刻换新证书？';
+      clearTimeout(regenTimer);
+      regenTimer = setTimeout(resetRegenerateButton, 6000);
+      return;
+    }
+    clearTimeout(regenTimer);
+    resetRegenerateButton();
+    button.disabled = true;
+    $('tls-regenerate-msg').textContent = '正在生成…';
+    try {
+      const result = await api('/control/tls/regenerate', { method: 'POST' });
+      const reloadNote =
+        result.reload && result.reload.attempted
+          ? result.reload.ok
+            ? '已热更（服务未重启）'
+            : `热更失败：${result.reload.error || ''}`
+          : result.note || '';
+      /*
+       * ACL 收紧失败是**降级提示**，不是失败：证书已经生成好、HTTPS 可用，
+       * 只是私钥可能对同机其他用户可读。显示服务端给的脱敏原因
+       * （不再显示 icacls 的原始 stderr —— 那是内部路径 + 控制台编码乱码）。
+       */
+      const aclWarn =
+        Array.isArray(result.warnings) && result.warnings.length > 0
+          ? ` · 注意：${String(result.warnings[0])}`
+          : '';
+      $('tls-regenerate-msg').textContent = `新指纹 ${String(result.info.fingerprint).slice(0, 23)}… · ${reloadNote}${aclWarn}`;
+      toast(aclWarn === '' ? '已重新生成自签证书' : '证书已生成，但私钥权限未能收紧（详见提示）');
+      await loadTlsStatus(false);
+    } catch (error) {
+      // 服务端已把消息脱敏（去掉 Command failed 前缀与绝对路径）
+      $('tls-regenerate-msg').textContent = `生成失败：${error.message}`;
+      toast(error.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  applyTlsModeUi();
+
   $('cfg-controlHost').addEventListener('input', updateControlHostWarning);
   wireRegisterModeInputs();
   $('recent-refresh').addEventListener('click', () => void loadRecentAccounts());
@@ -493,21 +811,49 @@
         require: $('cfg-authRequire').checked,
         registerMode: registerModeValue(),
       },
+      /*
+       * 传输安全（v0.1.3 / F4）。
+       *
+       * 路径**只在 custom 模式下发**：off / selfsigned 下那两个输入框是隐藏的，
+       * 发空串会把用户之前配好的证书路径清掉。服务端对 tls 的语义是
+       * "字段缺席＝保持原值"，正是为这种分模式表单设计的。
+       */
+      tls: {
+        mode: tlsModeValue(),
+        httpsPort: Number($('cfg-tls-httpsPort').value),
+        ...(tlsModeValue() === 'custom'
+          ? {
+              certPath: $('cfg-tls-certPath').value.trim(),
+              keyPath: $('cfg-tls-keyPath').value.trim(),
+            }
+          : {}),
+      },
     };
-    $('cfg-save').disabled = true;
+    savingConfig = true;
+    updateTlsSaveGate();
     try {
       const result = await api('/control/config', { method: 'PUT', body: JSON.stringify(payload) });
       fillConfigForm(result.config);
       $('cfg-msg').textContent = result.note || '已保存';
-      toast(result.workerRestartRequired ? '配置已保存，重启后台服务后生效' : '配置已保存');
+      const hotReloaded = result.tlsReload && result.tlsReload.attempted && result.tlsReload.ok;
+      toast(hotReloaded ? '已保存并热更（服务未重启）' : '配置已保存');
       await refreshStatus();
+      // 保存后重读一次：证书指纹 / 监听端口 / 警告都可能刚变
+      await loadTlsStatus(true);
       // 保存后刷新一次：换了策略时"最近注册账户"的显隐要立刻跟着变
       if (registerModeValue() === 'open') await loadRecentAccounts();
     } catch (error) {
       toast(error.message, true);
-      $('cfg-msg').textContent = error.message;
+      /*
+       * 证书类错误要把逐条原因显示出来（需求：不匹配时"回显原因"）。
+       * 只显示一句"自定义证书不可用"等于让用户自己去猜是哪个文件的问题。
+       */
+      const details = error.payload && error.payload.error ? error.payload.error.details : null;
+      const extra = details && Array.isArray(details.problems) ? `：${details.problems.join('；')}` : '';
+      $('cfg-msg').textContent = `${error.message}${extra}`;
     } finally {
-      $('cfg-save').disabled = false;
+      savingConfig = false;
+      updateTlsSaveGate();
     }
   });
 
@@ -654,7 +1000,7 @@
 
   async function loadGovernance() {
     if (!govLoggedIn()) return;
-    await Promise.all([loadGovAccounts(), loadGovRepos(), loadGovCards()]);
+    await Promise.all([loadGovAccounts(), loadGovRepos(), loadGovCards(), loadGovAudit()]);
   }
 
   async function loadGovAccounts() {
@@ -662,13 +1008,15 @@
     try {
       const result = await api('/control/accounts?limit=200');
       const items = result.items || [];
-      renderGovTable(body, 6, items, (item) => {
-        const cells = [item.username, item.role === 'admin' ? '管理员' : '普通', item.status === 'disabled' ? '已禁用' : '启用', fmtTime(item.createdAt), item.lastLoginAt ? fmtTime(item.lastLoginAt) : '—'];
-        const action = document.createElement('button');
-        action.type = 'button';
-        action.className = `btn btn-small ${item.status === 'disabled' ? '' : 'btn-danger'}`;
-        action.textContent = item.status === 'disabled' ? '启用' : '禁用';
-        action.addEventListener('click', async () => {
+      renderGovTable(body, 7, items, (item) => {
+        const cells = [item.username, item.uid || '—', item.role === 'admin' ? '管理员' : '普通', item.status === 'disabled' ? '已禁用' : '启用', fmtTime(item.createdAt), item.lastLoginAt ? fmtTime(item.lastLoginAt) : '—'];
+        const action = document.createElement('span');
+        action.className = 'btn-group';
+        const statusButton = document.createElement('button');
+        statusButton.type = 'button';
+        statusButton.className = `btn btn-small ${item.status === 'disabled' ? '' : 'btn-danger'}`;
+        statusButton.textContent = item.status === 'disabled' ? '启用' : '禁用';
+        statusButton.addEventListener('click', async () => {
           const verb = item.status === 'disabled' ? '启用' : '禁用';
           if (!window.confirm(`${verb}账户「${item.username}」？`)) return;
           try {
@@ -682,20 +1030,171 @@
             toast(error.message, true);
           }
         });
+        action.append(statusButton);
+
+        /*
+         * 注销账户（v0.1.3 / F3，需求 2）。
+         *
+         * 走 govApi（管理员 JWT 直连 worker 的 /api/accounts/:id），
+         * 不走 `/control/accounts/...` —— 那个控制端口只打开 users 表，
+         * 删不掉卡片、版本、令牌与 git 仓库。
+         *
+         * 二次确认**必须输入用户名**：`window.confirm` 那种单点确定
+         * 对一个物理删除操作是不够的（手滑一下就没了）。
+         */
+        const purgeButton = document.createElement('button');
+        purgeButton.type = 'button';
+        purgeButton.className = 'btn btn-small btn-danger';
+        purgeButton.textContent = '注销…';
+        purgeButton.dataset.role = 'gov-account-purge';
+        purgeButton.dataset.accountId = item.id;
+        purgeButton.addEventListener('click', () => void govPurgeAccount(item));
+        action.append(purgeButton);
         return { cells, action };
+      });
+    } catch (error) {
+      body.replaceChildren(govMessageRow(7, `读取失败：${error.message}`));
+    }
+  }
+
+  /**
+   * 注销审计（v0.1.3 / F3，需求 3）。
+   *
+   * 走 `/api/audit/account-purges` 而不是拉 `/api/events?all=true` 再前端筛：
+   * 分页 + 前端过滤会漏 —— 最近 50 条里可能一条注销事件都没有，
+   * 于是"查过了，没有"这个结论是假的。服务端在 SQL 里筛，分页边界才对。
+   */
+  async function loadGovAudit() {
+    const body = $('gov-audit');
+    try {
+      const result = await govApi('/api/audit/account-purges?limit=50');
+      const items = result.items || [];
+      if (result.retentionDays) {
+        $('gov-audit-hint').textContent =
+          `审计事件保留 ${result.retentionDays} 天；账户注销后这些记录仍然保留，` +
+          '用于追溯"谁在什么时候注销了谁"。';
+      }
+      if (items.length === 0) {
+        body.replaceChildren(govMessageRow(6, '还没有任何账户被注销'));
+        return;
+      }
+      renderGovTable(body, 6, items, (item) => {
+        const detail = item.counts
+          ? `${item.counts.cards ?? 0} 卡 / ${item.counts.versions ?? 0} 版本 / ${item.counts.repos ?? 0} 仓库 / ${item.counts.repoTokens ?? 0} 令牌`
+          : '—';
+        const target = item.targetUsername
+          ? `${item.targetUsername}（${item.targetUid || '—'}）`
+          : item.targetUid || '—';
+        return {
+          cells: [
+            fmtTime(item.at),
+            item.actor || '—',
+            target,
+            item.path === 'admin' ? '管理员' : item.path === 'self' ? '自助' : '—',
+            item.ip || '—',
+            detail,
+          ],
+          action: null,
+        };
       });
     } catch (error) {
       body.replaceChildren(govMessageRow(6, `读取失败：${error.message}`));
     }
   }
 
-  async function loadGovRepos() {
-    const body = $('gov-repos');
+  // ── 注销账户（v0.1.3 / F3，需求 2）──────────────────────────
+  //
+  // 与客户端那条路径同一套交互：警告 → 统计"将删除什么" → 必须手打用户名 → 实心危险按钮。
+  // 二次确认放在这里而不是 window.confirm，是因为后者只有一个"确定"按钮，
+  // 而这是物理删除（没有回收站）。
+  let purgeTarget = null; // { id, username, uid }
+
+  function purgeMatches() {
+    const typed = $('gov-purge-confirm-username').value.trim();
+    if (!purgeTarget || typed === '') return false;
+    return typed.toLowerCase() === purgeTarget.username.toLowerCase();
+  }
+
+  function purgeResync() {
+    $('gov-purge-submit').disabled = !purgeMatches();
+    if (purgeMatches()) $('gov-purge-msg').textContent = '';
+  }
+
+  function closeGovPurge() {
+    $('gov-purge-overlay').hidden = true;
+    $('gov-purge-confirm-username').value = '';
+    $('gov-purge-msg').textContent = '';
+    purgeTarget = null;
+  }
+
+  async function govPurgeAccount(item) {
+    purgeTarget = { id: item.id, username: item.username, uid: item.uid || '' };
+    $('gov-purge-overlay').hidden = false;
+    $('gov-purge-expect').textContent = item.username;
+    $('gov-purge-confirm-username').value = '';
+    $('gov-purge-msg').textContent = '';
+    $('gov-purge-submit').disabled = true;
+    $('gov-purge-summary').textContent = '正在统计该账户下的数据…';
+
+    /*
+     * 统计走 `/api/accounts/:id/summary`（管理员版），一次请求拿全。
+     *
+     * 为什么不在前端用 `/api/cards?all=true` 自己数：CardSummary **不含 ownerId**，
+     * 前端没有可靠办法把卡归到某个账户（第一版就是这么写的，数出来恒为 0）。
+     * 而且这个端点与客户端那条路径共用服务端的 `summarizeAccount`，
+     * 口径与真正删除时完全一致。
+     */
+    try {
+      const stats = await govApi(`/api/accounts/${encodeURIComponent(item.id)}/summary`);
+      $('gov-purge-summary').textContent =
+        `将永久删除：${stats.cards} 张角色卡（含回收站）、${stats.versions} 个历史版本、` +
+        `${stats.repos} 个仓库、${stats.repoTokens} 个仓库令牌。` +
+        `${stats.sessions} 个登录会话会同时失效。`;
+    } catch (error) {
+      // 读不到就明说，不编数字（"将删除 0 张卡"是最危险的谎）
+      $('gov-purge-summary').textContent =
+        `无法读取数据统计（${error.message}）—— 注销仍会删除该账户的全部数据`;
+    }
+    $('gov-purge-confirm-username').focus();
+  }
+
+  async function submitGovPurge() {
+    if (!purgeTarget || !purgeMatches()) return;
+    const button = $('gov-purge-submit');
+    button.disabled = true;
+    button.textContent = '正在注销…';
+    try {
+      const result = await govApi(`/api/accounts/${encodeURIComponent(purgeTarget.id)}`, { method: 'DELETE' });
+      const counts = result.counts || {};
+      toast(`已注销「${result.username}」：${counts.cards ?? 0} 张卡、${counts.repos ?? 0} 个仓库已清除`);
+      closeGovPurge();
+      await loadGovernance();
+    } catch (error) {
+      // 服务端原话：可能是"最后一名管理员""管理员不能注销自己"这类规则拒绝
+      $('gov-purge-msg').textContent = `注销失败：${error.message}`;
+    } finally {
+      button.textContent = '永久注销';
+      purgeResync();
+    }
+  }
+
+  $('gov-purge-confirm-username').addEventListener('input', purgeResync);
+  $('gov-purge-cancel').addEventListener('click', closeGovPurge);
+  $('gov-purge-close').addEventListener('click', closeGovPurge);
+  $('gov-purge-submit').addEventListener('click', () => void submitGovPurge());
+  $('gov-purge-overlay').addEventListener('click', (event) => {
+    if (event.target === $('gov-purge-overlay')) closeGovPurge();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !$('gov-purge-overlay').hidden) closeGovPurge();
+  });
+
+  async function loadGovRepos() {    const body = $('gov-repos');
     try {
       const result = await govApi('/api/repos?all=true');
       const items = result.items || [];
       renderGovTable(body, 5, items, (item) => {
-        const cells = [item.name, item.ownerId ? item.ownerId.slice(0, 8) + '…' : '—', `${item.cardCount} 张`, item.isDefault ? '默认' : ''];
+        const cells = [item.name, formatOwner(item), `${item.cardCount} 张`, item.isDefault ? '默认' : ''];
         const action = document.createElement('span');
         if (item.isDefault) {
           action.className = 'muted';
@@ -763,7 +1262,7 @@
         moveButton.className = 'btn btn-small';
         moveButton.textContent = '移动…';
         moveButton.addEventListener('click', async () => {
-          const options = repoOptions.map((repo, index) => `${index + 1}. ${repo.name}（${repo.ownerId ? repo.ownerId.slice(0, 8) : '?'}）`).join('\n');
+          const options = repoOptions.map((repo, index) => `${index + 1}. ${repo.name}（${formatOwner(repo)}）`).join('\n');
           const answer = window.prompt(`把「${item.name}」移到哪个仓库？输入编号：\n\n${options}`, '1');
           if (answer === null) return;
           const target = repoOptions[Number.parseInt(answer.trim(), 10) - 1];
@@ -834,12 +1333,25 @@
         td.textContent = text;
         row.append(td);
       }
-      const last = document.createElement('td');
-      last.append(action);
-      row.append(last);
+      /*
+       * action 为 null 表示这张表没有操作列（例如注销审计：它是只读记录）。
+       *
+       * 不能无条件 append：`Node.append(null)` 会把 null 转成**字符串 "null"**
+       * 塞进单元格 —— 于是审计表最后一列会显示一个 "null"。
+       * 更不能反正都是空就 append 一个空 td：那会让列数与 thead 对不上，
+       * 表格整体右移一格。
+       */
+      if (action !== null && action !== undefined) {
+        const last = document.createElement('td');
+        last.append(action);
+        row.append(last);
+      }
       body.append(row);
     }
   }
+
+  // 审计卡片的刷新按钮：如果不绑，它是一个点了没反应的按钮（比不摆更糟）
+  $('gov-audit-refresh').addEventListener('click', () => void loadGovAudit());
 
   $('gov-login').addEventListener('click', () => void govLogin());
   $('gov-password').addEventListener('keydown', (event) => {
@@ -879,6 +1391,13 @@
       void loadConfigForm().then(() => {
         if (registerModeValue() === 'open') void loadRecentAccounts();
       });
+      /*
+       * 传输安全状态走**独立的控制面端点**（`/control/tls/status`），
+       * 因为证书全路径只在控制面下发（`configSummary` 会随 `/api/stats`
+       * 发给任何已鉴权客户端）。每次进入这个视图都重读一次：
+       * 面板是快照，用户切走再回来时监听状态可能已经变了。
+       */
+      void loadTlsStatus(true);
     }
     if (view === 'api') { state.visibleToken = false; $('token-input').value = '（已隐藏，点击显示）'; }
     if (view === 'governance') {
@@ -895,22 +1414,119 @@
   // 支持 #token=<token>&view=config 形式的深链（截图 / 本机快捷入口用）。
   // 放在 hash 里不会发往服务端，也不会进访问日志；解析后立即从地址栏清除。
   let initialView = 'overview';
+  /*
+   * hash 里的参数要**先存下来**再用。
+   *
+   * `history.replaceState` 会把 hash 清掉，之后 `location.search` 里根本没有
+   * 那些参数 —— 第一版把自动登录参数也塞进了 hash（`#token=…&gov=1`），
+   * 结果 `replaceState` 之后 `debugParams.get('gov')` 恒为 null，
+   * 治理页停在"需要管理员登录"，截出来是一张登录页。
+   *
+   * 所以这里把解析结果留一份给后面的自动登录用。
+   */
+  let hashParams = new URLSearchParams();
   if (location.hash.length > 1) {
-    const params = new URLSearchParams(location.hash.slice(1));
-    const hashToken = params.get('token');
+    hashParams = new URLSearchParams(location.hash.slice(1));
+    const hashToken = hashParams.get('token');
     if (hashToken) {
       state.token = hashToken.trim();
       localStorage.setItem(TOKEN_KEY, state.token);
     }
-    initialView = params.get('view') || 'overview';
+    initialView = hashParams.get('view') || 'overview';
     history.replaceState(null, '', location.pathname);
   }
 
+  /*
+   * 截图/联调入口：`?gov=1&govUser=…&govPassword=…` 自动登录治理页。
+   *
+   * 走的是**真实登录**（同一个 `govLogin` 那条路径，只是预填了输入框），
+   * 不是伪造身份 —— 否则截出来的治理页可能与真实状态不一致，
+   * 而截图验收的意义正在于"这就是用户会看到的界面"。
+   *
+   * 只在带参数时生效，正常访问不受影响。
+   */
+  /*
+   * 自动登录参数可能来自 search（`?gov=1`）或 hash（`#gov=1`，与面板令牌一起传）。
+   * 两处都查：截图脚本为了少写一个 URL 入口，把它们都放进了 hash。
+   */
+  const debugParams = new URLSearchParams(location.search);
+  const readParam = (key) => debugParams.get(key) ?? hashParams.get(key);
+  const govAutoLogin = readParam('gov') === '1';
+
   if (state.token) {
     enterApp()
-      .then(() => { if (initialView !== 'overview') switchView(initialView); })
+      .then(() => {
+        if (initialView !== 'overview') switchView(initialView);
+        if (govAutoLogin) return autoGovLogin(readParam);
+        return undefined;
+      })
+      /*
+       * 截图入口的错误**就地吞掉并打日志**，不要落到下面的 `.catch(showLogin)`：
+       * 那会把它显示成登录页，于是"脚本摆错了状态"看起来像"面板坏了"。
+       */
+      .then(() =>
+        runTlsDemo(readParam).catch((error) => {
+          console.error('tlsDemo 失败：', error);
+        }),
+      )
       .catch(() => showLogin());
   } else {
     showLogin();
+    if (govAutoLogin) void autoGovLogin(readParam);
+  }
+
+  async function autoGovLogin(params) {
+    const user = params('govUser') || '';
+    const password = params('govPassword') || '';
+    if (user === '' || password === '') return;
+    switchView('governance');
+    $('gov-username').value = user;
+    $('gov-password').value = password;
+    await govLogin();
+  }
+
+  /**
+   * 截图/联调入口：`?tlsDemo=off|selfsigned|custom-ok|custom-bad`。
+   *
+   * 为什么需要它：四种状态里有一种（**不匹配拦截**）必须"先填两个路径再看结果"，
+   * 而 `chrome --screenshot` 不能点也不能打字。这个入口只做"把表单摆成那个状态"，
+   * 之后的校验仍然走真实的 `POST /control/tls/inspect`、状态仍然来自
+   * `/control/tls/status` —— 截出来的界面与用户自己操作时完全一致。
+   *
+   * 不伪造任何返回值：`custom-bad` 用的是**真实的**一对不匹配文件，
+   * 服务端真的会拒。
+   */
+  async function runTlsDemo(params) {
+    const mode = params('tlsDemo');
+    if (mode === null) return;
+    if (state.view !== 'config') switchView('config');
+    // switchView 里的 loadTlsStatus 是"发射即忘"，这里要等它回填完再动表单，
+    // 否则后续 setTlsMode 会被回填覆盖（顺序竞赛）
+    await loadTlsStatus(true);
+
+    if (mode === 'custom-ok' || mode === 'custom-bad') {
+      setTlsMode('custom');
+      $('cfg-tls-certPath').value = params('certPath') || '';
+      $('cfg-tls-keyPath').value = params('keyPath') || '';
+      await checkTlsCustom();
+    } else if (mode === 'off' || mode === 'selfsigned') {
+      setTlsMode(mode);
+    }
+    /*
+     * 只在**卡片没完整露出来**时才滚动。
+     *
+     * 前两版无条件 `scrollIntoView`（先 start、再 center），在 headless 下
+     * 都会让侧边栏与整块布局一起下移、上方留一片空白 —— 截出来的图看起来
+     * 像布局坏了，而其实是滚动位置的问题。截图脚本把视口调得足够高
+     * （1460×1560，配置页整屏可见），于是正常情况下这里根本不用滚。
+     *
+     * 试过再加一个"滚到底"的开关去拍变灰的保存按钮，结果同样错位 ——
+     * 所以那条路走不通，改用 `--dump-dom` 断言按钮的 `disabled`（见
+     * scripts/capture-f4-tls.sh 的断言段）：机器核对比让肉眼在一张小图里找灰色按钮可靠。
+     */
+    const rect = $('tls-card').getBoundingClientRect();
+    if (rect.bottom > window.innerHeight) {
+      window.scrollTo({ top: window.scrollY + rect.top - 16 });
+    }
   }
 })();

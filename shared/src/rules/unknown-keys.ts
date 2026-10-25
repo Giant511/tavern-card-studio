@@ -142,6 +142,8 @@ export const PLATFORM_RULE_ELEMENT_KEYS = [
   // T10.33：世界书条目规则用（category 决定审计分组，when 表达跨字段条件）
   'category',
   'when',
+  // v0.1.3 追加项一：显式声明内容规则也适用于初始场景/对话示例
+  'contentOptIn',
   // placeholder-min-count / placeholder-forbid / pattern-required
   'token',
   'min',
