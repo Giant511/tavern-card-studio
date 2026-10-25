@@ -57,18 +57,35 @@ lines.forEach((line, i) => {
 });
 
 // ── 2/3. 用户向纯净度 ──────────────────────────────────────
+/*
+ * docs 例外清单**从 .gitignore 派生**，不在这里再维护一份。
+ *
+ * 原来是硬编码两份文件名，于是新增一份对外文档要在三个地方同步：
+ * `.gitignore` 的 `!docs/…`、`test/ops-doc.test.mjs` 的 PUBLISHED_DOCS、
+ * 还有这里的两个 `.replace()`。漏掉第三处的表现是"文档能上传、但 README
+ * 一提它 check:readme 就红"，而错误信息说的是"死链"—— 指向完全错误的方向。
+ *
+ * `.gitignore` 是唯一事实源：它决定"哪些 docs 会入库"，也就决定了"哪些 docs
+ * 的链接不是死链"。`test/ops-doc.test.mjs` 已经守着它与 PUBLISHED_DOCS 一致。
+ */
+const publishedDocs = readPublishedDocs();
+
 lines.forEach((line, i) => {
   /*
-   * docs 例外：只有 .gitignore 明确放行的那几份（目前是 server-cmd.md 与
-   * server-developer.md）是**入库的**，所以指向它们的链接不是死链。
-   * 清单与 test/ops-doc.test.mjs 的 PUBLISHED_DOCS 保持一致。
-   *
    * 判断按"去掉这些链接后还有没有 docs/ 引用"来做，而不是简单地白名单整行 ——
    * 一行里同时写了死链和活链时，前者仍必须被抓出来。
+   *
+   * 两种形态都要去掉：文件名含空格时，Markdown 链接里必须写 `%20`
+   * （CommonMark 的链接目的地不允许裸空格），所以同一份文档会出现
+   * `docs/Cloud Deployment Manual.md` 与 `docs/Cloud%20Deployment%20Manual.md`
+   * 两种写法。只去前者会让后者被判成死链。
    */
-  const withoutPublishedDocs = line
-    .replace(/docs\/server-cmd\.md/g, '')
-    .replace(/docs\/server-developer\.md/g, '');
+  let withoutPublishedDocs = line;
+  for (const path of publishedDocs) {
+    withoutPublishedDocs = withoutPublishedDocs.split(path).join('');
+    const encoded = encodeURI(path);
+    if (encoded !== path) withoutPublishedDocs = withoutPublishedDocs.split(encoded).join('');
+  }
   if (/docs\//.test(withoutPublishedDocs)) {
     fail(`第 ${i + 1} 行引用了 docs/ 路径（GitHub 上死链）：${line.trim().slice(0, 80)}`);
   }
@@ -78,6 +95,17 @@ lines.forEach((line, i) => {
     fail(`第 ${i + 1} 行出现开发命令：${line.trim().slice(0, 80)}`);
   }
 });
+
+/** 从 .gitignore 读出 `!docs/…` 放行清单（即会入库、因而链接不是死链的 docs） */
+function readPublishedDocs() {
+  const gitignorePath = join(dirname(fileURLToPath(import.meta.url)), '..', '.gitignore');
+  if (!existsSync(gitignorePath)) return [];
+  return readFileSync(gitignorePath, 'utf8')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('!docs/'))
+    .map((line) => line.slice(1));
+}
 
 // ── 4. 相对链接 / 图片目标存在 ────────────────────────────
 const linkTargets = new Set();

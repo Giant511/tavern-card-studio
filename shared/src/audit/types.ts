@@ -99,18 +99,26 @@ export interface WordCountTotal {
 }
 
 export interface WordCountReport {
-  /** 六个板块各自的字数（顺序同 BLOCK_IDS） */
+  /** 八个板块各自的字数（顺序同 BLOCK_IDS） */
   blocks: BlockWordCount[];
-  /** 六板块合计 */
+  /** 全板块合计（所有可编辑文本，含两个字段板块与世界书） */
   total: WordCountTotal;
   /**
    * 按落盘字段口径的合计（与平台长度规则同一口径）：
-   * description = 除性格外五板块之和，personality = 性格，character_book = 世界书条目。
+   * description = 四个 description 板块之和（**不含**性格、两个字段板块与世界书），
+   * personality = 性格，character_book = 世界书条目，
+   * first_mes = 初始场景（含备用开场白拼成的一段），mes_example = 对话示例。
+   *
+   * v0.1.3 起 description 只累计真正写进 description 的那几段。
+   * 此前它把"除性格外所有板块"相加，加入字段板块后那样算会把开场白与示例对话
+   * 算进 description —— 长度规则会因此误判「description 超长」。
    */
   byField: {
     description: WordCountTotal;
     personality: WordCountTotal;
     character_book: WordCountTotal;
+    first_mes: WordCountTotal;
+    mes_example: WordCountTotal;
   };
 }
 

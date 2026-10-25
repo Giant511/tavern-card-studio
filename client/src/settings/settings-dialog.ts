@@ -46,6 +46,20 @@ export interface SettingsCallbacks {
   /** 点「退出登录」 */
   onLogout?: () => Promise<void>;
   /**
+   * 点「注销账户…」：打开二次确认弹窗（v0.1.3 / F3）。
+   *
+   * 不在这里实现弹窗，因为注销要联动 AuthSession、清登录态、刷新顶栏与面板 ——
+   * 那些都是 App 的职责。设置面板只负责"把入口摆出来"。
+   */
+  onDeleteAccount?: () => void;
+  /**
+   * 当前是否处于仓库令牌模式（v0.1.3 / F5 后半）。null = 不是。
+   *
+   * 设置页需要它把身份行改成"仓库令牌模式 · X"：那个模式下没有账户身份，
+   * 显示「已登录：xxx」会让人误以为自己有完整的账户权限。
+   */
+  getRepoTokenMode?: () => { repoName: string } | null;
+  /**
    * 点「导出诊断日志」（T10.26）。由 app 提供：它知道版本、连接状态、会话摘要，
    * 也知道日志文件在哪（契约返回的路径）。
    *
@@ -63,6 +77,10 @@ export class SettingsDialog {
   /** 账户那一行：已登录 / 未登录 + 动作按钮（登录… / 退出登录） */
   private readonly identityText: HTMLElement;
   private readonly identityButton: HTMLButtonElement;
+  /** 「注销账户…」（v0.1.3 / F3）：仅账户登录时可见 */
+  private readonly deleteAccountButton: HTMLButtonElement;
+  /** 两条凭证路径的说明（v0.1.3 / F5 后半） */
+  private readonly identityHint: HTMLElement;
   /** 「导出诊断日志」按钮与它那一行结果（T10.26） */
   private readonly diagnosticsButton: HTMLButtonElement;
   private readonly diagnosticsStatus: HTMLElement;
@@ -145,14 +163,57 @@ export class SettingsDialog {
     this.identityButton.dataset['role'] = 'settings-identity-action';
     this.identityButton.addEventListener('click', () => void this.actOnIdentity());
     identityRow.append(this.identityText, this.identityButton);
-    identityField.append(
-      identityRow,
+    /*
+     * 「注销账户」（v0.1.3 / F3）。
+     *
+     * 放在身份行**同一行的末尾**，但用 danger 样式且默认隐藏（仅账户登录时出现）：
+     *   · 放在这里是因为"账户"这一行就是用户找账户操作的地方；
+     *   · 用 danger 而不是普通按钮，是因为它旁边就是「退出登录」——
+     *     两者视觉上必须能一眼分开，否则手滑点错的代价是"账户没了"。
+     *   · 仓库令牌模式下**不显示**：那个模式没有账户可言（令牌代表别人），
+     *     摆一个注定 403 的按钮比不摆更糟。
+     */
+    this.deleteAccountButton = el('button', 'btn small danger', '注销账户…');
+    this.deleteAccountButton.type = 'button';
+    this.deleteAccountButton.dataset['role'] = 'settings-delete-account';
+    this.deleteAccountButton.hidden = true;
+    this.deleteAccountButton.addEventListener('click', () => this.callbacks.onDeleteAccount?.());
+    identityRow.append(this.deleteAccountButton);
+    identityField.append(identityRow);
+    /*
+     * 两条凭证路径的适用场景（v0.1.3 / F5 后半重写）。
+     *
+     * 上一版只写「令牌由客户端自动管理，不需要手工填写」—— 那句话回答了
+     * "要不要手填令牌"，但没回答用户真正困惑的问题：
+     *   「仓库与令牌里签出来的那些令牌，到底该在哪里用？」
+     * 实测反馈里就有人签了一把 tcr_ 令牌，然后找不到任何入口能粘它。
+     *
+     * 所以这里必须把两条路径**并列写清**（账户 = 身份 / 仓库令牌 = 受限授权），
+     * 并给出各自的适用场景 —— 判决标准是"你是在自己常用的机器上，
+     * 还是要把这个仓库交给别人/别的工具"。
+     */
+    this.identityHint = el('p', 'field-hint settings-path-hint');
+    this.identityHint.dataset['role'] = 'settings-credential-paths';
+    this.identityHint.append(
+      el('strong', '', '两条凭证路径（按场景选）：'),
       el(
         'span',
-        'field-hint',
-        '登录后会用账户身份同步；令牌由客户端自动管理，不需要手工填写。',
+        'settings-path-line',
+        '· 账户登录 = 身份。本机常用，用自己的用户名密码登录，全权管理自己名下的全部仓库与卡片。',
+      ),
+      el(
+        'span',
+        'settings-path-line',
+        '· 仓库令牌 = 受限授权。把令牌交给其他设备、脚本或他人，让它们只能访问这一个仓库、' +
+          '且只到令牌范围允许的程度（读 / 写 / 回滚）；不暴露账户密码，也不能管理仓库与令牌。',
+      ),
+      el(
+        'span',
+        'settings-path-line',
+        '令牌在「同步 → 仓库与令牌…」里签发，拿到后到登录界面的「使用仓库令牌连接」粘贴。',
       ),
     );
+    identityField.append(this.identityHint);
 
     /*
      * 兼容模式（≤v0.1.1 的服务端）收进「高级」折叠区，默认收起。
@@ -388,19 +449,49 @@ export class SettingsDialog {
     const identity = this.callbacks.getIdentity?.() ?? { phase: 'anonymous' as AuthPhase, user: null };
     this.identityText.textContent = identityLabel(identity.phase, identity.user);
     this.identityText.dataset['phase'] = identity.phase;
+
+    /*
+     * 仓库令牌模式（v0.1.3 / F5 后半）：身份行改说"当前用的是哪种凭证"。
+     *
+     * 不能沿用"已登录：xxx" —— 令牌模式下没有账户身份（令牌代表签发人，
+     * 用令牌的未必是同一个人）。这里必须说清"你正在用一把受限授权"，
+     * 否则用户会以为自己在账户身份里，然后奇怪为什么别的仓库不见了。
+     */
+    const tokenMode = this.callbacks.getRepoTokenMode?.() ?? null;
+    if (tokenMode !== null) {
+      this.identityText.textContent = `仓库令牌模式 · ${tokenMode.repoName === '' ? '未知仓库' : tokenMode.repoName}`;
+      this.identityText.dataset['phase'] = 'repo-token';
+      this.identityButton.textContent = '退出令牌模式';
+      this.identityButton.dataset['action'] = 'logout';
+      this.identityButton.hidden = this.callbacks.onLogout === undefined;
+      // 仓库令牌模式没有账户可注销：那时点了也是 403，不如不显示
+      this.deleteAccountButton.hidden = true;
+      this.updateSyncNote();
+      return;
+    }
+
     const loggedIn = identity.phase === 'authenticated';
     this.identityButton.textContent = loggedIn ? '退出登录' : '登录…';
     this.identityButton.dataset['action'] = loggedIn ? 'logout' : 'login';
     // 没有接回调时把按钮藏起来，而不是留一个点了没反应的按钮
     this.identityButton.hidden =
       loggedIn ? this.callbacks.onLogout === undefined : this.callbacks.onLogin === undefined;
+    /*
+     * 注销入口只在**账户登录**时出现。
+     *
+     * `loggedIn` 用的是 phase === 'authenticated'，而 legacy 全局令牌不会把 phase
+     * 置成 authenticated（它没有账户身份）—— 所以这里不会给"运维令牌"用户
+     * 摆一个注定 403 的按钮。
+     */
+    this.deleteAccountButton.hidden = !loggedIn;
     this.updateSyncNote();
   }
 
-  /** 身份行按钮：登录 → 打开登录框；已登录 → 退出 */
+  /** 身份行按钮：登录 → 打开登录框；已登录/令牌模式 → 退出 */
   private async actOnIdentity(): Promise<void> {
     const identity = this.callbacks.getIdentity?.() ?? { phase: 'anonymous' as AuthPhase, user: null };
-    if (identity.phase === 'authenticated') {
+    const tokenMode = this.callbacks.getRepoTokenMode?.() ?? null;
+    if (identity.phase === 'authenticated' || tokenMode !== null) {
       if (this.callbacks.onLogout === undefined) return;
       this.identityButton.disabled = true;
       try {

@@ -17,7 +17,16 @@
 import { BLOCK_DEFINITION_MAP, BLOCK_IDS, type BlockId } from '../model/blocks.js';
 import { createEmptyCard, type CardBlock, type UnifiedCard } from '../model/unified-card.js';
 import { iterateLines, matchHeadingLine, normalizeHeading, parseDescription } from './description.js';
-import { headingTextFor, presetAliasTable, type TxtPreset } from './preset.js';
+import { isFieldBlock } from './field-blocks.js';
+import { parseGreetings, type GreetingFormatParams } from './greeting-preset.js';
+import {
+  headingTextFor,
+  presetAliasTable,
+  presetGreetingFormat,
+  separatorToken,
+  trimTrailingSeparatorText,
+  type TxtPreset,
+} from './preset.js';
 import {
   mergeWorldbookEntries,
   parseWorldbookText,
@@ -54,6 +63,11 @@ export interface RenderCardTextOptions {
 export interface ParseCardTextOptions {
   /** strict（默认）：缺板块即中止；lenient：缺失按空块填充并警告 */
   mode?: CardTextMode;
+  /**
+   * 「初始场景」多条开场白的分隔格式（v0.1.3 / 追加项一）。
+   * 缺省按 TXT 预设的 `greeting.separator`，再缺省用冻结默认值。
+   */
+  greetingFormat?: GreetingFormatParams;
   /**
    * **全量保全**（v0.1.2，见 docs/06 §7）。默认 `false`，TXT 导入路径显式开启。
    *
@@ -579,7 +593,10 @@ export function parseCardText(text: string, preset: TxtPreset, options: ParseCar
   // 但 ≥1 的情况下 `missing` 标记仍然照实打 —— 那个板块确实没有标题，
   // 编辑器把它标成「原文缺失」是准确的信息，审计据此提示也不算误报。
   const orderIndex = new Map<BlockId, number>(preset.blockOrder.map((id, index) => [id, index]));
-  const missing = BLOCK_IDS.filter((id) => !byBlock.has(id));
+  // 两个字段板块（对话示例 / 初始场景）**不参与"缺失板块"判定**：
+  // 它们是可选内容，六板块时代导出的 TXT 里本来就没有这两个标题，
+  // 报"缺少板块"会让每一份历史 TXT 都看起来有问题（而内容并没丢）。
+  const missing = BLOCK_IDS.filter((id) => !byBlock.has(id) && !isFieldBlock(id));
   for (const blockId of missing) {
     if (preserve) break;
     const presetIndex = orderIndex.get(blockId) ?? BLOCK_IDS.indexOf(blockId);
@@ -651,7 +668,13 @@ export function parseCardText(text: string, preset: TxtPreset, options: ParseCar
   // 切换预设时又会按旧 raw 找回旧内容（保全的内容凭空消失）。
   // 所以这里按**最终的** settings 文本重建这一段，标题行字节保持原样。
   const descriptionSections = scan.sections
-    .filter((section) => section.blockId !== 'worldbook' && section.blockId !== 'personality')
+    .filter(
+      (section) =>
+        section.blockId !== 'worldbook' &&
+        section.blockId !== 'personality' &&
+        // 字段板块不进 description：它们的内容属于 first_mes / mes_example
+        !isFieldBlock(section.blockId),
+    )
     .sort((a, b) => a.start - b.start);
   const settingsSection = byBlock.get('settings');
   const descriptionChunks = descriptionSections.map((section) => {
@@ -671,12 +694,44 @@ export function parseCardText(text: string, preset: TxtPreset, options: ParseCar
   const parsedDescription = parseDescription(descriptionRaw, { aliases, separator: preset.separator });
   const parsedById = new Map(parsedDescription.blocks.map((block) => [block.id, block]));
 
+  // ---- 字段板块（v0.1.3）：初始场景 / 对话示例 ----
+  //
+  // 这两段**不进 description**：它们的正文属于 first_mes / alternate_greetings / mes_example
+  // 三个独立顶层字段。若跟着 description 走，用户导出再导入会发现"开场白跑进了 description"。
+  //
+  // 末尾可能残留板块分隔符（如 divider 预设的 `---`）：它属于排版，不属于内容，
+  // 先按预设的板块分隔符剔除，再按开场白分隔符切分。
+  const blockSeparatorToken = separatorToken(preset.separator);
+  const fieldSectionText = (id: BlockId): string | null => {
+    const section = byBlock.get(id);
+    if (section === undefined) return null;
+    return trimTrailingSeparatorText(section.body, blockSeparatorToken);
+  };
+  const greetingFormat = options.greetingFormat ?? presetGreetingFormat(preset);
+  const greetingText = fieldSectionText('initial-scene');
+  const greetings = parseGreetings(greetingText ?? '', greetingFormat);
+  const examplesText = fieldSectionText('chat-examples');
+
   const buildCard = (): UnifiedCard => {
     const card = createEmptyCard();
     const personalitySection = byBlock.get('personality');
     const personalityText = personalitySection?.body ?? '';
 
     card.blocks = BLOCK_IDS.filter((id) => id !== 'worldbook').map((id) => {
+      // 字段板块：正文直接落 residual（见下方），板块里显示同一段文本
+      if (isFieldBlock(id)) {
+        const text = (id === 'initial-scene' ? greetingText : examplesText) ?? '';
+        return {
+          id,
+          text,
+          raw: text,
+          dirty: false,
+          anchor: null,
+          // 0 板块识别时整篇原文在【其他设定】里，说"这两个板块缺失"是误导：
+          // 不是缺，是这张卡本来就没有开场白/示例对话（与 personality 的处理一致）
+          missing: (id === 'initial-scene' ? greetingText : examplesText) === null && !(plan !== null && plan.wholeText),
+        };
+      }
       if (id === 'personality') {
         return {
           id: 'personality' as BlockId,
@@ -730,6 +785,14 @@ export function parseCardText(text: string, preset: TxtPreset, options: ParseCar
       structured: parsedDescription.structured,
       preface: parsedDescription.preface,
     };
+    // 开场白族与对话示例落在独立字段上，由板块文本解析而来。
+    // 空白开场白板块 → 单条空 first_mes（而不是"保留旧值"）：TXT 是本文件的事实源。
+    card.residual = {
+      ...card.residual,
+      firstMes: greetings.firstMes,
+      alternateGreetings: [...greetings.alternateGreetings],
+      mesExample: examplesText ?? '',
+    };
     card.worldbook = {
       entries: worldbookParsed.entries,
       text: renderWorldbookText(worldbookParsed.entries),
@@ -777,6 +840,14 @@ export function applyCardText(card: UnifiedCard, text: string, preset: TxtPreset
   const next: UnifiedCard = structuredClone(card);
   next.blocks = result.card.blocks;
   next.description = result.card.description;
+  // 只回写"由 TXT 承载"的三个开场白族字段。其余 residual（scenario / system_prompt /
+  // 群聊开场白 / extensions 之类）TXT 里没有，绝不能因为解析结果是新建卡就被清空。
+  next.residual = {
+    ...card.residual,
+    firstMes: result.card.residual.firstMes,
+    alternateGreetings: [...result.card.residual.alternateGreetings],
+    mesExample: result.card.residual.mesExample,
+  };
   const merge = mergeWorldbookEntries(card.worldbook.entries, result.card.worldbook.entries);
   next.worldbook = {
     entries: merge.entries,

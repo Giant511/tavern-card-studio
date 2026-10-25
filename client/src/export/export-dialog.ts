@@ -5,9 +5,9 @@
  * 「仍要导出 / 取消」，默认焦点在「取消」上——避免误按回车就导出坏卡。
  */
 
-import type { AuditReport, TxtPreset, UnifiedCard } from '@tcs/shared';
+import type { AuditReport, GreetingFormatParams, TxtPreset, UnifiedCard } from '@tcs/shared';
 
-import { isShellAvailable, pickSavePath, writeFileAtomic } from '../contract';
+import { askConfirm, isShellAvailable, pickSavePath, writeFileAtomic } from '../contract';
 import {
   buildExportAsync,
   evaluateExportGate,
@@ -28,7 +28,13 @@ function el<K extends keyof HTMLElementTagNameMap>(
 
 export interface ExportDialogCallbacks {
   /** 取当前卡片与审计报告（导出前必须是最新状态） */
-  getState: () => { card: UnifiedCard; report: AuditReport | null; preset: TxtPreset | null };
+  getState: () => {
+    card: UnifiedCard;
+    report: AuditReport | null;
+    preset: TxtPreset | null;
+    /** 初始场景预设的分隔格式（v0.1.3 追加项一）；缺省 = 冻结默认 */
+    greetingFormat?: GreetingFormatParams;
+  };
   /** 重新审计（导出前强制刷新，避免用旧报告放行） */
   revalidate: () => AuditReport | null;
   notify: (message: string, kind?: 'ok' | 'warn' | 'bad' | 'info') => void;
@@ -204,9 +210,11 @@ export class ExportDialog {
     const gate = evaluateExportGate(report);
 
     if (gate.blocked && !this.bypassGate) {
-      // 二次确认：默认「取消」
-      const proceed = window.confirm(
+      // 二次确认：默认「取消」。必须 await —— askConfirm 在壳里是异步的，
+      // 直接 `if (!window.confirm(...))` 会拿 Promise 当真值，闸门等于没有。
+      const proceed = await askConfirm(
         `${gate.message}\n\n仍要导出吗？（建议先修正；导出后可随时重新导出）`,
+        '导出闸门',
       );
       if (!proceed) {
         this.callbacks.notify('已取消导出', 'info');
@@ -220,7 +228,7 @@ export class ExportDialog {
     this.confirmButton.textContent = '导出中…';
 
     try {
-      const artifact = await buildExportAsync(state.card, state.preset, this.pendingFormat);
+      const artifact = await buildExportAsync(state.card, state.preset, this.pendingFormat, state.greetingFormat);
 
       if (!isShellAvailable()) {
         // 浏览器模式：给出可手动保存的提示（不假装成功）

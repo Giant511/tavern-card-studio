@@ -25,6 +25,17 @@ import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSyn
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
+/**
+ * promisify 版本。
+ *
+ * **必须**用它而不是 `await execFile(...)`：后者返回的是 `ChildProcess`，
+ * `await` 一个非 Promise 值会立刻返回（拿不到 stdout，也不报错）——
+ * 我第一版就写成那样，于是 `currentUserSid()` 静默返回 null、
+ * `readKeyAclSddl()` 在文件还没生成时就去读 → ENOENT。
+ * 这类"await 了个不是 Promise 的东西"不会编译报错，只会让功能悄悄降级。
+ */
+const execFileAsync = promisify(execFile);
+
 import { X509Certificate, X509CertificateGenerator, cryptoProvider } from '@peculiar/x509';
 
 // @peculiar/x509 需要一个 WebCrypto 实现；Node 22 自带。
@@ -48,6 +59,66 @@ export interface CertificatePaths {
 export function certificatePaths(dataDir: string): CertificatePaths {
   const dir = join(dataDir, 'tls');
   return { dir, cert: join(dir, 'server.crt'), key: join(dir, 'server.key') };
+}
+
+/**
+ * 旧证书的备份目录（v0.1.3 / F4 需求第 1 条）。
+ *
+ * 为什么从"证书旁边放 `.bak`"改成独立目录：面板的「重新生成」按钮是**用户主动
+ * 反复点**的操作，备份文件散落在 `data/tls/` 里会越堆越多，而且和真正生效的
+ * `server.crt` / `server.key` 混在一起 —— 排查"客户端说证书变了"时，
+ * 分不清哪个是当前用的。独立目录 + 时间戳命名让"哪一份是哪个时刻的"可读，
+ * 也方便运维整个目录打包带走。
+ */
+export function certsBackupDir(dataDir: string): string {
+  return join(dataDir, 'certs-backup');
+}
+
+/**
+ * 把当前生效的证书/私钥移到备份目录，返回备份后的证书路径。
+ *
+ * 命名 `<ISO 时间戳>-server.crt`（冒号与点被换成 `-`：Windows 文件名不允许冒号）。
+ * 同一毫秒内重复备份时追加 `-1` / `-2` 后缀 —— **不能覆盖**：
+ * 备份的意义就是"旧的那份还在"，覆盖等于没备份。
+ */
+async function backupCurrentPair(
+  dataDir: string,
+  paths: CertificatePaths,
+  now: Date,
+  aclProblems: string[],
+  aclOptions: RestrictOptions,
+): Promise<string> {
+  const dir = certsBackupDir(dataDir);
+  mkdirSync(dir, { recursive: true });
+  const stamp = now.toISOString().replace(/[:.]/g, '-');
+
+  let certTarget = join(dir, `${stamp}-server.crt`);
+  let keyTarget = join(dir, `${stamp}-server.key`);
+  for (let suffix = 1; existsSync(certTarget) || existsSync(keyTarget); suffix += 1) {
+    certTarget = join(dir, `${stamp}-${String(suffix)}-server.crt`);
+    keyTarget = join(dir, `${stamp}-${String(suffix)}-server.key`);
+  }
+
+  renameSync(paths.cert, certTarget);
+  renameSync(paths.key, keyTarget);
+  /*
+   * 备份的私钥同样是秘密：不收紧权限等于把旧私钥留在默认可读的位置。
+   *
+   * 但**失败不能中断备份**：文件已经改名完成，此时抛错会让"备份成功、调用方
+   * 以为失败"，反过来还会让证书生成整体失败 —— 事故里就是这个链条。
+   * 失败只记进 aclProblems，由调用方降级成 warn。
+   */
+  const acl = await restrictKeyPermissions(keyTarget, aclOptions);
+  if (!acl.ok) {
+    /*
+     * **不写路径**：这条文案会一路到面板的错误框。
+     * 需求明确要求"不再直接显示含内部路径的内容"，而备份目录名里还带着
+     * `C:\Users\…` / `C:\ProgramData\…` 这种与用户无关的信息。
+     * 具体文件位置进日志（日志里有完整的 backupPath 字段）。
+     */
+    aclProblems.push(...acl.problems.map((problem) => `备份私钥的权限未能收紧（${problem}）`));
+  }
+  return certTarget;
 }
 
 export interface CertificateInfo {
@@ -159,62 +230,174 @@ async function generatePair(options: GenerateOptions = {}): Promise<GeneratedPai
  * 而 `C:\ProgramData` 对普通用户是可读的 —— 不收紧的话，同机任何用户都能
  * 拷走私钥，HTTPS 就只剩"传输过程看起来是加密的"这一层表象。
  *
- * 失败时**抛错**而不是忽略：权限没收紧的私钥等于没有保护，让服务带着这个状态
- * 跑下去比启动失败更危险。调用方（ensureSelfSigned）会把这个错误暴露出来。
+ * ## v0.1.3 真机事故：这里曾经把服务器搞挂（`icacls ... /grant:r MP2F1GZG$:(F)`）
  *
- * **用异步 execFile 而不是 execFileSync**：两个原因 ——
- * ① icacls 每次要 ~50–100ms，同步调用会卡住事件循环（服务此时已经在受理请求）；
- * ② 本机环境的 Node 无法 spawnSync（EBUSY），同步版本连测试都写不了。
+ * 两个叠加的错误，任一单独存在都不会出事：
+ *
+ *   1. **用账户名而不是 SID**。原实现取 `process.env.USERNAME` 拼成授权主体。
+ *      但 Windows 服务（session 0）以 LocalSystem 运行时，`USERNAME` 是
+ *      **机器账户** `MP2F1GZG$` —— 它不是一个可以 `/grant` 的主体名，
+ *      icacls 直接失败。同时 `SYSTEM` / `Administrators` 写的是**本地化名称**，
+ *      在非英文系统上本来就不可靠。
+ *   2. **把 icacls 的失败当成致命错误**。ACL 是纵深防御，不是门禁；
+ *      它失败却导致"证书生成不出来"，把一个可选加固变成了功能不可用。
+ *
+ * 现在的做法：
+ *   · 授权主体一律用**众所周知的 SID 字面量** + `*` 前缀（按 SID 解析，不查名字）：
+ *     `*S-1-5-18`（SYSTEM）、`*S-1-5-32-544`（Administrators）。区域无关、
+ *     代码页无关、不可能被翻译成乱码。
+ *   · 额外补上**当前进程令牌**的用户 SID（通过 `whoami /user` 读，不做名字解析），
+ *     否则非管理员用绿色包跑时会把自己锁在私钥外面。
+ *   · **永不抛错**：失败返回 `{ ok:false, problems:[脱敏后的原因] }`，由调用方降级成
+ *     warn 并继续生成证书。
+ *   · **脱敏**：不再把 stderr 原文（含内部路径与乱码）往外抛。
+ *
+ * 这条规范已写进 `docs/29-security-review-checklist.md`（Windows ACL 操作）。
+ *
+ * **用异步 execFile 而不是 execFileSync**：icacls 每次要 ~50–100ms，
+ * 同步调用会卡住事件循环（服务此时已经在受理请求）。
  */
-export async function restrictKeyPermissions(keyPath: string): Promise<void> {
-  if (process.platform !== 'win32') {
-    try {
-      await execFileAsync('chmod', ['600', keyPath]);
-    } catch {
-      /* 尽力而为：非 Windows 上由 umask 兜底 */
-    }
-    return;
+
+/** 众所周知的 SID（区域/代码页无关）；`*` 前缀让 icacls 按 SID 解析而不是查账户名 */
+export const KEY_ACL_GRANTS = Object.freeze({
+  system: '*S-1-5-18',
+  administrators: '*S-1-5-32-544',
+});
+
+/** 跑一条系统命令（默认真执行；测试可注入以模拟失败） */
+export type AclRunner = (command: string, args: string[]) => Promise<void>;
+
+export interface AclResult {
+  ok: boolean;
+  /** 实际授予的主体（SID 字面量，含 `*` 前缀，便于日志与测试断言） */
+  grantees: string[];
+  /** 失败原因（**已脱敏**：不含 stderr 原文、不含内部路径） */
+  problems: string[];
+}
+
+const runProcess: AclRunner = async (command, args) => {
+  /*
+   * 故障注入（**仅测试用**）：`TCS_TEST_ACL_FAIL=1` 时让所有 ACL 命令失败。
+   *
+   * 为什么需要它：真机事故发生在 **session 0 的 Windows 服务**里，
+   * 单测可以注入 runner，但"进程内直调"证明不了 `POST /control/tls/regenerate`
+   * 这条跨进程链路在 ACL 坏掉时不会 500。端到端脚本
+   * （scripts/verify-f4-tls.mjs）用它起一个"icacls 不可用"的服务端。
+   *
+   * 不设这个变量时行为完全不变；名字带 TCS_TEST_ 前缀，避免与真实环境变量混淆。
+   */
+  if (process.env['TCS_TEST_ACL_FAIL'] === '1') {
+    const injected = new Error(`模拟 ${command} 失败（TCS_TEST_ACL_FAIL=1）`);
+    (injected as { code?: number }).code = 5;
+    throw injected;
   }
+  // `encoding: 'buffer'` + 不解析输出：本函数只关心退出码。
+  // 顺带绕开"icacls 按控制台代码页输出、Node 按 UTF-8 解码"造成的乱码 ——
+  // 那正是事故里面板上那些 ◆ 字符的来源。
+  await execFileAsync(command, args, { encoding: 'buffer', windowsHide: true });
+};
 
-  const user = process.env['USERNAME'] ?? '';
-  const grants = ['SYSTEM:(F)', 'Administrators:(F)'];
-  if (user) grants.push(`${user}:(F)`);
-
-  // /inheritance:r 去掉继承（否则父目录的 Users 读权限会重新生效），
-  // 再用 /grant:r 逐个授予白名单主体
-  await execFileAsync('icacls', [keyPath, '/inheritance:r']);
-  for (const grant of grants) {
-    await execFileAsync('icacls', [keyPath, '/grant:r', grant]);
+/**
+ * 当前进程令牌的用户 SID。
+ *
+ * **不是账户名解析**：`whoami /user` 直接把令牌里的 SID 打出来，我们只取那串
+ * `S-1-…`（纯 ASCII，任何代码页下字节都相同）。拿不到就返回 null —— 调用方
+ * 只用 SYSTEM + Administrators 两个 SID 继续，不影响功能。
+ *
+ * 为什么需要它：绿色包由普通用户前台运行时，该用户既不是 SYSTEM 也不在
+ * Administrators 里；只授那两个 SID 会把他自己锁在私钥外面。
+ */
+export async function currentUserSid(): Promise<string | null> {
+  if (process.platform !== 'win32') return null;
+  try {
+    const whoami = join(process.env['SystemRoot'] ?? 'C:\\Windows', 'System32', 'whoami.exe');
+    const result = await execFileAsync(whoami, ['/user', '/fo', 'csv', '/nh'], {
+      encoding: 'buffer',
+      windowsHide: true,
+    });
+    const stdout: Buffer = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(String(result.stdout));
+    // latin1：SID 是 ASCII，用 latin1 逐字节映射即可稳定取出。
+    // 用 utf8 解码 GBK 输出会得到替换字符，用 GBK 解码又依赖系统语言。
+    const match = /(S-\d+(?:-\d+)+)/.exec(stdout.toString('latin1'));
+    return match === null ? null : match[1]!;
+  } catch {
+    // whoami 不可用（精简镜像 / 策略禁用）：只授众所周知的 SID，照常工作
+    return null;
   }
 }
 
-const execFileAsync = promisify(execFile);
+/** 把 exec 的失败翻成一句脱敏的话（退出码可留，stderr 不留） */
+function describeAclFailure(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === 'number') return `系统命令 icacls 失败（退出码 ${String(code)}）`;
+  if (typeof code === 'string' && code !== '') return `系统命令 icacls 失败（${code}）`;
+  return '系统命令 icacls 失败（原因见服务端日志）';
+}
+
+export interface RestrictOptions {
+  /** 注入用的命令执行器（测试模拟失败） */
+  run?: AclRunner;
+  /** 注入当前用户 SID；`undefined` = 自动探测，`null` = 不追加 */
+  userSid?: string | null;
+}
 
 /**
- * 读回私钥文件的 ACL，返回可读主体列表（测试与面板展示用）。
+ * 收紧私钥权限。**永不抛错。**
  *
- * 只解析 `icacls` 输出里形如 `BUILTIN\Administrators:(F)` 的片段。
- * 这是"尽力"的解析：icacls 的输出格式随本地语言变化，所以判定
- * 「是否只有白名单主体」时以**主体名**为准，不以权限串为准。
+ * 顺序：一次 icacls 调用同时做「去掉继承」与「按 SID 授予」——
+ * `/inheritance:r` 之后父目录的 `Users` 读权限不会重新生效，
+ * 而 `/grant:r` 保证白名单主体仍然可读。
  */
-export async function readKeyPermissions(keyPath: string): Promise<string[]> {
+export async function restrictKeyPermissions(
+  keyPath: string,
+  options: RestrictOptions = {},
+): Promise<AclResult> {
+  const run = options.run ?? runProcess;
+
   if (process.platform !== 'win32') {
-    const mode = statSync(keyPath).mode & 0o777;
-    return [`chmod:${mode.toString(8)}`];
-  }
-  const { stdout } = await execFileAsync('icacls', [keyPath], { encoding: 'utf8' });
-  const subjects: string[] = [];
-  for (const line of stdout.split(/\r?\n/)) {
-    // 形如：  NT AUTHORITY\SYSTEM:(F)  或  BUILTIN\Administrators:(OI)(CI)(F)
-    const match = /^(.+?):\(([^)]*)\)/.exec(line.trim());
-    if (match) {
-      const subject = match[1]!.trim();
-      // 跳过 "Successfully processed 1 files" 这类尾部信息
-      if (/^(Successfully|已成功|处理)/i.test(subject)) continue;
-      subjects.push(subject);
+    try {
+      await run('chmod', ['600', keyPath]);
+      return { ok: true, grantees: [], problems: [] };
+    } catch (error) {
+      return { ok: false, grantees: [], problems: [`chmod 600 失败：${describeAclFailure(error)}`] };
     }
   }
-  return subjects;
+
+  const userSid = options.userSid === undefined ? await currentUserSid() : options.userSid;
+  // 显式标注 string[]：`Object.freeze` 会把字面量类型收窄成两个字面量的联合，
+  // 后面 push 用户 SID 就通不过类型检查
+  const grantees: string[] = [KEY_ACL_GRANTS.system, KEY_ACL_GRANTS.administrators];
+  if (userSid !== null && typeof userSid === 'string' && /^S-\d+(?:-\d+)+$/.test(userSid)) {
+    const asGrant = `*${userSid}`;
+    if (!grantees.includes(asGrant)) grantees.push(asGrant);
+  }
+
+  try {
+    await run('icacls', [keyPath, '/inheritance:r', '/grant:r', ...grantees.map((sid) => `${sid}:(F)`)]);
+    return { ok: true, grantees, problems: [] };
+  } catch (error) {
+    return { ok: false, grantees, problems: [describeAclFailure(error)] };
+  }
+}
+
+/**
+ * 读回私钥文件的 ACL 的 **SDDL**（测试与诊断用）。
+ *
+ * 为什么读 SDDL 而不是 `icacls <file>` 的普通输出：普通输出是**主体名**
+ * （`BUILTIN\Administrators`），随系统语言变化；SDDL 用 `;;;BA)` / `;;;SY)`
+ * 这类众所周知代码，是纯 ASCII，任何区域/代码页下都一样 —— 才能拿来做断言。
+ *
+ * `icacls /save` 写出的是 UTF-16LE 文件，所以按 UTF-16LE 解码。
+ */
+export async function readKeyAclSddl(keyPath: string, savePath: string): Promise<string> {
+  if (process.platform !== 'win32') {
+    const mode = statSync(keyPath).mode & 0o777;
+    return `chmod:${mode.toString(8)}`;
+  }
+  await execFileAsync('icacls', [keyPath, '/save', savePath], { encoding: 'buffer', windowsHide: true });
+  const raw = readFileSync(savePath);
+  // 文件是 UTF-16LE：去掉 BOM 后按 utf16le 解码，得到 `D:PAI(A;;FA;;;BA)(A;;FA;;;SY)`
+  return raw.toString('utf16le').replace(/^\uFEFF/, '').trim().split(/\r?\n/).pop() ?? '';
 }
 
 export interface EnsureOptions {
@@ -225,6 +408,10 @@ export interface EnsureOptions {
   subjectAltNames?: string[];
   /** 强制重新生成（测试/运维用） */
   force?: boolean;
+  /** 注入 ACL 命令执行器（测试模拟 icacls 失败） */
+  aclRun?: AclRunner;
+  /** 注入当前用户 SID（测试用；`undefined` = 自动探测） */
+  aclUserSid?: string | null;
 }
 
 export interface EnsureResult {
@@ -236,6 +423,13 @@ export interface EnsureResult {
   backupPath: string | null;
   /** 是否临近过期（< 30 天） */
   expiringSoon: boolean;
+  /**
+   * ACL 收紧过程中没能完成的部分（**已脱敏**）。
+   *
+   * 非空不影响证书可用：ACL 是纵深防御，不是门禁。调用方负责把它降级成
+   * warn（日志 + 事件日志），并如实告诉使用者"私钥可能对同机其他用户可读"。
+   */
+  aclProblems: string[];
 }
 
 /**
@@ -245,34 +439,43 @@ export interface EnsureResult {
  *
  * | 现状 | 动作 |
  * |---|---|
- * | 文件缺失 | 生成 |
- * | 已过期 | 备份旧的 → 生成新的 |
- * | 剩余 < 30 天 | 备份旧的 → 生成新的（**不让重启即断链**） |
+ * | 文件缺失 | 生成（无备份，本来就没有旧的） |
+ * | 已过期 | 备份到 `certs-backup/` → 生成新的 |
+ * | 剩余 < 30 天 | 备份到 `certs-backup/` → 生成新的（**不让重启即断链**） |
  * | 剩余 ≥ 30 天 | 直接复用 |
+ * | `force: true` 且已有 | 备份到 `certs-backup/` → 生成新的（面板的「重新生成」） |
  *
  * 「临近过期就续期」是刻意的：等服务真的过期了再处理，客户端会在那一刻
  * 集体报证书错误，而用户看到的是"服务端挂了"。提前 30 天续期把这件事
  * 变成一次静默的、有备份的滚动更新。
+ *
+ * `force` 也必须备份：面板的「重新生成」是**用户主动点**的操作，指纹会立刻变，
+ * 所有客户端下次连接都会看到"证书变了"。旧那份必须留得下来，否则
+ * "我只是想换一张，能换回去吗"没有答案。
  */
 export async function ensureSelfSigned(options: EnsureOptions): Promise<EnsureResult> {
   const now = options.now ?? new Date();
   const paths = certificatePaths(options.dataDir);
   mkdirSync(paths.dir, { recursive: true });
 
+  const aclOptions: RestrictOptions = { run: options.aclRun, userSid: options.aclUserSid };
+  /** ACL 失败一律进这里，**绝不**影响证书生成本身 */
+  const aclProblems: string[] = [];
+
   const exists = existsSync(paths.cert) && existsSync(paths.key);
-  let generate = options.force === true || !exists;
+  let generate = false;
   let backupPath: string | null = null;
 
-  if (exists && !generate) {
+  if (!exists) {
+    generate = true;
+  } else if (options.force === true) {
+    backupPath = await backupCurrentPair(options.dataDir, paths, now, aclProblems, aclOptions);
+    generate = true;
+  } else {
     const info = await inspectCertificate(paths.cert, now);
     if (info.daysUntilExpiry < EXPIRY_WARNING_DAYS) {
       // 过期或临近过期 → 备份后重新生成
-      const stamp = now.toISOString().replace(/[:.]/g, '-');
-      const backupCert = `${paths.cert}.${stamp}.bak`;
-      const backupKey = `${paths.key}.${stamp}.bak`;
-      renameSync(paths.cert, backupCert);
-      renameSync(paths.key, backupKey);
-      backupPath = backupCert;
+      backupPath = await backupCurrentPair(options.dataDir, paths, now, aclProblems, aclOptions);
       generate = true;
     }
   }
@@ -285,11 +488,24 @@ export async function ensureSelfSigned(options: EnsureOptions): Promise<EnsureRe
     });
     writeFileSync(paths.cert, pair.certPem, { encoding: 'utf8', mode: 0o644 });
     writeFileSync(paths.key, pair.keyPem, { encoding: 'utf8', mode: 0o600 });
-    // 写完立刻收紧 ACL：哪怕后面的步骤出错，私钥也不能留在"默认可读"状态
-    await restrictKeyPermissions(paths.key);
-  } else {
-    // 复用已有证书时也再收紧一次：可能是旧版本生成的、或用户手工拷进来的
-    await restrictKeyPermissions(paths.key);
+  }
+
+  /*
+   * 收紧 ACL（生成后 / 复用旧证书都要做）。
+   *
+   * **无论成败都不抛错**：私钥已经写到磁盘上了，此时抛错会让"证书生成失败"
+   * 这个结论变成假话（文件其实好好的），而真机事故就是这条链把整个
+   * 「重新生成」按钮打成 500。
+   */
+  const acl = await restrictKeyPermissions(paths.key, aclOptions);
+  if (!acl.ok) {
+    aclProblems.push(
+      ...acl.problems.map(
+        (problem) =>
+          `私钥文件权限未能收紧（${problem}）：该私钥可能对同机其他用户可读。` +
+          'HTTPS 可正常使用，但建议检查 `icacls` 是否可用（见 docs/29 Windows ACL 操作）。',
+      ),
+    );
   }
 
   const info = await inspectCertificate(paths.cert, now);
@@ -299,6 +515,7 @@ export async function ensureSelfSigned(options: EnsureOptions): Promise<EnsureRe
     generated: generate,
     backupPath,
     expiringSoon: info.daysUntilExpiry < EXPIRY_WARNING_DAYS,
+    aclProblems,
   };
 }
 

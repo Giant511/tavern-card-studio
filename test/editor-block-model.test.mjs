@@ -40,13 +40,16 @@ function texts(card) {
   return Object.fromEntries(collectBlocks(card).map((block) => [block.id, block.text]));
 }
 
-test('六板块投影：顺序固定、世界书有文本', () => {
+test('八板块投影：顺序固定、世界书有文本', () => {
   const blocks = collectBlocks(loadCard());
   assert.deepEqual(
     blocks.map((block) => block.id),
     [...EDITOR_BLOCK_IDS],
   );
-  assert.equal(blocks.length, 6);
+  // v0.1.3 起六→八板块。断言写 EDITOR_BLOCK_IDS.length 而不是字面量 8：
+  // 这样再加板块时不该红（顺序仍由上面那条 deepEqual 守着），
+  // 而「投影漏掉某个板块」会被 deepEqual 抓出来。
+  assert.equal(blocks.length, EDITOR_BLOCK_IDS.length);
   for (const block of blocks) {
     assert.equal(typeof block.text, 'string');
     assert.ok(block.label.length > 0);

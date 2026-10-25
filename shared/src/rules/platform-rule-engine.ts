@@ -9,6 +9,7 @@ import type { UnifiedCard } from '../model/unified-card.js';
 import { countText, findLiteralOffsets, measure, offsetToLineColumn, lineTextAt } from '../text/count.js';
 import type { ContentRule, FieldRequirement, ResolvedPlatformRule, Severity, Selector } from './platform-rule.js';
 import { collectScopedTexts, normalizeSelectorList, readFieldText, type ScopedText } from './scopes.js';
+import { scopeForContentRule } from './format-only-blocks.js';
 import { isWorldbookScopedRule, mergeWorldbookRules } from './worldbook-checks.js';
 
 const MAX_ISSUES_PER_RULE = 20;
@@ -214,7 +215,15 @@ function checkFields(card: UnifiedCard, rule: ResolvedPlatformRule): AuditIssue[
 function checkContentRule(card: UnifiedCard, rule: ResolvedPlatformRule, contentRule: ContentRule): AuditIssue[] {
   if (contentRule.enabled === false) return [];
   const issues: AuditIssue[] = [];
-  const scoped = collectScopedTexts(card, contentRule.scope);
+  /*
+   * 「新两板块 v0.1.3 只做格式审计」的实际落点。
+   *
+   * 过滤粒度是**每段文本**而不是整条规则：`scope: "*"` 的规则会同时命中
+   * basic/settings 与两个新板块，按整条挡会连带关掉本来该跑的那几块。
+   * 显式 `field:first_mes` / `field:mes_example` 的文本 blockId 为 null，
+   * 不在这里被丢 —— 那是规则作者的明确点名。
+   */
+  const scoped = scopeForContentRule(collectScopedTexts(card, contentRule.scope), contentRule);
 
   const report = (params: {
     start: number;

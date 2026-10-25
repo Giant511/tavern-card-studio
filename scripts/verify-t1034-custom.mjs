@@ -17,6 +17,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   checkWorldbookFormat,
@@ -31,12 +32,19 @@ import {
 import { importWorldbookPreset, importTxtPreset, serializePreset } from '../client/src/rules/preset-library.ts';
 
 const ROOT = join(import.meta.dirname, '..');
-const asJson = process.argv.includes('--json');
-const checks = [];
-function check(ok, name, detail = '') {
-  checks.push({ ok, name, detail });
-  if (!asJson) console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail === '' ? '' : `  — ${detail}`}`);
-}
+
+/**
+ * 跑全部断言。
+ *
+ * 导出成函数而不是只做 CLI：`test/` 直接 import 同一份实现，
+ * 避免「测试一份、脚本另一份」两份实现漂移（见 docs/41 §1/§9）。
+ *
+ * @returns {{checks: {ok: boolean, name: string, detail: string}[], failures: number}}
+ */
+export function runT1034Custom() {
+  const checks = [];
+  const check = (ok, name, detail = '') => checks.push({ ok, name, detail });
+
 
 // ── 样本：用户交上来的那一份（不是我们编的格式）
 const SAMPLE_TXT = [
@@ -240,18 +248,31 @@ const NO_KEYS_TXT = SAMPLE_TXT.split('\n').filter((line) => !line.startsWith('�
 
 // ────────────────────────────────── 输出
 
-const failed = checks.filter((item) => !item.ok);
-if (asJson) {
-  console.log(JSON.stringify({ at: new Date().toISOString(), total: checks.length, failed: failed.length, checks }, null, 2));
-} else {
-  console.log('');
-  console.log(`合计 ${String(checks.length)} 项，失败 ${String(failed.length)} 项`);
+  return { checks, failures: checks.filter((item) => !item.ok).length };
 }
 
-mkdirSync(join(ROOT, '.verify'), { recursive: true });
-writeFileSync(
-  join(ROOT, '.verify', 't1034-custom.json'),
-  `${JSON.stringify({ at: new Date().toISOString(), total: checks.length, failed: failed.length, checks }, null, 2)}\n`,
-  'utf8',
-);
-process.exit(failed.length === 0 ? 0 : 1);
+const invokedDirectly =
+  process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1];
+
+if (invokedDirectly) {
+  const asJson = process.argv.includes('--json');
+  const { checks, failures } = runT1034Custom();
+  if (asJson) {
+    console.log(JSON.stringify({ at: new Date().toISOString(), total: checks.length, failed: failures, checks }, null, 2));
+  } else {
+    for (const item of checks) {
+      console.log(`${item.ok ? 'PASS' : 'FAIL'}  ${item.name}${item.detail === '' ? '' : `  — ${item.detail}`}`);
+    }
+    console.log('');
+    console.log(`合计 ${String(checks.length)} 项，失败 ${String(failures)} 项`);
+  }
+
+  // 落一份 JSON 便于人工对照；失败也不影响（这是产物，不是判据）
+  mkdirSync(join(ROOT, '.verify'), { recursive: true });
+  writeFileSync(
+    join(ROOT, '.verify', 't1034-custom.json'),
+    `${JSON.stringify({ at: new Date().toISOString(), total: checks.length, failed: failures, checks }, null, 2)}\n`,
+    'utf8',
+  );
+  process.exit(failures === 0 ? 0 : 1);
+}

@@ -1,13 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口最小权限：只允许单文件对话框与单个目录对话框（T9.8，非递归）、自身配置读写；刻意不授予任意路径 fs 访问与 opener 插件",
+  "description": "主窗口最小权限：只允许单文件对话框与单个目录对话框（T9.8，非递归）、二次确认框；自身配置读写；刻意不授予任意路径 fs 访问与 opener 插件",
   "windows": ["main"],
   "permissions": [
     "core:default",
 
     "dialog:allow-open",
     "dialog:allow-save",
+    "dialog:allow-message",
 
     "store:default",
     "log:default",

@@ -27,10 +27,11 @@ import {
   EXPIRY_WARNING_DAYS,
   SELF_SIGNED_VALIDITY_DAYS,
   certificatePaths,
+  certsBackupDir,
   ensureSelfSigned,
   expiryWarningText,
   inspectCertificate,
-  readKeyPermissions,
+  readKeyAclSddl,
   restrictKeyPermissions,
   validateCustomCertificate,
 } from '../server/dist/tls/certificate.js';
@@ -135,9 +136,17 @@ test('T10.5 selfsigned：临近过期（<30 天）自动重新生成并保留旧
   assert.ok(second.backupPath && existsSync(second.backupPath), '旧证书必须备份');
   assert.notEqual(second.info.fingerprint, first.info.fingerprint, '续期后指纹应改变');
 
-  // 备份目录里应能看到旧文件（cert + key 各一份）
-  const backups = readdirSync(certificatePaths(dir).dir).filter((name) => name.endsWith('.bak'));
-  assert.ok(backups.length >= 2, `旧证书与旧私钥都要备份，实际只有 ${String(backups.length)} 个 .bak`);
+  // 备份目录里应能看到旧文件（cert + key 各一份）。
+  //
+  // v0.1.3 / F4 起备份位置从"证书旁边的 .bak"改成 `data/certs-backup/`：
+  // 面板的「重新生成」会让备份反复产生，散落在 `data/tls/` 里会与真正
+  // 生效的 server.crt / server.key 混在一起，排查"客户端说证书变了"时分不清。
+  const backups = readdirSync(certsBackupDir(dir));
+  assert.ok(backups.length >= 2, `旧证书与旧私钥都要备份，实际只有 ${String(backups.length)} 个`);
+  assert.ok(
+    backups.some((name) => /-server\.crt$/.test(name)),
+    `备份文件名要含时间戳且标明是证书：${JSON.stringify(backups)}`,
+  );
 });
 
 test('T10.5 selfsigned：已过期也自动重新生成（重启不会带一张过期证书）', async () => {
@@ -232,40 +241,71 @@ test('T10.5 过期计算：临近过期但未过期的文案区别于已过期',
 });
 
 // ══════════════════════════════════════════════════════════
-// 3. ACL
+// 3. ACL（v0.1.3 真机事故后改为 SID + SDDL 判据）
 // ══════════════════════════════════════════════════════════
 
-test('T10.5 ACL：生成的私钥只有 SYSTEM / Administrators / 当前用户可读', async () => {
+/**
+ * 为什么不再解析 `icacls <file>` 的主体名：
+ *
+ * 那是**本地化文本**（`BUILTIN\Administrators`、`NT AUTHORITY\SYSTEM`），随系统语言
+ * 变化，而且中文系统上 icacls 的提示行是 GBK —— Node 按 UTF-8 解码就是一堆 ◆。
+ * 真机事故里面板上那些乱码正是这样来的。
+ *
+ * 改成读 SDDL：`icacls <file> /save` 写出 `D:PAI(A;;FA;;;BA)(A;;FA;;;SY)`，
+ * 全是 ASCII，`BA`/`SY` 是众所周知主体的固定代码，任何语言下都一样。
+ */
+test('T10.5 ACL：私钥只授予 SYSTEM / Administrators / 当前用户（用 SID 判据）', async () => {
   const dir = freshDir();
   const result = await ensureSelfSigned({ dataDir: dir, now: new Date('2026-10-23T00:00:00.000Z') });
 
-  const subjects = await readKeyPermissions(result.paths.key);
-  assert.ok(subjects.length > 0, `读不到 ACL：${JSON.stringify(subjects)}`);
+  if (process.platform !== 'win32') return; // 非 Windows 走 chmod 600，另有判据
 
-  if (process.platform === 'win32') {
-    // 判定用"主体名必须都在白名单里"而不是"数量等于 3"：icacls 的输出
-    // 随本地语言与系统账户变化，数量断言会变成环境相关的脆弱测试。
-    const allowList = [/system/i, /administrator/i, /^builtin/i, new RegExp(`\\\\${process.env['USERNAME'] ?? 'x'}$`, 'i')];
-    const unexpected = subjects.filter((subject) => !allowList.some((pattern) => pattern.test(subject)));
-    assert.deepEqual(
-      unexpected,
-      [],
-      `私钥 ACL 里出现了不该有的主体：${unexpected.join(', ')}（完整列表 ${JSON.stringify(subjects)}）`,
-    );
-    // 继承必须被去掉，否则父目录的 Users 读权限会重新生效。
-    //
-    // 判据不用 execFileSync 再查一次 icacls：本机 Node 无法 spawnSync（EBUSY）。
-    // 改为「主体名单里不能出现 Users / Authenticated Users / Everyone」——
-    // 这几个正是"继承来的、对普通用户开放"的主体，它们消失就说明 /inheritance:r 起了作用。
-    const inheritedRisk = subjects.filter((subject) =>
-      /^(builtin\\)?(users|authenticated users|everyone)$/i.test(subject.trim()),
-    );
-    assert.deepEqual(
-      inheritedRisk,
-      [],
-      `私钥 ACL 里仍有继承主体：${inheritedRisk.join(', ')}（完整列表 ${JSON.stringify(subjects)}）`,
+  const sddl = await readKeyAclSddl(result.paths.key, join(dir, 'acl-save.txt'));
+  assert.ok(sddl.startsWith('D:'), `SDDL 读不到：${sddl}`);
+
+  // 必须有：SYSTEM（SY）与 Administrators（BA）
+  assert.match(sddl, /;;;SY\)/, `私钥 ACL 缺少 SYSTEM：${sddl}`);
+  assert.match(sddl, /;;;BA\)/, `私钥 ACL 缺少 Administrators：${sddl}`);
+
+  // 必须没有：Everyone（WD）/ Users（BU）/ Authenticated Users（AU）
+  // —— 这三个正是"父目录继承来的、对普通用户开放"的主体。
+  for (const [code, name] of [
+    ['WD', 'Everyone'],
+    ['BU', 'Users'],
+    ['AU', 'Authenticated Users'],
+  ]) {
+    assert.equal(
+      sddl.includes(`;;;${String(code)})`),
+      false,
+      `私钥 ACL 里仍有 ${String(name)}（${String(code)}）—— /inheritance:r 没生效：${sddl}`,
     );
   }
+
+  // 继承标记必须消失（PAI = 已去掉继承）
+  assert.ok(sddl.includes('D:PAI'), `继承未被切断（期待 D:PAI 前缀）：${sddl}`);
+});
+
+test('T10.5 ACL：授权主体用 SID 字面量，不含任何账户名', async () => {
+  const dir = freshDir();
+  const results = [];
+  const run = async (command, args) => {
+    results.push(args);
+  };
+  const acl = await restrictKeyPermissions(join(dir, 'probe.key'), { run, userSid: null });
+  assert.equal(acl.ok, true);
+  assert.deepEqual(acl.grantees, ['*S-1-5-18', '*S-1-5-32-544'], `默认主体应是两个 SID：${String(acl.grantees)}`);
+
+  const grantArgs = results.at(-1) ?? [];
+  assert.ok(grantArgs.includes('/inheritance:r'), '必须同时去掉继承');
+  for (const sid of ['*S-1-5-18:(F)', '*S-1-5-32-544:(F)']) {
+    assert.ok(grantArgs.includes(sid), `缺少 SID 授权项 ${String(sid)}：${JSON.stringify(grantArgs)}`);
+  }
+  // 真机事故的根因：把机器账户名 / 用户账户名当主体传进去
+  assert.equal(
+    grantArgs.some((arg) => /MACHINE\$|MP2F1GZG\$|^[^*(]+:\(F\)$/.test(arg) && !arg.startsWith('*S-1-')),
+    false,
+    `授权参数里出现了非 SID 主体：${JSON.stringify(grantArgs)}`,
+  );
 });
 
 test('T10.5 ACL：证书本身保持可读（它不是秘密，客户端要能取指纹）', async () => {
@@ -280,12 +320,17 @@ test('T10.5 ACL：restrictKeyPermissions 可重复执行（幂等）', async () 
   const dir = freshDir();
   const result = await ensureSelfSigned({ dataDir: dir, now: new Date('2026-10-23T00:00:00.000Z') });
 
-  const beforeCount = (await readKeyPermissions(result.paths.key)).length;
+  const sddl = (path) => (process.platform === 'win32' ? readKeyAclSddl(path, join(dir, 'acl-idem.txt')) : Promise.resolve(''));
+  const first = await sddl(result.paths.key);
   await restrictKeyPermissions(result.paths.key);
   await restrictKeyPermissions(result.paths.key);
-  const afterCount = (await readKeyPermissions(result.paths.key)).length;
+  const after = await sddl(result.paths.key);
 
-  assert.equal(afterCount, beforeCount, '重复收紧权限不该不断累加 ACE（每次启动都会调用）');
+  if (process.platform === 'win32') {
+    assert.equal(after, first, '重复收紧权限不该不断累加 ACE（每次启动都会调用）');
+    // 反复执行后 ACE 数量仍应是 3（SY + BA + 当前用户）
+    assert.equal((after.match(/\(A;/g) ?? []).length, 3, `ACE 数量应稳定为 3：${after}`);
+  }
 });
 
 // ══════════════════════════════════════════════════════════

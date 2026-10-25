@@ -5,6 +5,8 @@
  * 选择器语法、占位符引用）。离线安装包里不必带 Ajv，命令行侧仍用 Ajv 做完整校验。
  */
 
+import { BLOCK_ID_ALTERNATION } from '../model/blocks.js';
+
 import type {
   ContentRule,
   FieldRequirement,
@@ -30,8 +32,11 @@ const ID_PATTERN = /^[a-z0-9][a-z0-9._:-]{1,79}$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
 // T10.32：世界书条目级选择器。字段白名单与 WORLDBOOK_SELECTABLE_FIELDS 同源 ——
 // 放行任意名字会让拼错的 selector 静默不命中，而"规则没生效"最难排查。
-const SELECTOR_PATTERN =
-  /^(\*|block:(basic|personality|settings|special|user|worldbook)|field:[a-z_]+|worldbook:entries\[\]\.(name|keys|secondary_keys|content|comment|position|insertion_order|priority|depth|constant|enabled|selective|case_sensitive))$/;
+// 板块部分从 BLOCK_ID_ALTERNATION 派生（v0.1.3）：写死清单会在加板块时漏改，
+// 而漏改的表现是"规则被校验拒收"或"静默不命中"，两种都不报错。
+const SELECTOR_PATTERN = new RegExp(
+  `^(\\*|block:(${BLOCK_ID_ALTERNATION})|field:[a-z_]+|worldbook:entries\\[\\]\\.(name|keys|secondary_keys|content|comment|position|insertion_order|priority|depth|constant|enabled|selective|case_sensitive))$`,
+);
 const TOKEN_PATTERN = /^(char|user|custom:[a-zA-Z][a-zA-Z0-9_]{0,31})$/;
 const SEVERITIES = new Set(['error', 'warning', 'info']);
 const RULE_TYPES = new Set([
@@ -138,6 +143,11 @@ function validateRule(
   if (typeof rule['message'] !== 'string' || rule['message'] === '') errors.push(`${where}: 缺少 message`);
   if (!SEVERITIES.has(String(rule['severity']))) errors.push(`${where}: severity 只能是 error/warning/info`);
   checkSelector(errors, where, rule['scope']);
+  // v0.1.3 追加项一：不是布尔值时**不报错**是危险的 —— `contentOptIn: "true"`
+  // 会被读成"没开"，于是规则静默不生效，而作者以为开了。
+  if (rule['contentOptIn'] !== undefined && typeof rule['contentOptIn'] !== 'boolean') {
+    errors.push(`${where}: contentOptIn 必须是布尔值（true 才生效）`);
+  }
 
   if (type.startsWith('placeholder')) {
     const token = rule['token'];

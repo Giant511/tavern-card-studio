@@ -157,7 +157,7 @@ curl.exe -s -X POST http://127.0.0.1:8730/api/auth/login \
 
 ```json
 {
-  "user": { "id": "u_ab12", "username": "alice", "role": "admin", "status": "active" },
+  "user": { "id": "u_ab12", "uid": "usr_ab12cd34", "username": "alice", "role": "admin", "status": "active" },
   "tokenType": "Bearer",
   "accessToken": "eyJhbGciOiJIUzI1NiIs…",
   "refreshToken": "rt_…",
@@ -210,10 +210,15 @@ curl.exe -s http://127.0.0.1:8730/api/auth/me -H "Authorization: Bearer <token>"
 ```
 
 ```json
-{ "via": "jwt", "role": "admin", "user": { "id": "u_ab12", "username": "alice", "role": "admin", "status": "active" } }
+{ "via": "jwt", "role": "admin", "user": { "id": "u_ab12", "uid": "usr_ab12cd34", "username": "alice", "role": "admin", "status": "active" } }
 ```
 
 用全局令牌时如实返回 `{"via":"legacy","role":"admin","user":null}`（它没有账户身份，不编一个假用户）。
+
+**`id` 与 `uid` 的区别（v0.1.3 起）**：`id` 是内部主键（uuid），用于外键与内部寻址，
+不适合给人看；`uid` 是**对外稳定标识**（`usr_` + 8 位），注册时生成、此后永不改变 ——
+**用户名可以改，uid 不会**。如果你要把操作记录与"某个人"绑定、并且会长久保存，
+请存 `uid` 而不是 `username`（改名之后用户名就对不上了）。
 
 ```http
 POST /api/auth/logout        → { "ok": true }     # 吊销当前会话，立即生效
@@ -539,6 +544,10 @@ curl.exe -s -X POST "http://127.0.0.1:8730/api/audit?platform=ccv2&preset=defaul
 }
 ```
 
+`wordCount.byField` 是按**落盘字段**的口径：`description`（四个 description 板块之和）、
+`personality`、`character_book`、`first_mes`、`mes_example`。
+注意 `description` **不含**开场白与示例对话（它们在独立字段上），也不含性格与世界书。
+
 `severity` ∈ `error` / `warning` / `info`；`summary.exportable === false` 表示有 `error` 级问题。
 `POST /api/audit` 响应头带 `X-TCS-Audit-Source: ad-hoc` 与 `X-TCS-Card-Sha256`。
 
@@ -570,7 +579,8 @@ curl.exe -s http://127.0.0.1:8730/api/repos -H "Authorization: Bearer <jwt>"
                "createdAt": "…", "updatedAt": "…", "cardCount": 12 } ] }
 ```
 
-管理员加 `?all=true` 可以看全部账户的仓库（每项多一个 `ownerId`）；非管理员带这个参数会 `403 ADMIN_ONLY`。
+管理员加 `?all=true` 可以看全部账户的仓库（每项多三个字段：`ownerId`（内部 id）、
+`ownerUsername`、`ownerUid`；后两者在账户已不存在时为 `null`）；非管理员带这个参数会 `403 ADMIN_ONLY`。
 
 **仓库令牌访问这个端点会 403**（`FORBIDDEN`）：它不该看到兄弟仓库的存在。
 

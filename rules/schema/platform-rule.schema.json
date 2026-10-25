@@ -184,7 +184,7 @@
     "selector": {
       "type": "string",
       "description": "\"*\" 全部文本板块；\"block:<id>\" 指定板块；\"field:<ST字段名>\" 指定原生字段；\"worldbook:entries[].<字段>\" 世界书**每个条目**的某个字段（name/keys/secondary_keys/content/comment/position/insertion_order/priority/depth/constant/enabled/selective/case_sensitive）。",
-      "pattern": "^(\\*|block:(basic|personality|settings|special|user|worldbook)|field:[a-z_]+|worldbook:entries\\[\\]\\.(name|keys|secondary_keys|content|comment|position|insertion_order|priority|depth|constant|enabled|selective|case_sensitive))$"
+      "pattern": "^(\\*|block:(basic|personality|settings|special|user|chat-examples|initial-scene|worldbook)|field:[a-z_]+|worldbook:entries\\[\\]\\.(name|keys|secondary_keys|content|comment|position|insertion_order|priority|depth|constant|enabled|selective|case_sensitive))$"
     },
     "selectorList": {
       "oneOf": [
@@ -406,6 +406,10 @@
           "type": "boolean",
           "default": false,
           "description": "仅用于 placeholder-min-count / pattern-required：true 表示把所有 scope 文本合并统计（全卡至少 N 次），false 表示对每个 scope 文本分别统计（每个板块都至少 N 次）。"
+        },
+        "contentOptIn": {
+          "type": "boolean",
+          "description": "显式声明这条内容规则也适用于「初始场景」「对话示例」。 缺省 false：scope 波及这两个板块时，它们的文本会被跳过（v0.1.3：这两块只做格式审计，内容审美无客观标准）。"
         }
       },
       "allOf": [

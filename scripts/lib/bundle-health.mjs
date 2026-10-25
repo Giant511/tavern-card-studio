@@ -23,7 +23,10 @@
  * 恰好从 70% 网眼里漏过去。真正的判据是第 2 条（逐文件命中），体积回归只当兜底网。
  */
 
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, relative, sep } from 'node:path';
 
 /** dist 总字节数下限。实测正常构建 client/dist ≈ 3.38 MB，取 500 KB 作下限（留足富余，只抓「几乎空」）。 */
@@ -232,3 +235,117 @@ export const mb = (bytes) => `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 
 /** 相对仓库根的路径，便于日志可点。 */
 export const rel = (root, path) => relative(root, path) || path;
+
+/**
+ * 找 WiX 的 `dark.exe`（MSI 反编译器）。
+ *
+ * 为什么它一定存在：Tauri 打 MSI 就是用 WiX 打的，工具链被缓存在
+ * `%LOCALAPPDATA%\tauri\WixTools*`。也就是说**只要刚刚成功产出了一个 MSI，
+ * 这个 exe 就在**。找不到只有两种情况：宿主把缓存清掉了，或者装了另一份 WiX。
+ * 所以三种位置都找：Tauri 缓存（全部 WixTools* 目录）、Program Files 的两处。
+ *
+ * @returns {string|null}
+ */
+export function findWixDark() {
+  const candidates = [];
+  const localAppData = process.env['LOCALAPPDATA'];
+  if (localAppData !== undefined) {
+    const tauriDir = join(localAppData, 'tauri');
+    if (existsSync(tauriDir)) {
+      for (const name of readdirSync(tauriDir)) {
+        if (/^WixTools/i.test(name)) candidates.push(join(tauriDir, name, 'dark.exe'));
+      }
+    }
+  }
+  for (const base of [process.env['ProgramFiles(x86)'], process.env['ProgramFiles'], process.env['ProgramW6432']]) {
+    if (base === undefined) continue;
+    for (const version of ['WiX Toolset v3.14', 'WiX Toolset v3.11']) {
+      candidates.push(join(base, version, 'bin', 'dark.exe'));
+    }
+  }
+  return candidates.find((path) => existsSync(path)) ?? null;
+}
+
+/**
+ * 把 MSI 解开，取出**里面那个** exe，再对它做内嵌资源审计。
+ *
+ * ## 为什么不审计 `target/release/tcs-shell.exe`
+ *
+ * 因为它不是出厂件。Tauri 打完包之后会**再 patch 一次 exe 写 bundle 类型**：
+ * 实测同一次构建里，MSI 内的 exe 是 `TAURI_BUNDLE_TYPE_VAR_MSI`，
+ * 而构建树里的是 `TAURI_BUNDLE_TYPE_VAR_UNK` —— 两者只差 **3 个字节**，
+ * 但确实是两个不同的二进制，且构建树那个的 mtime 反而晚 10 秒
+ * （`report-release.mjs` 第 5 节专门写了「不断言 exe ≤ MSI」，就是这个原因）。
+ *
+ * 于是"审计构建树的 exe"其实审计了一个**没有发出去的文件**。
+ * v0.1.3 的「MSI 缺功能」反馈排查时正是卡在这里：先要证明出厂件里到底有什么。
+ *
+ * ## 判据
+ *
+ * 与 `auditShellAssets` 完全相同（逐资源键 includes）。这里额外说明一点：
+ * vite 产出的文件名本身是**内容哈希**（`main-BzSOta9K.js`），所以
+ * "键在"不只是"名字在"，而是"这一版内容被内嵌了" —— 换一版内容名字就会变。
+ *
+ * @param {string} msiPath
+ * @param {string} distDir
+ * @returns {{
+ *   ok: boolean, skipped: boolean, reason?: string,
+ *   checked: number, missing: string[], exeBytes: number, exeSha256: string,
+ *   dark: string|null,
+ * }}
+ */
+export function auditMsiShellAssets(msiPath, distDir) {
+  const skippedResult = (reason) => ({
+    ok: false,
+    skipped: true,
+    reason,
+    checked: 0,
+    missing: [],
+    exeBytes: 0,
+    exeSha256: '',
+    dark: null,
+  });
+
+  if (!existsSync(msiPath)) return skippedResult(`MSI 不存在：${msiPath}`);
+  const dark = findWixDark();
+  if (dark === null) {
+    return skippedResult('找不到 dark.exe（WiX 反编译器）—— 无法审计出厂件里的 exe');
+  }
+
+  const workDir = mkdtempSync(join(tmpdir(), 'tcs-msi-audit-'));
+  try {
+    execFileSync(dark, ['-x', join(workDir, 'out'), '-o', join(workDir, 'out.wxs'), msiPath], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 180_000,
+    });
+
+    // 取 `File/` 下最大的那个文件当主程序：客户端包里 4.9 MB 的 exe 与
+    // 几 KB 的规则/脚本差着三个数量级，不需要猜文件名（dark 导出时名字会变成 `Path`）。
+    const fileDir = join(workDir, 'out', 'File');
+    if (!existsSync(fileDir)) return skippedResult('dark.exe 没有导出 File 目录（MSI 结构异常）');
+    let main = null;
+    for (const name of readdirSync(fileDir, { withFileTypes: true })) {
+      if (!name.isFile()) continue;
+      const full = join(fileDir, name.name);
+      const bytes = statSync(full).size;
+      if (main === null || bytes > main.bytes) main = { path: full, bytes };
+    }
+    if (main === null) return skippedResult('MSI 的 File 目录是空的');
+
+    const bytes = readFileSync(main.path);
+    const audit = auditShellAssets(main.path, distDir);
+    return {
+      ok: audit.ok,
+      skipped: false,
+      checked: audit.checked,
+      missing: audit.missing,
+      exeBytes: main.bytes,
+      exeSha256: createHash('sha256').update(bytes).digest('hex'),
+      dark,
+    };
+  } catch (error) {
+    return skippedResult(`dark.exe 解包失败：${String(error.message).split('\n')[0]}`);
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}

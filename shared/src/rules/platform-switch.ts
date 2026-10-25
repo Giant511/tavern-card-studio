@@ -7,8 +7,9 @@
  * 返回一份「将要发生什么」的变更清单，供 UI 预览。
  */
 
-import type { BlockId } from '../model/blocks.js';
+import { BLOCK_DEFINITION_MAP, BLOCK_DEFINITIONS, type BlockId } from '../model/blocks.js';
 import type { UnifiedCard } from '../model/unified-card.js';
+import { applyFieldBlockReflection, refreshFieldBlockViews } from '../format/field-blocks.js';
 import { renderWorldbookText } from '../format/worldbook.js';
 import type { AutoFixOp, ResolvedPlatformRule, Selector } from './platform-rule.js';
 import { parseSelector } from './scopes.js';
@@ -39,14 +40,9 @@ interface EditableTarget {
   set(value: string): void;
 }
 
-const BLOCK_LABELS: Record<BlockId, string> = {
-  basic: '基本信息',
-  personality: '性格',
-  settings: '其他设定',
-  special: '特殊设定',
-  user: '用户相关设定',
-  worldbook: '世界书',
-};
+const BLOCK_LABELS: Record<BlockId, string> = Object.fromEntries(
+  BLOCK_DEFINITIONS.map((definition) => [definition.id, definition.label]),
+) as Record<BlockId, string>;
 
 function collectTargets(card: UnifiedCard): EditableTarget[] {
   const targets: EditableTarget[] = [];
@@ -55,7 +51,9 @@ function collectTargets(card: UnifiedCard): EditableTarget[] {
     targets.push({
       label: BLOCK_LABELS[block.id],
       blockId: block.id,
-      field: block.id === 'personality' ? 'personality' : 'description',
+      // 承载字段取自定义：字段板块是 first_mes / mes_example，
+      // 这样 `field:first_mes` 与 `block:initial-scene` 两个选择器都能命中同一处
+      field: BLOCK_DEFINITION_MAP[block.id].stField,
       get: () => block.text,
       set: (value) => {
         if (block.text !== value) {
@@ -66,10 +64,13 @@ function collectTargets(card: UnifiedCard): EditableTarget[] {
     });
   }
 
-  const residualEntries: { field: string; label: string; key: 'scenario' | 'firstMes' | 'mesExample' | 'systemPrompt' | 'postHistoryInstructions' }[] = [
+  // 已由字段板块承载的字段**不再**单独列目标：
+  // 否则同一次替换会在板块与残余字段上各跑一遍，count 翻倍，
+  // 且板块那一份会因为 dirty 回写把残余字段的改动覆盖掉。
+  // 开场白族（first_mes + alternate_greetings）都装在 initial-scene 板块里，
+  // 所以 `alternate_greetings[i]` 也不再是独立目标。
+  const residualEntries: { field: string; label: string; key: 'scenario' | 'systemPrompt' | 'postHistoryInstructions' }[] = [
     { field: 'scenario', label: '场景', key: 'scenario' },
-    { field: 'first_mes', label: '开场白', key: 'firstMes' },
-    { field: 'mes_example', label: '对话示例', key: 'mesExample' },
     { field: 'system_prompt', label: '系统提示词', key: 'systemPrompt' },
     { field: 'post_history_instructions', label: '历史后指令', key: 'postHistoryInstructions' },
   ];
@@ -85,18 +86,6 @@ function collectTargets(card: UnifiedCard): EditableTarget[] {
       },
     });
   }
-
-  card.residual.alternateGreetings.forEach((greeting, index) => {
-    targets.push({
-      label: `备选开场白 ${index + 1}`,
-      blockId: null,
-      field: `alternate_greetings[${index}]`,
-      get: () => greeting,
-      set: (value) => {
-        card.residual.alternateGreetings[index] = value;
-      },
-    });
-  });
 
   card.worldbook.entries.forEach((entry, index) => {
     targets.push({
@@ -163,7 +152,11 @@ export function planPlatformSwitch(
   to: ResolvedPlatformRule,
   options: SwitchOptions = {},
 ): PlatformSwitchPlan {
-  const working = structuredClone(card);
+  // 先把字段板块的"视图"刷新成 residual 的最新值（未编辑的板块才会被刷新）。
+  // 为什么要这一步：residual 是权威，板块 text 是视图，两者只在导入时天然一致。
+  // 如果有人（或旧代码）直接改 residual.firstMes 就来做平台切换，
+  // 不刷新视图就会"换平台了但开场白没变"，而且不报错。
+  const working = structuredClone(refreshFieldBlockViews(card));
   const targets = collectTargets(working);
   const changes: TextChange[] = [];
   const notes: string[] = [];
@@ -231,7 +224,10 @@ export function planPlatformSwitch(
     working.worldbook.text = renderWorldbookText(working.worldbook.entries);
   }
 
-  return { card: working, changes, notes };
+  // 把字段板块的改动回写进 residual，让 plan.card 成为一张**自洽**的卡：
+  // 否则 blocks 里是新文本、residual 里还是旧文本，而 applySwitchPlan 会把
+  // 旧 residual 拷回真卡 —— 中间状态不一致，排查起来非常费时。
+  return { card: applyFieldBlockReflection(working), changes, notes };
 }
 
 /** 生成变更摘要文案（客户端确认弹窗直接用） */

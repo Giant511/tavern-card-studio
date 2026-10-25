@@ -323,11 +323,11 @@ test('未落盘：新建会话无文件路径，persisted=false', () => {
   assert.equal(session.persisted, false);
 });
 
-test('未落盘：空白会话有六个板块骨架，且 name 为空', () => {
+test('未落盘：空白会话有八板块骨架，且 name 为空', () => {
   const session = createBlankSession();
   assert.equal(session.card.meta.name, '');
-  // 五个文本板块在 blocks 里，世界书单独一段
-  assert.equal(session.card.blocks.length, 5);
+  // 除世界书外的七个板块在 blocks 里，世界书单独一段
+  assert.equal(session.card.blocks.length, 7);
   assert.ok(session.card.worldbook !== undefined);
 });
 

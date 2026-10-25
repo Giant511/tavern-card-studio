@@ -11,8 +11,10 @@
 import { isSyncReady, type ProbeResult } from '../net/server-probe';
 import { syncGateMessage, type SyncGateState } from '../auth/entry-policy';
 import type { RepoSummary } from './repo-client';
-import { pickRepoId, toRepoOptions } from './repo-select';
+import { pickRepoId, shouldShowRepoPicker, toRepoOptions, type RepoTokenContext } from './repo-select';
+import { describeCapabilities } from '../auth/repo-token';
 import { connectLocalService, describeLocalSuccess } from '../net/local-connect';
+import { askConfirm } from '../contract';
 import {
   SyncError,
   fetchVersionText,
@@ -61,8 +63,18 @@ export interface SyncDialogCallbacks {
    *
    * `remoteSeq` 是**应用后远端最新的序号**：回滚会新建一个版本，它不等于目标版本的 seq。
    * 会话基线要记的是前者 —— 记错了下次上传会被误报成分叉。
+   *
+   * `context` 是 v0.1.3 追加项三新加的：零标签时 App 要**自动建卡**，而建卡需要
+   *    · `cardId`：必须用服务端的那个，否则下一次上传会在远端新建一张卡；
+   *    · `mode`：决定状态栏说"已创建卡片…"还是"已回滚并载入…"。
+   * 面板不持有卡片状态，这两件事只能由 App 做，所以只能把信息交出去。
    */
-  onRemoteTextApplied: (text: string, version: VersionSummary, remoteSeq: number) => void;
+  onRemoteTextApplied: (
+    text: string,
+    version: VersionSummary,
+    remoteSeq: number,
+    context: { cardId: string; mode: 'restore' | 'rollback' },
+  ) => void;
   /** 一键连接成功后把探测结果交回 App（顶栏指示与同步开关据此刷新） */
   onConnectionReady?: (result: ProbeResult) => void;
   /**
@@ -85,6 +97,15 @@ export interface SyncDialogCallbacks {
   onSelectRepo?: (repoId: string) => void;
   /** 打开「仓库与令牌」面板（T10.8） */
   onOpenRepos?: () => void;
+  /**
+   * 仓库令牌模式上下文（v0.1.3 / F5 后半）。
+   *
+   * 返回 null = 不在该模式（账户登录 / legacy）。非 null 时面板要做三件事：
+   *   ① 顶部显示「仓库令牌模式 · <仓库名>」；
+   *   ② **隐藏**仓库选择器（令牌绑死一个仓库）；
+   *   ③ 按 `caps` 置灰上传/回滚，并用 `reason` 说明缺哪一档。
+   */
+  getRepoTokenContext?: () => RepoTokenContext | null;
   /**
    * 同步门槛（v0.1.2 追加任务）。
    *
@@ -119,11 +140,31 @@ export class SyncDialog {
   private readonly repoRow: HTMLElement;
   private readonly repoSelect: HTMLSelectElement;
   private readonly repoHint: HTMLElement;
+  /** v0.1.3 / F5 后半：仓库令牌模式的说明条（与上面那行互斥） */
+  private readonly repoTokenRow: HTMLElement;
+  private readonly repoTokenLabel: HTMLElement;
+  private readonly repoTokenHint: HTMLElement;
   private versions: VersionSummary[] = [];
   /** 防止「连接本机服务端」被连点（重入会让两次探测结果互相覆盖） */
   private busy = false;
   /** 当前历史面板展示的卡片 ID；null 时回落到会话自己的 cardId */
   private historyCardId: string | null = null;
+  /**
+   * 仓库令牌模式上下文（v0.1.3 / F5 后半）。
+   *
+   * 存成字段而不是每次回调现取：`renderStatus` 与 `renderVersions` 都要用它
+   * 判按钮，而它们刷新频率远高于仓库列表。每次现取会让"置灰"与"可用"
+   * 在两次渲染之间跳变。
+   */
+  private tokenContext: RepoTokenContext | null = null;
+  /**
+   * 上一次 `renderStatus` 算出的门槛。
+   *
+   * `setBusy` / `canUploadNow` 在 renderStatus 之外被调用，需要一个可读的
+   * 上一次结论 —— 重新调 `getGate()` 在那两个时机语义不同（正在上传时
+   * 回调可能还没变，也可能已经变了），会算错。
+   */
+  private lastGate: SyncGateState = 'no-server';
 
   constructor(private readonly callbacks: SyncDialogCallbacks) {
     this.overlay = el('div', 'modal-overlay');
@@ -207,6 +248,21 @@ export class SyncDialog {
     reposButton.addEventListener('click', () => this.callbacks.onOpenRepos?.());
     this.repoRow.append(repoLabel, this.repoSelect, this.repoHint, reposButton);
     uploadSection.append(this.repoRow);
+
+    /*
+     * 仓库令牌模式的说明条（v0.1.3 / F5 后半）。
+     *
+     * 与仓库下拉**互斥**：下拉隐藏时这一行出现，把"为什么只有一个仓库"
+     * 讲清楚。只隐藏下拉而不给替代说明，用户会以为仓库列表加载失败了。
+     */
+    this.repoTokenRow = el('div', 'field-row sync-repo-token-row');
+    this.repoTokenRow.hidden = true;
+    this.repoTokenRow.dataset['role'] = 'repo-token-mode-row';
+    this.repoTokenLabel = el('span', 'sync-repo-token-label');
+    this.repoTokenLabel.dataset['role'] = 'repo-token-mode-label';
+    this.repoTokenHint = el('span', 'field-hint sync-repo-token-hint');
+    this.repoTokenRow.append(this.repoTokenLabel, this.repoTokenHint);
+    uploadSection.append(this.repoTokenRow);
 
     uploadSection.append(
       el(
@@ -350,8 +406,32 @@ export class SyncDialog {
   private setBusy(text: string | null): void {
     this.busyBox.hidden = text === null;
     if (text !== null) this.busyBox.textContent = text;
-    this.uploadButton.disabled = text !== null;
-    this.refreshButton.disabled = text !== null;
+    /*
+     * 这里**必须**也看 scope（v0.1.3 / F5 后半）。
+     *
+     * 第一版只写 `disabled = text !== null`，于是出现了下面这条时间线：
+     *   renderStatus 按 scope 把「上传当前内容」置灰 → 用户点上传（按钮其实是灰的，
+     *   但**上传流程结束后 setBusy(null) 会把它解锁**）→ 按钮亮回来。
+     * 实测 dump 抓到了这一幕：read 令牌下该按钮 title 写着"没有写权限"、
+     * disabled 却是 false。截图看不出差别（灰蓝两种态很像），只有读 DOM 才发现。
+     *
+     * 所以现在按钮可用性只有两个判据来源：`renderStatus` 与 `setBusy`，
+     * 两处都走同一个 `canUploadNow()` / `canRefreshNow()`，不再各写一套。
+     */
+    this.uploadButton.disabled = text !== null || !this.canUploadNow();
+    this.refreshButton.disabled = text !== null || !this.canRefreshNow();
+  }
+
+  /** 「上传当前内容」此刻该不该可点（不含 busy 判定 —— busy 由调用方叠加） */
+  private canUploadNow(): boolean {
+    if (this.tokenContext !== null) return this.tokenContext.caps.canUpload;
+    return this.callbacks.getGate?.() === 'ready' || this.lastGate === 'ready';
+  }
+
+  /** 「刷新」此刻该不该可点（只需要 read） */
+  private canRefreshNow(): boolean {
+    if (this.tokenContext !== null) return this.tokenContext.caps.canRead;
+    return this.callbacks.getGate?.() === 'ready' || this.lastGate === 'ready';
   }
 
   /**
@@ -369,6 +449,9 @@ export class SyncDialog {
     const gate: SyncGateState =
       this.callbacks.getGate?.() ?? (isSyncReady(connection) ? 'ready' : 'need-login');
     const ready = gate === 'ready';
+    // 记住上一次的门槛判定：`setBusy` 与 `canUploadNow` 在 renderStatus 之外
+    // 被调用时，不能只靠回调现算（那时可能正在上传，回调语义不同）
+    this.lastGate = gate;
 
     this.statusLine.replaceChildren();
     // 未登录是"待办"不是"故障"，用中性色；只有按凭证发出的请求失败才用 bad
@@ -379,9 +462,28 @@ export class SyncDialog {
       this.statusLine.textContent = syncGateMessage(gate);
     }
 
-    this.uploadButton.disabled = !ready;
-    this.refreshButton.disabled = !ready;
-    this.historySelect.disabled = !ready;
+    /*
+     * 可用性 = 门槛通过 **且** scope 允许（v0.1.3 / F5 后半）。
+     *
+     * 两个条件必须同时成立：门槛只看"有没有地址和凭证"，
+     * 而令牌可能有效却只有 read —— 只判门槛会让上传按钮亮着、
+     * 点了拿到 403，用户以为是程序坏了。
+     *
+     * 注意 `canUploadNow()` 内部已经含 `lastGate === 'ready'`，
+     * 所以这里不再重复写 `!ready` —— 但 `historySelect` 没有 busy 概念，
+     * 它的判据仍要显式带上 ready。
+     */
+    const caps = this.tokenContext?.caps ?? null;
+    const reason = this.tokenContext?.reason ?? null;
+    this.uploadButton.disabled = !ready || (caps !== null && !caps.canUpload);
+    this.refreshButton.disabled = !ready || (caps !== null && !caps.canRead);
+    this.historySelect.disabled = !ready || (caps !== null && !caps.canRead);
+
+    // 置灰时必须说清缺哪一档：这把令牌通常是别人签的
+    if (caps !== null && !caps.canUpload && reason !== null) this.uploadButton.title = reason.upload;
+    else this.uploadButton.removeAttribute('title');
+    if (caps !== null && !caps.canRead) this.refreshButton.title = '此令牌没有「读」权限';
+    else this.refreshButton.removeAttribute('title');
     this.loginButton.hidden = gate !== 'need-login' || this.callbacks.onLogin === undefined;
     // 一键连接只在"连地址都没有/连不通"时才有意义；登录阶段摆着它只会分散注意力
     this.connectButton.hidden = gate !== 'no-server';
@@ -466,13 +568,44 @@ export class SyncDialog {
    * 选中的仓库用 `pickRepoId` 决定（默认仓库优先，记忆值仍存在时优先）。
    */
   private async reloadRepos(): Promise<void> {
+    /*
+     * 先处理仓库令牌模式（v0.1.3 / F5 后半）。
+     *
+     * 这一段必须在"取仓库列表"之前：该模式下 `getRepos()` 会返回空数组
+     * （令牌绑死一个仓库，没有可选项），若先走下面的空数组分支，
+     * 面板会同时隐藏下拉**和**说明条 —— 用户看到的是"这一块什么都没有"，
+     * 完全不知道自己在令牌模式下、也不知道在哪个仓库。
+     */
+    const tokenContext = this.callbacks.getRepoTokenContext?.() ?? null;
+    this.tokenContext = tokenContext;
+    if (tokenContext !== null) {
+      this.repoTokenRow.hidden = false;
+      this.repoTokenLabel.textContent = tokenContext.label;
+      this.repoTokenLabel.dataset['repoName'] = tokenContext.repoName;
+      // 权限说明：把"这个模式能做什么"直接写在仓库名旁边，
+      // 而不是只体现在灰掉的按钮上（后者要用户去试才知道）
+      this.repoTokenHint.textContent = describeCapabilities(tokenContext.caps);
+      // 下拉隐藏 —— 需求「仓库选择器隐藏（只有一个仓库）」
+      this.repoRow.hidden = true;
+      this.renderStatus();
+      return;
+    }
+
+    this.repoTokenRow.hidden = true;
+    this.repoTokenLabel.textContent = '';
+    delete this.repoTokenLabel.dataset['repoName'];
+    this.repoTokenHint.textContent = '';
+    this.repoRow.removeAttribute('title');
+    this.uploadButton.removeAttribute('title');
+    this.refreshButton.removeAttribute('title');
+
     if (!this.callbacks.getRepos) {
       this.repoRow.hidden = true;
       return;
     }
     try {
       const repos = await this.callbacks.getRepos();
-      if (repos.length === 0) {
+      if (!shouldShowRepoPicker(repos, tokenContext)) {
         this.repoRow.hidden = true;
         return;
       }
@@ -528,7 +661,19 @@ export class SyncDialog {
       const cards = await listCards(config, { limit: 50 });
       this.renderHistoryOptions(cards);
 
-      const historyId = this.effectiveHistoryCardId();
+      /*
+       * 零标签（v0.1.3 追加项三）：自动选中列表里的第一张卡。
+       *
+       * 需求要的是「零标签 → 点取回/回滚 → 自动建卡」。若停在"本次会话（未打开
+       * 卡片）"，版本列表是空的，用户根本点不到任何版本 —— 那条路等于不存在。
+       * 自动选第一张只是省一次点击，选择权仍在（下拉照常可改）。
+       */
+      let historyId = this.effectiveHistoryCardId();
+      if (historyId === null && this.sessionCardId() === null && cards.length > 0) {
+        historyId = cards[0]!.cardId;
+        this.historyCardId = historyId;
+        this.historySelect.value = historyId;
+      }
       if (historyId) await this.loadVersions(historyId);
       else this.versionList.replaceChildren(el('p', 'issue-empty', '选择一张卡片后显示版本历史'));
     } catch (error) {
@@ -661,11 +806,24 @@ export class SyncDialog {
       const isLatest = version.seq === this.versions[0]?.seq;
       // 只读查看别的卡片时也不给回滚：在别人的卡上回滚等于往人家的历史里塞版本，
       // 而用户的本意可能只是"看看"。按钮直接置灰比点了再报错诚实。
-      const isOwnCard = this.effectiveHistoryCardId() === this.sessionCardId();
+      /*
+       * 零标签（v0.1.3 追加项三）：没有"自己的卡"可比，选中的那张就是目标。
+       *
+       * 这时回滚按钮必须**可点** —— 否则需求里"零标签回滚"这条路在界面上
+       * 根本走不到（按钮恒灰，用户只能看到一句"只能回滚当前会话所属的卡片"）。
+       */
+      const sessionCardId = this.sessionCardId();
+      const isOwnCard =
+        sessionCardId === null || this.effectiveHistoryCardId() === sessionCardId;
       const rollbackButton = el('button', 'btn small', '回滚到此版本');
       rollbackButton.type = 'button';
-      rollbackButton.disabled = isLatest || !isOwnCard || version.pruned === true;
+      // 令牌没有 rollback 范围时也置灰（v0.1.3 / F5 后半）：
+      // 与"最新版本"「别人的卡」同样是**已知不可能成立**的动作，
+      // 让它亮着只会换来一次 403
+      const noRollbackScope = this.tokenContext !== null && !this.tokenContext.caps.canRollback;
+      rollbackButton.disabled = isLatest || !isOwnCard || version.pruned === true || noRollbackScope;
       if (version.pruned === true) rollbackButton.title = '这一版的内容已被清除，无法回滚到它';
+      else if (noRollbackScope) rollbackButton.title = this.tokenContext?.reason.rollback ?? '此令牌没有「回滚」权限';
       else if (isLatest) rollbackButton.title = '这已是最新版本';
       else if (!isOwnCard) rollbackButton.title = '只能回滚当前会话所属的卡片；其他卡片的历史是只读的';
       rollbackButton.addEventListener('click', () => void this.rollback(version));
@@ -718,10 +876,11 @@ export class SyncDialog {
       this.callbacks.notify('请先登录并选择一张卡片', 'warn');
       return;
     }
-    const ok = window.confirm(
+    const ok = await askConfirm(
       `清除 v${String(version.seq)} 的内容？\n\n` +
         '正文与摘要会被清空，版本记录（时间/作者/说明）保留，\n' +
         '从此不能再取回或回滚到这一版。这个操作不可恢复。',
+      '清除版本内容',
     );
     if (!ok) return;
 
@@ -822,16 +981,32 @@ export class SyncDialog {
       this.callbacks.notify('请先选择目标卡片', 'warn');
       return;
     }
-    if (cardId !== this.sessionCardId()) {
+    /*
+     * 「必须是当前会话的卡」这条限制**只在有标签时成立**（v0.1.3 追加项三）。
+     *
+     * 原来的判据是 `cardId !== this.sessionCardId()`，零标签时左边是选中的卡、
+     * 右边是 null，恒不相等 → 直接拒绝。而零标签下用户能点到这里，说明他
+     * 是先在下拉里选了某张卡的历史（面板允许，只读查看）。此时"回滚到这一版"
+     * 是一个完整而合理的要求：把他看到的内容变成手上的一张卡。
+     *
+     * 所以现在分两种：
+     *   · 有标签 → 沿用原判据（在别人的卡上回滚仍然要拦，那是往人家历史里塞版本）；
+     *   · 零标签 → 放行，App 会按服务端 cardId 新建一张卡来承接内容。
+     */
+    const sessionCardId = this.sessionCardId();
+    if (sessionCardId !== null && cardId !== sessionCardId) {
       this.callbacks.notify('只能回滚当前会话所属的卡片；查看其他卡片的历史是只读的', 'warn');
       return;
     }
 
-    const confirmed = window.confirm(
+    const confirmed = await askConfirm(
       `回滚到 v${version.seq}？\n\n` +
         `· 服务端会新建一个提交（历史只增不改，可再回滚回去）\n` +
-        `· 当前编辑内容将被覆盖，建议先另存\n\n` +
-        `要同时把 v${version.seq} 的内容载入编辑器吗？点「确定」将载入。`,
+        (sessionCardId === null
+          ? '· 当前没有打开的卡片，会为这张卡新建一个标签并载入内容\n'
+          : '· 当前编辑内容将被覆盖，建议先另存\n') +
+        `\n要同时把 v${version.seq} 的内容载入编辑器吗？点「确定」将载入。`,
+      '回滚版本',
     );
     if (!confirmed) {
       this.callbacks.notify('已取消回滚', 'info');
@@ -849,7 +1024,10 @@ export class SyncDialog {
       const text = await fetchVersionText(config, cardId, version.seq);
       // 基线记 result.seq（回滚新建的那个版本），不是目标版本的 seq ——
       // 记错了下一次上传会被服务端误判成分叉
-      this.callbacks.onRemoteTextApplied(text, version, result.seq);
+      this.callbacks.onRemoteTextApplied(text, version, result.seq, {
+        cardId,
+        mode: 'rollback',
+      });
 
       await this.loadVersions(cardId);
       this.callbacks.notify(
@@ -873,7 +1051,10 @@ export class SyncDialog {
     try {
       const text = await fetchVersionText(config, cardId, version.seq);
       // 内容与远端 v{seq} 一致，于是基线就是它
-      this.callbacks.onRemoteTextApplied(text, version, version.seq);
+      this.callbacks.onRemoteTextApplied(text, version, version.seq, {
+        cardId,
+        mode: 'restore',
+      });
       this.callbacks.notify(`已载入 v${version.seq} 的内容（未改动服务端）`, 'ok');
     } catch (error) {
       this.reportError('取回失败', error);
