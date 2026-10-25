@@ -4,7 +4,7 @@
  * 结构：
  *   ┌ 摘要（等级计数，可点击当筛选器）
  *   ├ 筛选条（严重度 / 类别 / 板块 / 关键字）
- *   ├ 字数分布（六板块条形 + 合计）
+ *   ├ 字数分布（八板块条形 + 合计，顺序同 BLOCK_IDS）
  *   └ 问题列表（按板块或类别分组；每条可点击定位）
  *
  * 约束：
@@ -15,6 +15,7 @@
  */
 
 import type { AuditIssue, AuditReport, BlockId, IssueCategory, Severity } from '@tcs/shared';
+import { BLOCK_DEFINITIONS } from '@tcs/shared';
 
 import {
   CATEGORY_LABELS,
@@ -49,14 +50,18 @@ export interface AuditPanelOptions {
   onFocusBlock?: (blockId: BlockId) => void;
 }
 
+/**
+ * 板块筛选下拉的选项。
+ *
+ * **从 `BLOCK_DEFINITIONS` 派生，不在这里再抄一份板块表**：这三行曾是客户端里
+ * 第三份板块清单副本（`block-doc.ts` 两份 + 这里一份），加板块时它不会报错，
+ * 表现只是「审计面板筛不到新板块的问题」—— 用户会以为新板块没有审计。
+ *
+ * 顺序即 `BLOCK_IDS`（世界书在最后）。首尾两个非板块选项单独拼。
+ */
 const BLOCK_FILTER_OPTIONS: Array<{ value: BlockId | 'all' | null; label: string }> = [
   { value: 'all', label: '全部板块' },
-  { value: 'basic', label: '基本信息' },
-  { value: 'personality', label: '性格' },
-  { value: 'settings', label: '其他设定' },
-  { value: 'special', label: '特殊设定' },
-  { value: 'user', label: '用户相关设定' },
-  { value: 'worldbook', label: '世界书' },
+  ...BLOCK_DEFINITIONS.map((definition) => ({ value: definition.id as BlockId, label: definition.label })),
   { value: null, label: '仅全文级' },
 ];
 
@@ -310,7 +315,7 @@ export class AuditPanel {
     this.summaryEl.append(line);
     // 只保留字数（等级计数已在上面的 line 里，不再重复一次）
     this.summaryEl.append(
-      el('div', 'summary-meta', `六板块合计 ${report.wordCount.total.chars} 字符 / ${report.wordCount.total.totalWords} 字`),
+      el('div', 'summary-meta', `八板块合计 ${report.wordCount.total.chars} 字符 / ${report.wordCount.total.totalWords} 字`),
     );
   }
 
@@ -373,7 +378,7 @@ export class AuditPanel {
     }
     this.wordSection.append(chart);
 
-    // 落盘字段口径（与平台长度规则同一口径，容易和"六板块合计"混淆，所以单列）
+    // 落盘字段口径（与平台长度规则同一口径，容易和"八板块合计"混淆，所以单列）
     const byField = report.wordCount.byField;
     const fieldRow = el('div', 'words-fields');
     fieldRow.append(el('span', 'words-fields-title', '落盘字段口径'));

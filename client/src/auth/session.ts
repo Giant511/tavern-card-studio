@@ -17,10 +17,23 @@
  *     而不是靠调用方记得不要调。
  */
 
-import type { AuthPolicy, AuthUser, RegisterOutcome, TokenBundle } from './auth-client.ts';
+import type { AuthPolicy, AuthUser, AccountSummary, DeleteAccountReceipt, RegisterOutcome, TokenBundle } from './auth-client.ts';
 import * as defaultApi from './auth-client.ts';
+import { capabilitiesFor, type RepoTokenCapabilities } from './repo-token.ts';
+import type { RepoTokenGrant } from './repo-token-client.ts';
 
 export type AuthPhase = 'anonymous' | 'authenticated' | 'expired';
+
+/**
+ * 当前生效的凭证路径（v0.1.3 / F5 后半）。
+ *
+ *   · `none`        —— 没有可用凭证
+ *   · `account`     —— 账户登录（身份：我是谁）
+ *   · `repo-token`  —— 仓库令牌（受限授权：我能对这个仓库做什么）
+ *
+ * 两条路径**互斥**，理由见 `enterRepoTokenMode` 的注释。
+ */
+export type CredentialMode = 'none' | 'account' | 'repo-token';
 
 /** 落进应用配置（契约 C5）的那部分 */
 export interface PersistedAuth {
@@ -29,6 +42,12 @@ export interface PersistedAuth {
   /** access 到期时刻（epoch ms）；0 = 未知 */
   accessExpiresAt: number;
   authUser: AuthUser | null;
+  /** 仓库令牌原文；空串 = 不在该模式 */
+  repoToken: string;
+  repoTokenRepoId: string;
+  repoTokenRepoName: string;
+  repoTokenScopes: string[];
+  repoTokenExpiresAt: string | null;
 }
 
 export const EMPTY_AUTH: PersistedAuth = {
@@ -36,6 +55,11 @@ export const EMPTY_AUTH: PersistedAuth = {
   refreshToken: '',
   accessExpiresAt: 0,
   authUser: null,
+  repoToken: '',
+  repoTokenRepoId: '',
+  repoTokenRepoName: '',
+  repoTokenScopes: [],
+  repoTokenExpiresAt: null,
 };
 
 export interface AuthApi {
@@ -44,6 +68,10 @@ export interface AuthApi {
   refresh: typeof defaultApi.refresh;
   logout: typeof defaultApi.logout;
   fetchPolicy: typeof defaultApi.fetchPolicy;
+  /** 自助注销（v0.1.3 / F3）。测试里注入假实现即可覆盖失败分支 */
+  deleteAccount: typeof defaultApi.deleteAccount;
+  /** 注销前的数据统计（v0.1.3 / F3） */
+  fetchAccountSummary: typeof defaultApi.fetchAccountSummary;
 }
 
 export interface AuthSessionDeps {
@@ -95,8 +123,153 @@ export class AuthSession {
     return this.state.authUser;
   }
 
-  /** 可直接放进 Authorization 的 access 令牌；没有则空串 */
+  // ── 凭证路径（v0.1.3 / F5 后半）────────────────────────────
+
+  /**
+   * 当前生效的凭证路径。
+   *
+   * 仓库令牌优先：它是用户刚刚主动粘贴进来的显式选择，不该被一个更早的、
+   * 还没过期的账户会话悄悄顶掉。（正常流程下两者不会并存 —— 见 enterRepoTokenMode。）
+   */
+  get mode(): CredentialMode {
+    if (this.state.repoToken !== '') return 'repo-token';
+    if (this.state.accessToken !== '' || this.state.refreshToken !== '') return 'account';
+    return 'none';
+  }
+
+  get isRepoTokenMode(): boolean {
+    return this.state.repoToken !== '';
+  }
+
+  /** 令牌绑定的仓库名（非该模式时为空串） */
+  get repoTokenRepoName(): string {
+    return this.state.repoTokenRepoName;
+  }
+
+  get repoTokenRepoId(): string {
+    return this.state.repoTokenRepoId;
+  }
+
+  get repoTokenScopes(): readonly string[] {
+    return this.state.repoTokenScopes;
+  }
+
+  get repoTokenExpiresAt(): string | null {
+    return this.state.repoTokenExpiresAt;
+  }
+
+  /**
+   * 当前凭证能做什么。
+   *
+   * 账户模式下按"全权"表达（账户能管自己的全部仓库与卡片）；
+   * 仓库令牌模式按 scope 算 —— 这就是两条路径的能力边界在代码里的落点。
+   */
+  get capabilities(): RepoTokenCapabilities {
+    if (this.mode === 'repo-token') return capabilitiesFor(this.state.repoTokenScopes);
+    // 账户 / legacy：不是"没有权限"，而是"权限不由 scope 表达"
+    return capabilitiesFor(['read', 'write', 'rollback']);
+  }
+
+  /**
+   * 进入仓库令牌模式。
+   *
+   * **必须同时清掉账户令牌**，这不是顺手之劳而是这个模式成立的前提：
+   * 仓库令牌的用途是"把令牌交给其他设备/工具/他人使用此仓库，不暴露账户密码"。
+   * 若进入这个模式后设备上仍留着完整的账户 access/refresh，那个"受限"就是字面上的
+   * 谎言 —— 任何能读配置的人都能直接拿账户令牌去管全部仓库。
+   *
+   * 清掉之后 `mode` 变成 repo-token，`accessToken` getter 返回令牌原文，
+   * 于是**既有的同步链路一行都不用改**就能按这把令牌寻址。
+   */
+  async enterRepoTokenMode(grant: RepoTokenGrant, rawToken: string): Promise<void> {
+    await this.persist({
+      // 先清账户身份：两条路径互斥
+      accessToken: '',
+      refreshToken: '',
+      accessExpiresAt: 0,
+      authUser: null,
+      repoToken: rawToken,
+      repoTokenRepoId: grant.repoId,
+      repoTokenRepoName: grant.repoName,
+      repoTokenScopes: [...grant.scopes],
+      repoTokenExpiresAt: grant.expiresAt,
+    });
+    this.setPhase('authenticated');
+  }
+
+  /**
+   * 退出仓库令牌模式（= 需求里的"退出登录"）。
+   *
+   * 只清令牌，不发请求：这把令牌属于**别人的账户**，本机退出这个模式
+   * 不该把它吊销掉 —— 那会让另一台正在用同一把令牌的设备突然断开。
+   * 要吊销请去签发它的客户端（账户登录后）。
+   */
+  async exitRepoTokenMode(): Promise<void> {
+    await this.persist({
+      repoToken: '',
+      repoTokenRepoId: '',
+      repoTokenRepoName: '',
+      repoTokenScopes: [],
+      repoTokenExpiresAt: null,
+    });
+    this.setPhase('anonymous');
+  }
+
+  /**
+   * 自助注销账户（v0.1.3 / F3）。
+   *
+   * 与「登出」的区别：登出只是丢掉本机令牌，账户与服务端数据都还在；
+   * 注销是**物理删除**，账户连同全部仓库、卡片、版本、令牌、会话一起消失。
+   *
+   * 成功后就地清空本地登录态：账户已经不存在，留着一个指向空气的令牌
+   * 会让后续每个请求都 401，而用户会以为"注销失败了"。
+   *
+   * **不触碰本地卡片会话**：标签页与未保存内容属于本地工作，
+   * 与"云端账户被删"是两件事。用户可能还有没保存的卡要另存（哪怕账户没了）。
+   */
+  /** 取"将要删除什么"（注销确认弹窗用）。失败时抛，由调用方决定显示什么。 */
+  async accountSummary(): Promise<AccountSummary> {
+    const serverUrl = this.requireServerUrl();
+    if (this.state.accessToken === '') throw new Error('需要账户登录');
+    return this.api.fetchAccountSummary(serverUrl, this.state.accessToken);
+  }
+
+  async deleteAccount(
+    confirmUsername: string,
+    password?: string,
+  ): Promise<DeleteAccountReceipt> {
+    const serverUrl = this.requireServerUrl();
+    if (this.state.accessToken === '') {
+      throw new Error('需要账户登录才能注销账户');
+    }
+    const receipt = await this.api.deleteAccount(serverUrl, this.state.accessToken, {
+      confirmUsername,
+      ...(password === undefined ? {} : { password }),
+    });
+    await this.persist({
+      accessToken: '',
+      refreshToken: '',
+      accessExpiresAt: 0,
+      authUser: null,
+      repoToken: '',
+      repoTokenRepoId: '',
+      repoTokenRepoName: '',
+      repoTokenScopes: [],
+      repoTokenExpiresAt: null,
+    });
+    this.setPhase('anonymous');
+    return receipt;
+  }
+
+  /**
+   * 可直接放进 Authorization 的令牌；没有则空串。
+   *
+   * 仓库令牌模式下返回**令牌原文** —— 这是"既有同步链路零改动就能用令牌寻址"
+   * 的关键：所有调用方本来就在读这个 getter，服务端认 `tcr_` 前缀并按令牌绑定的
+   * 仓库寻址，于是上传/历史/回滚自动落到那一个仓库上。
+   */
   get accessToken(): string {
+    if (this.state.repoToken !== '') return this.state.repoToken;
     return this.state.accessToken;
   }
 
@@ -108,13 +281,17 @@ export class AuthSession {
     return this.state.accessExpiresAt;
   }
 
-  /** 有多少令牌（含 refresh）—— 界面用它决定显示"登录"还是"登出" */
+  /** 有多少令牌（含 refresh 或仓库令牌）—— 界面用它决定显示"登录"还是"登出" */
   get hasCredentials(): boolean {
-    return this.state.accessToken !== '' || this.state.refreshToken !== '';
+    return this.state.repoToken !== '' || this.state.accessToken !== '' || this.state.refreshToken !== '';
   }
 
   /** 是否已到该续期的时候（不实际发请求，纯判断，便于测） */
   needsRefresh(at: number = this.now()): boolean {
+    // 仓库令牌没有续期概念（服务端只认它自己的到期时间）——
+    // 这里必须早退，否则会拿一把 tcr_ 去调 /api/auth/refresh，必然 401，
+    // 然后被 refreshNow 的失败分支判成"登录过期"，把人赶回登录框。
+    if (this.state.repoToken !== '') return false;
     if (this.state.refreshToken === '') return false;
     if (this.state.accessExpiresAt === 0) return false; // 未知，交给 401 路径兜底
     return this.state.accessExpiresAt - at <= this.skew;
@@ -137,9 +314,16 @@ export class AuthSession {
       this.state = { ...EMPTY_AUTH };
     }
 
-    if (this.state.refreshToken === '' && this.state.accessToken === '') {
+    if (this.state.refreshToken === '' && this.state.accessToken === '' && this.state.repoToken === '') {
       this.setPhase('anonymous');
       return false;
+    }
+
+    // 仓库令牌模式：没有续期、也没有会话可确认，有令牌就算可用。
+    // 令牌是否还有效由第一次真实请求说了算（401 → 回登录界面）。
+    if (this.state.repoToken !== '') {
+      this.setPhase('authenticated');
+      return true;
     }
 
     if (!this.needsRefresh()) {
@@ -185,6 +369,8 @@ export class AuthSession {
 
   /** 在需要访问服务端前调用：快过期就先续，避免"刚好过期"的请求白跑一趟 */
   async ensureFresh(): Promise<boolean> {
+    // 仓库令牌不需要续期，直接判"有没有"
+    if (this.state.repoToken !== '') return true;
     if (this.state.refreshToken === '' && this.state.accessToken === '') return false;
     if (!this.needsRefresh()) return this.state.accessToken !== '';
     return this.refreshNow();
@@ -214,8 +400,17 @@ export class AuthSession {
    *
    * 服务端调用失败也照样清本地状态：把用户困在"登出失败"里既没有安全收益
    * （令牌本来就要丢），也让人以为按钮坏了。
+   *
+   * 仓库令牌模式下走的是 {@link exitRepoTokenMode} —— **两种"退出"不是一件事**：
+   * 账户登出要吊销服务端会话，令牌退出只是本机不再使用这把令牌。
+   * 在这里分开处理，而不是让 logout 去判断，是为了让"点了退出会发生什么"
+   * 在调用处就能读出来。
    */
   async logout(): Promise<void> {
+    if (this.state.repoToken !== '') {
+      await this.exitRepoTokenMode();
+      return;
+    }
     const serverUrl = this.deps.serverUrl();
     const token = this.state.accessToken;
     if (serverUrl !== null && token !== '') {
@@ -292,6 +487,15 @@ export class AuthSession {
       refreshToken: bundle.refreshToken,
       accessExpiresAt: bundle.accessExpiresAt,
       authUser: bundle.user,
+      // 账户登录成功 = 明确切回账户路径，把仓库令牌清掉。
+      // 两条路径互斥（理由见 enterRepoTokenMode）：若不清，accessToken getter
+      // 会继续优先返回 repository 令牌，于是"刚登录成功"却仍在按旧令牌寻址 ——
+      // 表现为"登录了但看不到我的卡"。
+      repoToken: '',
+      repoTokenRepoId: '',
+      repoTokenRepoName: '',
+      repoTokenScopes: [],
+      repoTokenExpiresAt: null,
     });
   }
 

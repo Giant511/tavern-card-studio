@@ -5,7 +5,7 @@
  * 序列化目标：输出符合 SillyTavern 习惯的键顺序，且未改动的文本逐字还原。
  */
 
-import { BLOCK_IDS, type BlockId } from '../model/blocks.js';
+import { BLOCK_IDS, DESCRIPTION_BLOCK_IDS, type BlockId } from '../model/blocks.js';
 import { cloneJson, isJsonObject, type JsonObject, type JsonValue } from '../model/json.js';
 import { detectSpec, type StCharacterBook, type StCharacterCard, type StSpecVersion, type StWorldbookEntry } from '../model/sillytavern.js';
 import {
@@ -17,6 +17,8 @@ import {
   type UnifiedCard,
 } from '../model/unified-card.js';
 import { assembleDescription, parseDescription, type AssembleOptions } from './description.js';
+import { applyFieldBlockReflection, blocksWithFieldBlocks } from './field-blocks.js';
+import type { GreetingFormatParams } from './greeting-preset.js';
 import { renderWorldbookText } from './worldbook.js';
 
 export class StCardParseError extends Error {
@@ -105,11 +107,14 @@ function buildBlocks(description: string, personality: string): {
     dirty: false,
     anchor: { field: 'personality', headingText: null, headingSpan: null, bodySpan: null },
   };
-  const blocks = BLOCK_IDS.filter((id) => id !== 'worldbook').map((id) =>
-    id === 'personality' ? personalityBlock : parsed.blocks.find((block) => block.id === id)!,
+  // 只产出「description 分段 + 性格」这几种板块；
+  // 两个字段板块（对话示例 / 初始场景）要等 residual 解析出来才能填，
+  // 由 blocksWithFieldBlocks 在 residual 之后补齐（顺序也由它统一到 BLOCK_IDS）。
+  const blocks = DESCRIPTION_BLOCK_IDS.map(
+    (id) => parsed.blocks.find((block) => block.id === id)!,
   );
   return {
-    blocks,
+    blocks: [personalityBlock, ...blocks],
     structured: parsed.structured,
     preface: parsed.preface,
     separator: parsed.separator,
@@ -117,7 +122,18 @@ function buildBlocks(description: string, personality: string): {
   };
 }
 
-export function parseStCard(input: unknown): ParseStCardResult {
+export interface ParseStCardOptions {
+  /**
+   * 「初始场景」多条开场白的分隔格式（v0.1.3 / 追加项一）。
+   *
+   * 缺省 = 冻结默认值。传它是为了让**用户选的初始场景预设**真正生效：
+   * JSON 里的 first_mes / alternate_greetings 是分开存的，分隔符不参与存储，
+   * 但它决定板块视图怎么拼（`---` 还是 `===`），而视图是用户编辑的对象。
+   */
+  greetingFormat?: GreetingFormatParams;
+}
+
+export function parseStCard(input: unknown, options: ParseStCardOptions = {}): ParseStCardResult {
   let source: JsonValue;
   if (typeof input === 'string') {
     try {
@@ -225,7 +241,7 @@ export function parseStCard(input: unknown): ParseStCardResult {
     ...createEmptyCard(meta.name),
     schemaVersion: UNIFIED_CARD_SCHEMA_VERSION,
     meta,
-    blocks: built.blocks,
+    blocks: blocksWithFieldBlocks(built.blocks, residual, options.greetingFormat),
     description: {
       raw: built.raw,
       separator: built.separator,
@@ -246,8 +262,8 @@ export function parseStCard(input: unknown): ParseStCardResult {
   return { card: unified, issues };
 }
 
-export function parseStCardText(text: string): ParseStCardResult {
-  return parseStCard(text);
+export function parseStCardText(text: string, options: ParseStCardOptions = {}): ParseStCardResult {
+  return parseStCard(text, options);
 }
 
 export interface SerializeStCardOptions extends AssembleOptions {
@@ -259,6 +275,8 @@ export interface SerializeStCardOptions extends AssembleOptions {
   legacyTopLevel?: 'sync' | 'preserve';
   /** 强制导出规范；缺省沿用卡片自身版本 */
   targetSpec?: StSpecVersion;
+  /** 「初始场景」多条开场白的分隔格式；缺省 = 冻结默认值 */
+  greetingFormat?: GreetingFormatParams;
 }
 
 const CANONICAL_DATA_ORDER = [
@@ -338,8 +356,12 @@ function buildData(card: UnifiedCard, description: string): JsonObject {
 
 export function serializeStCard(card: UnifiedCard, options: SerializeStCardOptions = {}): StCharacterCard {
   const spec: StSpecVersion = options.targetSpec ?? card.meta.spec;
+  // 字段板块（对话示例 / 初始场景）被改过时，把改动回写到 residual：
+  // 只处理 dirty 的板块，未编辑的板块一律用原字段值 —— 否则 first_mes 里
+  // 天然含有的一行 `---` 会被当成分隔符切开（静默改数据）。
+  const effective = applyFieldBlockReflection(card, options.greetingFormat);
   const description = assembleDescription(card.blocks, card.description, options);
-  const data = buildData(card, description);
+  const data = buildData(effective, description);
   const legacyMode = options.legacyTopLevel ?? 'sync';
 
   if (spec === 'v1') {
@@ -350,9 +372,9 @@ export function serializeStCard(card: UnifiedCard, options: SerializeStCardOptio
     out['name'] = card.meta.name;
     out['description'] = description;
     out['personality'] = data['personality']!;
-    out['scenario'] = card.residual.scenario;
-    out['first_mes'] = card.residual.firstMes;
-    out['mes_example'] = card.residual.mesExample;
+    out['scenario'] = effective.residual.scenario;
+    out['first_mes'] = effective.residual.firstMes;
+    out['mes_example'] = effective.residual.mesExample;
     out['creatorcomment'] = card.meta.creatorNotes;
     out['tags'] = [...card.meta.tags];
     out['creator'] = card.meta.creator;

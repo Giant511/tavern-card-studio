@@ -17,6 +17,7 @@
 
 import type {
   PreservedInfo,
+  GreetingFormatParams,
   TxtPreset,
   UnifiedCard,
   WorldbookFormat,
@@ -64,6 +65,13 @@ export interface ImportDialogDeps {
   getCard: () => UnifiedCard;
   /** 当前预设（TXT 分块按它切） */
   getPreset: () => TxtPreset | null;
+  /**
+   * 初始场景预设的分隔格式（v0.1.3 追加项一）；缺省 = 冻结默认。
+   *
+   * TXT 导入必须用**用户当前选的**那套分隔符：他手上的卡可能就是用 `===`
+   * 分段的（来自别的工具），按冻结默认切会把整段当成一条开场白。
+   */
+  getGreetingFormat?: () => GreetingFormatParams | undefined;
 }
 
 export class ImportDialog {
@@ -236,7 +244,13 @@ export class ImportDialog {
 
     this.strictRadio.checked = this.mode === 'strict';
     this.lenientRadio.checked = this.mode === 'lenient';
-    this.cardPreview = previewCardText(this.deps.getCard(), this.rawText, preset, this.mode);
+    this.cardPreview = previewCardText(
+      this.deps.getCard(),
+      this.rawText,
+      preset,
+      this.mode,
+      this.deps.getGreetingFormat?.(),
+    );
     this.worldbookPreview = null;
 
     this.summaryEl.replaceChildren();

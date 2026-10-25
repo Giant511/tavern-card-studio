@@ -14,9 +14,12 @@
 
 import {
   editDistance,
+  parseFieldPreset,
   parsePreset,
   parseWorldbookPreset,
   splitRuleError,
+  type FieldPreset,
+  type FieldPresetBlock,
   type RuleIssue,
   type TxtPreset,
   type WorldbookPreset,
@@ -132,7 +135,52 @@ export function importWorldbookPreset(
   };
 }
 
+/**
+ * 导入字段板块预设（初始场景 / 对话示例，v0.1.3 追加项一）。
+ *
+ * 与世界书预设**逐条同构**：原子回退、同 id 覆盖、不自动切换、unknown-keys
+ * warning、改名建议。多出来的一条是 `block` 校验 —— 把「对话示例预设」
+ * 导进「初始场景」那一栏之后，用户会得到一份"看着导入成功、但完全不生效"的
+ * 预设，而界面上没有任何线索。
+ */
+export function importFieldPreset(
+  current: readonly FieldPreset[],
+  text: string,
+  block: FieldPresetBlock,
+): PresetImportOutcome<FieldPreset[]> {
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(text) as unknown;
+  } catch (error) {
+    return emptyOutcome([...current], parseFailure(`JSON 解析失败：${error instanceof Error ? error.message : String(error)}`));
+  }
+
+  const result = parseFieldPreset(parsedJson, block);
+  if (!result.preset) return emptyOutcome([...current], result.errors.map(splitRuleError), result.warnings);
+
+  const preset = result.preset;
+  const existingIds = current.map((item) => item.id);
+  const replaced = existingIds.includes(preset.id);
+  const collidesBuiltin = current.some((item) => item.id === preset.id && item.builtin === true);
+  const label = block === 'initial-scene' ? '初始场景预设' : '对话示例预设';
+  const warnings = collidesBuiltin
+    ? [...result.warnings, `已覆盖内置${label} "${preset.id}"：本次运行内生效，重启后恢复为内置版本。`]
+    : result.warnings;
+
+  const merged = [...current.filter((item) => item.id !== preset.id), preset];
+  return {
+    ok: true,
+    value: merged,
+    issues: [],
+    warnings,
+    id: preset.id,
+    name: preset.name,
+    replaced,
+    renameHint: suggestExistingId(preset.id, existingIds),
+  };
+}
+
 /** 当前预设 → 可导出的完整 JSON（含用户自定义项；导出的是"当前生效的值"而不是原始文本） */
-export function serializePreset(preset: TxtPreset | WorldbookPreset): string {
+export function serializePreset(preset: TxtPreset | WorldbookPreset | FieldPreset): string {
   return `${JSON.stringify(preset, null, 2)}\n`;
 }

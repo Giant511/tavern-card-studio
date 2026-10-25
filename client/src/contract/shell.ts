@@ -12,7 +12,7 @@
  */
 
 import { invoke } from '@tauri-apps/api/core';
-import { open, save } from '@tauri-apps/plugin-dialog';
+import { confirm as confirmDialog, open, save } from '@tauri-apps/plugin-dialog';
 import { load, type Store } from '@tauri-apps/plugin-store';
 
 import { ShellError, toShellError } from './errors.js';
@@ -332,6 +332,45 @@ export function shellInfo(): Promise<ShellInfo> {
 /** 供 UI 判断「是不是跑在壳里」（浏览器直开时这些能力不可用） */
 export function isShellAvailable(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+/**
+ * 二次确认。**所有环境统一的异步版本**，渲染层只许用它，不许直接写 `window.confirm`。
+ *
+ * ## 为什么不能直接用 `window.confirm`
+ *
+ * `tauri-plugin-dialog` 在初始化脚本（`init-iife.js`）里**改写**了这两个全局函数：
+ *
+ * ```js
+ * window.alert = e => invoke('plugin:dialog|message', { message: e.toString() })
+ * window.confirm = async e => 'Ok' === await invoke('plugin:dialog|message', { message: ..., buttons: 'OkCancel' })
+ * ```
+ *
+ * 于是壳里 `window.confirm(...)` 返回的是 **Promise**，不是 boolean。而我们所有调用点
+ * 写的都是同步用法 `if (!window.confirm(...)) return;` —— Promise 恒为真值，
+ * `!proceed` 永远是 `false`，结果是：
+ *
+ *   · 确认框**根本不出现**；
+ *   · 操作**直接执行**（删除卡片、删除仓库、导出闸门、重排原文全在内）。
+ *
+ * 2026-10-24 的生产日志就是这么发现的：`client-error.log` 里两条
+ * `UNHANDLEDREJECTION Command plugin:dialog|message not allowed by ACL` ——
+ * capabilities 当时只给了 `dialog:allow-open` / `dialog:allow-save`，
+ * 少了 `dialog:allow-message`（`dialog:default` 里本来是三项齐全的）。
+ *
+ * 那次事故同时说明为什么这个 bug 能活到发版：**端到端测试跑在 Chrome 里**，
+ * 那里的 `window.confirm` 是原生的同步函数，行为完全正常；只有壳里才被改写。
+ *
+ * ## 现在的约定
+ *
+ *   · 壳里：走插件的 `confirm()`（本来就是 `Promise<boolean>`，语义对得上）；
+ *   · 浏览器里：走原生 `window.confirm`（同步 boolean），包一层 Promise 统一形状。
+ *
+ * `validate-config.mjs` 会静态拦下渲染层里任何直接的 `window.confirm` / `window.alert`。
+ */
+export async function askConfirm(text: string, title = '请确认'): Promise<boolean> {
+  if (!isShellAvailable()) return window.confirm(text);
+  return await confirmDialog(text, { title, kind: 'warning' });
 }
 
 // 这里不再复述导出：类型与错误分别由 ./types、./errors 提供，

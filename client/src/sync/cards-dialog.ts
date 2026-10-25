@@ -13,6 +13,7 @@
  * 声称了就是假话。真实提示见 `isolationNote()`。
  */
 
+import { askConfirm } from '../contract';
 import {
   deleteCard,
   listCards,
@@ -23,6 +24,8 @@ import {
 } from './server-sync.ts';
 import { type RepoSummary } from './repo-client.ts';
 import { emptyCardsText, isolationNote, toCardRow, type CardRowView } from './card-row.ts';
+import type { RepoTokenContext } from './repo-select.ts';
+import { describeCapabilities } from '../auth/repo-token.ts';
 
 export { isolationNote };
 
@@ -58,6 +61,15 @@ export interface CardsDialogDeps {
    * 没有仓库列表就没法选目标，摆一个点了没用的按钮比不摆更糟。
    */
   getRepos?: () => Promise<RepoSummary[]>;
+  /**
+   * 仓库令牌模式上下文（v0.1.3 / F5 后半）。null = 不在该模式。
+   *
+   * 这个面板需要它做三件事：
+   *   ① 顶部提示改成"只显示该仓库的卡片"，而不是账户隔离那句；
+   *   ② 「退出」按钮在这个模式下也要显示（= 退出令牌模式，需求第 2 条最后一项）；
+   *   ③ 没有 write 范围时隐藏「移动…」「删除」这类写操作。
+   */
+  getRepoTokenContext?: () => RepoTokenContext | null;
 }
 
 /**
@@ -79,6 +91,8 @@ export class CardsDialog {
   private readonly deps: CardsDialogDeps;
   private rows: CardSummary[] = [];
   private busy = false;
+  /** 仓库令牌模式上下文（open 时定一次，渲染各行时用；null = 不在该模式） */
+  private tokenContext: RepoTokenContext | null = null;
 
   constructor(deps: CardsDialogDeps) {
     this.deps = deps;
@@ -153,10 +167,31 @@ export class CardsDialog {
 
   async open(): Promise<void> {
     this.overlay.hidden = false;
-    const note = isolationNote(this.deps.isAccountLogin(), this.deps.isIsolationEnforced());
-    this.noteEl.hidden = note === null;
-    if (note !== null) this.noteEl.textContent = note;
-    this.logoutButton.hidden = this.deps.onLogout === undefined || !this.deps.isAccountLogin();
+    /*
+     * 顶部提示三选一（v0.1.3 / F5 后半）。
+     *
+     * 令牌模式下**不能**再显示"账户隔离"那句：它讲的是"你的卡片按账户过滤"，
+     * 而令牌模式下过滤的依据是**仓库 + scope**，两句话说的不是一件事。
+     * 说错比不说更糟 —— 用户会以为自己看到的是自己账户的全部卡。
+     */
+    const tokenContext = this.deps.getRepoTokenContext?.() ?? null;
+    if (tokenContext !== null) {
+      this.noteEl.hidden = false;
+      this.noteEl.textContent =
+        `${tokenContext.label}：只显示该仓库的卡片，能力受令牌范围限制（${describeCapabilities(tokenContext.caps)}）。`;
+    } else {
+      const note = isolationNote(this.deps.isAccountLogin(), this.deps.isIsolationEnforced());
+      this.noteEl.hidden = note === null;
+      if (note !== null) this.noteEl.textContent = note;
+    }
+    /*
+     * 「退出」按钮在令牌模式下也要出现 —— 需求要求"退出登录 = 退出该模式"。
+     * 文案要改：这时候没有"登出账户"这回事，只有"不再使用这把令牌"。
+     */
+    const showLogout = this.deps.onLogout !== undefined && (this.deps.isAccountLogin() || tokenContext !== null);
+    this.logoutButton.hidden = !showLogout;
+    this.logoutButton.textContent = tokenContext !== null ? '退出令牌模式' : '登出';
+    this.tokenContext = tokenContext;
     this.searchInput.value = '';
     await this.reload();
     this.searchInput.focus();
@@ -266,10 +301,12 @@ export class CardsDialog {
    * 前者让用户敢点（知道能撤销），后者会让人宁可不敢用这个功能。
    */
   private async confirmDelete(view: CardRowView): Promise<void> {
-    const ok = window.confirm(
+    // 必须 await：壳里 window.confirm 被 dialog 插件改写成异步，同步真值判断会直接放行
+    const ok = await askConfirm(
       `删除「${view.name}」？\n\n` +
         '它会进入回收站：立刻从列表消失，但保留期内可以恢复。\n' +
         '（彻底清除只能由管理员在管理面板里做，且不可恢复。）',
+      '删除卡片',
     );
     if (!ok) return;
 
@@ -397,11 +434,23 @@ export class CardsDialog {
       });
 
       const actions = el('div', 'cards-row-actions');
+      /*
+       * 写操作按 scope 置灰（v0.1.3 / F5 后半）：
+       * 需求「无写 → 无删除/移动」。这里用 disabled + title 而不是整块隐藏 ——
+       * 隐藏会让人以为"这版客户端没有这个功能"，置灰加说明了才指向真实原因
+       * （令牌缺 write，去找签发人）。
+       */
+      const caps = this.tokenContext?.caps ?? null;
+      const noWrite = caps !== null && !caps.canMove;
+      const writeReason = this.tokenContext?.reason.move ?? '';
+
       if (this.deps.getRepos) {
         const moveButton = el('button', 'btn small', '移动…');
         moveButton.type = 'button';
         moveButton.dataset['role'] = 'card-move';
         moveButton.dataset['cardId'] = view.cardId;
+        moveButton.disabled = noWrite;
+        if (noWrite) moveButton.title = writeReason;
         moveButton.addEventListener('click', (event) => {
           event.stopPropagation();
           void this.openMove(view);
@@ -412,6 +461,8 @@ export class CardsDialog {
       deleteButton.type = 'button';
       deleteButton.dataset['role'] = 'card-delete';
       deleteButton.dataset['cardId'] = view.cardId;
+      deleteButton.disabled = noWrite;
+      if (noWrite) deleteButton.title = this.tokenContext?.reason.delete ?? '';
       deleteButton.addEventListener('click', (event) => {
         event.stopPropagation();
         void this.confirmDelete(view);

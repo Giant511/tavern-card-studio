@@ -20,6 +20,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST="$REPO/client/dist"
 DUMPS="$REPO/.verify/t10x-dumps"
 SHOTS="$REPO/assets"
+PROFILES="$REPO/.verify/chrome-profiles"
 PORT=8951
 
 CHROME="/c/Program Files/Google/Chrome/Application/chrome.exe"
@@ -35,7 +36,7 @@ if [ ! -f "$DIST/index.html" ]; then
   exit 2
 fi
 
-mkdir -p "$DUMPS" "$SHOTS"
+mkdir -p "$DUMPS" "$SHOTS" "$PROFILES"
 
 PY="C:/Users/PC/.workbuddy/binaries/python/versions/3.13.12/python.exe"
 if [ ! -f "$PY" ]; then
@@ -55,25 +56,28 @@ done
 BASE="http://127.0.0.1:$PORT/index.html"
 
 # capture <名字> <query> —— 只存 DOM，不存截图
+#
+# 注意：**不要** rm -rf profile。单个 Chrome profile 有近 200 个文件，
+# 批量删除会撞上本机 safe-delete 钩子（阈值 50），脚本当场中断、
+# 表现为「抓到第一个样本就停了」。改用独立目录且不删（.verify 已被 gitignore）。
 capture() {
   local name="$1" query="$2"
-  local profile="$REPO/.verify/chrome-t10x-$name-$$"
-  rm -rf "$profile"
+  local profile="$PROFILES/capture-$name-$"
+  mkdir -p "$profile"
   "$CHROME" \
     --headless=new --disable-gpu --no-sandbox --no-first-run --hide-scrollbars \
     --user-data-dir="$profile" \
     --virtual-time-budget=11000 \
     --dump-dom \
     "$BASE$query" > "$DUMPS/$name.html" 2>/dev/null || true
-  rm -rf "$profile"
   echo "  $name.html  $(wc -c < "$DUMPS/$name.html") 字节"
 }
 
 # shot <文件名> <query> [尺寸]
 shot() {
   local name="$1" query="$2" size="${3:-1420,940}"
-  local profile="$REPO/.verify/chrome-t10x-shot-$name-$$"
-  rm -rf "$profile"
+  local profile="$PROFILES/shot-$name-$"
+  mkdir -p "$profile"
   "$CHROME" \
     --headless=new --disable-gpu --no-sandbox --no-first-run --hide-scrollbars \
     --force-device-scale-factor=2 \
@@ -82,7 +86,6 @@ shot() {
     --window-size="$size" \
     --screenshot="$SHOTS/$name" \
     "$BASE$query" >/dev/null 2>&1 || true
-  rm -rf "$profile"
   echo "  $name  已生成"
 }
 

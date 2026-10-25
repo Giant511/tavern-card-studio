@@ -111,6 +111,14 @@ interface BaseContentRule {
   category?: IssueCategory;
   /** 同一 scope 内的跨字段条件（见 RuleCondition） */
   when?: RuleCondition;
+  /**
+   * 显式声明"这条内容规则也适用于「初始场景」「对话示例」"（v0.1.3 / 追加项一）。
+   *
+   * 缺省 false：scope 波及那两个新板块时，这几段文本会被跳过
+   * （见 `format-only-blocks.ts`）。理由：这两块的**内容**没有客观标准，
+   * 默认不管；愿意负责的规则作者可以自己打开。
+   */
+  contentOptIn?: boolean;
 }
 
 export interface PlaceholderCountRule extends BaseContentRule {

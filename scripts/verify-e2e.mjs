@@ -89,17 +89,23 @@ async function main() {
   mkdirSync(join(REPO, '.verify'), { recursive: true });
   console.log(`读取 DOM 快照：${DUMPS}\n`);
 
-  // ── 1. 启动与六板块 ────────────────────────────────
-  console.log('1. TXT 分块编辑：六板块与折叠懒渲染');
+  // ── 1. 启动与八板块 ────────────────────────────────
+  console.log('1. TXT 分块编辑：八板块与折叠懒渲染');
   const base = dumpDom('default');
   // 用 `<section class="block ..." data-block-id=` 精确匹配：
   // 光数 data-block-id 会把编辑器内部（CodeMirror 镜像该属性）也算进来，得到 12。
   const blockCount = count(base, /<section class="block[^"]*" data-block-id="/g);
-  check(blockCount === 6, '六个板块已渲染', `${blockCount} 个`);
-  const uniqueIds = new Set([...base.matchAll(/<section class="block[^"]*" data-block-id="([a-z]+)"/g)].map((m) => m[1]));
-  check(uniqueIds.size === 6 && uniqueIds.has('worldbook'), '六个板块 id 齐全（含 worldbook）', [...uniqueIds].join(','));
-  check(count(base, /class="cm-editor/g) === 2, '默认挂载 2 个编辑器（懒渲染）');
-  check(count(base, /class="cm-host"><\/div>/g) === 4, '其余 4 块未进 DOM');
+  check(blockCount === 8, '八个板块已渲染', `${blockCount} 个`);
+  // id 正则必须含连字符：chat-examples / initial-scene 在 [a-z]+ 下匹配不到，
+  // 于是 uniqueIds 会静默少算两个、size 对不上却看不出是谁缺了。
+  const uniqueIds = new Set([...base.matchAll(/<section class="block[^"]*" data-block-id="([a-z-]+)"/g)].map((m) => m[1]));
+  check(
+    uniqueIds.size === 8 && uniqueIds.has('worldbook') && uniqueIds.has('chat-examples') && uniqueIds.has('initial-scene'),
+    '八个板块 id 齐全（含两个新板块与世界书）',
+    [...uniqueIds].join(','),
+  );
+  check(count(base, /class="cm-editor/g) === 2, '默认仍只挂载 2 个编辑器（懒渲染红线）');
+  check(count(base, /class="cm-host"><\/div>/g) === 6, '其余 6 块未进 DOM');
   check(textOf(base, 'card-name').trim() !== '', '卡片名已加载', textOf(base, 'card-name'));
   // 默认只展开前两块（懒渲染），所以这里只断言"有内容"，不按六块预期
   const blockTexts = count(base, /class="cm-line"/g);
@@ -120,7 +126,7 @@ async function main() {
   const issues = count(base, /class="issue (error|warning|info)"/g);
   check(issues > 0, '问题列表有条目', `${issues} 条`);
   check(/class="word-row"/.test(base), '字数分布已渲染');
-  check(count(base, /class="word-row"/g) === 6, '六个板块的字数条');
+  check(count(base, /class="word-row"/g) === 8, '八个板块的字数条（顺序同 BLOCK_IDS）');
 
   // ── 4. 编辑 → 审计联动（修正即消失已验证于单测，这里验报错侧）──
   console.log('\n4. 审计：错误注入与拦截');

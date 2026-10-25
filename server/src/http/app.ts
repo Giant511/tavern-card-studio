@@ -18,6 +18,7 @@ import { TokenGate } from './auth.js';
 import { ALL_CARDS, scopeFromIdentity, type CardScope } from '../storage/card-scope.js';
 import { registerAuthRoutes } from './auth-routes.js';
 import { registerRepoRoutes } from './repo-routes.js';
+import { registerAccountRoutes } from './account-routes.js';
 import { TrustProxyResolver, decideTokenGate } from '../net/trust-proxy.js';
 import { AuthService } from '../auth/service.js';
 import { LiveRegisterMode } from '../config-live.js';
@@ -313,12 +314,23 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     auth: authService,
     identify: (context) => gate.identify(context.req),
     clientIp,
+    // 仓库令牌入口（v0.1.3 / F5 后半）：登录界面第三个入口调的校验端点
+    repoTokens,
+    repos,
+    users,
   });
 
   registerRepoRoutes(router, {
     repos,
     tokens: repoTokens,
     identify: (context) => gate.identify(context.req),
+    // 治理页的归属列要显示「用户名（uid）」（v0.1.3 / F2）。
+    // 这里只给只读查询：账户被删之后历史仓库仍可能存在，查不到就回 null。
+    describeOwner: (ownerId) => {
+      if (ownerId === '') return null;
+      const owner = users.findById(ownerId);
+      return owner === null ? null : { username: owner.username, uid: owner.uid };
+    },
     // 跨账户仓库删除要留痕。事件写进同一张 events 表，
     // 于是它和卡片级操作在面板的治理视图里是同一条时间线。
     onAudit: (event) => {
@@ -332,6 +344,58 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
         ownerId: event.ownerId,
       });
     },
+  });
+
+  /*
+   * 账户注销（v0.1.3 / F3）。
+   *
+   * 放在 worker 而不是 supervisor 控制端口：注销要删卡片、版本、blob 与 git 仓库，
+   * 这些只有数据面才有（supervisor 只打开 users 表读写）。
+   * 治理页也是直连 worker 的（与 `/api/repos?all=true` 同一条路）。
+   */
+  registerAccountRoutes(router, {
+    users,
+    sessions,
+    limiter,
+    db: ctx.db,
+    git: ctx.git,
+    blobs: ctx.blobs,
+    identify: (context) => gate.identify(context.req),
+    clientIp,
+    logger: ctx.logger,
+  });
+
+  /**
+   * TLS 热重载（v0.1.3 / F4 需求第 2 条）。
+   *
+   * 为什么热重载要**经过 HTTP 端点**而不是 supervisor 直接改内存：
+   * 监听器属于 worker 进程，控制面（supervisor）与它不共享内存。
+   * 控制面保存配置后调这里，拿到同步结果 —— 只有这样面板才能
+   * 如实回一句"已热更"或"已回滚，原因是…"，而不是含糊的"配置已保存"。
+   *
+   * 权限：管理员（legacy 全局令牌也算）。**仓库令牌一律拒绝** ——
+   * 它是"某个仓库的受限授权"，改全站传输安全显然超出授权范围。
+   */
+  router.post('/api/tls/reload', async (_ctx) => {
+    const identity = gate.identify(_ctx.req);
+    if (identity !== null && identity.via === 'repo-token') {
+      throw new AppError(403, 'ADMIN_ONLY', '仓库令牌不能修改传输安全设置');
+    }
+    if (identity !== null && identity.role !== 'admin') {
+      throw new AppError(403, 'ADMIN_ONLY', '修改传输安全设置仅管理员可用');
+    }
+    if (ctx.tlsReload === undefined) {
+      // 手工构造的 ctx（单测）没有监听器可重载：如实说，不要假装成功
+      throw new AppError(503, 'INTERNAL', '当前进程没有可热重载的 TLS 运行时');
+    }
+    const result = await ctx.tlsReload();
+    // 失败返回 409 而不是 500：这不是程序错误，是"配置与现状冲突"，
+    // 调用方（supervisor）要根据这个状态码决定回滚配置文件。
+    sendJson(_ctx.res, result.ok ? 200 : 409, {
+      ok: result.ok,
+      error: result.error,
+      tls: result.state,
+    });
   });
 
   router.get('/api/health', (_ctx) => {
@@ -823,7 +887,12 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       const isTokenBootstrap = method === 'GET' && pathname === '/api/token';
       const isAuthEntry =
         method === 'POST' &&
-        (pathname === '/api/auth/login' || pathname === '/api/auth/register' || pathname === '/api/auth/refresh');
+        (pathname === '/api/auth/login' ||
+          pathname === '/api/auth/register' ||
+          pathname === '/api/auth/refresh' ||
+          // v0.1.3 / F5 后半：仓库令牌校验。调用方此时正拿着一把尚未被认可的
+          // 令牌、没有别的凭证 —— 它本身就是鉴权入口，不能过 TokenGate。
+          pathname === '/api/auth/repo-token');
       // `GET /api/auth/config` 也必须免鉴权（T10.7）：客户端要在**登录框出现之前**
       // 就知道该不该显示「注册」入口。它只回公开的策略（注册模式、版本号），
       // 不含任何账户信息 —— 因此没有信息泄露面。

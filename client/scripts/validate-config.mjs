@@ -123,10 +123,14 @@ if (frontendDist) {
   // 它会内嵌一个空映射，运行期才炸成 `asset not found: index.html`。
   // 这里只做最便宜的一道：入口 html 必须在产物根上。
   const entry = join(distPath, 'index.html');
+  const entryExists = existsSync(entry);
   check(
     `frontendDist 根上有 index.html（${frontendDist}）`,
-    existsSync(entry),
-    existsSync(distPath) ? '空的产物目录，Tauri 会内嵌空映射（白屏）' : '',
+    entryExists,
+    // 第三个参数是**失败时**才显示的提示；通过时给空串。
+    // 第一版这里无条件给了提示文案，于是绿项后面也挂着"空的产物目录…"，
+    // 看着像在报警。
+    entryExists ? '' : '空的产物目录，Tauri 会内嵌空映射（白屏）',
   );
 }
 
@@ -158,6 +162,7 @@ function walk(dir) {
 const tsFiles = existsSync(SRC) ? walk(SRC) : [];
 const violationImport = [];
 const violationHtml = [];
+const violationNativeDialog = [];
 
 for (const file of tsFiles) {
   const relative = file.slice(CLIENT.length + 1).replace(/\\/g, '/');
@@ -176,6 +181,27 @@ for (const file of tsFiles) {
   if (/\binnerHTML\b|\binsertAdjacentHTML\b|\bouterHTML\b/.test(code)) {
     violationHtml.push(relative);
   }
+
+  /*
+   * C. 不许直接写 `window.confirm` / `window.alert`，必须走 contract 的 `askConfirm`。
+   *
+   * 这不是风格问题，是 2026-10-24 的生产缺陷：`tauri-plugin-dialog` 在初始化脚本里
+   * **改写**了这两个全局函数，把它们转成 `invoke('plugin:dialog|message')`。于是
+   * 壳里 `window.confirm(...)` 返回 **Promise**，而调用点写的是
+   * `if (!window.confirm(...)) return;` —— Promise 恒真 ⇒ 确认框不出现、操作直接执行
+   * （删除卡片 / 删除仓库 / 导出闸门 / 重排原文全中）。当时 capabilities 还漏了
+   * `dialog:allow-message`，于是那个 Promise 被 ACL 拒绝，只在
+   * client-error.log 里留下一行 `UNHANDLEDREJECTION`。
+   *
+   * **为什么端到端测试没抓到**：E2E 跑在 Chrome 里，那里的 `window.confirm` 是原生的
+   * 同步函数，行为完全正常。只有壳里才被改写 —— 这类"只在壳里错"的缺陷，
+   * 浏览器侧断言永远是绿的，只能靠静态检查 + 真机验收兜住。
+   *
+   * 例外只有 contract/shell.ts（askConfirm 自己要在浏览器分支用原生 confirm）。
+   */
+  if (!relative.startsWith('src/contract/') && /\bwindow\.(confirm|alert)\s*\(/.test(code)) {
+    violationNativeDialog.push(relative);
+  }
 }
 
 check(
@@ -188,6 +214,14 @@ check(
   '渲染层无 innerHTML / insertAdjacentHTML / outerHTML',
   violationHtml.length === 0,
   violationHtml.length ? `越界：${violationHtml.join(', ')}` : '',
+);
+
+check(
+  '渲染层不直接用 window.confirm / window.alert（走 contract.askConfirm）',
+  violationNativeDialog.length === 0,
+  violationNativeDialog.length
+    ? `越界：${violationNativeDialog.join(', ')}（壳里这两个函数被 dialog 插件改成异步，同步判断会直接放行）`
+    : '',
 );
 
 // ── 6. PLAN.md 决策表序号连续性 ───────────────────────────

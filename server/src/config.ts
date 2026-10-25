@@ -11,6 +11,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { parseTrustProxyEntries } from './net/trust-proxy.js';
+import { warnOnce } from './warn-once.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 
@@ -505,14 +506,25 @@ export function assertSafeConfig(config: ServerConfigFile): void {
   // 拒绝启动会让"我就想做成公开社区服务"的用户彻底没路可走，
   // 而我们真正要防的是"随手把 host 改成 0.0.0.0 调试，忘了 registerMode 是 open"。
   if (config.auth.registerMode === 'open' && !isLoopbackHost(config.host)) {
-    // 只记录，不抛错。调用方（CLI / supervisor）会把这条打出来
-    process.emitWarning
-      ? process.emitWarning(
-          `已开启自助注册（auth.registerMode=open）且 API 监听 ${config.host}（非回环）：` +
-            '任何能访问该地址的人都可以创建账户。若非有意，请改为 closed 或 admin-only。',
-          'SecurityWarning',
-        )
-      : undefined;
+    /*
+     * **同一配置状态只警告一次**（v0.1.3 真机反馈）。
+     *
+     * 原来直接 `process.emitWarning`，于是每次进程启动都打一条：真机上
+     * worker 反复重启 4 次，err.log 里就是 4 条一模一样的警告，看起来像
+     * "服务一直在出问题"。安全警告不能因为烦就不打，但也不该被重启刷屏 ——
+     * 那样真正的新警告会淹没在噪声里。
+     *
+     * 去重靠 `<dataDir>/.warned.json` 持久化「上次警告时的配置签名」：
+     * 签名 = registerMode + host，配置一变就重新提示。
+     */
+    warnOnce({
+      dataDir: config.dataDir,
+      key: 'security:open-register-non-loopback',
+      signature: `${config.auth.registerMode}|${config.host}`,
+      message:
+        `已开启自助注册（auth.registerMode=open）且 API 监听 ${config.host}（非回环）：` +
+        '任何能访问该地址的人都可以创建账户。若非有意，请改为 closed 或 admin-only。',
+    });
   }
 
   // ── 可信反向代理（v0.1.2 追加任务）────────────────────────

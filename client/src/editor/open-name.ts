@@ -64,6 +64,18 @@ function sanitizeName(name: string): string {
   return cleaned === '' ? '未命名角色' : cleaned;
 }
 
+/**
+ * 让角色名在本地已打开的标签里唯一（重名追加 ` (2)`）。
+ *
+ * 抽成导出函数供**两条**自动建卡路径共用（v0.1.3 追加项三）：
+ *   · 零标签「打开…」按文件名建卡（`deriveCardNameFromFile`）；
+ *   · 零标签从服务端「取回 / 回滚」建卡（名字来自 `card.meta.name`）。
+ * 两处若各写一份，序号规则迟早不一致 —— 一个 ` (2)`、一个 `-2`。
+ */
+export function uniqueCardName(name: string, existingNames: readonly string[] = []): string {
+  return truncateName(uniqueAmong(sanitizeName(name), existingNames));
+}
+
 /** 重名时追加 ` (2)`；再重名 ` (3)`…（比 `-2` 更像人起的名字，也不易与文件名冲突） */
 function uniqueAmong(name: string, existingNames: readonly string[]): string {
   const taken = new Set(existingNames.map((item) => item.trim().toLowerCase()));

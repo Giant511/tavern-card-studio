@@ -12,7 +12,7 @@ import { CardService } from './storage/cards.js';
 import { Db } from './storage/db.js';
 import { GitStore } from './storage/git-store.js';
 
-export const SERVER_VERSION = '0.1.2';
+export const SERVER_VERSION = '0.1.3';
 export const API_VERSION = 'v1';
 
 export interface ServerContext {
@@ -35,6 +35,16 @@ export interface ServerContext {
    * 看的是**实际加载的那张证书**，不是配置里那个路径。
    */
   tls: RuntimeTlsState;
+  /**
+   * TLS 热重载入口（v0.1.3 / F4）。
+   *
+   * 由 worker 在监听层装配完后注入 —— 监听器属于 worker 进程，
+   * 控制面（supervisor）没法直接碰它，只能通过 main API 上的
+   * `/api/tls/reload` 让 worker 自己重载。
+   *
+   * 可选：单测里手工构造的 ctx 不带它，此时那个端点回 503 而不是假装成功。
+   */
+  tlsReload?: () => Promise<{ ok: boolean; error: string | null; state: RuntimeTlsState }>;
 }
 
 export interface RuntimeTlsState {
@@ -181,6 +191,11 @@ export function configSummary(config: ServerConfigFile): Record<string, unknown>
       httpsPort: config.tls.httpsPort,
       // **不下发 certPath/keyPath 的完整路径**：面板会被远程访问，路径里常带用户名，
       // 而且用户不需要在界面上看到磁盘结构。只给"是否已配置"，够判断状态。
+      //
+      // v0.1.3 / F4 的「传输安全」分区需要**可编辑**的路径，所以它改从
+      // `/control/tls/status` 取（控制面，仅持令牌的管理员可达）。
+      // 那份能带全路径的原因是：`configSummary` 会随 `/api/stats` 下发给
+      // **任何已鉴权客户端**（含普通用户），而控制面不会。
       customConfigured: config.tls.certPath !== '' && config.tls.keyPath !== '',
       // 面板据此显示常驻红色明文横幅（T10.5 / 需求 F1.3）。
       // plaintext 是**持续事实**，不是一次性提示，所以由后端给判据、前端常驻渲染。

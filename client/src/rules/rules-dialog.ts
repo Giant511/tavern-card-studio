@@ -12,13 +12,14 @@
  *   · UI 不自行重排文本——「应用预设」只调用 shared 的 plan → 确认 → apply。
  */
 
-import type { PresetApplyPlan, TxtPreset, WorldbookPreset } from '@tcs/shared';
+import type { FieldPreset, PresetApplyPlan, TxtPreset, WorldbookPreset } from '@tcs/shared';
 
 import {
   pickRuleFile,
   pickSavePath,
   readTextExact,
   isShellAvailable,
+  askConfirm,
   writeFileAtomic,
 } from '../contract';
 
@@ -79,6 +80,14 @@ export interface RulesDialogCallbacks {
   /** 选中世界书预设（只改导出/解析格式） */
   onWorldbookPresetSelect: (id: string) => void;
 
+  /** 导入 / 选中 / 导出字段板块预设（v0.1.3 追加项一） */
+  importGreetingPresetText: (text: string) => PresetImportOutcome<FieldPreset[]>;
+  onGreetingPresetSelect: (id: string) => void;
+  exportGreetingPreset: (id: string) => string | null;
+  importChatExamplePresetText: (text: string) => PresetImportOutcome<FieldPreset[]>;
+  onChatExamplePresetSelect: (id: string) => void;
+  exportChatExamplePreset: (id: string) => string | null;
+
   /** 当前状态快照 */
   getState: () => DialogState;
   /** 状态栏消息 */
@@ -102,6 +111,17 @@ export interface DialogState {
   decideFor: (presetId: string) => ReturnType<typeof decideApplyPreset> | null;
   worldbookPresetId: string | null;
   worldbookPresets: Array<{ id: string; name: string; builtin: boolean; summary: string }>;
+  /** 初始场景 / 对话示例预设（v0.1.3 追加项一） */
+  greetingPresetId: string | null;
+  greetingPresets: Array<{ id: string; name: string; builtin: boolean; summary: string }>;
+  /**
+   * 「初始场景」当前分隔符从哪来：greeting-preset / txt-preset / frozen。
+   * 面板要如实说一句 —— TXT 预设里也有一份 greeting.separator（v0.1.3 早期写法），
+   * 不说清的话用户会以为自己选的预设没生效。
+   */
+  greetingFormatSource: 'greeting-preset' | 'txt-preset' | 'frozen';
+  chatExamplePresetId: string | null;
+  chatExamplePresets: Array<{ id: string; name: string; builtin: boolean; summary: string }>;
 }
 
 export class RulesDialog {
@@ -112,6 +132,11 @@ export class RulesDialog {
   private readonly presetPreview: HTMLElement;
   private readonly worldbookSelect: HTMLSelectElement;
   private readonly worldbookSummary: HTMLElement;
+  private readonly greetingSelect: HTMLSelectElement;
+  private readonly greetingSummary: HTMLElement;
+  private readonly greetingSourceNote: HTMLElement;
+  private readonly chatExampleSelect: HTMLSelectElement;
+  private readonly chatExampleSummary: HTMLElement;
   private readonly errorBox: HTMLElement;
   private readonly applyButton: HTMLButtonElement;
 
@@ -202,7 +227,7 @@ export class RulesDialog {
     this.presetPreview.dataset['role'] = 'preset-preview';
 
     const presetActions = el('div', 'field-row');
-    this.applyButton = this.actionButton('应用预设（重排原文）…', () => this.applyPreset());
+    this.applyButton = this.actionButton('应用预设（重排原文）…', () => void this.applyPreset());
     this.applyButton.classList.add('primary');
     presetActions.append(
       this.applyButton,
@@ -251,6 +276,82 @@ export class RulesDialog {
     );
     wbSection.append(wbTitle, this.worldbookSelect, this.worldbookSummary, wbActions, wbHint);
 
+    // ── ⑤ 初始场景预设（格式轨，v0.1.3 追加项一）──────────
+    const greetingSection = el('section', 'form-section');
+    greetingSection.dataset['role'] = 'greeting-preset-section';
+    const greetingTitle = el('h3', 'form-title', '初始场景预设');
+    const greetingHint = el(
+      'p',
+      'field-hint',
+      '决定「初始场景」怎么写：多条开场白之间的分隔行、以及可选的段标签行。' +
+        '内置「标准初始场景」等价于 v0.1.3 冻结格式（空行+--- +空行，不写标签）。' +
+        '**只影响格式**，不评价开场白写得好不好。',
+    );
+
+    this.greetingSelect = el('select', 'select wide') as HTMLSelectElement;
+    this.greetingSelect.dataset['role'] = 'greeting-preset-select';
+    this.greetingSelect.addEventListener('change', () => {
+      const id = this.greetingSelect.value;
+      this.callbacks.onGreetingPresetSelect(id);
+      this.renderGreetingSummary();
+    });
+
+    this.greetingSummary = el('div', 'preset-preview');
+    this.greetingSummary.dataset['role'] = 'greeting-preset-summary';
+    // 来源提示：TXT 预设里也有一份 greeting.separator（v0.1.3 早期写法）。
+    // 不说清"现在生效的是哪一份"，用户会以为自己选的预设没起作用。
+    this.greetingSourceNote = el('p', 'field-hint');
+    this.greetingSourceNote.dataset['role'] = 'greeting-format-source';
+
+    const greetingActions = el('div', 'field-row');
+    greetingActions.append(
+      this.actionButton('导入初始场景预设…', () => void this.importFieldPreset('greeting')),
+      this.actionButton('导出当前初始场景预设…', () => void this.exportFieldPreset('greeting')),
+    );
+    greetingSection.append(
+      greetingTitle,
+      this.greetingSelect,
+      this.greetingSummary,
+      this.greetingSourceNote,
+      greetingActions,
+      greetingHint,
+    );
+
+    // ── ⑥ 对话示例预设（格式轨，v0.1.3 追加项一）──────────
+    const exampleSection = el('section', 'form-section');
+    exampleSection.dataset['role'] = 'chat-example-preset-section';
+    const exampleTitle = el('h3', 'form-title', '对话示例预设');
+    const exampleHint = el(
+      'p',
+      'field-hint',
+      '决定「对话示例」怎么读：轮次分隔（只用于审计统计轮数，**不改写正文**）与轮次称呼。' +
+        '内置「标准对话示例」= 不切分，即 v0.1.3 冻结行为。',
+    );
+
+    this.chatExampleSelect = el('select', 'select wide') as HTMLSelectElement;
+    this.chatExampleSelect.dataset['role'] = 'chat-example-preset-select';
+    this.chatExampleSelect.addEventListener('change', () => {
+      const id = this.chatExampleSelect.value;
+      this.callbacks.onChatExamplePresetSelect(id);
+      this.renderChatExampleSummary();
+    });
+
+    this.chatExampleSummary = el('div', 'preset-preview');
+    this.chatExampleSummary.dataset['role'] = 'chat-example-preset-summary';
+
+    const exampleActions = el('div', 'field-row');
+    exampleActions.append(
+      this.actionButton('导入对话示例预设…', () => void this.importFieldPreset('example')),
+      this.actionButton('导出当前对话示例预设…', () => void this.exportFieldPreset('example')),
+    );
+    exampleSection.append(
+      exampleTitle,
+      this.chatExampleSelect,
+      this.chatExampleSummary,
+      exampleActions,
+      exampleHint,
+    );
+
     // ── 错误区（导入失败时显示，含字段位置）──────────────
     this.errorBox = el('div', 'rule-errors');
     this.errorBox.hidden = true;
@@ -267,7 +368,17 @@ export class RulesDialog {
     done.addEventListener('click', () => this.close());
     foot.append(note, done);
 
-    panel.append(head, platformSection, highlightSection, presetSection, wbSection, this.errorBox, foot);
+    panel.append(
+      head,
+      platformSection,
+      highlightSection,
+      presetSection,
+      wbSection,
+      greetingSection,
+      exampleSection,
+      this.errorBox,
+      foot,
+    );
     this.overlay.append(panel);
     this.overlay.addEventListener('click', (event) => {
       if (event.target === this.overlay) this.close();
@@ -333,10 +444,31 @@ export class RulesDialog {
     }
     if (state.worldbookPresetId) this.worldbookSelect.value = state.worldbookPresetId;
 
+    this.fillFieldPresetSelect(this.greetingSelect, state.greetingPresets, state.greetingPresetId);
+    this.fillFieldPresetSelect(this.chatExampleSelect, state.chatExamplePresets, state.chatExamplePresetId);
+
     this.hideErrors();
     this.renderPresetPreview();
     this.renderWorldbookSummary();
+    this.renderGreetingSummary();
+    this.renderChatExampleSummary();
     this.overlay.hidden = false;
+  }
+
+  /** 两个字段板块下拉共用的填充逻辑（少一份重复就少一处"只改了一边"） */
+  private fillFieldPresetSelect(
+    select: HTMLSelectElement,
+    presets: readonly { id: string; name: string; builtin: boolean }[],
+    currentId: string | null,
+  ): void {
+    select.replaceChildren();
+    for (const preset of presets) {
+      const option = el('option');
+      option.value = preset.id;
+      option.textContent = `${preset.name}${preset.builtin ? '' : '（自定义）'}`;
+      select.append(option);
+    }
+    if (currentId !== null) select.value = currentId;
   }
 
   /**
@@ -393,7 +525,56 @@ export class RulesDialog {
     this.highlightSelect.value = state.highlightId;
     if (state.presetId) this.presetSelect.value = state.presetId;
     if (state.worldbookPresetId) this.worldbookSelect.value = state.worldbookPresetId;
+    this.fillFieldPresetSelect(this.greetingSelect, state.greetingPresets, state.greetingPresetId);
+    this.fillFieldPresetSelect(this.chatExampleSelect, state.chatExamplePresets, state.chatExamplePresetId);
     this.renderWorldbookSummary();
+    this.renderGreetingSummary();
+    this.renderChatExampleSummary();
+  }
+
+  /** 初始场景预设摘要 + 「现在生效的是哪一份」 */
+  private renderGreetingSummary(): void {
+    const state = this.callbacks.getState();
+    const id = this.greetingSelect.value;
+    const preset = state.greetingPresets.find((item) => item.id === id);
+    this.greetingSummary.replaceChildren();
+    if (!preset) {
+      this.greetingSummary.append(el('p', 'field-hint', '未选择初始场景预设'));
+    } else {
+      const row = el('div', 'preview-row');
+      row.append(el('span', 'preview-key', '格式'), el('code', 'preview-value', preset.summary));
+      this.greetingSummary.append(row);
+    }
+
+    const source = state.greetingFormatSource;
+    if (source === 'txt-preset') {
+      // 这一句必须说：TXT 预设里也有一份 greeting.separator（v0.1.3 早期写法）。
+      // 用户换了初始场景预设却看到"来自 TXT 预设"时，至少知道是两者冲突，
+      // 而不是以为功能坏了。
+      this.greetingSourceNote.textContent =
+        '当前生效的分隔符来自 TXT 预设的 greeting.separator（旧写法）；选择一份自定义的初始场景预设会覆盖它。';
+      this.greetingSourceNote.dataset['source'] = 'txt-preset';
+    } else {
+      this.greetingSourceNote.textContent =
+        source === 'frozen'
+          ? '当前使用冻结默认分隔符（空行 + --- + 空行）。'
+          : '当前生效的分隔符来自上选的初始场景预设。';
+      this.greetingSourceNote.dataset['source'] = source;
+    }
+  }
+
+  private renderChatExampleSummary(): void {
+    const state = this.callbacks.getState();
+    const id = this.chatExampleSelect.value;
+    const preset = state.chatExamplePresets.find((item) => item.id === id);
+    this.chatExampleSummary.replaceChildren();
+    if (!preset) {
+      this.chatExampleSummary.append(el('p', 'field-hint', '未选择对话示例预设'));
+      return;
+    }
+    const row = el('div', 'preview-row');
+    row.append(el('span', 'preview-key', '格式'), el('code', 'preview-value', preset.summary));
+    this.chatExampleSummary.append(row);
   }
 
   // ── 预设预览 ─────────────────────────────────────────────
@@ -450,7 +631,7 @@ export class RulesDialog {
       decision.kind === 'noop' ? decision.message : '会先列出变更供你确认';
   }
 
-  private applyPreset(): void {
+  private async applyPreset(): Promise<void> {
     const state = this.callbacks.getState();
     const presetId = this.presetSelect.value;
     const decision = state.decideFor(presetId);
@@ -464,7 +645,7 @@ export class RulesDialog {
     const detail = decision.plan.changes.length
       ? decision.plan.changes.join('\n')
       : '标题样式将按新预设重写';
-    const ok = window.confirm(`${decision.message}\n\n${detail}\n\n确定重排原文吗？此操作可撤销（Ctrl+Z 除外，建议先另存）。`);
+    const ok = await askConfirm(`${decision.message}\n\n${detail}\n\n确定重排原文吗？此操作可撤销（Ctrl+Z 除外，建议先另存）。`, '应用预设');
     if (!ok) return;
 
     this.callbacks.onPresetApply(presetId, decision.plan);
@@ -636,6 +817,24 @@ export class RulesDialog {
     await this.importPreset('worldbook');
   }
 
+  /** greeting = 初始场景预设，example = 对话示例预设（两个入口共用一套流程） */
+  private async importFieldPreset(kind: 'greeting' | 'example'): Promise<void> {
+    await this.importPreset(kind);
+  }
+
+  private async exportFieldPreset(kind: 'greeting' | 'example'): Promise<void> {
+    const id = kind === 'greeting' ? this.greetingSelect.value : this.chatExampleSelect.value;
+    const text =
+      kind === 'greeting'
+        ? this.callbacks.exportGreetingPreset(id)
+        : this.callbacks.exportChatExamplePreset(id);
+    if (text === null) {
+      this.callbacks.notify('这份预设无法导出（可能来自内置包）', 'warn');
+      return;
+    }
+    await this.saveAs(`${id}.json`, text);
+  }
+
   /**
    * 预设导入（T10.30/31）。
    *
@@ -643,7 +842,7 @@ export class RulesDialog {
    * 「不自动切换」是刻意的 —— 导入是往候选列表里加东西，不是"立刻改用"。
    * 用户正在看一份按当前预设排版的内容，格式被悄悄换掉会让人以为文件坏了。
    */
-  private async importPreset(kind: 'txt' | 'worldbook'): Promise<void> {
+  private async importPreset(kind: 'txt' | 'worldbook' | 'greeting' | 'example'): Promise<void> {
     this.hideErrors();
     let text: string;
     try {
@@ -658,9 +857,22 @@ export class RulesDialog {
       return;
     }
 
-    const label = kind === 'txt' ? '预设' : '世界书预设';
+    const label =
+      kind === 'txt'
+        ? '预设'
+        : kind === 'worldbook'
+          ? '世界书预设'
+          : kind === 'greeting'
+            ? '初始场景预设'
+            : '对话示例预设';
     const outcome =
-      kind === 'txt' ? this.callbacks.importTxtPresetText(text) : this.callbacks.importWorldbookPresetText(text);
+      kind === 'txt'
+        ? this.callbacks.importTxtPresetText(text)
+        : kind === 'worldbook'
+          ? this.callbacks.importWorldbookPresetText(text)
+          : kind === 'greeting'
+            ? this.callbacks.importGreetingPresetText(text)
+            : this.callbacks.importChatExamplePresetText(text);
 
     if (!outcome.ok) {
       this.showErrors(`导入失败，已保留原有${label}列表（未做任何修改）`, outcome.issues);

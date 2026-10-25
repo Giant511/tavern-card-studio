@@ -5,8 +5,7 @@
  * 返回的 ScopedText 带 blockId / field，问题定位与编辑器内标记都依赖它。
  */
 
-import type { BlockId } from '../model/blocks.js';
-import { BLOCK_IDS } from '../model/blocks.js';
+import { BLOCK_DEFINITION_MAP, BLOCK_ID_ALTERNATION, BLOCK_IDS, type BlockId } from '../model/blocks.js';
 import type { UnifiedCard } from '../model/unified-card.js';
 import { WORLDBOOK_SELECTABLE_FIELDS, type Selector } from './platform-rule.js';
 
@@ -16,7 +15,14 @@ export type ParsedSelector =
   | { kind: 'field'; field: string; raw: string }
   | { kind: 'worldbook-field'; field: string; raw: string };
 
-const BLOCK_SELECTOR = /^block:(basic|personality|settings|special|user|worldbook)$/;
+/**
+ * 板块选择器：**从 BLOCK_IDS 派生**，不写死清单。
+ *
+ * 写死的后果（v0.1.3 加板块时实测）：`parseSelector` 认不出新 id 就返回 null，
+ * 而 `collectScopedTexts` 对 null 是 `continue` —— 规则永远不生效，且**不报任何错**。
+ * 只有拿两份审计结果对比才发现"这条规则怎么没命中"。
+ */
+const BLOCK_SELECTOR = new RegExp(`^block:(${BLOCK_ID_ALTERNATION})$`);
 const FIELD_SELECTOR = /^field:([a-z_]+)$/;
 const WB_FIELD_SELECTOR = /^worldbook:entries\[\]\.([a-z_]+)$/;
 
@@ -182,7 +188,9 @@ export function collectScopedTexts(card: UnifiedCard, scope: Selector | Selector
         push({
           key: `block:${blockId}`,
           blockId,
-          field: blockId === 'personality' ? 'personality' : 'description',
+          // 承载字段从定义读：字段板块是 first_mes / mes_example，
+          // 这样问题定位到"哪个 ST 字段"时不会被一律写成 description
+          field: BLOCK_DEFINITION_MAP[blockId].stField,
           text: block.text,
           selector: raw,
         });
@@ -200,7 +208,7 @@ export function collectScopedTexts(card: UnifiedCard, scope: Selector | Selector
       push({
         key: `block:${block.id}`,
         blockId: block.id,
-        field: block.id === 'personality' ? 'personality' : 'description',
+        field: BLOCK_DEFINITION_MAP[block.id].stField,
         text: block.text,
         selector: raw,
       });
@@ -238,8 +246,10 @@ export function collectScopedTexts(card: UnifiedCard, scope: Selector | Selector
     if (field === 'name') {
       push({ key: 'field:name', blockId: null, field, text: card.meta.name, selector: raw });
     } else if (field === 'description') {
+      // 只取 description 里的那几段。字段板块（对话示例 / 初始场景）有各自独立的
+      // ST 字段，把它们算进 description 会让"description 有多少字/命中几条"全错。
       for (const block of card.blocks) {
-        if (block.id === 'personality') continue;
+        if (BLOCK_DEFINITION_MAP[block.id].kind !== 'description-segment') continue;
         push({ key: `block:${block.id}`, blockId: block.id, field: 'description', text: block.text, selector: raw });
       }
     } else if (field === 'personality') {
@@ -282,7 +292,7 @@ export function readFieldText(card: UnifiedCard, path: string): { text: string; 
   }
   if (path === 'description') {
     const text = card.blocks
-      .filter((block) => block.id !== 'personality')
+      .filter((block) => BLOCK_DEFINITION_MAP[block.id].kind === 'description-segment')
       .map((block) => block.text)
       .join('\n\n');
     return { text, blockId: null, field: 'description', isArray: false, itemCount: 0 };

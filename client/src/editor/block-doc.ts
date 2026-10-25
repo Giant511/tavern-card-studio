@@ -1,40 +1,74 @@
 /**
- * 六板块文档模型（纯逻辑，无 DOM / 无 CodeMirror 依赖）。
+ * 八板块文档模型（纯逻辑，无 DOM / 无 CodeMirror 依赖）。
  *
  * 这一层是可单测的：编辑 → 拼装 → 解析 → 再编辑 的 round-trip 就在这里验证。
  * UI 层（app.ts）只负责把这里的快照渲染成编辑器，不自己拼字符串。
  *
  * 与 shared 的分工：
  *   · 板块拆分/拼装、世界书 TXT 解析、ST 序列化 —— 全部复用 shared，本文件不重复实现；
- *   · 本文件只做「六板块视图」到「UnifiedCard」的投影与回写。
+ *   · 本文件只做「板块视图」到「UnifiedCard」的投影与回写。
  */
 
 import {
   applyCardText,
   BLOCK_DEFINITIONS,
+  BLOCK_DEFINITION_MAP,
+  BLOCK_IDS,
+  FIELD_BLOCK_IDS,
+  isBlockId,
   parseWorldbookText,
   renderWorldbookText,
   serializeStCard,
+  setFieldBlockText,
+  TEXT_BLOCK_IDS as SHARED_TEXT_BLOCK_IDS,
   type BlockId,
   type CardBlock,
+  type GreetingFormatParams,
   type PreservedInfo,
   type TxtPreset,
   type UnifiedCard,
 } from '@tcs/shared';
 
-/** 五个「纯文本」板块（世界书单独走结构化路径） */
-export const TEXT_BLOCK_IDS = ['basic', 'personality', 'settings', 'special', 'user'] as const;
-export type TextBlockId = (typeof TEXT_BLOCK_IDS)[number];
+/**
+ * 有纯文本编辑器的板块（除世界书 —— 它走结构化编辑器）。
+ *
+ * **从 shared 派生，不在客户端持有清单副本**（v0.1.3 / F6b 的教训）：
+ * 加板块时若客户端还有一份副本，表现是"新板块在编辑器里根本不出现"，
+ * 而且不报错 —— 只有对比 BLOCK_IDS 才发现少了两项。
+ */
+export const TEXT_BLOCK_IDS: readonly BlockId[] = SHARED_TEXT_BLOCK_IDS;
 
-/** 六个板块（含 worldbook），顺序即 UI 展示顺序 */
-export const EDITOR_BLOCK_IDS: readonly BlockId[] = [
-  'basic',
-  'personality',
-  'settings',
-  'special',
-  'user',
-  'worldbook',
-];
+/** 文本板块的 id 类型（供内部窄化用） */
+export type TextBlockId = Exclude<BlockId, 'worldbook'>;
+
+/** 全部板块（含 worldbook），顺序即 UI 展示顺序 —— 直接就是 BLOCK_IDS */
+export const EDITOR_BLOCK_IDS: readonly BlockId[] = BLOCK_IDS;
+
+/**
+ * 首屏默认展开的板块数（懒渲染红线）。
+ *
+ * **这个数必须保持 2，不能随板块总数变大**（v0.1.3 六→八板块时刻意不变）。
+ * 理由：折叠即销毁编辑器（`collapse()` 会 `editor.destroy()` + 清空 host），
+ * 所以这个数就是**常驻 CodeMirror 实例数**。从 2 涨到 4，长文本卡的首屏
+ * 要多建两个 CM6 实例（每个都带 DOM 树、状态字段与扩展）—— 那是"加板块"
+ * 顺手把启动成本翻倍，用户不会理解为什么升级后变卡。
+ *
+ * 新增的两个板块（对话示例 / 初始场景）落在 `BLOCK_IDS` 的第 6、7 位，
+ * 于是天然在 `index < 2` 之外，默认折叠 —— 这是**结构保证**，不是运气：
+ * 新板块只可能追加在中后部，`BLOCK_IDS` 的前两位固定是 basic 与 personality。
+ */
+export const DEFAULT_EXPANDED_COUNT = 2;
+
+/**
+ * 首屏应当展开的板块 id（纯函数，供 `reloadBlocksFromCard` 消费，也供单测钉死）。
+ *
+ * 抽成函数而不是内联 `index < 2` 的唯一原因：让"常驻实例数"这条红线
+ * 能在 `npm test` 里被断言。写在 UI 方法里就只能靠浏览器端到端，
+ * 而那条链路在 CI 上不一定跑。
+ */
+export function defaultExpandedBlockIds(blocks: readonly EditorBlockSnapshot[]): BlockId[] {
+  return blocks.slice(0, DEFAULT_EXPANDED_COUNT).map((block) => block.id);
+}
 
 export interface EditorBlockSnapshot {
   id: BlockId;
@@ -70,14 +104,16 @@ function findBlock(card: UnifiedCard, id: TextBlockId): CardBlock | undefined {
   return card.blocks.find((block) => block.id === id);
 }
 
-/** 把卡片投影成六板块快照（UI 的唯一数据源） */
+/** 把卡片投影成八板块快照（UI 的唯一数据源） */
 export function collectBlocks(card: UnifiedCard): EditorBlockSnapshot[] {
   return EDITOR_BLOCK_IDS.map((id) => {
-    if (id === 'worldbook') {
-      // 优先用 text；若为空但 entries 非空，按 entries 现场渲染（导入的卡可能是这种情况）
+    const definition = BLOCK_DEFINITION_MAP[id];
+
+    // 结构化板块（世界书）：走自己的路径，**不与文本块合并**。
+    // 优先用 text；若为空但 entries 非空，按 entries 现场渲染（导入的卡可能是这种情况）。
+    if (definition.kind === 'structured') {
       const section = card.worldbook;
-      const text =
-        section.text !== '' ? section.text : renderWorldbookText(section.entries ?? []);
+      const text = section.text !== '' ? section.text : renderWorldbookText(section.entries ?? []);
       return {
         id,
         label: labelOf(id),
@@ -89,6 +125,9 @@ export function collectBlocks(card: UnifiedCard): EditorBlockSnapshot[] {
       };
     }
 
+    // 文本板块：description 分段、性格、以及两个字段板块（对话示例 / 初始场景）。
+    // 它们都从 `card.blocks` 读文本 —— 字段板块的 text 是 residual 的视图
+    // （权威在 residual，由 shared 的 field-blocks 维护同步）。
     const block = findBlock(card, id as TextBlockId);
     return {
       id,
@@ -160,6 +199,14 @@ export function setBlockText(card: UnifiedCard, id: BlockId, text: string): SetB
     return { card, changed: false, worldbookIssues: [] };
   }
 
+  // 字段板块（对话示例 / 初始场景）走 shared 的实现：那里定义了"改过的板块要 dirty
+  // 才回写 residual"这条语义。客户端自己再写一遍 setBlockText 等于两套口径 ——
+  // 只要有一处忘了置 dirty，用户的编辑在导出时就会静默丢失。
+  if (BLOCK_DEFINITION_MAP[blockId].kind === 'field-backed') {
+    const result = setFieldBlockText(card, blockId, text);
+    return { card: result.card, changed: result.changed, worldbookIssues: [] };
+  }
+
   const blocks = card.blocks.map((block) =>
     block.id === blockId ? { ...block, text, dirty: true } : block,
   );
@@ -178,7 +225,7 @@ export function serializeCard(card: UnifiedCard): string {
   return `${JSON.stringify(result, null, 2)}\n`;
 }
 
-/** 六板块合计字数（按码点，给 UI 显示用；正式统计走审计报告） */
+/** 全板块合计字数（按码点，给 UI 显示用；正式统计走审计报告） */
 export function totalLength(blocks: readonly EditorBlockSnapshot[]): number {
   return blocks.reduce((sum, block) => sum + block.length, 0);
 }
@@ -199,12 +246,17 @@ export function importCardText(
   text: string,
   preset: TxtPreset,
   mode: 'strict' | 'lenient' = 'lenient',
+  greetingFormat?: GreetingFormatParams,
 ): {
   card: UnifiedCard | null;
   issues: Array<{ code: string; message: string; line?: number }>;
   preserved: PreservedInfo | null;
 } {
-  const result = applyCardText(card, text, preset, { mode, preserveUnrecognized: true });
+  const result = applyCardText(card, text, preset, {
+    mode,
+    preserveUnrecognized: true,
+    ...(greetingFormat === undefined ? {} : { greetingFormat }),
+  });
   const issues = result.issues.map((issue) => ({
     code: issue.code,
     message: issue.message,

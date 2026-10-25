@@ -108,3 +108,26 @@ export function phaseTitle(phase: AuthPhase, user: AuthUser | null): string {
   if (phase === 'authenticated' && user) return `已登录：${user.username}。点此查看账户与卡片`;
   return '未登录：点此登录或注册账户';
 }
+
+/**
+ * 顶栏账户按钮在**仓库令牌模式**下的文案（v0.1.3 / F5 后半）。
+ *
+ * 单独一个函数而不是往 phaseLabel 里塞分支：这个模式下压根没有"账户",
+ * `user` 恒为 null，用它去拼文案会得到「登录…」—— 那是在骗人（明明已经连上了）。
+ *
+ * 显示仓库名而不是用户名：这个模式的边界就是"只能访问这一个仓库"，
+ * 顶栏写清楚是防止用户误以为自己还在账户身份里（然后奇怪为什么别的仓库不见了）。
+ */
+export function repoTokenLabel(repoName: string): string {
+  const name = repoName.trim() === '' ? '未知仓库' : repoName.trim();
+  return `仓库令牌模式 · ${name}`;
+}
+
+/** 顶栏按钮在令牌模式下的 title：把"你是谁"与"你能做什么"的边界说清 */
+export function repoTokenTitle(repoName: string, capsText: string): string {
+  const name = repoName.trim() === '' ? '未知仓库' : repoName.trim();
+  return (
+    `仓库令牌模式 · ${name}（${capsText}）。` +
+    '这是受限授权，不是账户登录：只能访问这一个仓库。点此退出该模式'
+  );
+}

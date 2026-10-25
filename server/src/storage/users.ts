@@ -23,11 +23,20 @@ import { randomUUID } from 'node:crypto';
 
 import type Database from 'better-sqlite3';
 
+import { generateUserUid } from './user-uid.js';
+
 export type UserRole = 'admin' | 'user';
 export type UserStatus = 'active' | 'disabled';
 
 export interface UserRow {
   id: string;
+  /**
+   * 对外稳定标识（v0.1.3 / F2）。注册时生成、此后**永不改变**。
+   *
+   * 为什么需要它：用户名可改，改名之后"同一个人"在审计与治理里就断了线索；
+   * 而 `id` 是内部主键（uuid），不适合给人看/口头核对。详见 `user-uid.ts` 头部。
+   */
+  uid: string;
   /** 显示用原名（保留用户输入的大小写） */
   username: string;
   /** 唯一性边界：小写规范化后的用户名 */
@@ -45,6 +54,8 @@ export interface UserRow {
 /** 对外暴露的用户信息（去掉哈希，防止顺手把整行丢进响应体） */
 export interface PublicUser {
   id: string;
+  /** 稳定标识，治理页与审计用它区分"同名的不同人" */
+  uid: string;
   username: string;
   role: UserRole;
   status: UserStatus;
@@ -56,6 +67,7 @@ export interface PublicUser {
 export function toPublicUser(row: UserRow): PublicUser {
   return {
     id: row.id,
+    uid: row.uid,
     username: row.username,
     role: row.role,
     status: row.status,
@@ -127,6 +139,8 @@ export class UserStore {
 
     const row: UserRow = {
       id: input.id ?? randomUUID(),
+      // uid 与 id 相互独立：id 是内部主键，uid 是对外稳定标识（见 user-uid.ts）
+      uid: generateUserUid(),
       username,
       username_key: key,
       password_hash: input.passwordHash,
@@ -139,8 +153,8 @@ export class UserStore {
 
     this.handle
       .prepare(
-        `INSERT INTO users (id, username, username_key, password_hash, role, status, created_at, updated_at, last_login_at)
-         VALUES (@id, @username, @username_key, @password_hash, @role, @status, @created_at, @updated_at, @last_login_at)`,
+        `INSERT INTO users (id, uid, username, username_key, password_hash, role, status, created_at, updated_at, last_login_at)
+         VALUES (@id, @uid, @username, @username_key, @password_hash, @role, @status, @created_at, @updated_at, @last_login_at)`,
       )
       .run(row);
 
@@ -149,6 +163,11 @@ export class UserStore {
 
   findById(id: string): UserRow | null {
     return (this.handle.prepare('SELECT * FROM users WHERE id = ?').get(id) as UserRow | undefined) ?? null;
+  }
+
+  /** 按 uid 查（治理与审计用稳定锚点，不受改名影响） */
+  findByUid(uid: string): UserRow | null {
+    return (this.handle.prepare('SELECT * FROM users WHERE uid = ?').get(uid) as UserRow | undefined) ?? null;
   }
 
   /** 按用户名查（大小写不敏感：走规范化键，不是 `username` 列） */

@@ -1,6 +1,6 @@
 {
   "name": "@tcs/server",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "description": "角色卡审计与版本控制服务端（CRUD / Git 版本控制 / 审计 API / Web 管理面板）",

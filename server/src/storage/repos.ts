@@ -24,6 +24,7 @@
 
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
+import { validateRepoName } from '@tcs/shared';
 import type Database from 'better-sqlite3';
 
 /** 令牌权限范围（需求 F2.3） */
@@ -107,16 +108,21 @@ export function generateRepoToken(): { raw: string; hash: string; prefix: string
   return { raw, hash: hashToken(raw), prefix: raw.slice(0, 12) };
 }
 
+/**
+ * 仓库名的规范形态与唯一性键。
+ *
+ * **校验逻辑已搬到 `@tcs/shared` 的 `validateRepoName`**（v0.1.3 / F1）：
+ * 客户端的输入框与服务端必须用同一份规则，否则会出现"能填进去却保存不了"。
+ * 这里只保留两个薄包装，避免整个代码库的调用点都改签名。
+ */
 export function normalizeRepoName(name: string): string {
   return name.trim().toLowerCase();
 }
 
-const REPO_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$/;
-
+/** 校验失败时抛错（保持 v0.1.2 的调用契约：调用方 try/catch 后转 400） */
 export function assertRepoNameShape(name: string): void {
-  if (!REPO_NAME_PATTERN.test(name.trim())) {
-    throw new Error('仓库名需 1–64 个字符，以字母或数字开头，可用字母、数字、下划线、连字符、点');
-  }
+  const check = validateRepoName(name);
+  if (!check.ok) throw new Error(check.message ?? '仓库名不合法');
 }
 
 export class RepoExistsError extends Error {
@@ -144,8 +150,17 @@ export class RepoStore {
     id?: string;
     now?: string;
   }): RepoRow {
-    const name = input.name.trim();
-    assertRepoNameShape(name);
+    /*
+     * 先校验**原始输入**，再落库。
+     *
+     * v0.1.2 这里写的是 `const name = input.name.trim(); assertRepoNameShape(name)` ——
+     * 先 trim 就永远看不到首尾空白，于是「仓库名首尾不能有空白」这条规则
+     * 在**创建**路径上等于不存在（只有 rename 才真的拒绝）。
+     * 同一个缺陷还有第二个后果：库里存的名字与用户输入的不同，
+     * 而仓库名是之后上传时要用来指定目标的东西 —— 差一个空格就找不到。
+     */
+    assertRepoNameShape(input.name);
+    const name = input.name;
     const key = normalizeRepoName(name);
     const now = input.now ?? new Date().toISOString();
 

@@ -320,3 +320,253 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
   .sidebar-foot { display: none; }
   .main { padding: 18px; }
 }
+
+/* ── 注销账户确认弹窗（v0.1.3 / F3）────────────────────────
+   与客户端同名弹窗保持同一套视觉语义：警告块 + 必须输入用户名 + 实心危险按钮。
+   面板是纯 vanilla，没有构建步骤，所以样式直接追加在这里。 */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(16, 32, 40, 0.42);
+  z-index: 50;
+  padding: 24px;
+}
+
+.modal-overlay[hidden] {
+  display: none;
+}
+
+.modal {
+  width: min(560px, 100%);
+  max-height: 88vh;
+  overflow: auto;
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: 0 18px 48px rgba(16, 32, 40, 0.22);
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px 10px;
+}
+
+.modal-head h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 20px 12px;
+}
+
+.modal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 20px 18px;
+  flex-wrap: wrap;
+}
+
+.purge-warning {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--danger-soft);
+  border: 1px solid #f0c2be;
+  border-left: 3px solid var(--danger);
+}
+
+.purge-warning-title {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.purge-warning-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #7a2e26;
+}
+
+/* 实心危险按钮：只给不可恢复的动作用 */
+.btn.btn-danger {
+  color: var(--danger);
+  border-color: #f0c2be;
+}
+
+.btn.btn-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+.modal-foot .btn.btn-danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+.modal-foot .btn.btn-danger:hover:not(:disabled) {
+  background: #9a352e;
+}
+
+.modal-foot .btn.btn-danger:disabled {
+  background: var(--text-3);
+  border-color: var(--text-3);
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ── 传输安全（v0.1.3 / F4）────────────────────────────────
+   常驻警告块 + 指纹 + 匹配校验结果 + 监听状态。
+   警告块是"持续事实"而不是一次性提示（tls.mode=off 期间一直在），
+   所以用实心左边框 + 浅底，与普通 .hint 明确区分。 */
+
+.tls-banners {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 4px 0 14px;
+}
+
+.tls-banner {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  border-left-width: 4px;
+}
+
+.tls-banner.is-danger {
+  background: var(--danger-soft);
+  border-color: #f0c2be;
+  border-left-color: var(--danger);
+}
+
+.tls-banner.is-warn {
+  background: #fdf6e7;
+  border-color: #eddcb4;
+  border-left-color: var(--warn);
+}
+
+.tls-banner-title {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.tls-banner.is-danger .tls-banner-title { color: var(--danger); }
+.tls-banner.is-warn .tls-banner-title { color: var(--warn); }
+
+.tls-banner-body {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
+}
+
+.tls-port-field { max-width: 260px; }
+
+.tls-fingerprint {
+  margin: 10px 0 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+.tls-fingerprint-label {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-bottom: 4px;
+}
+
+.tls-fingerprint code {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  word-break: break-all;
+  color: var(--text);
+}
+
+.tls-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--text-2);
+  margin-bottom: 10px;
+}
+
+.tls-regenerate {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.tls-check {
+  margin: 8px 0 4px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.tls-check.is-ok { background: #eaf6ef; border-color: #bfe3cd; }
+.tls-check.is-warn { background: #fdf6e7; border-color: #eddcb4; }
+.tls-check.is-bad { background: var(--danger-soft); border-color: #f0c2be; }
+.tls-check.is-checking { color: var(--text-3); }
+
+.tls-check-title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.tls-check.is-ok .tls-check-title { color: var(--ok); }
+.tls-check.is-warn .tls-check-title { color: var(--warn); }
+.tls-check.is-bad .tls-check-title { color: var(--danger); }
+
+.tls-check .bullets { margin: 6px 0 0 18px; padding: 0; }
+.tls-check .bullets li { margin: 2px 0; }
+
+.tls-listen {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.tls-listen-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.tls-listen-label {
+  min-width: 68px;
+  color: var(--text-3);
+}
+
+.tls-listen-value { color: var(--text-2); font-family: var(--mono); }
+.tls-listen-value.is-ok { color: var(--ok); }
+.tls-listen-value.is-bad { color: var(--danger); }
+.tls-listen-value.is-idle { color: var(--text-3); }

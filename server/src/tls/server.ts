@@ -89,6 +89,14 @@ export async function prepareTlsMaterial(options: PrepareOptions): Promise<Prepa
     if (result.expiringSoon) {
       warnings.push(expiryWarningText(result.info));
     }
+    /*
+     * ACL 收紧失败也要带出去（v0.1.3 真机事故修复）。
+     *
+     * 它**不是**启动失败的理由 —— 证书已经生成好、HTTPS 能正常工作；
+     * 但"私钥可能对同机其他用户可读"是一个必须被看见的安全事实，
+     * 所以进 warnings：启动日志会有 `tls.warning`，面板横幅也会显示。
+     */
+    warnings.push(...result.aclProblems);
 
     return {
       material: {

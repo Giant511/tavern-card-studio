@@ -10,7 +10,7 @@
  *   按序贪心接受，与已接受区间重叠的候选丢弃（区间占位模型）。
  */
 
-import type { BlockId } from '../model/blocks.js';
+import { BLOCK_DEFINITION_MAP, type BlockId } from '../model/blocks.js';
 import type { HighlightScope, HighlightSpan, MatchSpec, ResolvedHighlightRule } from '../rules/highlight-rule.js';
 
 /** 单条规则编译后的形式 */
@@ -155,10 +155,16 @@ export function ruleMatchesContext(item: CompiledHighlightRuleItem, context: Hig
     if (selector.startsWith('field:')) {
       const name = selector.slice(6);
       if (field !== null && field === name) return true;
-      // 板块上下文里给出等价字段名：性格板块对应 personality，世界书对应 character_book
-      if (blockId === 'personality' && name === 'personality') return true;
-      if (blockId === 'worldbook' && name === 'character_book') return true;
-      if (blockId !== null && blockId !== 'personality' && blockId !== 'worldbook' && name === 'description') return true;
+      /*
+       * 板块上下文里给出等价字段名：直接与该板块**承载的 ST 字段**比对。
+       *
+       * 原来这里是三条硬编码判断（personality / worldbook / "其余都算 description"）。
+       * v0.1.3 加了两个字段板块后，第三条把 `chat-examples`、`initial-scene` 也算成
+       * description —— 于是 `appliesTo: ["field:description"]` 的高亮规则会错误地
+       * 作用到"对话示例"上（它的字段其实是 mes_example）。改成派生后，
+       * 新增板块自动正确，不必再改这里。
+       */
+      if (blockId !== null && BLOCK_DEFINITION_MAP[blockId]?.stField === name) return true;
       continue;
     }
   }

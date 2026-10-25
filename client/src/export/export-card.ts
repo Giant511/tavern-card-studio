@@ -12,10 +12,14 @@
  */
 
 import {
+  BLOCK_DEFINITION_MAP,
+  BLOCK_IDS,
   assembleDescription,
   presetAssembleOptions,
   serializeStCard,
   type AuditReport,
+  type BlockId,
+  type GreetingFormatParams,
   type TxtPreset,
   type UnifiedCard,
 } from '@tcs/shared';
@@ -87,9 +91,15 @@ export interface ExportArtifact {
  * 用 2 空格缩进 + 结尾换行，与服务端/既有导出链路一致 ——
  * 这样"导出 → 上传 → 版本 diff"不会因为格式差异产生噪声。
  */
-export function buildJsonExport(card: UnifiedCard, preset: TxtPreset | null): ExportArtifact {
+export function buildJsonExport(
+  card: UnifiedCard,
+  preset: TxtPreset | null,
+  greetingFormat?: GreetingFormatParams,
+): ExportArtifact {
   const options = preset ? presetAssembleOptions(preset) : {};
-  const payload = serializeStCard(card, options);
+  // v0.1.3 追加项一：初始场景预设决定"多条开场白用哪个分隔行"。
+  // 只影响 dirty 板块的回写切分（未编辑的板块用原字段值，不重算）。
+  const payload = serializeStCard(card, greetingFormat ? { ...options, greetingFormat } : options);
   const text = `${JSON.stringify(payload, null, 2)}\n`;
 
   return {
@@ -113,6 +123,19 @@ export function buildJsonExport(card: UnifiedCard, preset: TxtPreset | null): Ex
  *   · TXT 是**给人看/给平台粘贴**的形态，包含标题行与分隔符；
  *   · 性格板块在 TXT 里也占一段（有标题），而 JSON 里它是独立字段。
  * 这正是"同一张卡、两种形态"的预期差异，不是 bug。
+ *
+ * ── v0.1.3 / 6d：补上字段板块 ────────────────────────────────
+ *
+ * 这里原来只拼 `assembleDescription` 的结果，而它**只处理 description 分段**。
+ * 于是「对话示例」「初始场景」不进 TXT：用户改完这两块、点导出 TXT，
+ * 文件里根本没有它们 —— 数据没丢（JSON 有），但 TXT 是主要分享形态，
+ * 少两块等于导出残缺，而且**没有任何提示**。
+ *
+ * 现在按 `preset.blockOrder` 排序"内容单元"：
+ *   · description 分段整体算一个单元（`assembleDescription` 的产物无法再切开），
+ *     位置取第一个 description 分段在 blockOrder 里的位置；
+ *   · 性格、每个字段板块各算一个单元；
+ *   · 世界书仍不写入（它是结构化字段，见 docs/04）。
  */
 export function buildTxtExport(card: UnifiedCard, preset: TxtPreset): ExportArtifact {
   const options = presetAssembleOptions(preset);
@@ -126,12 +149,39 @@ export function buildTxtExport(card: UnifiedCard, preset: TxtPreset): ExportArti
     personalityText.trim() === '' ||
     description.includes(`${personalityHeading}\n${personalityText}`);
 
-  const parts = [description];
+  /** 每个"内容单元"在预设顺序里的位置；不存在的板块给 Infinity 以便稳定排在最后 */
+  const orderIndex = (id: BlockId): number => {
+    const index = preset.blockOrder.indexOf(id);
+    return index === -1 ? Number.POSITIVE_INFINITY : index;
+  };
+
+  interface Unit {
+    at: number;
+    text: string;
+  }
+  const units: Unit[] = [];
+
+  if (description.trim() !== '') {
+    // description 单元的锚点：blockOrder 里第一个 description 分段的位置
+    const anchors = BLOCK_IDS.filter(
+      (id) => BLOCK_DEFINITION_MAP[id].kind === 'description-segment',
+    ).map(orderIndex);
+    units.push({ at: Math.min(...anchors), text: description });
+  }
   if (!alreadyIncluded) {
-    parts.push(`${personalityHeading}\n${personalityText}`);
+    units.push({ at: orderIndex('personality'), text: `${personalityHeading}\n${personalityText}` });
+  }
+  for (const id of BLOCK_IDS) {
+    if (BLOCK_DEFINITION_MAP[id].kind !== 'field-backed') continue;
+    const block = card.blocks.find((item) => item.id === id);
+    const body = block?.text ?? '';
+    // 空板块不输出：TXT 里冒一个只有标题的空段没意义，解析端也会按空块处理
+    if (body.trim() === '') continue;
+    units.push({ at: orderIndex(id), text: `${options.heading(id)}\n${body}` });
   }
 
-  const text = `${parts.filter((part) => part.trim() !== '').join(preset.separator)}`;
+  units.sort((a, b) => a.at - b.at);
+  const text = units.map((unit) => unit.text).join(preset.separator);
   const finalText = text.endsWith('\n') ? text : `${text}\n`;
 
   return {
@@ -152,8 +202,9 @@ export function buildExport(
   card: UnifiedCard,
   preset: TxtPreset | null,
   format: ExportFormat,
+  greetingFormat?: GreetingFormatParams,
 ): ExportArtifact {
-  if (format === 'json') return buildJsonExport(card, preset);
+  if (format === 'json') return buildJsonExport(card, preset, greetingFormat);
   if (!preset) {
     throw new Error('TXT 导出需要预设：无法确定标题与分隔符');
   }
@@ -209,8 +260,9 @@ export async function buildExportAsync(
   card: UnifiedCard,
   preset: TxtPreset | null,
   format: ExportFormat,
+  greetingFormat?: GreetingFormatParams,
 ): Promise<ExportArtifactReady> {
-  const artifact = buildExport(card, preset, format);
+  const artifact = buildExport(card, preset, format, greetingFormat);
   const sha256 = await sha256Hex(artifact.text);
   return { ...artifact, sha256 };
 }

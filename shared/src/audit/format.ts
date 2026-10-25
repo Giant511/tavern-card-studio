@@ -15,12 +15,13 @@
  */
 
 import type { TxtPreset } from '../format/preset.js';
-import { descriptionOrderOf, headingTextFor } from '../format/preset.js';
-import { assembleDescription } from '../format/description.js';
+import { descriptionOrderOf, headingTextFor, presetGreetingFormat } from '../format/preset.js';
+import { assembleDescription, matchHeadingLine, normalizeHeading } from '../format/description.js';
+import { greetingDividerToken } from '../format/greeting-preset.js';
 import { parseWorldbookTextWith } from '../format/worldbook.js';
 import { DEFAULT_WORLDBOOK_FORMAT, type WorldbookFormatParams } from '../format/worldbook-preset.js';
 import { stringifyStCard } from '../format/sillytavern-io.js';
-import { BLOCK_IDS } from '../model/blocks.js';
+import { BLOCK_DEFINITIONS, BLOCK_DEFINITION_MAP, BLOCK_IDS, DESCRIPTION_BLOCK_IDS } from '../model/blocks.js';
 import type { BlockId } from '../model/blocks.js';
 import type { UnifiedCard } from '../model/unified-card.js';
 import { lineTextAt } from '../text/count.js';
@@ -30,11 +31,53 @@ import { makeAuditIssue } from './issue.js';
 import { collectOmittedDefaults } from './st-defaults.js';
 import type { AuditIssue } from './types.js';
 
-/** description 板块（性格独占 personality、世界书独占 character_book，不参与分块检查） */
-const TXT_BLOCK_IDS: readonly BlockId[] = ['basic', 'settings', 'special', 'user'];
+/**
+ * **标题相关**检查的范围：只有 description 分段板块有标题行可查
+ * （性格独占字段、世界书结构化、两个字段板块无标题行，都不该进这里）。
+ */
+const HEADING_BLOCK_IDS: readonly BlockId[] = DESCRIPTION_BLOCK_IDS;
+
+/**
+ * **「原文缺失」检查的范围**：所有靠标题从 TXT 里切出来的文本板块，
+ * 包括两个字段板块。
+ *
+ * 这两者**必须分开**（v0.1.3 / 6c 发现的问题）：6b 里我把它们合并成
+ * `TXT_BLOCK_IDS = DESCRIPTION_BLOCK_IDS`，结果两个新板块的 `missing` 标记
+ * 永远触发不了 `builtin:block-missing` —— 标记被设置了、却从没有任何地方读它，
+ * 属于"静默失效"。UI 上「原文缺失」标签还在，看起来一切正常，最误导人。
+ *
+ * 字段板块的缺失**只报 info**：它是可选内容，缺了不影响导出；
+ * 若两个都缺还说明这是旧格式卡片（那条另有 `builtin:legacy-six-block`）。
+ */
+const MISSING_CHECK_BLOCK_IDS: readonly BlockId[] = BLOCK_IDS.filter((id) => id !== 'worldbook');
 
 function normalize(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, '');
+}
+
+/**
+ * description.raw 里是否出现过某板块的标题行（按预设别名判定）。
+ *
+ * 用途：判断这份 description 是**哪个版本的预设**渲染出来的。
+ * 只看"有没有这个板块的标题行"，不做位置/顺序判断 —— 这里只需要一个
+ * 布尔信号，用来区分"六板块预设渲染的老文本"和"八板块预设渲染的新文本"。
+ *
+ * 逐行比对（`normalizeHeading` 归一化后相等），不走子串匹配：
+ * 正文里恰好提到「对话示例」这四个字不该被当成标题。
+ */
+function descriptionHasHeadingFor(card: UnifiedCard, preset: TxtPreset, blockId: BlockId): boolean {
+  const aliases = new Set(
+    (preset.headings?.[blockId]?.aliases ?? [BLOCK_DEFINITION_MAP[blockId].defaultHeading]).map(
+      (alias) => normalizeHeading(alias),
+    ),
+  );
+  if (aliases.size === 0) return false;
+  for (const line of card.description.raw.split(/\r?\n/)) {
+    const heading = matchHeadingLine(line);
+    if (heading === null) continue;
+    if (aliases.has(normalizeHeading(heading))) return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------- 1. JSON 合法性
@@ -103,7 +146,91 @@ export function checkJsonValidity(card: UnifiedCard, rawJsonText?: string | null
 // ---------------------------------------------------------------- 2. 预设符合性
 
 export function checkPresetConformance(card: UnifiedCard, preset: TxtPreset): AuditIssue[] {
-  const issues: AuditIssue[] = [];
+  let issues: AuditIssue[];
+
+  // ---- 旧格式卡片（v0.1.3 / F6，铁律项）----
+  //
+  // 六板块时代（v0.1.2 及更早）的卡没有「对话示例 / 初始场景」这两块内容。
+  // 它**不是问题**：历史卡片必须永远可审计。所以只给一条 info 解释清楚，
+  // 绝不出 warning（更不出 error）—— 一次报两条"缺失"会让每张老卡看起来都有毛病。
+  //
+  // ## 判据为什么不能只看 `missing`（v0.1.3 / 6d 修正）
+  //
+  // 第一版用 `fieldBlocks.every(b => b.missing === true)`。但 `missing` 只在
+  // **TXT 导入**路径上被设置（`parseCardText` 找不到标题时打标记）；
+  // 而服务端审计的是 **JSON 字节** —— `parseStCard` 走的是 `blocksWithFieldBlocks`，
+  // 两个字段板块从 residual 渲染出来，`missing` 恒为 false。
+  // 于是这条判据在**服务端根本不会触发**，双样本冒烟当场抓出来了。
+  //
+  // 现在的主判据是**结构性**的：description 已被标题分块（`structured`），
+  // 但里面**没有任何**新板块的标题行（按预设别名判定）——
+  // 说明这份 description 是六板块预设渲染出来的。这与"从哪条路径导入"无关，
+  // JSON / TXT 两条路都成立。
+  //
+  // 为什么"有没有新板块标题"是可靠信号：八板块预设渲染整卡 TXT 时
+  // `includeEmptyBlocks` 默认 true，**空板块也会写出标题行**。
+  // 所以只要经过 v0.1.3 的导出，description 里一定有两个新标题。
+  // 反过来说，没有这两个标题的、且已分块的 description，只可能来自更早的版本。
+  //
+  // 一条边界：用户手删了这两个标题行、但字段里仍有内容。此时会报"六板块格式"——
+  // 就文本形态而言这个说法是准确的（文本里确实只有六块），而且只是 info。
+  const fieldBlocks = card.blocks.filter(
+    (block) => BLOCK_DEFINITION_MAP[block.id].kind === 'field-backed',
+  );
+  const allMissing = fieldBlocks.length > 0 && fieldBlocks.every((block) => block.missing === true);
+  const hasNewHeading =
+    card.description.raw !== '' &&
+    fieldBlocks.some((block) => descriptionHasHeadingFor(card, preset, block.id));
+  const sixBlockShape = card.description.structured && card.description.raw !== '' && !hasNewHeading;
+  if (allMissing || sixBlockShape) {
+    issues = [
+      makeAuditIssue({
+        ruleId: 'builtin:legacy-six-block',
+        category: 'structure',
+        severity: 'info',
+        message: '旧格式卡片：本卡为六板块格式，不含「对话示例」「初始场景」（对应 ST 的 mes_example / first_mes）',
+        hint: '不影响导出与审计；需要补写时直接在对应板块输入即可',
+        field: 'file',
+      }),
+    ];
+  } else {
+    issues = [];
+  }
+
+  // ---- 开场白分隔行二义（info）----
+  //
+  // 渲染规则是 `[first_mes, ...alternate_greetings].join(分隔行)`，
+  // 所以分隔行的**条数**恰好等于备用开场白的条数。多出来的分隔行只可能来自
+  // `first_mes` 正文自己（作者用 `---` 做剧情分镜，很常见）。
+  // 这种卡导出成 TXT 再导入时，那些行会被当开场白分隔符切开 —— 内容不丢，
+  // 但第一条开场白会被拆成多条。因为无损无法保证，这里至少要让它**可见**。
+  const sceneBlock = card.blocks.find((block) => block.id === 'initial-scene');
+  if (sceneBlock) {
+    const token = greetingDividerToken(presetGreetingFormat(preset).separator);
+    if (token !== null) {
+      const dividers = sceneBlock.text
+        .replace(/\r\n/g, '\n')
+        .split('\n')
+        .filter((line) => line.trim() === token).length;
+      const alternates = card.residual.alternateGreetings.length;
+      if (dividers > alternates) {
+        issues.push(
+          makeAuditIssue({
+            ruleId: 'builtin:greeting-divider-ambiguous',
+            category: 'format',
+            severity: 'info',
+            message: `初始场景里有 ${String(dividers)} 处分隔行（${token}），但只有 ${String(alternates)} 条备用开场白：多出的来自 first_mes 正文本身`,
+            hint: 'TXT 往返后这些行会被当作开场白分隔符，first_mes 会被拆成多条；若要保持一条，请把正文里的分隔行改成别的写法',
+            blockId: 'initial-scene',
+            field: 'first_mes',
+            start: 0,
+            end: 0,
+            text: sceneBlock.text,
+          }),
+        );
+      }
+    }
+  }
 
   if (card.description.raw !== '' && !card.description.structured) {
     issues.push(
@@ -121,20 +248,37 @@ export function checkPresetConformance(card: UnifiedCard, preset: TxtPreset): Au
     );
   }
 
-  for (const blockId of TXT_BLOCK_IDS) {
+  // ---- 缺失板块（覆盖所有文本板块，含两个字段板块）----
+  //
+  // 严重级分两档，理由见 MISSING_CHECK_BLOCK_IDS 的注释：
+  //   · description 分段板块缺失 = warning（内容本该有、现在没有，值得看一眼）；
+  //   · 字段板块缺失 = **info**（可选内容；而且"两个都缺"时那是旧格式卡片，
+  //     上面已经有一条 legacy 说明，再报两条 warning 就是纯噪音）。
+  const fieldBlockAllMissing =
+    card.blocks.filter((block) => BLOCK_DEFINITION_MAP[block.id].kind === 'field-backed').every(
+      (block) => block.missing === true,
+    ) &&
+    card.blocks.some((block) => BLOCK_DEFINITION_MAP[block.id].kind === 'field-backed');
+
+  for (const blockId of MISSING_CHECK_BLOCK_IDS) {
     const block = card.blocks.find((item) => item.id === blockId);
     if (!block) continue;
 
     if (block.missing === true) {
+      const fieldBacked = BLOCK_DEFINITION_MAP[blockId].kind === 'field-backed';
+      // 旧格式卡片：两个字段板块都缺 → 由 legacy 那条统一说明，这里不再逐条报
+      if (fieldBacked && fieldBlockAllMissing) continue;
       issues.push(
         makeAuditIssue({
           ruleId: 'builtin:block-missing',
           category: 'structure',
-          severity: 'warning',
+          severity: fieldBacked ? 'info' : 'warning',
           message: `板块「${labelOf(blockId)}」在导入源中没有标题，当前按空块处理`,
-          hint: '不是内容为空——是导入时根本没找到该板块，请确认后再保存',
+          hint: fieldBacked
+            ? `可选内容：该字段（${BLOCK_DEFINITION_MAP[blockId].stField}）在导入源里不存在，导出时写空值`
+            : '不是内容为空——是导入时根本没找到该板块，请确认后再保存',
           blockId,
-          field: 'description',
+          field: BLOCK_DEFINITION_MAP[blockId].stField,
           start: 0,
           end: 0,
           text: block.text,
@@ -142,6 +286,9 @@ export function checkPresetConformance(card: UnifiedCard, preset: TxtPreset): Au
       );
       continue;
     }
+
+    // 标题相关检查只对 description 分段板块成立（字段板块没有标题行）
+    if (!HEADING_BLOCK_IDS.includes(blockId)) continue;
 
     const headingText = block.anchor?.headingText ?? null;
     if (!headingText) continue;
@@ -192,8 +339,9 @@ export function checkPresetConformance(card: UnifiedCard, preset: TxtPreset): Au
 
   // 板块顺序：只提示，不阻断（导出不主动重排）
   const currentOrder = descriptionOrderOf(card);
-  const presetOrder = (preset.blockOrder ?? []).filter((id) => TXT_BLOCK_IDS.includes(id));
-  const currentFiltered = currentOrder.filter((id) => TXT_BLOCK_IDS.includes(id));
+  // 顺序检查只看 description 分段板块：字段板块的先后不体现在 description 里
+  const presetOrder = (preset.blockOrder ?? []).filter((id) => HEADING_BLOCK_IDS.includes(id));
+  const currentFiltered = currentOrder.filter((id) => HEADING_BLOCK_IDS.includes(id));
   if (presetOrder.length > 0 && currentFiltered.join('>') !== presetOrder.join('>')) {
     issues.push(
       makeAuditIssue({
@@ -223,14 +371,9 @@ export function checkPresetConformance(card: UnifiedCard, preset: TxtPreset): Au
   return issues;
 }
 
-const LABELS: Readonly<Record<string, string>> = {
-  basic: '基本信息',
-  personality: '性格',
-  settings: '其他设定',
-  special: '特殊设定',
-  user: '用户相关设定',
-  worldbook: '世界书',
-};
+const LABELS: Readonly<Record<string, string>> = Object.fromEntries(
+  BLOCK_DEFINITIONS.map((definition) => [definition.id, definition.label]),
+);
 
 function labelOf(blockId: BlockId): string {
   return LABELS[blockId] ?? blockId;

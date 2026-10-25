@@ -1,6 +1,6 @@
 {
   "name": "@tcs/client",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "description": "酒馆角色卡审计编辑工具链 · 桌面客户端（Tauri 2 壳 + Web 渲染层）",
@@ -8,7 +8,7 @@
     "dev": "tauri dev",
     "dev:ui": "vite",
     "build": "tauri build",
-    "build:ui": "vite build",
+    "build:ui": "node ../scripts/clean-client-dist.mjs && vite build",
     "typecheck": "tsc -p tsconfig.json",
     "tauri": "tauri",
     "icons": "node scripts/gen-icons.mjs"

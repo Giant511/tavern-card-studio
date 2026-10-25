@@ -8,12 +8,15 @@
  * - `words`        拉丁/数字词数
  * - `totalWords`   「字数」口径 = cjk + words（中文一字一词，英文一词一计）
  *
+ * 字段板块（对话示例 / 初始场景）按板块文本统计，并在 byField 里单列，
+ * 不混进 description —— 它们写的是独立顶层字段。
+ *
  * 世界书特殊处理：按 `entries` 的 **keys + content** 统计，而不是按 TXT 文本统计——
  * `@@ENTRY` / `keys:` 这类标记不属于角色卡内容，计入会虚高。
  * 仅当 entries 为空、但 TXT 非空（用户刚编辑尚未解析）时才退化为按 TXT 统计。
  */
 
-import { BLOCK_DEFINITIONS, BLOCK_IDS } from '../model/blocks.js';
+import { BLOCK_DEFINITIONS, BLOCK_DEFINITION_MAP, BLOCK_IDS } from '../model/blocks.js';
 import type { BlockId } from '../model/blocks.js';
 import type { UnifiedCard } from '../model/unified-card.js';
 import type { StWorldbookEntry } from '../model/sillytavern.js';
@@ -72,6 +75,8 @@ export function countCardWords(card: UnifiedCard): WordCountReport {
   let grand = emptyTotal();
   let description = emptyTotal();
   let personality = emptyTotal();
+  let firstMes = emptyTotal();
+  let mesExample = emptyTotal();
 
   for (const id of BLOCK_IDS) {
     const block = card.blocks.find((item) => item.id === id);
@@ -88,8 +93,24 @@ export function countCardWords(card: UnifiedCard): WordCountReport {
       missing: block?.missing === true,
     });
     grand = addTotal(grand, count);
-    if (id === 'personality') personality = count;
-    else description = addTotal(description, count);
+    // byField 必须按「真的写进哪个字段」累计：
+    // 字段板块有各自的顶层字段，算进 description 会让长度规则误判超长。
+    switch (BLOCK_DEFINITION_MAP[id].stField) {
+      case 'description':
+        description = addTotal(description, count);
+        break;
+      case 'personality':
+        personality = count;
+        break;
+      case 'first_mes':
+        firstMes = count;
+        break;
+      case 'mes_example':
+        mesExample = count;
+        break;
+      default:
+        break; // character_book 由下方 worldbook 分支单独统计
+    }
   }
 
   const worldbook = countWorldbook(card);
@@ -111,6 +132,8 @@ export function countCardWords(card: UnifiedCard): WordCountReport {
       description,
       personality,
       character_book: worldbook.total,
+      first_mes: firstMes,
+      mes_example: mesExample,
     },
   };
 }

@@ -2,7 +2,8 @@
  * 角色卡统一内部模型（UnifiedCard）。
  *
  * 设计目标（对应 T0.3）：
- * 1. 六个板块为编辑与审计的一等公民，每块是纯文本，与 TXT 分块格式一一对应。
+ * 1. 八个板块为编辑与审计的一等公民（v0.1.3 起；此前六个）。其中 description 分段的那几个
+ *    与 TXT 分块格式一一对应，两个字段板块（对话示例 / 初始场景）直接对应独立 ST 字段。
  * 2. 与 SillyTavern 原生 JSON 双向转换「无损」：
  *    - 通过 `raw` + `anchor`（原文偏移量）实现「只替换改动片段」的补丁式序列化，
  *      未被用户编辑过的板块一律逐字还原，不重排、不丢空格、不丢未知字段。
@@ -15,7 +16,7 @@
  *   ③ block 无 anchor（新建卡片 / 新增板块）→ 按 order 与 separator 拼接插入。
  */
 
-import type { BlockId } from './blocks.js';
+import { BLOCK_IDS, type BlockId } from './blocks.js';
 import type { JsonObject, JsonValue } from './json.js';
 import type { StCharacterBook, StSpecVersion, StWorldbookEntry } from './sillytavern.js';
 
@@ -127,7 +128,7 @@ export interface CardSource {
 export interface UnifiedCard {
   schemaVersion: typeof UNIFIED_CARD_SCHEMA_VERSION;
   meta: CardMeta;
-  /** 有序板块列表（basic / personality / settings / special / user） */
+  /** 有序板块列表（BLOCK_IDS 去掉 worldbook；worldbook 在下方独立字段） */
   blocks: CardBlock[];
   description: DescriptionDocument;
   worldbook: WorldbookSection;
@@ -138,7 +139,9 @@ export interface UnifiedCard {
 
 /** 新建空白卡片 */
 export function createEmptyCard(name = ''): UnifiedCard {
-  const blockIds: BlockId[] = ['basic', 'personality', 'settings', 'special', 'user'];
+  // 从 BLOCK_IDS 派生：加板块时只需要改 blocks.ts，不必记得这里还有一份清单
+  // （世界书不是 CardBlock，它独占世界书字段）
+  const blockIds: BlockId[] = BLOCK_IDS.filter((id) => id !== 'worldbook');
   return {
     schemaVersion: UNIFIED_CARD_SCHEMA_VERSION,
     meta: {

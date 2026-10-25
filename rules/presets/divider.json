@@ -3,10 +3,19 @@
   "schemaVersion": 1,
   "id": "divider",
   "name": "分隔线 · 方括号标题",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "【标题】+ 单独一行 --- 作为板块分隔，适合长卡阅读。解析时 --- 会从板块正文末尾剔除，不会重复写出。",
   "builtin": true,
-  "blockOrder": ["basic", "personality", "settings", "special", "user", "worldbook"],
+  "blockOrder": [
+    "basic",
+    "personality",
+    "settings",
+    "special",
+    "user",
+    "chat-examples",
+    "initial-scene",
+    "worldbook"
+  ],
   "headings": {
     "basic": {
       "pattern": "【{title}】",
@@ -28,6 +37,14 @@
       "pattern": "【{title}】",
       "aliases": ["用户相关设定", "用户设定", "玩家设定", "用户相关", "用户信息", "user"]
     },
+    "chat-examples": {
+      "pattern": "【{title}】",
+      "aliases": ["对话示例", "对话范例", "示例对话", "对话样例", "example dialogue"]
+    },
+    "initial-scene": {
+      "pattern": "【{title}】",
+      "aliases": ["初始场景", "开场白", "起始场景", "初始情境", "first message"]
+    },
     "worldbook": {
       "pattern": "【{title}】",
       "aliases": ["世界书", "世界观", "世界设定", "设定集", "worldbook", "world info"]
@@ -35,5 +52,6 @@
   },
   "separator": "\n\n---\n\n",
   "worldbook": { "includeHeading": true },
-  "meta": { "author": "Tavern Card Studio", "updatedAt": "2026-10-21" }
+  "greeting": { "separator": "\n\n---\n\n" },
+  "meta": { "author": "Tavern Card Studio", "updatedAt": "2026-10-25" }
 }

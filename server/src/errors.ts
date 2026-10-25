@@ -60,6 +60,34 @@ export type ErrorCode =
   | 'VERSION_CONTENT_CLEARED'
   | 'NOT_EMPTY'
   | 'ADMIN_ONLY'
+  // v0.1.3 / F5 后半：仓库令牌连接入口（POST /api/auth/repo-token）的四个码。
+  //
+  //   TOKEN_FORMAT_INVALID —— 形态不对（不查库就能判，无泄露面）
+  //   TOKEN_REVOKED        —— 已吊销
+  //   TOKEN_EXPIRED        —— 已过期
+  //   TOKEN_INVALID        —— 不存在 / 仓库已删 / 账户已禁用，**共用一句**
+  //
+  // 为什么这里敢区分「吊销/过期」而不怕枚举：令牌是 32 字节 CSPRNG
+  // （256 位熵），这两类必须以"手里已经握着这把令牌"为前提才能被观察到；
+  // 而没有令牌的人只会看到 TOKEN_INVALID —— 与"不存在"逐字节相同。
+  // 这与登录那条（账户名低熵、可批量试）保护的对象不同，所以判据也不同。
+  // 详细取舍见 server/src/auth/repo-token-entry.ts 文件头。
+  | 'TOKEN_FORMAT_INVALID'
+  | 'TOKEN_REVOKED'
+  | 'TOKEN_EXPIRED'
+  | 'TOKEN_INVALID'
+  // v0.1.3 / F4 传输安全 UI 化。
+  //
+  //   TLS_CERT_INVALID   —— custom 的证书/私钥不可用（不存在 / 格式错 / 不匹配 / 已过期）。
+  //                         保存前就拒，与"启动时拒绝"是同一条判据，所以共用一个码。
+  //   TLS_RELOAD_FAILED  —— 配置写下了但热更失败（端口占用等），**已回滚**。
+  //                         客户端据 409 + rolledBack 显示"未生效，已恢复原设置"，
+  //                         而不是含糊的"保存失败"。
+  | 'TLS_CERT_INVALID'
+  | 'TLS_RELOAD_FAILED'
+  // 面板「重新生成自签证书」失败。与 TLS_CERT_INVALID（custom 证书不可用）
+  // 分开：这里的处置是"看日志 / 检查目录写权限"，与"换一对匹配的证书"不同。
+  | 'TLS_REGENERATE_FAILED'
   | 'INTERNAL';
 
 export class AppError extends Error {

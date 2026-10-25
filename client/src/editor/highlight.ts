@@ -17,9 +17,25 @@ import {
   type HighlightRuleFile,
 } from '@tcs/shared';
 
-/** 每个 scope 一个 mark 类，样式在 styles.css 里定义 */
-function markFor(scope: string): Decoration {
-  return Decoration.mark({ class: `tcs-hl tcs-hl-${scope}` });
+/**
+ * 每个 scope 一个 mark 类，样式在 styles.css 里定义。
+ *
+ * `data-rule` 是 v0.1.3 追加项二加的：把**命中的规则 id** 也写进 DOM。
+ *
+ * 两个理由：
+ *   1. 诊断 —— 某一行被染成了奇怪的色，右键看一眼就知道是哪条规则干的。
+ *      以前只能靠"把规则一条条注释掉再刷新"；
+ *   2. 可断言 —— 浏览器侧测试能直接断言"`@@ENTRY` 是 `worldbook-entry-open`
+ *      染的"，而不是含糊地"它有 heading 类"。后者在规则换实现（比如被
+ *      `block-heading` 抢走）时仍然通过，等于没验。
+ *
+ * 与 `renderInlineHtml`（预览用）输出的 `data-rule` 语义一致，两边可以对读。
+ */
+function markFor(scope: string, ruleId: string): Decoration {
+  return Decoration.mark({
+    class: `tcs-hl tcs-hl-${scope}`,
+    attributes: { 'data-rule': ruleId },
+  });
 }
 
 /** 生成纯高亮装饰（不含问题标记；问题标记由 block-editor 叠加） */
@@ -34,7 +50,7 @@ export function buildHighlightRanges(
   return spans.map((span) => ({
     from: span.start,
     to: span.end,
-    decoration: markFor(span.scope),
+    decoration: markFor(span.scope, span.ruleId),
   }));
 }
 
@@ -100,13 +116,23 @@ export function buildPreviewFragment(
 export function applySchemeStyles(scheme: HighlightRuleFile): void {
   const lines: string[] = [];
 
+  /*
+   * theme **只写到内容区容器**，绝不写 `:root`（v0.1.3 / F7）。
+   *
+   * `.cm-host` 是 CM6 编辑器的宿主，`.preview` 是渲染预览 —— 两者都是"卡片内容"，
+   * 跟随高亮方案的底色是合理的。而顶栏 / 面板 / 对话框 / 审计面板用应用自身的
+   * 设计令牌（--app-fg / --panel / --border），不受任何高亮方案影响。
+   *
+   * v0.1.2 这里写的是 `:root{--tcs-fg:…;--tcs-bg:…}`，而界面元素又直接读这两个变量，
+   * 结果是一套深色方案把整个应用外壳一起染黑 —— 看起来像"应用换主题了"，
+   * 但用户只是换了高亮配色。作用域收在这里之后，那个串色路径就不存在了。
+   */
   const theme = scheme.theme;
   if (theme) {
-    lines.push(`:root{--tcs-fg:${theme.foreground};--tcs-bg:${theme.background};}`);
-    if (theme.caret) lines.push(`:root{--tcs-caret:${theme.caret};}`);
-    if (theme.selectionBackground) {
-      lines.push(`:root{--tcs-selection:${theme.selectionBackground};}`);
-    }
+    const vars = [`--tcs-fg:${theme.foreground}`, `--tcs-bg:${theme.background}`];
+    if (theme.caret) vars.push(`--tcs-caret:${theme.caret}`);
+    if (theme.selectionBackground) vars.push(`--tcs-selection:${theme.selectionBackground}`);
+    lines.push(`.cm-host, .preview { ${vars.join(';')} }`);
   }
 
   for (const scope of scheme.scopes) {

@@ -63,8 +63,9 @@ installer.zip
 # 本地照常读写；对外的界面截图放 assets/。
 #
 # 例外（面向用户/开发者，随仓库上传）：
-#   docs/server-cmd.md        —— 服务端运维命令手册
-#   docs/server-developer.md  —— 服务端 API 对接文档（第三方开发者自包含）
+#   docs/server-cmd.md                —— 服务端运维命令手册
+#   docs/server-developer.md          —— 服务端 API 对接文档（第三方开发者自包含）
+#   docs/Cloud Deployment Manual.md   —— 云部署手册（反代 / HTTPS / trustProxy）
 #
 # 必须写成 `docs/*` 而不是 `docs/`：Git 不会进入被忽略的**目录**，
 # 目录一旦被排除，里面的 `!` 全部失效（放行的文件仍然上传不了）。
@@ -74,4 +75,5 @@ installer.zip
 docs/*
 !docs/server-cmd.md
 !docs/server-developer.md
+!docs/Cloud Deployment Manual.md
 PLAN.md

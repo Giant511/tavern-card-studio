@@ -10,6 +10,8 @@
  *   3. 继承：extends 目标存在、不成环、合并后 scope 引用仍可解析。
  */
 
+import { BLOCK_ID_ALTERNATION } from '../model/blocks.js';
+
 import type {
   EditorTypography,
   HighlightRule,
@@ -38,7 +40,9 @@ const SCOPE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
 const COLOR_PATTERN = /^(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)|[a-zA-Z]{3,20})$/;
 const FLAGS_PATTERN = /^[gimsu]*$/;
-const SELECTOR_PATTERN = /^(\*|block:(basic|personality|settings|special|user|worldbook)|field:[a-z_]+)$/;
+// 板块部分从 BLOCK_ID_ALTERNATION 派生（v0.1.3）：写死清单会在加板块时漏改，
+// appliesTo 里写了新板块却被校验拒收，而用户看到的是"这条配色规则没生效"。
+const SELECTOR_PATTERN = new RegExp(`^(\\*|block:(${BLOCK_ID_ALTERNATION})|field:[a-z_]+)$`);
 const MATCH_TYPES = new Set(['regex', 'word-list', 'line-prefix', 'delimiter-block']);
 
 export interface HighlightParseResult {

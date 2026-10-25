@@ -82,12 +82,13 @@ function makeCard(overrides = {}) {
 
 // ---------------------------------------------------------------- T4.1
 
-test('T4.1 字数统计：六板块分布 + 合计 = 各板块之和', () => {
+test('T4.1 字数统计：八板块分布 + 合计 = 各板块之和', () => {
   const card = sampleCard();
   const report = countCardWords(card);
 
   assert.deepEqual(report.blocks.map((block) => block.blockId), [
-    'basic', 'personality', 'settings', 'special', 'user', 'worldbook',
+    'basic', 'personality', 'settings', 'special', 'user',
+    'chat-examples', 'initial-scene', 'worldbook',
   ]);
   assert.equal(report.blocks[0].label, '基本信息');
 
@@ -124,7 +125,11 @@ test('T4.1 世界书按 entries 计（不含 @@ENTRY / keys: 等标记）', () =
 test('T4.1 byField 口径与落盘字段一致', () => {
   const card = sampleCard();
   const report = countCardWords(card);
-  const nonPersonality = report.blocks.filter((block) => block.blockId !== 'personality' && block.blockId !== 'worldbook');
+  // v0.1.3 起 description 只累计真正写进该字段的板块：性格独占 personality、
+  // 世界书独占 character_book、两个字段板块各有独立顶层字段（first_mes / mes_example）。
+  // 旧断言是「除性格外全算」，加字段板块后会把开场白和示例对话算进 description。
+  const descriptionSide = ['basic', 'settings', 'special', 'user'];
+  const nonPersonality = report.blocks.filter((block) => descriptionSide.includes(block.blockId));
   const expected = nonPersonality.reduce((acc, block) => acc + block.chars, 0);
   assert.equal(report.byField.description.chars, expected);
   assert.equal(report.byField.personality.chars, report.blocks.find((block) => block.blockId === 'personality').chars);
@@ -312,7 +317,7 @@ test('T4.4 报告是纯 JSON（可 parse、无 Map/函数）且字段齐全', ()
   assert.ok(report.platformRule.lineage.includes('ccv2'));
   assert.equal(report.presetId, 'default');
   assert.equal(typeof report.card.name, 'string');
-  assert.ok(report.wordCount.blocks.length === 6);
+  assert.equal(report.wordCount.blocks.length, 8);
   assert.deepEqual(Object.keys(report.summary).sort(), ['error', 'exportable', 'info', 'warning']);
   // T10.9：新增 worldbook 类别 —— 世界书的条目结构 / id / 触发键问题
   // 不再混在「格式」里（混在一起时面板上"格式 12 条"看不出到底是排版还是条目坏了）

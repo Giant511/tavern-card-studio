@@ -135,7 +135,7 @@
     },
     "selector": {
       "type": "string",
-      "pattern": "^(\\*|block:(basic|personality|settings|special|user|worldbook)|field:[a-z_]+)$",
+      "pattern": "^(\\*|block:(basic|personality|settings|special|user|chat-examples|initial-scene|worldbook)|field:[a-z_]+)$",
       "description": "\"*\" / \"block:<id>\" / \"field:<ST字段名>\"。"
     }
   }

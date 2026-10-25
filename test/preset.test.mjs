@@ -88,24 +88,33 @@ test('三份内置预设全部加载成功', () => {
   assert.deepEqual(presets.map((preset) => preset.id).sort(), ['default', 'divider', 'markdown']);
 });
 
-test('每个预设的 blockOrder 都是六板块的完整排列，别名表覆盖六个板块', () => {
+test('每个预设的 blockOrder 都是八板块的完整排列，别名表覆盖八个板块', () => {
   for (const preset of presets) {
-    assert.equal(preset.blockOrder.length, 6, `${preset.id}: blockOrder 长度应为 6`);
+    assert.equal(preset.blockOrder.length, 8, `${preset.id}: blockOrder 长度应为 8`);
     assert.deepEqual(
       [...preset.blockOrder].sort(),
-      ['basic', 'personality', 'settings', 'special', 'user', 'worldbook'],
-      `${preset.id}: blockOrder 必须覆盖六个板块`,
+      ['basic', 'chat-examples', 'initial-scene', 'personality', 'settings', 'special', 'user', 'worldbook'],
+      `${preset.id}: blockOrder 必须覆盖八个板块`,
     );
     const table = presetAliasTable(preset);
-    for (const blockId of ['basic', 'personality', 'settings', 'special', 'user', 'worldbook']) {
+    for (const blockId of ['basic', 'personality', 'settings', 'special', 'user', 'chat-examples', 'initial-scene', 'worldbook']) {
       assert.ok(table[preset.headings[blockId].aliases[0]] === blockId, `${preset.id}: ${blockId} 的别名未生效`);
       assert.ok(preset.headings[blockId].aliases.length > 0, `${preset.id}: ${blockId} 缺少别名`);
     }
   }
 });
 
-test('默认预设的板块顺序固定为 基本信息→性格→其他设定→特殊设定→用户相关设定→世界书', () => {
-  assert.deepEqual(DEFAULT_PRESET.blockOrder, ['basic', 'personality', 'settings', 'special', 'user', 'worldbook']);
+test('默认预设的板块顺序固定为 基本→性格→其他→特殊→用户→对话示例→初始场景→世界书', () => {
+  assert.deepEqual(DEFAULT_PRESET.blockOrder, [
+    'basic',
+    'personality',
+    'settings',
+    'special',
+    'user',
+    'chat-examples',
+    'initial-scene',
+    'worldbook',
+  ]);
   assert.equal(headingTextFor(DEFAULT_PRESET, 'basic'), '【基本信息】');
   assert.equal(headingTextFor(presets.find((preset) => preset.id === 'markdown'), 'basic'), '## 基本信息');
 });
@@ -113,11 +122,20 @@ test('默认预设的板块顺序固定为 基本信息→性格→其他设定�
 test('非法预设被拒绝：缺板块 / 别名冲突 / pattern 缺 {title} / 分隔符无换行', () => {
   const base = structuredClone(DEFAULT_PRESET);
 
-  const missing = structuredClone(base);
-  missing.blockOrder = ['basic', 'personality', 'settings', 'special', 'user'];
-  const missingResult = parsePreset(missing);
-  assert.equal(missingResult.preset, null);
-  assert.ok(missingResult.errors.some((error) => error.includes('blockOrder 缺少板块 "worldbook"')), missingResult.errors.join(' | '));
+  // v0.1.3 起「缺板块」不再是错误：补成八板块并给 info 提示（旧预设不能被拒之门外）。
+  const partial = structuredClone(base);
+  partial.blockOrder = ['basic', 'personality', 'settings', 'special', 'user'];
+  const partialResult = parsePreset(partial);
+  assert.deepEqual(partialResult.errors, []);
+  assert.equal(partialResult.preset.blockOrder.length, 8);
+  assert.ok(partialResult.notices.some((text) => text.includes('已自动扩展为八板块')));
+
+  // 真正的硬错误是「写了不存在的板块」：拼写错误不能被补齐逻辑掩盖
+  const unknown = structuredClone(base);
+  unknown.blockOrder = ['basic', 'personality', 'settings', 'special', 'user', 'worldbook', 'not-a-block'];
+  const unknownResult = parsePreset(unknown);
+  assert.equal(unknownResult.preset, null);
+  assert.ok(unknownResult.errors.some((error) => error.includes('未知板块')), unknownResult.errors.join(' | '));
 
   const collision = structuredClone(base);
   collision.headings.special.aliases = ['基本信息'];
@@ -231,7 +249,7 @@ test('分隔线预设：重复解析不会叠加 ---，再次应用预设为无�
   assert.equal((second.text.match(/^---$/gm) ?? []).length, 2);
 });
 
-test('自定义顺序预设：按用户给定顺序渲染，别名表仍覆盖六板块', () => {
+test('自定义顺序预设：按用户给定顺序渲染，别名表仍覆盖八板块', () => {
   const custom = structuredClone(DEFAULT_PRESET);
   custom.id = 'custom-reverse';
   custom.name = '反序测试';
@@ -240,7 +258,14 @@ test('自定义顺序预设：按用户给定顺序渲染，别名表仍覆盖�
 
   const { preset, errors: customErrors } = parsePreset(custom);
   assert.deepEqual(customErrors, []);
-  assert.deepEqual(preset.blockOrder, ['user', 'worldbook', 'special', 'settings', 'personality', 'basic']);
+  // 用户给的六个板块的相对顺序必须原样保留；缺的两个按规范位置补齐
+  const userGiven = ['user', 'worldbook', 'special', 'settings', 'personality', 'basic'];
+  assert.deepEqual(
+    preset.blockOrder.filter((id) => userGiven.includes(id)),
+    userGiven,
+    '补齐不能打乱用户给定的相对顺序',
+  );
+  assert.equal(preset.blockOrder.length, 8);
 
   const { card } = nonStandardCard();
   const plan = planPresetApply(card, preset);

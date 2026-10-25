@@ -16,9 +16,11 @@
  */
 
 import {
+  BLOCK_DEFINITION_MAP,
   exportWorldbook,
   importWorldbook,
   renderWorldbookText,
+  type GreetingFormatParams,
   type UnifiedCard,
   type WorldbookExportResult,
   type WorldbookFormatParams,
@@ -70,8 +72,9 @@ export function previewCardText(
   text: string,
   preset: TxtPreset,
   mode: ImportMode,
+  greetingFormat?: GreetingFormatParams,
 ): CardTextPreview {
-  const result = importCardText(card, text, preset, mode);
+  const result = importCardText(card, text, preset, mode, greetingFormat);
   const issues: ImportIssueView[] = result.issues.map((issue) => ({
     // 只有「缺板块」这一条会随模式改变级别：严格是 error（导入中止），
     // 宽松是 warning（按空块处理）。其它问题（重复标题、未知标题）与模式无关。
@@ -82,8 +85,11 @@ export function previewCardText(
     ...(issue.line === undefined ? {} : { line: issue.line }),
   }));
 
+  // 只报「description 侧」的缺失：两个字段板块（对话示例 / 初始场景）没有标题是常态
+  // —— 六板块时代的 TXT 里本来就没有它们。把它们列进「这些板块为空」会让
+  // 每一次历史 TXT 导入都显示一条无意义的提醒（审计里另有 legacy 说明）。
   const missingBlocks = (result.card?.blocks ?? [])
-    .filter((block) => block.missing === true)
+    .filter((block) => block.missing === true && BLOCK_DEFINITION_MAP[block.id].kind !== 'field-backed')
     .map((block) => block.id);
 
   return {

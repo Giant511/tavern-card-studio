@@ -7,6 +7,38 @@
  */
 
 import type { RepoSummary } from './repo-client.js';
+import type { RepoTokenCapabilities } from '../auth/repo-token.js';
+
+/**
+ * 仓库令牌模式下，同步面板需要的全部上下文（v0.1.3 / F5 后半）。
+ *
+ * 让 App 一次交清 `caps` 与四条置灰理由，而不是让面板自己去 `includes('write')`：
+ * scope→能力的映射只在 `auth/repo-token.ts` 里定义一份，面板只消费结论。
+ * 这样"哪个按钮该灰"不会在两个文件里各判一套。
+ */
+export interface RepoTokenContext {
+  repoId: string;
+  repoName: string;
+  /** 面板顶部那行「仓库令牌模式 · <仓库名>」 */
+  label: string;
+  caps: RepoTokenCapabilities;
+  /** 置灰按钮的悬浮说明（点名缺哪一档）；可用的为空串 */
+  reason: Record<'upload' | 'rollback' | 'delete' | 'move', string>;
+}
+
+/**
+ * 该不该显示仓库选择器。
+ *
+ * 令牌模式下**必须隐藏**：令牌绑死一个仓库，显示一个只有一个选项的下拉
+ * 会让人以为还能选别的（需求「仓库选择器隐藏（只有一个仓库）」）。
+ */
+export function shouldShowRepoPicker(
+  repos: readonly RepoSummary[],
+  tokenContext: RepoTokenContext | null,
+): boolean {
+  if (tokenContext !== null) return false;
+  return repos.length > 0;
+}
 
 export interface RepoOption {
   id: string;

@@ -136,6 +136,24 @@ export interface ClientConfig {
    * 这里不该依赖它，避免契约层被网络层牵着走）。
    */
   authUser: { userId: string; username: string; role: 'admin' | 'user' } | null;
+  /**
+   * 仓库令牌模式（v0.1.3 / F5 后半）。空串 = 当前不在这个模式。
+   *
+   * 与 `accessToken` 是**两条互斥的凭证路径**：账户登录答"你是谁"，
+   * 仓库令牌答"你能对这个仓库做什么"。两者同时存在时以仓库令牌为准 ——
+   * 因为进入这个模式是个显式动作（用户主动粘贴令牌），
+   * 不该被一个更早的、还没过期的账户会话悄悄顶掉。
+   *
+   * 存原文而不是哈希：客户端本来就要用它发请求，服务端只存 sha256。
+   */
+  repoToken: string;
+  /** 令牌绑定的仓库（id 用于寻址，name 只用于显示） */
+  repoTokenRepoId: string;
+  repoTokenRepoName: string;
+  /** 令牌的权限范围（read/write/rollback）。存下来是为了**离线**也能正确置灰按钮 */
+  repoTokenScopes: string[];
+  /** 令牌到期时刻（ISO）；null = 永不过期。仅用于显示 */
+  repoTokenExpiresAt: string | null;
   /** 当前平台规则 id */
   platformRuleId: string | null;
   /** 当前 TXT 预设 id */
@@ -159,6 +177,11 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
   refreshToken: '',
   accessExpiresAt: 0,
   authUser: null,
+  repoToken: '',
+  repoTokenRepoId: '',
+  repoTokenRepoName: '',
+  repoTokenScopes: [],
+  repoTokenExpiresAt: null,
   platformRuleId: null,
   presetId: null,
   highlightSchemeId: null,

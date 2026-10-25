@@ -211,11 +211,11 @@ test('摘要：筛选后描述区分总量与筛出量', () => {
 
 // ── 字数分布 ────────────────────────────────────────────────
 
-test('字数：六板块都出现，百分比在合理范围', () => {
+test('字数：八板块都出现，百分比在合理范围', () => {
   const report = reportFor('sillytavern');
   const bars = buildWordBars(report);
 
-  assert.equal(bars.length, 6);
+  assert.equal(bars.length, 8);
   for (const bar of bars) {
     assert.ok(bar.percent >= 0 && bar.percent <= 100);
     assert.ok(bar.share >= 0 && bar.share <= 100);

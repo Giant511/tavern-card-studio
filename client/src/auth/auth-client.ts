@@ -324,8 +324,7 @@ export async function logout(
 }
 
 /** 当前身份（用于启动时确认令牌与服务端是否一致） */
-export async function me(
-  serverUrl: string,
+export async function me(  serverUrl: string,
   accessToken: string,
   options: AuthRequestOptions = {},
 ): Promise<{ via: string; user: AuthUser | null; role: 'admin' | 'user' }> {
@@ -341,5 +340,117 @@ export async function me(
     via: String(body['via'] ?? ''),
     user: body['user'] === null || body['user'] === undefined ? null : toUser(body['user']),
     role: body['role'] === 'admin' ? 'admin' : 'user',
+  };
+}
+
+/** 注销回执（服务端返回"删了什么"） */
+export interface DeleteAccountReceipt {
+  uid: string;
+  username: string;
+  counts: {
+    cards: number;
+    versions: number;
+    repos: number;
+    repoTokens: number;
+    sessions: number;
+    loginAttempts: number;
+    blobs: number;
+    gitRepos: number;
+  };
+  /** 磁盘上删不掉的东西（通常为空；非空说明"没删干净"，必须如实告诉用户） */
+  warnings: string[];
+}
+
+/**
+ * 注销前的"将要删除什么"（v0.1.3 / F3）。
+ *
+ * 由服务端算，口径与真正删除时同一批 SQL —— 前端自己拼 5 个请求的话，
+ * 任何一个失败都会让数字变小，而"将删除 0 张卡"是危险的谎。
+ */
+export interface AccountSummary {
+  username: string;
+  uid: string;
+  cards: number;
+  versions: number;
+  repos: number;
+  repoTokens: number;
+  sessions: number;
+}
+
+export async function fetchAccountSummary(
+  serverUrl: string,
+  accessToken: string,
+  options: AuthRequestOptions = {},
+): Promise<AccountSummary> {
+  const response = await send(
+    serverUrl,
+    '/api/account/summary',
+    { method: 'GET', headers: { Authorization: `Bearer ${accessToken}` } },
+    options,
+  );
+  if (!response.ok) throw failure(response.status, response.body);
+  const body = response.body ?? {};
+  const n = (key: string): number => (typeof body[key] === 'number' ? (body[key] as number) : 0);
+  return {
+    username: String(body['username'] ?? ''),
+    uid: String(body['uid'] ?? ''),
+    cards: n('cards'),
+    versions: n('versions'),
+    repos: n('repos'),
+    repoTokens: n('repoTokens'),
+    sessions: n('sessions'),
+  };
+}
+
+/**
+ * 自助注销账户（v0.1.3 / F3）。
+ *
+ * 二次确认在**服务端**校验，这里只是把它传上去。客户端也会先比一遍用户名，
+ * 但那只是省一次往返 —— 判据在服务端（只靠客户端等于没设闸）。
+ *
+ * `password` 是可选的加强项：服务端规定"给了就必须对"。
+ */
+export async function deleteAccount(
+  serverUrl: string,
+  accessToken: string,
+  input: { confirmUsername: string; password?: string },
+  options: AuthRequestOptions = {},
+): Promise<DeleteAccountReceipt> {
+  const body: Record<string, unknown> = { confirmUsername: input.confirmUsername };
+  if (input.password !== undefined && input.password !== '') body['password'] = input.password;
+
+  const response = await send(
+    serverUrl,
+    '/api/account/delete',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify(body),
+    },
+    options,
+  );
+  if (!response.ok) throw failure(response.status, response.body);
+
+  const payload = response.body ?? {};
+  const counts = typeof payload['counts'] === 'object' && payload['counts'] !== null
+    ? (payload['counts'] as Record<string, unknown>)
+    : {};
+  const num = (key: string): number => (typeof counts[key] === 'number' ? (counts[key] as number) : 0);
+  return {
+    uid: String(payload['uid'] ?? ''),
+    username: String(payload['username'] ?? ''),
+    counts: {
+      cards: num('cards'),
+      versions: num('versions'),
+      repos: num('repos'),
+      repoTokens: num('repoTokens'),
+      sessions: num('sessions'),
+      loginAttempts: num('loginAttempts'),
+      blobs: num('blobs'),
+      gitRepos: num('gitRepos'),
+    },
+    warnings: Array.isArray(payload['warnings'])
+      ? payload['warnings'].filter((item): item is string => typeof item === 'string')
+      : [],
   };
 }

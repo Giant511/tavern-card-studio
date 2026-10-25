@@ -22,7 +22,11 @@ import { fileURLToPath } from 'node:url';
 import Ajv from 'ajv';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const RULES_DIR = join(ROOT, 'rules');
+// 可以用 --rules-dir 指向别处（比如服务端包内的 rules），
+// 用于验证「打进包里的那份规则同样合法」—— 包内的文件和仓库里的是两份拷贝，
+// 只校验仓库那份等于没验装到用户机器上的那份。
+const rulesDirArg = process.argv.find((arg) => arg.startsWith('--rules-dir='));
+const RULES_DIR = rulesDirArg ? rulesDirArg.slice('--rules-dir='.length) : join(ROOT, 'rules');
 
 const ajv = new Ajv({ allErrors: true, strict: false, allowUnionTypes: true });
 
@@ -182,7 +186,7 @@ async function validateHighlightRules() {
         warn(file, `规则 "${rule.id}" 含空白关键字`);
       }
       for (const selector of [].concat(rule.appliesTo ?? [])) {
-        if (!/^(\*|block:(basic|personality|settings|special|user|worldbook)|field:[a-z_]+)$/.test(selector)) {
+        if (!/^(\*|block:(basic|personality|settings|special|user|chat-examples|initial-scene|worldbook)|field:[a-z_]+)$/.test(selector)) {
           fail(file, `规则 "${rule.id}" 的 appliesTo "${selector}" 不是合法选择器`);
         }
       }
@@ -226,15 +230,32 @@ async function validateHighlightRules() {
 }
 
 // ---------- 预设格式 ----------
-const ALL_BLOCK_IDS = ['basic', 'personality', 'settings', 'special', 'user', 'worldbook'];
-const BLOCK_LABELS = {
-  basic: '基本信息',
-  personality: '性格',
-  settings: '其他设定',
-  special: '特殊设定',
-  user: '用户相关设定',
-  worldbook: '世界书',
-};
+//
+// 板块清单与中文名从 `shared/src/model/blocks.ts` **读源码**派生，而不是在这里再抄一份。
+// 理由：本脚本刻意只依赖 Ajv（能在没构建过的干净 clone 里跑），
+// 但"再抄一份板块表"就意味着加板块时要记得改这里 —— 那正是 F6 要消灭的那类副本。
+// 从 BLOCK_IDS 与 BLOCK_DEFINITIONS 的字面量里解析，既零依赖，也只有一处真相。
+const BLOCKS_SOURCE = await readFile(join(ROOT, 'shared/src/model/blocks.ts'), 'utf8');
+
+function readBlockTable(source) {
+  const arrayMatch = /export const BLOCK_IDS = \[([\s\S]*?)\] as const;/.exec(source);
+  if (!arrayMatch) throw new Error('无法从 shared/src/model/blocks.ts 解析 BLOCK_IDS');
+  const ids = [...arrayMatch[1].matchAll(/'([^']+)'/g)].map((match) => match[1]);
+  const labels = {};
+  const headings = {};
+  const definitionRe = /id: '([^']+)',\s*\n\s*label: '([^']+)',[\s\S]*?defaultHeading: '([^']+)'/g;
+  for (const match of source.matchAll(definitionRe)) {
+    labels[match[1]] = match[2];
+    headings[match[1]] = match[3];
+  }
+  if (ids.length !== Object.keys(labels).length) {
+    throw new Error(`板块表解析不一致：BLOCK_IDS ${String(ids.length)} 项，定义 ${String(Object.keys(labels).length)} 项`);
+  }
+  return { ids, labels, headings };
+}
+
+const { ids: ALL_BLOCK_IDS, headings: BLOCK_HEADINGS } = readBlockTable(BLOCKS_SOURCE);
+const BLOCK_LABELS = BLOCK_HEADINGS;
 
 /** 与 shared/src/format/description.ts 的 normalizeHeading 保持一致 */
 function normalizeHeading(text) {
@@ -266,13 +287,16 @@ async function validatePresets() {
     if (byId.has(data.id)) fail(file, `预设 id "${data.id}" 重复`);
     byId.set(data.id, { file, data });
 
-    // 顺序必须覆盖六个板块
+    // 顺序：允许部分排列（旧预设兼容），但不得有重复项、不得超出板块集合
     const order = data.blockOrder ?? [];
-    for (const blockId of ALL_BLOCK_IDS) {
-      if (!order.includes(blockId)) fail(file, `blockOrder 缺少板块 "${blockId}"`);
+    const seenOrder = new Set();
+    for (const blockId of order) {
+      if (!ALL_BLOCK_IDS.includes(blockId)) fail(file, `blockOrder 含未知板块 "${blockId}"`);
+      if (seenOrder.has(blockId)) fail(file, `blockOrder 中板块 "${blockId}" 重复`);
+      seenOrder.add(blockId);
     }
 
-    // 别名：必须覆盖六个板块、互相不冲突、包含板块默认标题
+    // 别名：互相不冲突、包含板块默认标题（缺项由 runtime 补齐，这里不判"必须覆盖全部"）
     const aliasOwner = new Map();
     for (const [blockId, heading] of Object.entries(data.headings ?? {})) {
       const aliases = heading.aliases ?? [];

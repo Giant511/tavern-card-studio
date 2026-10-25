@@ -1,10 +1,11 @@
 /**
- * 六板块编辑器（T6.1）+ 审计面板（T6.5）。
+ * 八板块编辑器（T6.1；v0.1.3 起六→八）+ 审计面板（T6.5）。
  *
  * 结构：
  *   顶栏（卡片名 / 统计 / 文件操作 / 连接状态 / 设置）
  *   同步条（可用性由服务端连接决定，与本地编辑解耦）
- *   ├ 左：六个板块（折叠面板，折叠时销毁编辑器 → 隐藏块不进 DOM）
+ *   ├ 左：八个板块（折叠面板，折叠时销毁编辑器 → 隐藏块不进 DOM；
+ *   │        首屏只展开前两个，常驻 CM6 实例数 = 2，见 block-doc.ts DEFAULT_EXPANDED_COUNT）
  *   └ 右：审计面板（过滤 / 分组 / 字数分布；点击问题定位到板块内偏移）
  *
  * 依赖方向：本文件只 import `../contract`（原生能力）与 `@tcs/shared`（纯逻辑），
@@ -15,9 +16,15 @@ import {
   applyPresetPlan,
   buildAuditReport,
   compileHighlightRule,
+  countExampleTurns,
   createEmptyCard,
+  DEFAULT_CHAT_EXAMPLES_PRESET,
+  DEFAULT_GREETING_PRESET,
   DEFAULT_WORLDBOOK_PRESET,
+  describeFieldPreset,
+  effectiveGreetingFormat,
   importWorldbook,
+  refreshFieldBlockViews,
   parseStCard,
   renderWorldbookTextWith,
   resolveHighlightRule,
@@ -27,6 +34,9 @@ import {
   type TxtPreset,
   type AuditReport,
   type BlockId,
+  type FieldPreset,
+  type FieldPresetBlock,
+  type GreetingFormatParams,
   type UnifiedCard,
   type WorldbookPreset,
 } from '@tcs/shared';
@@ -46,6 +56,7 @@ import {
 
 import {
   collectBlocks,
+  defaultExpandedBlockIds,
   importCardText,
   serializeCard,
   setBlockText,
@@ -53,6 +64,7 @@ import {
   type EditorBlockSnapshot,
 } from './block-doc';
 import { BlockEditor, type EditorIssue } from './block-editor';
+import { planRemoteApply } from '../sync/remote-apply';
 import { applySchemeStyles, buildPreviewFragment } from './highlight';
 import {
   buildRuleset,
@@ -78,10 +90,13 @@ import { SyncDialog } from '../sync/sync-dialog';
 import { CardsDialog } from '../sync/cards-dialog';
 import { RepoDialog } from '../sync/repo-dialog';
 import { listRepos } from '../sync/repo-client';
+import type { RepoTokenContext } from '../sync/repo-select';
 import type { SyncConfig } from '../sync/server-sync';
 import { AuthSession } from '../auth/session';
 import { LoginDialog } from '../auth/login-dialog';
-import { phaseLabel, phaseTitle } from '../auth/policy';
+import { AccountDeleteDialog } from '../auth/account-delete-dialog';
+import { phaseLabel, phaseTitle, repoTokenLabel, repoTokenTitle } from '../auth/policy';
+import { describeCapabilities, disabledReason, repoTokenModeLabel } from '../auth/repo-token';
 import {
   connectionLabel,
   hasServerUrl,
@@ -95,6 +110,7 @@ import { decideShortcut } from './shortcuts';
 import { ImportDialog } from './import-dialog';
 import { applyWorldbookImport, exportWorldbookText, suggestWorldbookFileName } from './import-flow';
 import {
+  importFieldPreset,
   importTxtPreset,
   importWorldbookPreset,
   serializePreset,
@@ -190,6 +206,8 @@ class EditorApp {
    */
   private authSession: AuthSession | null = null;
   private loginDialog: LoginDialog | null = null;
+  /** 注销账户的二次确认弹窗（v0.1.3 / F3） */
+  private accountDeleteDialog: AccountDeleteDialog | null = null;
   private cardsDialog: CardsDialog | null = null;
   /** TXT 角色卡 / 世界书导入对话框（T10.9） */
   private importDialog: ImportDialog | null = null;
@@ -211,6 +229,16 @@ class EditorApp {
   /** 世界书格式预设（T10.31）：内置 default + 用户导入项，只存在运行期 */
   private worldbookPresets: WorldbookPreset[] = [DEFAULT_WORLDBOOK_PRESET];
   private worldbookPreset: WorldbookPreset = DEFAULT_WORLDBOOK_PRESET;
+  /**
+   * 字段板块格式预设（v0.1.3 追加项一）。
+   *
+   * 两个板块各一条独立列表：`block` 字段不同，混在一个下拉里用户会选错，
+   * 而选错的后果是"分隔符改了但内容没变"，很难归因。
+   */
+  private greetingPresets: FieldPreset[] = [DEFAULT_GREETING_PRESET];
+  private greetingPreset: FieldPreset = DEFAULT_GREETING_PRESET;
+  private chatExamplePresets: FieldPreset[] = [DEFAULT_CHAT_EXAMPLES_PRESET];
+  private chatExamplePreset: FieldPreset = DEFAULT_CHAT_EXAMPLES_PRESET;
   private validateTimer: number | null = null;
   private activeIssueId: string | null = null;
 
@@ -337,6 +365,108 @@ class EditorApp {
     // 不可能长得不一样。
     this.mountActiveSession();
     this.refreshTabs();
+
+    // 调试/截图入口：`?preview=<mode>` 驱动「渲染预览」，把结果写进 body.dataset
+    // 供端到端断言读取（scripts/verify-e2e.mjs）。
+    // F8 回归：该按钮曾因 buildPreviewFragment 的无限循环让整页假死，
+    // 表现为「点了没反应、必须重启客户端」，且控制台无任何报错。
+    //
+    // **必须放在 mountActiveSession() 之后**：它统计的是 `this.blocks` 里
+    // 已经展开的板块数，而板块是在 mount 时才建出来的。之前这段在 wireSettings()
+    // 里（那时 blocks 还是空的），于是 `data-preview-expanded` 恒为 0、
+    // 「预览打开期间仍可输入」拿不到 `.cm-content` —— 三条断言一起失败。
+    // 当时快照抓的是空工作台，这个错位一直没暴露出来（2026-10-25 修）。
+    const previewMode = new URLSearchParams(location.search).get('preview');
+    if (previewMode !== null) await this.runPreviewScenario(previewMode);
+
+    /*
+     * 登录 / 仓库令牌入口的截图调试入口（v0.1.3 / F5 后半）。
+     *
+     *   ?login=1                    打开登录框（三个入口并列的状态）
+     *   ?login=1&repoToken=1        打开并直接切到「使用仓库令牌连接」
+     *   &token=<tcr_…>              预填令牌（不提交）
+     *   &connectToken=1             **真的点一次「连接」**（走真实 HTTP）
+     *   &sync=1                     连接成功后打开同步面板
+     *
+     * 为什么要有 `connectToken` 这种"真点"开关：截图要证明的是
+     * 「这把令牌真能连上、顶栏真会变成仓库令牌模式」。直接往内存里塞状态
+     * 截出来的是假象 —— 按钮绑定、请求参数、scope 解析全都没经过。
+     * 与 `?settings=1&localConnect=1` 同一条原则。
+     *
+     * **位置是判据的一部分**：必须放在 `wireAccount()` 之后（这里是 `start()` 尾部）。
+     * 第一版写在 `wireSettings()` 里，而那个方法在 `wireAccount()` **之前**执行 ——
+     * `this.loginDialog` 还是 null，可选链静默跳过，两张截图拍出来都是空工作台、
+     * 字节完全相同（65281），看起来像"登录框没有第三入口"。
+     * 同类错在本仓库已出现过一次（`?preview=` 也曾写在 wireSettings 里，见上一段注释）。
+     */
+    const debugParams = new URLSearchParams(location.search);
+    if (debugParams.get('login') === '1') {
+      const wantToken = debugParams.get('repoToken') === '1';
+      const prefill = debugParams.get('token') ?? undefined;
+      if (wantToken) await this.loginDialog?.openRepoTokenMode(prefill);
+      else await this.loginDialog?.open();
+
+      if (debugParams.get('connectToken') === '1') {
+        // 真点按钮：成功与失败都走同一条代码，错误上屏也才有得看
+        document.querySelector<HTMLButtonElement>('[data-role="auth-submit"]')?.click();
+        // 等连接结束：成功时对话框自己关掉、body 上已打上 credentialMode
+        for (let i = 0; i < 100; i += 1) {
+          if (document.body.dataset['credentialMode'] === 'repo-token') break;
+          if (this.loginDialog?.isOpen === false) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        if (debugParams.get('sync') === '1') this.syncDialog?.open();
+      }
+    }
+
+    /*
+     * `?openRepos=1&loginUser=…&loginPassword=…` —— 登录后打开「仓库与令牌」面板（截图用）。
+     *
+     * 为什么走**真实登录**而不是往配置里塞令牌：`getStore()` 是
+     * `@tauri-apps/plugin-store`，在浏览器里根本不可用（第一版用 `configPatch`
+     * 注入 accessToken，写入静默失败，截图里那个面板显示"需要先登录账户"）。
+     * 而 `AuthSession.login()` 只依赖 fetch —— 浏览器里完全可用。
+     *
+     * 所以这里点的是真登录：拿到的令牌由 `AuthSession` 正常持有，
+     * 面板看到的身份与用户手动登录时完全一致，没有任何伪造状态。
+     */
+    if (debugParams.get('openRepos') === '1') {
+      const username = debugParams.get('loginUser') ?? '';
+      const password = debugParams.get('loginPassword') ?? '';
+      if (username !== '' && password !== '' && this.authSession !== null) {
+        try {
+          await this.authSession.login(username, password);
+          this.refreshAccountButton();
+          this.applyScopeGating();
+        } catch {
+          /* 登录失败时面板会如实显示"需要先登录"，截图即可暴露问题 */
+        }
+      }
+      this.repoDialog?.open();
+    }
+
+    /*
+     * `?openDelete=1&loginUser=…&loginPassword=…` —— 登录后打开注销确认弹窗（截图用）。
+     *
+     * 同样走**真实登录**：弹窗要显示"将删除 N 张卡"，那个 N 来自
+     * `/api/account/summary`，只有真登录才拿得到。塞假状态截出来的
+     * 是一张"统计读取失败"的图，证明不了任何事。
+     */
+    if (debugParams.get('openDelete') === '1') {
+      const username = debugParams.get('loginUser') ?? '';
+      const password = debugParams.get('loginPassword') ?? '';
+      if (username !== '' && password !== '' && this.authSession !== null) {
+        try {
+          await this.authSession.login(username, password);
+          this.refreshAccountButton();
+          this.applyScopeGating();
+          this.settings?.refreshIdentity();
+        } catch {
+          /* 登录失败时弹窗会显示"读不到统计"，截图即可暴露问题 */
+        }
+      }
+      await this.accountDeleteDialog?.open();
+    }
   }
 
   // ── 规则与预设（T6.2 / T6.3）─────────────────────────────
@@ -392,6 +522,12 @@ class EditorApp {
       importTxtPresetText: (text) => this.importTxtPresetText(text),
       importWorldbookPresetText: (text) => this.importWorldbookPresetText(text),
       onWorldbookPresetSelect: (id) => this.selectWorldbookPreset(id),
+      importGreetingPresetText: (text) => this.importFieldPresetText('initial-scene', text),
+      onGreetingPresetSelect: (id) => this.selectFieldPreset('initial-scene', id),
+      exportGreetingPreset: (id) => this.exportFieldPresetById('initial-scene', id),
+      importChatExamplePresetText: (text) => this.importFieldPresetText('chat-examples', text),
+      onChatExamplePresetSelect: (id) => this.selectFieldPreset('chat-examples', id),
+      exportChatExamplePreset: (id) => this.exportFieldPresetById('chat-examples', id),
 
       exportPlatformRule: (id) => this.rules?.platformSourceText[id] ?? null,
       exportHighlightScheme: (id) => this.rules?.highlightSourceText[id] ?? null,
@@ -407,6 +543,8 @@ class EditorApp {
         card: this.card,
         report: this.report,
         preset: this.rules?.preset ?? null,
+        // 初始场景预设决定"多条开场白用哪个分隔行回写"（v0.1.3 追加项一）
+        greetingFormat: this.greetingFormat().format,
       }),
       // 导出前强制重算：不能用过期报告放行
       revalidate: () => {
@@ -425,7 +563,9 @@ class EditorApp {
       // 上传内容与「导出 JSON」同一份，保证服务端字节与本地可复现
       getPayload: () => {
         const preset = this.rules?.preset ?? null;
-        return buildExportAsync(this.card, preset, 'json').then((artifact) => artifact.text);
+        return buildExportAsync(this.card, preset, 'json', this.greetingFormat().format).then(
+          (artifact) => artifact.text,
+        );
       },
       // 上传目标 = 活动会话（F11）：cardId 创建时定死，baseSeq 是上次对齐的版本
       getUploadTarget: () => {
@@ -438,8 +578,8 @@ class EditorApp {
         if (!this.hasSession) return;
         this.session.noteRemoteVersion(cardId, seq);
       },
-      onRemoteTextApplied: (text, version, remoteSeq) => {
-        this.applyRemoteText(text, version.seq, remoteSeq);
+      onRemoteTextApplied: (text, version, remoteSeq, context) => {
+        this.applyRemoteText(text, version.seq, remoteSeq, context);
       },
       // 同步面板里一键连接成功后，把结论交回 App：
       // 顶栏指示与三个同步入口的启用状态都读 this.connection，必须同步更新，
@@ -455,6 +595,11 @@ class EditorApp {
       // 只对**账户登录**提供仓库列表：legacy 与仓库令牌都没有"选仓库"的自由，
       // 返回 null 让面板把这一行整行隐藏（而不是显示一个改了也不生效的下拉）
       getRepos: async () => {
+        // 仓库令牌模式（v0.1.3 / F5 后半）：令牌绑死一个仓库，没有可选项。
+        // 返回空数组 → 面板隐藏整行选择器（需求「仓库选择器隐藏」）。
+        // 这里不能"返回那一个仓库让它显示出来"：一个只有一个选项的下拉
+        // 会让人以为还能选别的。
+        if (this.authSession?.isRepoTokenMode === true) return [];
         const config = this.repoClientConfig();
         if (!config) return [];
         return listRepos(config);
@@ -465,6 +610,8 @@ class EditorApp {
         this.selectedRepoId = repoId;
       },
       onOpenRepos: () => void this.repoDialog?.open(),
+      // 令牌模式下的仓库名与能力（面板用来显示"仓库令牌模式 · X"与置灰按钮）
+      getRepoTokenContext: () => this.repoTokenContext(),
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
     });
 
@@ -492,6 +639,13 @@ class EditorApp {
           refreshToken: config.refreshToken,
           accessExpiresAt: config.accessExpiresAt,
           authUser: config.authUser,
+          // 仓库令牌模式（v0.1.3 / F5 后半）：重启后要能恢复 ——
+          // 否则"把令牌交给另一台设备"这件事在每次开机后都要重做一遍
+          repoToken: config.repoToken,
+          repoTokenRepoId: config.repoTokenRepoId,
+          repoTokenRepoName: config.repoTokenRepoName,
+          repoTokenScopes: config.repoTokenScopes,
+          repoTokenExpiresAt: config.repoTokenExpiresAt,
         };
       },
       save: async (patch) => {
@@ -539,11 +693,32 @@ class EditorApp {
         // 用户点开面板时不用再等一轮。
         void this.cardsDialog?.preload();
       },
+      /*
+       * 仓库令牌连接成功（v0.1.3 / F5 后半）。
+       *
+       * 与 onAuthenticated 同一套动作：重画顶栏 → 重探 → 立刻按现有连接重算文案。
+       * 多出来一步 `applyScopeGating()`：这个模式下按钮要按 scope 置灰，
+       * 而 applyConnection 只负责把按钮**全部置为可用**（那是账户路径的语义）。
+       */
+      onRepoTokenConnected: () => {
+        this.refreshAccountButton();
+        this.applyScopeGating();
+        if (this.connection) this.applyConnection(this.connection);
+        void this.autoProbe();
+      },
     });
 
     this.cardsDialog = new CardsDialog({
       getConfig: () => this.currentSyncConfig(),
-      isAccountLogin: () => session.accessToken !== '' || session.refreshToken !== '',
+      /*
+       * 必须是 `mode === 'account'`，不能只看 `accessToken !== ''`（v0.1.3 / F5 后半）。
+       *
+       * 仓库令牌模式下 `session.accessToken` 返回的是**令牌原文**（那是让既有同步链路
+       * 零改动的关键），所以旧的判据会把令牌模式误判成"账户已登录"，
+       * 于是卡片列表里会显示「登出」按钮、还会打出"账户隔离"的说明 ——
+       * 而这两件事在令牌模式下都不成立。
+       */
+      isAccountLogin: () => session.mode === 'account',
       // T10.8：服务端说"已隔离"就不再提示未隔离（避免永远为真的免责声明）
       isIsolationEnforced: () => this.connection?.isolationEnforced ?? null,
       onPick: (cardId) => {
@@ -555,22 +730,77 @@ class EditorApp {
       // 「移动…」要选目标仓库：列表由仓库客户端现取（不缓存 —— 用户可能刚在
       // 仓库面板里新建过一个，缓存会让它在这里看不到）
       getRepos: async () => {
-        // 仓库管理只认账户 access 令牌（仓库令牌/legacy 都调不了 /api/repos 的管理动作），
-        // 用与仓库面板同一个 helper，避免两处各自拼配置
+        /*
+         * 仓库管理只认**账户** access 令牌（仓库令牌与 legacy 都调不了 /api/repos
+         * 的管理动作，服务端会 403）。
+         *
+         * 这里必须显式挡掉令牌模式：`repoClientConfig()` 读的是
+         * `authSession.accessToken`，而那个 getter 在令牌模式下返回的是令牌原文
+         * （这样既有同步链路才能零改动地按令牌寻址）。不挡的话，
+         * 「我的卡片」里点「移动…」会拿 tcr_ 去调 /api/repos，得到 403。
+         */
+        if (this.authSession?.isRepoTokenMode === true) return [];
         const config = this.repoClientConfig();
         if (!config) return [];
         return listRepos(config);
       },
+      getRepoTokenContext: () => this.repoTokenContext(),
       onUnauthorized: () => this.handleUnauthorized(),
       onLogout: async () => {
+        // 仓库令牌模式的"退出" = 退出该模式（不吊销令牌 —— 它可能还在别的设备上用）
+        const wasRepoToken = session.isRepoTokenMode;
         await session.logout();
-        this.setStatus('已登出：后续同步将使用全局令牌（若有）', 'info');
+        if (wasRepoToken) {
+          this.setStatus('已退出仓库令牌模式：上传/同步不再可用（本地编辑不受影响）', 'info');
+        } else {
+          this.setStatus('已登出：后续同步将使用全局令牌（若有）', 'info');
+        }
         this.refreshAccountButton();
+        this.applyScopeGating();
         void this.autoProbe();
       },
     });
 
     byId<HTMLButtonElement>('btn-account').addEventListener('click', () => void this.openAccountEntry());
+
+    /*
+     * 注销账户（v0.1.3 / F3）。
+     *
+     * 三个回调各自的分工：
+     *   · `getStats` 走 `/api/account/summary` —— 服务端算，与真正删除同一口径；
+     *     失败时返回 null，弹窗会**明说"读不到统计"**而不是显示 0。
+     *   · `onConfirm` 交给 AuthSession（它负责调接口并在成功后清本地登录态）。
+     *   · `onDeleted` 负责把界面恢复到"未登录"：顶栏、按钮置灰、探测重跑。
+     *
+     * 刻意**不关任何本地标签**：账户没了不等于本地未保存的编辑要丢。
+     * 用户可能正想把自己写的卡另存出来 —— 这条边界与登出完全一致。
+     */
+    this.accountDeleteDialog = new AccountDeleteDialog({
+      getUsername: () => session.user?.username ?? '',
+      getStats: async () => {
+        try {
+          return await session.accountSummary();
+        } catch {
+          return null;
+        }
+      },
+      onConfirm: (input) => session.deleteAccount(input.confirmUsername, input.password),
+      onDeleted: (receipt) => {
+        this.refreshAccountButton();
+        this.applyScopeGating();
+        // 账户已不存在 → 卡片列表/同步面板里的东西都过期了，重探一次
+        void this.autoProbe();
+        this.setStatus(
+          `账户「${receipt.username}」已注销：本地未保存的编辑不受影响，建议先另存需要保留的内容`,
+          'warn',
+        );
+        // 「我的卡片」如果开着，里面的列表已经全部失效（账户没了）
+        this.cardsDialog?.close();
+        this.syncDialog?.close();
+        this.repoDialog?.close();
+      },
+      notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
+    });
 
     /*
      * 仓库与令牌面板（T10.8）。
@@ -619,10 +849,100 @@ class EditorApp {
     return { serverUrl, accessToken: token };
   }
 
+  /**
+   * 仓库令牌模式下要交给同步面板的上下文（v0.1.3 / F5 后半）。
+   *
+   * 非该模式时返回 null —— 面板据此保持原样（显示选择器与"全部仓库"的语义）。
+   * 结构里带 `canXxx` 而不是让面板自己去 `includes('write')`：
+   * scope→能力的映射只在 `auth/repo-token.ts` 里定义一份，服务端那边的
+   * `requiredScope()` 是它的镜像（测试里交叉断言两者一致）。
+   */
+  private repoTokenContext(): RepoTokenContext | null {
+    const session = this.authSession;
+    if (session?.isRepoTokenMode !== true) return null;
+    const caps = session.capabilities;
+    return {
+      repoId: session.repoTokenRepoId,
+      repoName: session.repoTokenRepoName,
+      label: repoTokenModeLabel(session.repoTokenRepoName),
+      caps,
+      reason: {
+        upload: disabledReason('upload', caps),
+        rollback: disabledReason('rollback', caps),
+        delete: disabledReason('delete', caps),
+        move: disabledReason('move', caps),
+      },
+    };
+  }
+
+  /**
+   * 三个同步按钮的可用性（v0.1.3 / F5 后半）。
+   *
+   * 两条路径的语义不同，所以必须在**同一处**判：
+   *   · 账户 / legacy：能连上就全可用（权限由账户角色决定，不由 scope 表达）；
+   *   · 仓库令牌：逐个按 scope 置灰 —— 读 → 无上传/回滚；无写 → 无删除/移动。
+   *
+   * 必须点名"缺哪一档"写在 title 里：这把令牌通常是别人签的，
+   * 用户需要知道去要哪一档，而不是自己去猜为什么按钮是灰的。
+   */
+  private applyScopeGating(): void {
+    const session = this.authSession;
+    const isRepoToken = session?.isRepoTokenMode === true;
+    const caps = session?.capabilities ?? null;
+
+    const set = (id: string, enabled: boolean, reason: string): void => {
+      const button = byId<HTMLButtonElement>(id);
+      button.disabled = !enabled;
+      if (enabled) {
+        button.removeAttribute('title');
+      } else {
+        button.title = reason;
+      }
+    };
+
+    if (!isRepoToken || caps === null) {
+      // 账户 / legacy：恢复"全部可用"，并把上一次令牌模式留下的 title 清掉
+      set('btn-upload', true, '');
+      set('btn-history', true, '');
+      set('btn-rollback', true, '');
+      document.body.dataset['credentialMode'] = this.authSession?.mode ?? 'none';
+      delete document.body.dataset['repoTokenScopes'];
+      return;
+    }
+
+    set('btn-upload', caps.canUpload, disabledReason('upload', caps));
+    // 历史只需要读：有 read 就能看
+    set('btn-history', caps.canRead, caps.canRead ? '' : '此令牌没有「读」权限');
+    set('btn-rollback', caps.canRollback, disabledReason('rollback', caps));
+
+    // 端到端断言用：不靠读文案判断模式与权限
+    document.body.dataset['credentialMode'] = 'repo-token';
+    document.body.dataset['repoTokenScopes'] = [...(this.authSession?.repoTokenScopes ?? [])].join(',');
+  }
+
   /** 账户按钮的文案与状态（唯一一处改它的地方） */
   private refreshAccountButton(): void {
     const button = byId<HTMLButtonElement>('btn-account');
     const session = this.authSession;
+
+    /*
+     * 仓库令牌模式（v0.1.3 / F5 后半）单独一条分支。
+     *
+     * 不能复用 phaseLabel：那个模式里 `user` 恒为 null（令牌代表的是**签发人**的账户，
+     * 用令牌的人未必是同一个），走原来的路径会显示「登录…」——
+     * 明明已经连上了却说没登录。文案必须写"仓库令牌 · <仓库名>"。
+     */
+    if (session?.isRepoTokenMode === true) {
+      const repoName = session.repoTokenRepoName;
+      button.textContent = repoTokenLabel(repoName);
+      button.title = repoTokenTitle(repoName, describeCapabilities(session.capabilities));
+      button.dataset['phase'] = 'repo-token';
+      button.dataset['repoName'] = repoName;
+      this.settings?.refreshIdentity();
+      return;
+    }
+    delete button.dataset['repoName'];
+
     const phase = session?.currentPhase ?? 'anonymous';
     const user = session?.user ?? null;
     button.textContent = phaseLabel(phase, user);
@@ -644,6 +964,26 @@ class EditorApp {
   private async openAccountEntry(): Promise<void> {
     const session = this.authSession;
     if (!session) return;
+
+    /*
+     * 仓库令牌模式（v0.1.3 / F5 后半）：点账户按钮 → 卡片列表，与账户模式一致。
+     * 「退出」在列表面板里（文案改成「退出令牌模式」），不在这里直接登出 ——
+     * 顶栏按钮一下就把连接断掉太容易误触，而列表面板里那个按钮
+     * 明确写着"退出令牌模式"，语义清楚。
+     *
+     * 前提仍是**有服务端地址**：令牌模式下地址是进来时用过的，
+     * 理论上不会丢，但用户可能刚在设置里清过。
+     */
+    if (session.isRepoTokenMode) {
+      if (!hasServerUrl(this.connection?.url ?? this.authServerUrl)) {
+        this.setStatus('服务端地址为空：先在设置里填写，再使用仓库令牌。', 'warn');
+        void this.settings?.open();
+        return;
+      }
+      await this.cardsDialog?.open();
+      return;
+    }
+
     if (!hasServerUrl(this.connection?.url ?? this.authServerUrl)) {
       this.setStatus('先在设置里填写服务端地址（同机可直接点「连接本机服务端」），再登录。', 'warn');
       void this.settings?.open();
@@ -690,6 +1030,9 @@ class EditorApp {
       // 严格/宽松判定需要"导入前的卡"做基线，所以给深拷贝而不是引用
       getCard: () => structuredClone(this.card),
       getPreset: () => this.rules?.preset ?? null,
+      // TXT 导入必须按**用户当前选的**初始场景分隔符切分：
+      // 他手上的卡可能是别的工具用 === 分段的，按冻结默认切会并成一条。
+      getGreetingFormat: () => this.greetingFormat().format,
     });
   }
 
@@ -772,12 +1115,52 @@ class EditorApp {
    * 回滚时两者不同（回滚新建了一个版本）：基线必须记后者，否则下一次上传
    * 服务端会拿"我上次传的是 v2"去比"远端最新是 v4"，凭空报一个分叉。
    */
-  private applyRemoteText(text: string, displaySeq: number, remoteSeq: number = displaySeq): void {
+  private applyRemoteText(
+    text: string,
+    displaySeq: number,
+    remoteSeq: number = displaySeq,
+    context?: { cardId: string; mode: 'restore' | 'rollback' },
+  ): void {
     try {
-      const parsed = parseStCard(JSON.parse(text) as unknown);
-      this.replaceCard(parsed.card);
-      this.session.noteRemoteVersion(this.session.cardId, remoteSeq);
-      this.setStatus(`已载入服务端 v${displaySeq} 的内容（原文件未自动保存，建议另存）`, 'warn');
+      const parsed = parseStCard(JSON.parse(text) as unknown, {
+        greetingFormat: this.greetingFormat().format,
+      });
+
+      /*
+       * 零标签（v0.1.3 追加项三）：不再报"请先打开卡片"，而是**自动建一张卡**。
+       *
+       * 决策全部在 `planRemoteApply` 里（纯函数、有单测），这里只负责落地：
+       *   · `create` → 走 `createSessionWithCard`（与「打开…」同一条建卡路径），
+       *     cardId 用服务端那个，于是下一次上传是追加版本而不是新建卡；
+       *   · `replace` → 既有行为，一字未改。
+       *
+       * 没有 context 时（旧调用方/截图入口）按"有标签替换"处理 —— 那种情况下
+       * 本来就一定有会话，否则旧代码会抛错。
+       */
+      const plan = planRemoteApply({
+        hasSession: this.hasSession,
+        mode: context?.mode ?? 'restore',
+        serverCardId: context?.cardId ?? (this.hasSession ? this.session.cardId : ''),
+        targetSeq: displaySeq,
+        remoteSeq,
+        cardName: parsed.card.meta.name,
+        existingNames: this.sessions.map((item) => item.card.meta.name),
+      });
+
+      if (plan.action === 'create') {
+        if (plan.newSessionName !== null) {
+          // 名字已在 plan 里去重；卡片本身的 meta.name 也要跟着改，
+          // 否则标签栏显示"卡片 (2)"、导出文件里还是原名。
+          const renamed = { ...parsed.card, meta: { ...parsed.card.meta, name: plan.newSessionName } };
+          this.createSessionWithCard(renamed, plan.cardId);
+        }
+        this.session.noteRemoteVersion(plan.cardId, plan.baseSeq);
+      } else {
+        this.replaceCard(parsed.card);
+        this.session.noteRemoteVersion(this.session.cardId, plan.baseSeq);
+      }
+
+      this.setStatus(plan.status, plan.action === 'create' ? 'ok' : 'warn');
     } catch (error) {
       this.setStatus(
         `载入服务端版本失败：${error instanceof Error ? error.message : String(error)}`,
@@ -809,6 +1192,21 @@ class EditorApp {
         name: preset.name,
         builtin: preset.builtin === true,
         summary: `${preset.format.entryOpen.replace('{id}', 'N')} / ${preset.format.contentMark} / ${preset.format.entryClose.replace('{id}', 'N')}`,
+      })),
+      greetingPresetId: this.greetingPreset.id,
+      greetingPresets: this.greetingPresets.map((preset) => ({
+        id: preset.id,
+        name: preset.name,
+        builtin: preset.builtin === true,
+        summary: describeFieldPreset(preset),
+      })),
+      greetingFormatSource: this.greetingFormat().source,
+      chatExamplePresetId: this.chatExamplePreset.id,
+      chatExamplePresets: this.chatExamplePresets.map((preset) => ({
+        id: preset.id,
+        name: preset.name,
+        builtin: preset.builtin === true,
+        summary: `${describeFieldPreset(preset)}${this.exampleTurnsNote(preset)}`,
       })),
     };
   }
@@ -928,6 +1326,90 @@ class EditorApp {
     return preset ? serializePreset(preset) : null;
   }
 
+  // ── 字段板块预设（v0.1.3 追加项一）────────────────────────────
+
+  /**
+   * 「初始场景」当前生效的分隔格式。
+   *
+   * 唯一入口：导入、导出、TXT 解析、审计、切换预设全部从这里取，
+   * 不各自去翻 `greetingPreset`/`rules.preset.greeting` —— 翻两处就会有两套优先级。
+   */
+  private greetingFormat(): { format: GreetingFormatParams; source: 'greeting-preset' | 'txt-preset' | 'frozen' } {
+    return effectiveGreetingFormat(this.greetingPreset, this.rules?.preset?.greeting);
+  }
+
+  /**
+   * 对话示例预设的「当前文本可切成几轮」。
+   *
+   * 这份预设**不改写正文**（mes_example 原样落盘），所以它的效果只能体现在
+   * "怎么读"上 —— 不把这个数字显示出来，用户在面板里就只能看到一句参数描述，
+   * 完全不知道选了它有什么用。
+   */
+  private exampleTurnsNote(preset: FieldPreset): string {
+    if (preset.format.separator === '') return ' · 当前不切分';
+    if (!this.hasSession) return '';
+    const block = this.card.blocks.find((item) => item.id === 'chat-examples');
+    const turns = countExampleTurns(block?.text ?? '', preset.format);
+    return turns === null ? '' : ` · 当前文本 ${String(turns)} 轮`;
+  }
+
+  private fieldPresetsOf(block: FieldPresetBlock): readonly FieldPreset[] {
+    return block === 'initial-scene' ? this.greetingPresets : this.chatExamplePresets;
+  }
+
+  private fieldPresetOf(block: FieldPresetBlock): FieldPreset {
+    return block === 'initial-scene' ? this.greetingPreset : this.chatExamplePreset;
+  }
+
+  /** 导入字段板块预设：原子回退 / 同 id 覆盖 / 不自动切换 全部在 preset-library 里 */
+  private importFieldPresetText(block: FieldPresetBlock, text: string): PresetImportOutcome<FieldPreset[]> {
+    const outcome = importFieldPreset(this.fieldPresetsOf(block), text, block);
+    if (!outcome.ok) return outcome;
+    if (block === 'initial-scene') this.greetingPresets = outcome.value;
+    else this.chatExamplePresets = outcome.value;
+    return outcome;
+  }
+
+  /**
+   * 切换字段板块预设。
+   *
+   * 切换后要做两件事，缺一件用户就会觉得"选了但没反应"：
+   *   1. 按新格式重算**未编辑**板块的视图（`refreshFieldBlockViews` 只刷新非 dirty 的）；
+   *   2. 重检 —— 分隔行二义、旧格式提示这些都会随格式变化。
+   */
+  private selectFieldPreset(block: FieldPresetBlock, id: string): void {
+    const preset = this.fieldPresetsOf(block).find((item) => item.id === id);
+    if (!preset) return;
+    if (block === 'initial-scene') this.greetingPreset = preset;
+    else this.chatExamplePreset = preset;
+
+    if (this.hasSession) {
+      const before = this.card;
+      const refreshed = refreshFieldBlockViews(this.card, this.greetingFormat().format);
+      if (refreshed !== before) {
+        // 视图变了就整体重挂一次——板块文本是会话状态的一部分，
+        // 只改 DOM 不同步会话，下一次校验读到的还是旧文本。
+        this.session.replaceCard(refreshed);
+        this.reloadBlocksFromCard();
+      }
+    }
+
+    this.validate();
+    this.refreshRulesLabel();
+    this.rulesDialog?.refresh();
+    this.setStatus(
+      block === 'initial-scene'
+        ? `已切换初始场景预设：${preset.name}（${describeFieldPreset(preset)}）`
+        : `已切换对话示例预设：${preset.name}（${describeFieldPreset(preset)}）`,
+      'ok',
+    );
+  }
+
+  private exportFieldPresetById(block: FieldPresetBlock, id: string): string | null {
+    const preset = this.fieldPresetsOf(block).find((item) => item.id === id);
+    return preset ? serializePreset(preset) : null;
+  }
+
   /** 选择预设（不重排）：只影响导出装配参数 + 格式检查口径 */
   private selectPresetById(id: string): void {    const preset = this.rules?.presets.find((item) => item.id === id);
     if (!preset || !this.rules) return;
@@ -1016,12 +1498,29 @@ class EditorApp {
     // 清掉空工作台留下的占位块。
     // 只删 this.blocks 里的板块是不够的 —— 空工作台那个 .empty-workspace 不在
     // this.blocks 里，于是"从零标签新建一张卡"之后它会残留在编辑区中间
-    // （2026-10-22 截图里同时出现空占位与六个板块，就是这个原因）。
+    // （2026-10-22 截图里同时出现空占位与八个板块，就是这个原因）。
     this.blockList.replaceChildren();
     this.blocks = collectBlocks(this.card).map((snapshot) => this.createBlock(snapshot));
-    const expandAll = new URLSearchParams(location.search).get('expand') === 'all';
-    for (const [index, runtime] of this.blocks.entries()) {
-      if (expandAll || index < 2) this.expand(runtime, true);
+    // `?expand=all` 全展开；`?expand=chat-examples,initial-scene` 只展开指定板块。
+    //
+    // 后者是为 v0.1.3 的截图验收加的：要拍「新板块展开编辑」就必须只展开
+    // 那两块 —— 用 all 会连带展开其余六块，截图里分不清是哪个板块在编辑。
+    // 逗号分隔的 id 会被静默过滤掉不认识的项（调试入口，不值得为拼错报错）。
+    const expandParam = new URLSearchParams(location.search).get('expand');
+    const expandAll = expandParam === 'all';
+    const explicitExpand = new Set(
+      (expandParam === null || expandAll ? '' : expandParam)
+        .split(',')
+        .map((item) => item.trim())
+        .filter((item) => item !== ''),
+    );
+    // 首屏只展开前两个板块（懒渲染红线：常驻 CM6 实例数 = DEFAULT_EXPANDED_COUNT）。
+    // 新增的两个板块在第 6、7 位，天然折叠 —— 见 block-doc.ts 的注释与单测。
+    const defaultExpanded = new Set(defaultExpandedBlockIds(this.blocks.map((runtime) => runtime.snapshot)));
+    for (const runtime of this.blocks) {
+      const shouldExpand =
+        expandAll || explicitExpand.has(runtime.snapshot.id) || (explicitExpand.size === 0 && defaultExpanded.has(runtime.snapshot.id));
+      if (shouldExpand) this.expand(runtime, true);
     }
     this.refreshStats();
     this.renderCardName();
@@ -1045,6 +1544,12 @@ class EditorApp {
         phase: this.authSession?.currentPhase ?? 'anonymous',
         user: this.authSession?.user ?? null,
       }),
+      // 令牌模式要单独告诉设置页：那个模式下没有账户身份（user 恒 null），
+      // 走 getIdentity 那条路会显示成「已登录」或「未登录」，两种都是错的
+      getRepoTokenMode: () =>
+        this.authSession?.isRepoTokenMode === true
+          ? { repoName: this.authSession.repoTokenRepoName }
+          : null,
       onLogin: () => void this.openAccountEntry(),
       onLogout: async () => {
         await this.authSession?.logout();
@@ -1052,6 +1557,8 @@ class EditorApp {
         void this.autoProbe();
         this.setStatus('已登出；本地编辑不受影响', 'info');
       },
+      // 注销账户（v0.1.3 / F3）：只负责把二次确认弹窗打开
+      onDeleteAccount: () => void this.accountDeleteDialog?.open(),
     });
 
     byId<HTMLButtonElement>('btn-settings').addEventListener('click', () => {
@@ -1090,13 +1597,6 @@ class EditorApp {
         this.syncDialog?.open();
       });
     }
-
-    // 调试/截图入口：?preview=<mode> 驱动「渲染预览」，把结果写进 body.dataset
-    // 供端到端断言读取（scripts/verify-e2e.mjs）。
-    // F8 回归：该按钮曾因 buildPreviewFragment 的无限循环让整页假死，
-    // 表现为「点了没反应、必须重启客户端」，且控制台无任何报错。
-    const previewMode = params.get('preview');
-    if (previewMode) void this.runPreviewScenario(previewMode);
 
     this.applyConnection(null);
     void this.autoProbe();
@@ -1304,9 +1804,9 @@ class EditorApp {
     text.textContent = label.text;
     chip.title = `服务端连接状态：${label.text}（账号仅决定能做什么，不是连接的前提）`;
 
-    for (const id of ['btn-upload', 'btn-history', 'btn-rollback']) {
-      byId<HTMLButtonElement>(id).disabled = false;
-    }
+    // 按钮可用性不在这里定：账户/legacy 路径是"全部可用"，仓库令牌路径要按
+    // scope 置灰。两个语义都在 applyScopeGating 里，只在一处写。
+    this.applyScopeGating();
 
     const gate = this.syncGate();
     const summary = syncHintText(gate, result?.cardCount ?? null);
@@ -1520,7 +2020,7 @@ class EditorApp {
     const { error: errors, warning: warnings } = this.lastSummary;
 
     this.toolbarStats.replaceChildren(
-      el('span', 'stat', `六板块 ${totalCp} 字`),
+      el('span', 'stat', `八板块 ${totalCp} 字`),
       el('span', 'stat', `块内合计 ${total} 字`),
       el('span', `stat ${errors > 0 ? 'bad' : 'ok'}`, `错误 ${errors}`),
       el('span', `stat ${warnings > 0 ? 'warn' : 'ok'}`, `警告 ${warnings}`),
@@ -2194,7 +2694,7 @@ class EditorApp {
     if (!request) return;
 
     const preset = this.rules?.preset ?? null;
-    // createEmptyCard 给出六板块骨架；预设决定导出时的标题与顺序（docs/15 §1），
+    // createEmptyCard 给出八板块骨架（从 BLOCK_IDS 派生）；预设决定导出时的标题与顺序（docs/15 §1），
     // 但空卡阶段没有正文，所以这里只需要把骨架建出来。
     const blank = createEmptyCard(request.name);
     const withId = withCardId(blank, request.cardId);
@@ -2254,7 +2754,7 @@ class EditorApp {
         return;
       }
 
-      const parsed = parseStCard(file.text);
+      const parsed = parseStCard(file.text, { greetingFormat: this.greetingFormat().format });
       this.replaceCard(parsed.card);
       // 打开的文件不在 cardsDir 里时说一句：用户会以为"打开过的卡都在那个目录"
       const outside = dir !== '' && !path.toLowerCase().startsWith(dir.toLowerCase());
@@ -2283,13 +2783,28 @@ class EditorApp {
    */
   private createSessionFromFile(path: string): string {
     const name = deriveCardNameFromFile(path, this.sessions.map((item) => item.card.meta.name));
+    return this.createSessionWithCard(createEmptyCard(name), generateCardId(name));
+  }
+
+  /**
+   * **零标签自动建卡的唯一入口**（v0.1.3 追加项三）。
+   *
+   * 两条路共用它，不各写一份：
+   *   · 「打开…」选了 TXT/JSON（`createSessionFromFile`）—— 名字从文件名推；
+   *   · 同步面板零标签「取回 / 回滚」—— 名字与 cardId 都来自服务端那张卡。
+   *
+   * 第二条路**必须传入服务端的 cardId**：这里不生成。若按名字重新生成，
+   * 下一次「上传当前内容」会在服务端新建一张卡，而原卡历史还留着 ——
+   * 两份历史从此分叉，且没有任何提示（`planRemoteApply` 的注释里写了这条）。
+   *
+   * 返回新卡的名字（调用方要放进状态栏 —— "我建了一张卡"这件事必须说出来）。
+   */
+  private createSessionWithCard(card: UnifiedCard, cardId: string): string {
     const preset = this.rules?.preset ?? null;
-    const blank = createEmptyCard(name);
-    const cardId = generateCardId(name);
-    const card = withCardId(blank, cardId);
+    const stamped = withCardId(card, cardId);
 
     const session = new CardSession({
-      card,
+      card: stamped,
       cardId,
       platformId: this.rules?.platformId,
       highlightId: this.rules?.highlightId,
@@ -2307,7 +2822,7 @@ class EditorApp {
     this.blocks = [];
     this.mountActiveSession();
     this.refreshTabs();
-    return name;
+    return stamped.meta.name;
   }
 
   /**
@@ -2653,6 +3168,44 @@ class EditorApp {
   }
 
   /**
+   * 演示/验证用：让**两个新板块**各产生一条真实的审计问题。
+   *
+   * 为什么需要它：`?forceError=1` 的问题都落在「基本信息」，看不出新板块
+   * 是否真的接进了审计链路（一个板块"显示出来"和"它的文本真的进入规则求值"
+   * 是两件事）。这里同样不伪造报告 —— 把新板块改成真正会触发内置检查的状态：
+   *   · 对话示例：标成"导入源里没有这个标题"（`missing`），触发 `builtin:block-missing`；
+   *   · 初始场景：写一段**分隔行条数多于备用开场白**的文本，触发
+   *     `builtin:greeting-divider-ambiguous`（这是 v0.1.3 新增的那条 info）。
+   * 两条问题的 `location.blockId` 分别是两个新板块，面板上可直接点着定位。
+   */
+  injectNewBlockIssuesForDemo(): void {
+    const broken = structuredClone(this.card);
+    const examples = broken.blocks.find((block) => block.id === 'chat-examples');
+    if (examples) {
+      examples.text = '';
+      examples.raw = '';
+      examples.dirty = false;
+      examples.missing = true;
+    }
+    const scene = broken.blocks.find((block) => block.id === 'initial-scene');
+    if (scene) {
+      // 分隔行 2 处、备用开场白 0 条 ⇒ 多出来的来自 first_mes 正文本身
+      scene.text = '第一幕\n\n---\n\n第二幕\n\n---\n\n第三幕';
+      scene.dirty = false;
+    }
+    this.replaceCard(broken);
+    this.validate();
+    const newBlockIssues = this.issues.filter(
+      (issue) => issue.location.blockId === 'chat-examples' || issue.location.blockId === 'initial-scene',
+    );
+    this.setStatus(
+      `演示：新板块产生 ${String(newBlockIssues.length)} 条问题（对话示例·原文缺失 / 初始场景·分隔行二义）`,
+      'warn',
+    );
+  }
+
+
+  /**
    * 演示/验证用：注入一个**真实会被规则引擎判为 error** 的问题。
    *
    * 做法不是伪造报告——而是把卡片改成真正违规（清空 name、并把某必填字段写空），
@@ -2836,6 +3389,119 @@ class EditorApp {
     );
   }
 
+  /**
+   * 演示/截图入口：把某一个板块的高亮效果单独展示出来（v0.1.3 追加项二）。
+   *
+   * 为什么不是"打开样例卡再滚过去"：headless Chrome 里 `scrollIntoView` 会让
+   * 整块布局下移、上方留一片空白，截出来像布局坏了（v0.1.3 / F4 踩过两次）。
+   * 这里改成**只展开目标板块**（其余折叠 → 折叠即销毁编辑器），
+   * 页面本身就短，不需要滚动。
+   *
+   * 内容也是刻意构造的：`worldbook` 要出现 `@@ENTRY` / `keys:` / `@@CONTENT` /
+   * `@@END`（否则看不见新增的那 5 条规则），`chat-examples` 要出现 `<START>`，
+   * `initial-scene` 要出现多条开场白的分隔行。用样例卡会碰运气。
+   */
+  demoHighlightBlock(blockId: string): void {
+    if (!this.hasSession) this.createSessionFromFile('高亮演示.txt');
+
+    const demoWorldbookText = [
+      '@@ENTRY 0',
+      'name: 银座',
+      'keys: 东京, 银座, 酒吧',
+      'insertion_order: 10',
+      '@@CONTENT',
+      '{{char}} 在这里第一次遇见 {{user}}。',
+      '@@END 0',
+      '',
+      '@@ENTRY 1',
+      'name: 旧宅',
+      'keys: 旧宅, 老屋',
+      '@@CONTENT',
+      '木门后面是{{user}}小时候住过的院子。',
+      '@@END 1',
+    ].join('\n');
+
+    const demoExamples = [
+      '<START>',
+      '{{user}}: 「今天也不打算说话？」',
+      '{{char}}: 「……嗯。」她把手里的书翻过一页。',
+      '<START>',
+      '{{user}}: 「我带了咖啡。」',
+      '{{char}}: （抬头看了一眼）「放那儿吧。」',
+    ].join('\n');
+
+    /*
+     * 分隔行刻意**两种都放**：`---` 与 `~~~`。
+     *
+     *   · `---` 会同时命中全局 `hr-line`(priority 80) 与专用 `scene-divider`(78)，
+     *     高优先级赢 —— 视觉上仍是分隔线，证明两条规则不打架；
+     *   · `~~~` 只有 `scene-divider` 认（`hr-line` 的字符类是 `-=*`），
+     *     这是本板块专用规则存在的**唯一可见证据**。
+     *
+     * 只放 `---` 的话，`scene-divider` 被 `hr-line` 压着，
+     * 删掉它截图也一模一样 —— 那样的"验收"等于没验（第一版就是这样）。
+     *
+     * 切分仍按冻结分隔符 `\n\n---\n\n`：`~~~` 在第二段正文里，不参与切分。
+     */
+    const demoScene = [
+      '{{char}} 推开窗，风把纸页吹得哗啦响。',
+      '',
+      '---',
+      '',
+      '「你来得比约定的早。」{{char}} 说。',
+      '',
+      '~~~',
+      '',
+      '雨停之后，{{user}} 在门口等到了她。',
+    ].join('\n');
+
+    const base = structuredClone(this.card);
+    base.blocks = base.blocks.map((block) => {
+      if (block.id === 'chat-examples') return { ...block, text: demoExamples, dirty: false };
+      if (block.id === 'initial-scene') return { ...block, text: demoScene, dirty: false };
+      return block;
+    });
+    base.worldbook = { ...base.worldbook, text: demoWorldbookText };
+    // residual 也一起改：否则下一次校验会按 residual 把视图刷回去，
+    // 截图里看到的是"内容变空"而不是演示文本。
+    base.residual = {
+      ...base.residual,
+      mesExample: demoExamples,
+      firstMes: demoScene.split('\n\n---\n\n')[0]!,
+      alternateGreetings: demoScene.split('\n\n---\n\n').slice(1),
+    };
+    this.replaceCard(base);
+
+    // 只留目标板块展开：折叠会销毁编辑器，页面于是只剩一块内容
+    for (const runtime of this.blocks) {
+      if (runtime.snapshot.id === blockId) this.expand(runtime, true);
+      else if (runtime.expanded) this.collapse(runtime);
+    }
+    this.setStatus(`高亮演示：${blockId}（当前方案 ${this.rules?.highlightId ?? '—'}）`, 'info');
+  }
+
+  /**
+   * 演示/截图入口：把规则面板滚到两个新预设区块之一（v0.1.3 追加项一）。
+   *
+   * ## 为什么滚的是 `.modal` 而不是 window
+   *
+   * 面板本体是 `.modal`（`max-height: 90vh; overflow: auto`），滚动容器是
+   * **它自己**，页面本身不滚。用 `scrollIntoView` 会连带滚动所有可滚祖先
+   * （含 window），在 headless 里表现是整块布局下移、上方留一片空白 ——
+   * v0.1.3 的 F4 截图为此返工过两次。这里直接改容器的 `scrollTop`，指哪打哪。
+   */
+  demoRulesSection(section: 'greeting' | 'example'): void {
+    const role = section === 'greeting' ? 'greeting-preset-section' : 'chat-example-preset-section';
+    const target = document.querySelector<HTMLElement>(`[data-role="${role}"]`);
+    if (target === null) return;
+    const scroller = target.closest<HTMLElement>('.modal');
+    if (scroller === null) return;
+    // 目标区块相对滚动容器的偏移（加 scrollTop 是因为 rect 已是"滚动后"的位置）
+    const offset = target.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
+    // 留 8px 呼吸位，避免标题贴着容器顶边
+    scroller.scrollTop = Math.max(0, offset - 8);
+  }
+
   /** 演示/截图入口：改名提示（T10.29）。`state` = 'show' 显示 / 'hide' 模拟已点过 */
   setNameHintForDemo(state: 'show' | 'hide'): void {
     if (state === 'hide') {
@@ -2908,6 +3574,18 @@ async function boot(): Promise<void> {
   // T10.26：注入一个真实渲染层异常（走全局 error 钩子）
   if (params.get('crashInject') === '1') app.injectCrashForDemo();
 
+  /*
+   * v0.1.3 追加项二：只展开某一个板块并填入演示文本（三板块高亮截图）。
+   *
+   * `?highlightDemo=worldbook|initial-scene|chat-examples`
+   *
+   * 放在这里是因为它只依赖会话与规则（`start()` 尾部已全部就绪），
+   * 不依赖任何面板。而 `?rulesSection=` 不在这里 —— 它依赖**面板已打开**，
+   * 见下方 `rules=1` 之后的位置（这条错位本仓库已经踩过三次）。
+   */
+  const highlightDemo = params.get('highlightDemo');
+  if (highlightDemo !== null) app.demoHighlightBlock(highlightDemo);
+
   // T10.29：改名提示的两态（show = 未点过 / hide = 已点过）
   const hintParam = params.get('nameHint');
   if (hintParam === 'show' || hintParam === 'hide') app.setNameHintForDemo(hintParam);
@@ -2926,6 +3604,19 @@ async function boot(): Promise<void> {
   const highlightParam = params.get('highlight');
   if (highlightParam) app.switchHighlightForDemo(highlightParam);
   if (params.get('rules') === '1') app.openRulesDialogForDemo();
+  /*
+   * `?rules=1&rulesSection=greeting|example` —— 打开面板并滚到对应的新预设区块。
+   *
+   * **必须写在 `openRulesDialogForDemo()` 之后**（v0.1.3 第三次踩同一个坑）：
+   * 第一版写在这之前，`querySelector('[data-role="greeting-preset-section"]')`
+   * 拿到 null，函数静默 return —— 于是两张截图字节完全相同（204323），
+   * 看起来像"两新区长得一模一样"。同类错此前有过两次（`?preview=` 与 `?login=`
+   * 都曾写在 `wireSettings()` 里，那时的依赖对象还没构造）。
+   */
+  const rulesSection = params.get('rulesSection');
+  if (rulesSection === 'greeting' || rulesSection === 'example') {
+    app.demoRulesSection(rulesSection);
+  }
   // T10.34：自定义路径演示（截图用）——custom=rules 开面板，custom=audit 看审计
   const customParam = params.get('custom');
   if (customParam === 'rules' || customParam === 'audit' || customParam === 'warn') {
@@ -2935,6 +3626,8 @@ async function boot(): Promise<void> {
   // ?export=1           打开导出面板（正常路径）
   // ?export=1&forceError=1  先注入一个 error 级问题，用于展示拦截弹窗
   if (params.get('forceError') === '1') app.injectErrorForDemo();
+  // v0.1.3 / 6c：让两个新板块各出一条真实审计问题（见 injectNewBlockIssuesForDemo）
+  if (params.get('newBlockIssues') === '1') app.injectNewBlockIssuesForDemo();
   if (params.get('export') === '1') app.openExportForDemo();
   const syncUrl = params.get('syncUrl');
   const syncToken = params.get('syncToken');
