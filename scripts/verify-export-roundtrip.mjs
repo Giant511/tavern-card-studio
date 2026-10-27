@@ -17,7 +17,16 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { BLOCK_IDS, WORLDBOOK_VISIBLE_KEYS, applyCardText, exportWorldbook, importWorldbook, loadPresets, parseStCard } from '../shared/dist/index.js';
+import {
+  BLOCK_IDS,
+  WORLDBOOK_VISIBLE_KEYS,
+  applyCardText,
+  exportWorldbook,
+  importWorldbook,
+  loadPresets,
+  parseStCard,
+  withStEntryComments,
+} from '../shared/dist/index.js';
 import { buildJsonExport, buildTxtExport } from '../client/src/export/export-card.ts';
 
 const ROOT = join(import.meta.dirname, '..');
@@ -98,9 +107,22 @@ export function runExportRoundtrip() {
   const wbJson = exportWorldbook({ format: 'json', entries: wbEntries, meta: {} });
   const wbJsonBack = importWorldbook(wbJson.text);
   check(wbJsonBack.ok, '世界书 JSON 能被重新导入');
+  /*
+   * 期望值要先过一遍 `withStEntryComments`，理由不是"迁就实现"，而是这条
+   * 检查的本意是**有没有丢东西**：
+   *
+   * - `exportWorldbook` 是「导出给 ST 用」的入口，v0.1.6 起会把条目显示名
+   *   补进 ST 认的 `comment`（ST 的条目标题只读这个键，见 docs/04 §3.2 的注）；
+   * - 补一个字段不属于"丢"，但会让 `JSON.stringify` 的逐条投影多一项，
+   *   于是这条**无损**检查就会被一条**新增**行为判红 —— 那是判据写错了，
+   *   不是产物错了。
+   *
+   * 所以把期望值也按同一规则对齐：这样"原有的字段一个不少"仍然被严格守着，
+   * 而"多出来的 comment 到底是什么"由 `test/worldbook-entry-title.test.mjs` 单独钉住。
+   */
   check(
-    entryDigest(wbJsonBack.entries) === entryDigest(wbEntries),
-    '世界书 JSON 逐条一致（可见字段）',
+    entryDigest(wbJsonBack.entries) === entryDigest(withStEntryComments(wbEntries)),
+    '世界书 JSON 逐条一致（可见字段，导出侧会补 comment）',
     `${String(wbEntries.length)} 条`,
   );
 

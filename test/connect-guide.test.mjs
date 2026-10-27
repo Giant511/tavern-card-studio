@@ -134,12 +134,40 @@ test('「已生效代理数」必须指向总览页（它不在参数配置页�
   assert.match(text, /总览/, '要指出它在总览页');
 });
 
-test('版本号：0.1.1 只能作为"升级来源"出现，当前版本必须是 0.1.2', () => {
-  assert.match(text, /0\.1\.2/, '页面上要标出这是 0.1.2 的流程');
-  const stale = lines.filter(
-    (line) => line.includes('0.1.1') && !/升级|更早版本|接管|≤v0\.1\.1|未升级/.test(line),
+test('版本号：标题与正文里的"当前版本"必须等于 package.json 的版本', () => {
+  // 这条断言原来写死成 `0.1.2`。结果从 v0.1.2 一路升到 v0.1.5、三次升版都没人动它，
+  // 而它一直绿着 —— **测试把旧值写成了期望值**，等于替这次漂移作保。
+  // 现在改成从单一真源（根 package.json）派生：
+  //   · 「当前版本」= 出现在标题、服务器名、"已连接（服务端 X）"、包名里的那个；
+  //   · 「历史分界」= 写成「X 起…」的句子，它记的是"哪一版开始变成这样"，不随升版变。
+  const current = JSON.parse(
+    readFileSync(join(import.meta.dirname, '..', 'package.json'), 'utf8'),
+  ).version;
+  assert.match(String(current), /^\d+\.\d+\.\d+$/, '根 package.json 的 version 必须是三段式');
+
+  assert.match(html, new RegExp(`服务端 ${current.replace(/\./g, '\\.')} · 如何连接`), '标题要标当前版本');
+  assert.match(
+    html,
+    new RegExp(`Server <b>${current.replace(/\./g, '\\.')}</b>`),
+    '正文要标当前版本',
   );
-  assert.deepEqual(stale, [], `0.1.1 只应出现在升级语境里：\n${stale.join('\n')}`);
+  assert.ok(
+    html.includes(`TavernCardStudioServer-${current}.msi`),
+    '故障排查里的包名必须是当前版本的包名（照着敲才不会找不到文件）',
+  );
+
+  // 其余版本号只允许出现在"X 起""从 X 升级""X 及更早"这类历史语境里 ——
+  // 否则就是一个没人维护的旧版本号留在用户第一份指引上。
+  //
+  // 取版本号的正则要带前后否定：`127.0.0.1` 的前 7 个字符也长得像三段版本号，
+  // 不带 lookaround 会把它当成"版本号不在历史语境里"，于是一条地址就把测试弄红。
+  const VERSION_HIT = /(?<![\d.])\d+\.\d+\.\d+(?![\d.])/g;
+  const HISTORY = /起|升级|更早|之前打出来|修复版|及以后/;
+  const stale = lines.filter((line) => {
+    const hits = line.match(VERSION_HIT) ?? [];
+    return hits.some((hit) => hit !== current) && !HISTORY.test(line);
+  });
+  assert.deepEqual(stale, [], `这些行里的版本号既不是当前版本、也不在历史语境里：\n${stale.join('\n')}`);
 });
 
 test('不残留 v0.1.1 时期的权限表述', () => {

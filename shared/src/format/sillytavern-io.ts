@@ -19,7 +19,8 @@ import {
 import { assembleDescription, parseDescription, type AssembleOptions } from './description.js';
 import { applyFieldBlockReflection, blocksWithFieldBlocks } from './field-blocks.js';
 import type { GreetingFormatParams } from './greeting-preset.js';
-import { renderWorldbookText } from './worldbook.js';
+import { renderWorldbookTextWith, withStEntryComments } from './worldbook.js';
+import { DEFAULT_WORLDBOOK_FORMAT, type WorldbookFormatParams } from './worldbook-preset.js';
 
 export class StCardParseError extends Error {
   constructor(message: string) {
@@ -131,6 +132,18 @@ export interface ParseStCardOptions {
    * 但它决定板块视图怎么拼（`---` 还是 `===`），而视图是用户编辑的对象。
    */
   greetingFormat?: GreetingFormatParams;
+  /**
+   * 世界书文本用什么格式渲染（v0.1.6 生产缺陷一 / 决策 #235）。
+   *
+   * `character_book.entries` 是**结构化的**，文本只是它的视图 —— 视图用哪套
+   * 标记，必须与「当前激活的世界书预设」一致。原先这里写死默认格式，于是
+   * 用户把世界书预设换成自定义那份之后：文本是 `@@ENTRY …`（默认写法）、
+   * 解析按自定义预设走 ⇒ 一条条目标记都认不出来 ⇒ 报
+   * `worldbook-no-entry-marker`（"格式不匹配"被误报成"解析不出"）。
+   *
+   * 传这个参数 = 到达时就按当前预设渲染，视图与解析天然同源。
+   */
+  worldbookFormat?: WorldbookFormatParams;
 }
 
 export function parseStCard(input: unknown, options: ParseStCardOptions = {}): ParseStCardResult {
@@ -250,7 +263,7 @@ export function parseStCard(input: unknown, options: ParseStCardOptions = {}): P
     },
     worldbook: {
       entries,
-      text: renderWorldbookText(entries),
+      text: renderWorldbookTextWith(entries, options.worldbookFormat ?? DEFAULT_WORLDBOOK_FORMAT),
       dirty: false,
       raw: characterBookRaw,
     },
@@ -277,6 +290,19 @@ export interface SerializeStCardOptions extends AssembleOptions {
   targetSpec?: StSpecVersion;
   /** 「初始场景」多条开场白的分隔格式；缺省 = 冻结默认值 */
   greetingFormat?: GreetingFormatParams;
+  /**
+   * 把世界书条目的显示名补进 ST 认的 `comment`（缺省 **false**）。
+   *
+   * `false` 是刻意的默认：`serializeStCard` 的契约是**无损**——
+   * 「导入什么都不改、直接导出，字节要一模一样」（`test/roundtrip.test.mjs`）。
+   * 默认补一个原本没有的 `comment` 就破坏了这个契约，而且是**静默**破坏：
+   * 用户看到的是"文件被动过"，却没有任何提示。
+   *
+   * 真正的字段对齐属于「为某个目标平台准备产物」，发生在导出管线
+   * （`client/src/export/export-card.ts` 的 `buildJsonExport`）——那里才是
+   * "这份文件是给 ST 用的"这句话成立的地方，所以由它显式打开。
+   */
+  entryTitleToComment?: boolean;
 }
 
 const CANONICAL_DATA_ORDER = [
@@ -302,7 +328,7 @@ const CANONICAL_DATA_ORDER = [
   'modification_date',
 ] as const;
 
-function buildData(card: UnifiedCard, description: string): JsonObject {
+function buildData(card: UnifiedCard, description: string, options: SerializeStCardOptions = {}): JsonObject {
   const data: JsonObject = {};
   const blocks = new Map<BlockId, CardBlock>(card.blocks.map((block) => [block.id, block]));
 
@@ -320,7 +346,19 @@ function buildData(card: UnifiedCard, description: string): JsonObject {
   const book = card.worldbook.raw ?? (card.worldbook.entries.length > 0 ? {} : null);
   if (book) {
     const merged: JsonObject = cloneJson(book);
-    merged['entries'] = cloneJson(card.worldbook.entries as unknown as JsonValue);
+    /*
+     * 补 `comment`（v0.1.6）：ST 只把 `comment` 当条目标题读，不认我们的 `name`。
+     * 不补的话，从 TXT 起手的卡导进 ST 后每一条标题都是空白 ——
+     * 数据没丢，只是写在 ST 不看的那一格。详见 `withStEntryComment` 的注释。
+     *
+     * **由 `entryTitleToComment` 控制，默认不动**：纯序列化必须无损（见该选项注释），
+     * 对齐发生在导出管线。
+     */
+    const bookEntries =
+      options.entryTitleToComment === true
+        ? withStEntryComments(card.worldbook.entries)
+        : card.worldbook.entries;
+    merged['entries'] = cloneJson(bookEntries as unknown as JsonValue);
     data['character_book'] = merged;
   }
 
@@ -361,7 +399,7 @@ export function serializeStCard(card: UnifiedCard, options: SerializeStCardOptio
   // 天然含有的一行 `---` 会被当成分隔符切开（静默改数据）。
   const effective = applyFieldBlockReflection(card, options.greetingFormat);
   const description = assembleDescription(card.blocks, card.description, options);
-  const data = buildData(effective, description);
+  const data = buildData(effective, description, options);
   const legacyMode = options.legacyTopLevel ?? 'sync';
 
   if (spec === 'v1') {

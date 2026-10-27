@@ -105,7 +105,9 @@ test('探测：地址不是本服务端时给出明确提示', async () => {
 
   assert.equal(result.reachable, false);
   assert.equal(result.stage, 'health');
-  assert.match(result.message, /不是 JSON/);
+  // 断言"说清了这可能不是本服务端"，不锁死具体措辞 ——
+  // 文案会随界面规范化调整，锁原文等于让测试替旧措辞作保
+  assert.match(result.message, /无法识别|不是本服务端|不是 Tavern Card Studio/);
 });
 
 test('探测：health.status 不是 ok 时不认作已连接', async () => {
@@ -145,7 +147,7 @@ test('探测：token 错误 → 明确 401，且不显示已连接', async () =>
   assert.equal(result.reachable, true);
   assert.equal(result.tokenValid, false);
   assert.equal(result.stage, 'auth');
-  assert.match(result.message, /token 无效/);
+  assert.match(result.message, /令牌无效|token 无效/);
   assert.equal(isSyncReady(result), false);
 });
 

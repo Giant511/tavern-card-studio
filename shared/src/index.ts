@@ -15,6 +15,7 @@ export * from './format/description.js';
 export * from './format/greeting-preset.js';
 export * from './format/field-preset.js';
 export * from './format/field-blocks.js';
+export * from './format/arrival.js';
 export * from './format/preset.js';
 export * from './format/sillytavern-io.js';
 export * from './format/worldbook.js';

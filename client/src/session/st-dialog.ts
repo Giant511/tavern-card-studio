@@ -35,7 +35,7 @@ import {
   pickDirectory,
   probeCardsDir,
   probePaths,
-  probeStAlive,
+  probeTcp,
   readTextExact,
   scanCardsDir,
   spawnDetached,
@@ -43,22 +43,19 @@ import {
   type ShellError,
 } from '../contract';
 import { fileNameOf, joinPath } from './cards-path.ts';
+import { resolveStAddress, type StAddressOk } from './st-address.ts';
 import {
   chooseLaunchTarget,
-  chooseStInstall,
   describeLaunchFailure,
   describeProbe,
-  describePushFace,
   judgeStInstall,
+  locateSt,
   nodeInstallCandidates,
   probeStState,
-  staleJsonSiblings,
   stCharactersDir,
   stDownloadUrl,
   stInstallTargetDir,
-  stPushFileName,
   stStatusText,
-  ST_BASE_URL,
   ST_LAUNCH_FAILURE_HINTS,
   ST_RELEASE,
   tailOfLog,
@@ -68,6 +65,7 @@ import {
   type StProbeResult,
   type StState,
 } from './st-install.ts';
+import { pushCardToSt } from './st-push.ts';
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -123,6 +121,14 @@ export class StDialog {
   private running = false;
   /** 最近一次探测的完整结论（诊断与文案都用它） */
   private probe: StProbeResult | null = null;
+  /**
+   * 当前使用的 ST 地址（v0.1.6 / T14.0）。
+   *
+   * 从配置读一次、缓存在这里：面板打开期间地址不该变（设置面板关闭时会
+   * 重新检测），而每次动作前都 `configGet()` 会让"点推送"多一次 IPC 往返。
+   * `refresh()` 是唯一的写入点 —— 保证"面板看到的地址"与"探测用的地址"同源。
+   */
+  private address: StAddressOk = resolveStAddress(null);
   /** 最近一次推送的文件名（非 null 即"推送完成"状态） */
   private pushedFile: string | null = null;
   /** 最近一次推送用的卡面来源（"推送完成"面板里如实显示） */
@@ -251,40 +257,25 @@ export class StDialog {
     this.setBusy(true, '正在检测本地 SillyTavern…');
     this.nodeMissing = false;
     try {
-      const scan = await findStCandidates();
-      this.home = scan.home;
-
-      const remembered = (await configGet()).stPath;
-      const dirs = new Set<string>();
-      for (const dir of scan.dirs) dirs.add(dir);
-      if (typeof remembered === 'string' && remembered.trim() !== '') dirs.add(remembered.trim());
-
-      const list = [...dirs];
-      const probePathsList: string[] = [];
-      for (const dir of list) {
-        probePathsList.push(joinPath(dir, 'package.json'), joinPath(dir, 'server.js'));
-      }
-      const probes = await probePaths(probePathsList);
-      const byPath = new Map(probes.map((item) => [item.path.toLowerCase(), item.exists]));
-
-      const verdicts: StInstallVerdict[] = [];
-      for (const dir of list) {
-        const hasPackageJson = byPath.get(joinPath(dir, 'package.json').toLowerCase()) === 'file';
-        const hasServerJs = byPath.get(joinPath(dir, 'server.js').toLowerCase()) === 'file';
-        // 只有 package.json 真的是文件时才读它（读目录会报 NOT_A_FILE，
-        // 而 ST 检测里"是个目录"与"不存在"都算没装，没必要制造噪声）
-        let packageJsonText: string | null = null;
-        if (hasPackageJson) {
-          try {
-            packageJsonText = (await readTextExact(joinPath(dir, 'package.json'), 1024 * 1024)).text;
-          } catch {
-            packageJsonText = null;
-          }
-        }
-        verdicts.push(judgeStInstall({ root: dir, hasPackageJson, packageJsonText, hasServerJs }));
-      }
-
-      const chosen = chooseStInstall(verdicts, remembered);
+      /*
+       * 检测只有一份实现（`locateSt`，v0.1.6 抽出）。
+       *
+       * 之所以抽出去：右侧常驻面板与这个对话框都要回答同一个问题，而检测规则
+       * 写两份的下场是"对话框说装了、面板说没装"，两边单测却都绿 ——
+       * F15 期间（审计传了预设、编辑器没传）已经付过一次学费。
+       */
+      const located = await locateSt({
+        findCandidates: () => findStCandidates(),
+        readConfig: async () => {
+          const config = await configGet();
+          return { stPath: config.stPath, stAddress: config.stAddress };
+        },
+        probePaths: (paths: string[]) => probePaths(paths),
+        readText: (path: string, maxBytes?: number) => readTextExact(path, maxBytes),
+      });
+      this.home = located.home;
+      this.address = located.address;
+      const chosen = located.chosen;
       this.verdict = chosen;
       this.pushedFile = null;
       this.hideError();
@@ -298,7 +289,10 @@ export class StDialog {
        */
       this.probe = chosen === null
         ? null
-        : await probeStState({ tcpProbe: (port) => probeStAlive(port) });
+        : await probeStState({
+            address: this.address,
+            tcpProbe: (host, port) => probeTcp(host, port),
+          });
       this.running = this.probe?.outcome === 'running';
 
       // 非"运行中"的探测结论一律进诊断日志，并把原始错误类型带出来
@@ -306,13 +300,28 @@ export class StDialog {
         void this.logDiagnostic(`probe_st ${this.probe.outcome} root=${chosen?.root ?? ''} ${describeProbe(this.probe)}`);
       }
       if (this.probe?.browserBlocked === true) {
+        /*
+         * 标签从 `webview-blocked` 改成 `webview-fetch-failed`。
+         *
+         * 旧名字断言了"被挡"，而实测证明它只意味着"webview 内读不到"——
+         * 主因是 ST 自己发的 `Cross-Origin-Resource-Policy: same-origin`
+         * （跨源 no-cors 读取一律失败），网络是通的。我上一次就是拿这个标签
+         * 断定"webview 到任何回环端口都被环境拦截"，方向全错、白查一轮。
+         *
+         * 日志的用词会直接决定下一个读它的人往哪儿查，所以这里不许含糊。
+         */
         void this.logDiagnostic(
-          `probe_st webview-blocked root=${chosen?.root ?? ''} browser=${this.probe.browserErrorName ?? ''}: ${this.probe.browserErrorMessage ?? ''}`,
+          `probe_st webview-fetch-failed root=${chosen?.root ?? ''} ` +
+            `browser=${this.probe.browserErrorName ?? ''}: ${this.probe.browserErrorMessage ?? ''} ` +
+            '（注意：这通常是 SillyTavern 的响应头策略所致，不代表网络不通；以进程内直连探测为准）',
         );
       }
 
       this.render();
-      this.callbacks.notify(stStatusText(this.currentStateName, { root: chosen?.root }), chosen === null ? 'warn' : 'info');
+      this.callbacks.notify(
+        stStatusText(this.currentStateName, { root: chosen?.root, address: this.address.text }),
+        chosen === null ? 'warn' : 'info',
+      );
     } catch (error) {
       this.showError(`检测失败：${describe(error)}`);
       void this.logDiagnostic(`probe_st failed: ${describe(error)}`);
@@ -391,13 +400,19 @@ export class StDialog {
       this.callbacks.notify(`已启动 SillyTavern（pid ${receipt.pid}，用的是 ${target}），等待 8000 端口…`, 'info');
 
       const ready = await waitForStReady(async () => {
-        const state = await probeStState({ tcpProbe: (port) => probeStAlive(port) });
+        const state = await probeStState({
+          address: this.address,
+          tcpProbe: (host, port) => probeTcp(host, port),
+        });
         return state.outcome === 'running';
       });
       if (!ready) {
         // 失败路径：把 ST 自己的输出贴出来（需求：不吞错），再给常见原因
         const tail = receipt.logPath === null ? '' : await this.readLogTail(receipt.logPath);
-        const probe = await probeStState({ tcpProbe: (port) => probeStAlive(port) });
+        const probe = await probeStState({
+          address: this.address,
+          tcpProbe: (host, port) => probeTcp(host, port),
+        });
         this.probe = probe;
         this.running = false;
         this.showError(
@@ -475,73 +490,39 @@ export class StDialog {
     this.setBusy(true, '正在推送当前卡…');
     this.hideError();
     try {
-      const built = await this.callbacks.buildStPush();
-      if (built === null) {
-        // 闸门拦下（世界书会丢内容那种），文案由调用方给过，这里只停手
-        this.showError('导出被拦下了：先修好审计面板里的硬阻断问题，再推送。');
-        return;
-      }
-
-      // characters 目录可能还没建（ST 装好但没跑过）：在一键推送里补建一级目录
-      const probe = await probeCardsDir(verdict.charactersDir, { create: true });
-      if (!probe.exists) {
-        this.showError(`角色卡目录不可用：${probe.reason ?? '未知原因'}`);
-        return;
-      }
-
       /*
-       * 扫描要**同时看 png 与 json**：
-       *   · png —— 判断新文件名是否冲突（唯一真正相关的扩展名）；
-       *   · json —— 找出 v0.1.5 之前推过的旧 JSON，提示用户它 ST 不认。
-       * 只扫 png 的话，用户会在资源管理器里看到两份文件却不知道为什么只出现一张卡。
+       * 推送链路只有一份实现（`st-push.ts`）。右侧常驻面板调的也是它 ——
+       * 两处各写一份的代价是"某天只在一个入口修了同名覆盖"，而缺陷只在
+       * 另一个入口出现，用户报上来还极难复现。
        */
-      const scan = await scanCardsDir(verdict.charactersDir, undefined, ['png', 'json']);
-      if (scan.truncated) {
-        // 扫描被截断时"没有同名"这个结论不成立 —— 宁可不推，也不能覆盖别人的卡。
-        this.showError(
-          `角色卡目录里的文件太多（超过扫描上限），无法确认新文件名是否冲突：${verdict.charactersDir}`,
-        );
-        return;
-      }
-      const fileName = stPushFileName(this.callbacks.getCardName(), scan.names);
-      const target = joinPath(verdict.charactersDir, fileName);
+      const outcome = await pushCardToSt({
+        charactersDir: verdict.charactersDir,
+        cardName: this.callbacks.getCardName(),
+        build: () => this.callbacks.buildStPush(),
+        deps: {
+          probeDir: (dir, options) => probeCardsDir(dir, options),
+          scanDir: (dir, limit, extensions) => scanCardsDir(dir, limit, extensions),
+          writeBinary: (path, base64, sha256) => writeBinaryFileAtomic(path, base64, sha256),
+        },
+      });
 
-      // PNG 走二进制写：与文本写**共用** write_atomic_impl（原子性 / 写前摘要断言 /
-      // 写后回读自证三条不会在这条路径上退化）
-      const receipt = await writeBinaryFileAtomic(target, toBase64Chunked(built.bytes), built.sha256);
-      if (!receipt.verified) {
-        // 回读自证失败 = 落盘内容与内存不一致，这时候不能报"成功"
-        this.showError('写入后回读校验失败：文件可能不完整，请检查磁盘空间后重试。');
+      if (!outcome.ok) {
+        this.showError(outcome.reason);
         return;
       }
 
-      this.pushedFile = fileName;
-      this.pushedFaceNote = describePushFace(built.face);
-      this.callbacks.notify(stStatusText('pushed', { fileName }), 'ok');
-
-      /*
-       * 旧 JSON 的处置（v0.1.5 / G8）：**只做一行灰字提示，不弹错误框**。
-       *
-       * 那是测试期用旧版（推 JSON）留下的文件：ST 的角色扫描不读它，所以它
-       * 在游戏里永远不会出现，但也**不影响**任何东西 —— 用户自己在资源管理器里
-       * 顺手删掉即可。拿红色错误框去报一件"无害且无需动作"的事，只会让人以为
-       * 这次推送出了问题（用户原话：ST 会忽略，无影响）。
-       */
-      const stale = staleJsonSiblings(this.callbacks.getCardName(), scan.names);
-      this.staleJsonNote =
-        stale.length === 0
-          ? ''
-          : `目录里还有更早版本推送的 ${stale.join('、')}（SillyTavern 的角色列表不读 .json，` +
-            '不影响这次推送，可自行删除）。';
+      this.pushedFile = outcome.fileName;
+      this.pushedFaceNote = outcome.faceNote;
+      this.staleJsonNote = outcome.staleNote;
+      this.callbacks.notify(stStatusText('pushed', { fileName: outcome.fileName }), 'ok');
 
       // 打开 ST 让用户直接看角色列表；打不开不影响"已经推好了"这个事实
       try {
-        await openExternal(ST_BASE_URL);
+        await openExternal(this.address.baseUrl);
       } catch (error) {
         this.showError(`卡已推送，但没能打开浏览器：${describe(error)}`);
       }
     } catch (error) {
-      void this.logDiagnostic(`push failed: ${describe(error)}`);
       this.showError(`推送失败：${describe(error)}`);
     } finally {
       this.setBusy(false);
@@ -840,8 +821,8 @@ export class StDialog {
         el(
           'p',
           'st-caution',
-          '注意：8000 端口其实在应答，只是 webview 连不上它（系统代理 / 安全软件 / 本地网络权限）。' +
-            '推送与打开浏览器都不受影响 —— 能看到这句说明探测走的是壳侧 TCP。',
+          '注意：SillyTavern 正在运行，但内嵌面板读不到它。' +
+            '这不影响推送卡片，也不影响在浏览器中打开。',
         ),
       );
     }
@@ -872,7 +853,7 @@ export class StDialog {
           '同名文件不覆盖，自动加序号。',
       ),
       el('p', 'st-text', '封面用这张卡自己的图（原图 → 记住的图库封面 → 内置默认），不在这里再弹选择。'),
-      el('p', 'st-text', '世界书随卡内嵌（character_book），不会另写 worldbooks 目录。'),
+      el('p', 'st-text', '世界书会随角色卡一起写入，不需要单独准备文件。'),
     );
     const actions = el('div', 'st-actions');
     const push = el('button', 'btn primary', '推送当前卡');
@@ -881,7 +862,7 @@ export class StDialog {
     push.addEventListener('click', () => void this.push());
     const openSt = el('button', 'btn ghost', '打开 SillyTavern');
     openSt.type = 'button';
-    openSt.addEventListener('click', () => void openExternal(ST_BASE_URL));
+    openSt.addEventListener('click', () => void openExternal(this.address.baseUrl));
     actions.append(push, openSt);
     wrap.append(actions);
     return wrap;
@@ -909,7 +890,7 @@ export class StDialog {
     const openSt = el('button', 'btn primary', '打开 SillyTavern');
     openSt.type = 'button';
     openSt.dataset['role'] = 'st-open-st';
-    openSt.addEventListener('click', () => void openExternal(ST_BASE_URL));
+    openSt.addEventListener('click', () => void openExternal(this.address.baseUrl));
     const again = el('button', 'btn', '再推一次（加序号）');
     again.type = 'button';
     again.addEventListener('click', () => {

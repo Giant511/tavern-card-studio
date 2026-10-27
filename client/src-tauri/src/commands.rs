@@ -1446,13 +1446,55 @@ pub struct PortProbe {
     pub error_message: Option<String>,
 }
 
-/// ST 的默认端口（需求写死；TS 侧 `ST_BASE_URL` 与它必须一致）
-pub const ST_DEFAULT_PORT: u16 = 8000;
-
 /// 单次 TCP 探测的超时（毫秒）。与 TS 侧 `ST_PROBE_TIMEOUT_MS` 同值。
 pub const PORT_PROBE_TIMEOUT_MS: u64 = 1500;
 
-/// 探测**回环地址**上某个端口有没有人 accept（v0.1.5 生产反馈追加）。
+/// 允许被探测的主机名（**只有回环**，小写比较）。
+///
+/// v0.1.6 / T14.0：探针从"端口写死 8000、主机写死 127.0.0.1"泛化成
+/// `probe_tcp(host, port)`，因为 ST 的端口可配（`config.yaml` 的 `listenPort`），
+/// 用户也可能多开。但**主机名仍然只能回环**，这条边界与 F0/D3 是同一条：
+///
+///   · 内嵌代理的目标只允许本机（`/st/*` 转发），探针是它的前置检查，
+///     两者口径必须一致 —— 否则会出现"探针能测外网、代理却拒绝"的撕裂；
+///   · 更实际的风险：配置文件（`client-config.json`）是普通 JSON，用户能被
+///     诱导改成内网/外网地址；若探针接受任意 host，它就变成一台
+///     **端口扫描器 + 内网连通性探测器**，而且是"客户端本机发出"的，
+///     绕过了所有基于浏览器源的防护。
+///
+/// `localhost` 与 `::1` 也放行：用户会照着 ST 控制台的
+/// `Go to: http://localhost:8000/` 抄，`localhost` 与 `127.0.0.1` 在这里等价。
+pub const PROBE_ALLOWED_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
+
+/// 默认 ST 地址（`host:port`）——**壳侧唯一来源**。
+///
+/// 与 TS 的 `contract/types.ts` 里的 `ST_DEFAULT_ADDRESS` 是同一个值，
+/// 两侧靠 `test/fixtures/st-address-cases.json` 的 `default` 字段对拍：
+/// 这个值一旦分叉，症状是"设置里显示 8000、代理却去连 8001"。
+pub const ST_DEFAULT_ADDRESS: &str = "127.0.0.1:8000";
+
+/// 规范化主机名并校验它在 [`PROBE_ALLOWED_HOSTS`] 内。
+///
+/// 只做**大小写与首尾空白**归一，不做 DNS 解析：
+/// `localhost.evil.com` 这种必须被拒，而任何"解析后再看是不是回环"的做法都会
+/// 把判断交给 DNS —— 那是可以被 hosts 文件与 DNS 投毒操纵的。
+fn normalize_probe_host(raw: &str) -> Option<String> {
+    let lowered = raw.trim().to_ascii_lowercase();
+    // IPv6 字面量允许带方括号（`[::1]` 是 URL 里的常见写法）
+    let bare = lowered
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(&lowered)
+        .to_string();
+    if PROBE_ALLOWED_HOSTS.contains(&bare.as_str()) {
+        Some(bare)
+    } else {
+        None
+    }
+}
+
+/// 探测**回环地址**上某个端口有没有人 accept（v0.1.5 生产反馈追加；
+/// v0.1.6 / T14.0 泛化为 `probe_tcp(host, port)`）。
 ///
 /// ## 为什么这条判据必须在壳里，而不是在 webview 里 fetch
 ///
@@ -1464,41 +1506,74 @@ pub const PORT_PROBE_TIMEOUT_MS: u64 = 1500;
 /// TCP `connect` 不经过任何 HTTP 中间层：能连上 = 端口有人在听 = ST 活着。
 /// 这正是需求要的那一个比特。
 ///
-/// ## 边界
+/// ## 边界（两条，都在壳侧，不接受调用方绕过）
 ///
-/// 只连 `127.0.0.1`（主机名写死，不接受参数），所以它**不是**端口扫描器 ——
-/// 只能问到本机。端口可通过参数指定是为了测试，默认 8000。
-/// 失败**不返回 Err**：连不上是正常结论，不是命令错误。
+///   1. `host` 必须是回环（见 [`PROBE_ALLOWED_HOSTS`]），否则报
+///      `PROBE_HOST_NOT_ALLOWED` —— 所以它**不是**端口扫描器；
+///   2. 端口范围 1–65535（`u16` 已经从类型上保证了上界，0 单独拒）。
+///
+/// 失败**不返回 Err**：连不上是正常结论（`alive: false` + `errorKind`），
+/// 只有"参数不合法"才是 Err —— 那是调用方写错了，静默返回 false 会让人以为
+/// "ST 没开"。
 #[tauri::command]
-pub fn probe_st_alive(port: Option<u16>) -> PortProbe {
-    use std::net::{Shutdown, SocketAddr, TcpStream};
+pub fn probe_tcp(host: String, port: u16) -> ShellResult<PortProbe> {
+    use std::net::{Shutdown, TcpStream, ToSocketAddrs};
     use std::time::Duration;
 
-    let port = port.unwrap_or(ST_DEFAULT_PORT);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Some(normalized) = normalize_probe_host(&host) else {
+        return Err(ShellError::ProbeHostNotAllowed {
+            host,
+            allowed: PROBE_ALLOWED_HOSTS.join(" / "),
+        });
+    };
+    if port == 0 {
+        return Err(ShellError::Io {
+            path: format!("{normalized}:0"),
+            message: "端口必须在 1–65535 之间".to_string(),
+        });
+    }
+
     let started = Instant::now();
+    // 用 `to_socket_addrs` 而不是手拼 `SocketAddr`：`::1` 要按 IPv6 走，
+    // 而 `localhost` 在本机可能同时解析出 v4/v6 两个地址。这里**只解析**上面
+    // 已校验过的三个名字，解析结果不可能跑到别的机器上。
+    let target = (normalized.as_str(), port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next());
+
+    let Some(addr) = target else {
+        return Ok(PortProbe {
+            alive: false,
+            host: normalized,
+            port,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            error_kind: Some("AddrNotAvailable".to_string()),
+            error_message: Some("这个主机名在本机解析不出地址".to_string()),
+        });
+    };
 
     match TcpStream::connect_timeout(&addr, Duration::from_millis(PORT_PROBE_TIMEOUT_MS)) {
         Ok(stream) => {
             // 立刻关掉：我们只要"能连上"这个事实，不在这条连接上收发任何数据
             let _ = stream.shutdown(Shutdown::Both);
-            PortProbe {
+            Ok(PortProbe {
                 alive: true,
-                host: "127.0.0.1".to_string(),
+                host: normalized,
                 port,
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 error_kind: None,
                 error_message: None,
-            }
+            })
         }
-        Err(error) => PortProbe {
+        Err(error) => Ok(PortProbe {
             alive: false,
-            host: "127.0.0.1".to_string(),
+            host: normalized,
             port,
             elapsed_ms: started.elapsed().as_millis() as u64,
             error_kind: Some(format!("{:?}", error.kind())),
             error_message: Some(error.to_string()),
-        },
+        }),
     }
 }
 
@@ -1688,6 +1763,182 @@ fn append_error_log_impl(app: &AppHandle, entry: &str) -> ShellResult<String> {
     file.sync_all().map_err(|error| ShellError::io(&target, error))?;
 
     Ok(paths::display_path(&target).unwrap_or_else(|| "<非 UTF-8 路径>".to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────
+// 本地回环反向代理（v0.1.6 / T14.1 / F2 F3）
+// ─────────────────────────────────────────────────────────────
+
+/// 代理的进程内状态：至多一个（面板是单例，多开没有意义）。
+///
+/// `std::sync::Mutex` 而不是 tokio 的：**持锁区间里没有 await**
+/// （起代理与停代理都是在锁外 await 完再进锁换值），所以不会阻塞运行时。
+pub struct ProxyState(std::sync::Mutex<Option<crate::proxy::RunningProxy>>);
+
+impl Default for ProxyState {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+}
+
+impl ProxyState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<crate::proxy::RunningProxy>> {
+        // 中毒（某个持有者 panic）不该让整个面板永远起不来 —— 代理本身没有
+        // 需要保持一致性的不变量，恢复数据继续用是安全的
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// 从配置文件读 ST 地址（`stAddress`），读不到就是 `None`（= 用默认值）。
+///
+/// **为什么由壳自己读，而不是让渲染层传目标**（决策 #221）：目标是这个代理的
+/// 唯一安全边界。渲染层一传参，边界就变成"渲染层说了算"，而被注入的脚本也在
+/// 渲染层里 —— 那时候这个端口就是一台到任意主机的代理。
+///
+/// 注意这里**不校验**、只取字符串：校验在 `proxy::resolve_st_target` 里，
+/// 与 TS 侧同一套规则（配 fixture 对拍）。读失败（文件不存在/坏 JSON）不是错误，
+/// 首次运行本来就没有这个文件。
+fn read_configured_st_address(app: &AppHandle) -> Option<String> {
+    let config_dir = app.path().app_config_dir().ok()?;
+    let text = fs::read_to_string(config_dir.join("client-config.json")).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
+    parsed
+        .get("stAddress")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+/// 起代理并把它的地址交给渲染层。
+///
+/// **不接受任何目标参数**：目标来自配置（见上）。重复调用返回**同一个端口** ——
+/// 换端口会让 iframe 整页重载，用户会以为"面板坏了"。
+///
+/// **记录在、监听器已死时要重新起**（v0.1.6 生产缺陷）：否则会把一个死端口
+/// 当成"已在运行"一直返回，面板永远打不开，而徽章（走 ST 探针）照样是绿的。
+#[tauri::command]
+pub async fn st_proxy_start(
+    app: AppHandle,
+    state: tauri::State<'_, ProxyState>,
+) -> ShellResult<crate::proxy::ProxyInfo> {
+    let stale_port = {
+        let mut guard = state.lock();
+        match guard.as_ref() {
+            Some(running) if running.is_alive() => return Ok(running.info()),
+            Some(running) => {
+                // 死掉的记录：先摘掉再往下重新起。记下端口是为了让留痕能说清
+                // "哪一条死了"，而不是只说"重启了一次"。
+                let port = running.info().port;
+                guard.take();
+                Some(port)
+            }
+            None => None,
+        }
+    };
+    if let Some(port) = stale_port {
+        log::warn!("ST 代理的监听器已退出（端口 {port}），本次调用重新起一个");
+    }
+
+    let target = crate::proxy::resolve_st_target(read_configured_st_address(&app).as_deref());
+    let started = crate::proxy::RunningProxy::start(target)
+        .await
+        .map_err(|error| ShellError::Io {
+            path: "127.0.0.1:0".to_string(),
+            message: format!("起本地代理失败：{error}"),
+        })?;
+    let info = started.info();
+
+    /*
+     * 抢位：锁里**只做替换，不 await**。
+     *
+     * `MutexGuard` 不是 Send，跨越 await 会让整个命令的 Future 不是 Send，
+     * `generate_handler!` 直接编译失败。所以流程拆成"锁内决策 / 锁外收尾"：
+     * 锁里只回答"是我占位，还是别人先占了"，await 放到锁外面。
+     */
+    let mut started = Some(started);
+    let displaced = {
+        let mut guard = state.lock();
+        match guard.as_ref() {
+            // 竞态：两次点击同时走到这里。后到的自己收掉，别把先到的挤掉 ——
+            // 挤掉的那个 iframe 会一脸茫然地白屏
+            Some(existing) => Some(existing.info()),
+            None => {
+                *guard = started.take();
+                return Ok(info);
+            }
+        }
+    };
+
+    if let Some(started) = started.take() {
+        started.shutdown().await;
+    }
+    Ok(displaced.unwrap_or(info))
+}
+
+/// 停代理并**等到端口真的释放**（面板关闭 / 应用退出时调用）。
+///
+/// `port` 是调用方**认为自己拥有的那个端口**。端口对不上就什么都不做 ——
+/// 迟到的停止请求不该杀掉后来新起的代理（时序见 `proxy::should_stop` 的注释）。
+/// 不传 = 停当前这条（应用退出走这条）。
+#[tauri::command]
+pub async fn st_proxy_stop(
+    state: tauri::State<'_, ProxyState>,
+    port: Option<u16>,
+) -> ShellResult<()> {
+    let (running, skipped) = {
+        let mut guard = state.lock();
+        let should = match guard.as_ref() {
+            Some(existing) => crate::proxy::should_stop(port, existing.info().port),
+            None => false,
+        };
+        if should {
+            (guard.take(), None)
+        } else {
+            (None, guard.as_ref().map(|existing| existing.info().port))
+        }
+    };
+    if let Some(current) = skipped {
+        // 记一条：这条日志是"迟到的停止请求被正确忽略"的唯一证据
+        log::info!("忽略了对端口 {current} 的停止请求（请求方持有的是 {port:?}）");
+    }
+    if let Some(running) = running {
+        running.shutdown().await;
+    }
+    Ok(())
+}
+
+/// 代理现在什么状态（渲染层刷新面板时用它决定要不要重新起）。
+#[tauri::command]
+pub fn st_proxy_status(state: tauri::State<'_, ProxyState>) -> crate::proxy::ProxyStatus {
+    let guard = state.lock();
+    // `running` 与 `alive` 分别回答两件事：记录在不在、监听器还在不在
+    crate::proxy::ProxyStatus::of(
+        guard
+            .as_ref()
+            .map(|running| (running.info(), running.is_alive(), running.stats())),
+    )
+}
+
+/// 应用退出时强制回收端口。
+///
+/// 进程退出本来会关掉所有 socket，所以这条**不是**为了"防止端口泄漏"，
+/// 而是为了两件事：
+///   1. 以后若加了"关到托盘"（窗口销毁但进程还在），端口不会继续开着；
+///   2. 退出前把在途连接断干净，避免 ST 那边留一堆半开连接。
+pub fn stop_proxy_blocking(app: &AppHandle) {
+    let state = app.state::<ProxyState>();
+    let running = {
+        let mut guard = state.lock();
+        guard.take()
+    };
+    let Some(running) = running else { return };
+    // 已经在 tokio 运行时线程上时不能再 block_on（会 panic：Cannot start a
+    // runtime from within a runtime）。这时只能交给运行时去收 —— 进程退出本身
+    // 会关闭所有 socket，所以"端口回收"这件事两种路径都成立。
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tauri::async_runtime::spawn(async move { running.shutdown().await });
+    } else {
+        tauri::async_runtime::block_on(running.shutdown());
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2159,13 +2410,23 @@ mod tests {
         assert!(collect_st_dirs(&missing).is_empty());
     }
 
+    // ── T14.0：回环 TCP 探针（probe_tcp）────────────────────
+
+    /// 取一个"确定没人听"的回环端口：先绑再立刻释放。
+    fn closed_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("应当能绑定回环端口");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
     #[test]
-    fn probe_st_alive_detects_listening_socket() {
+    fn probe_tcp_detects_listening_socket() {
         // 真起一个监听（绑 0 端口让 OS 分配，避免撞上用户机器上真在跑的 8000）
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("应当能绑定回环端口");
         let port = listener.local_addr().unwrap().port();
 
-        let result = probe_st_alive(Some(port));
+        let result = probe_tcp("127.0.0.1".to_string(), port).expect("回环地址应当被放行");
         assert!(result.alive, "端口有人 listen 时必须判活着：{result:?}");
         assert_eq!(result.host, "127.0.0.1");
         assert_eq!(result.port, port);
@@ -2175,14 +2436,9 @@ mod tests {
     }
 
     #[test]
-    fn probe_st_alive_reports_not_listening_after_close() {
-        // 先占一个端口再关掉 —— 这样拿到的是"确定没人听"的端口号
-        // （直接挑一个随机端口可能被别的东西占着，测试会偶发）
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("应当能绑定回环端口");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let result = probe_st_alive(Some(port));
+    fn probe_tcp_reports_not_listening_after_close() {
+        let port = closed_loopback_port();
+        let result = probe_tcp("127.0.0.1".to_string(), port).expect("回环地址应当被放行");
         assert!(!result.alive, "端口关掉后必须判没活着");
 
         /*
@@ -2209,12 +2465,64 @@ mod tests {
     }
 
     #[test]
-    fn probe_st_alive_default_port_is_the_documented_one() {
-        assert_eq!(ST_DEFAULT_PORT, 8000);
-        // 只断言"调用不 panic 且回执自洽"，不断言结果 —— 本机可能真装着 ST
-        let result = probe_st_alive(None);
-        assert_eq!(result.port, 8000);
-        assert!(result.alive == result.error_kind.is_none());
+    fn probe_tcp_accepts_the_three_loopback_spellings() {
+        // 用户会照着 ST 控制台的 `Go to: http://localhost:8000/` 抄地址，
+        // 也有人在 URL 里写 `[::1]`。三种都该被认出是回环。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("应当能绑定回环端口");
+        let port = listener.local_addr().unwrap().port();
+
+        for spelling in ["127.0.0.1", "localhost", "LOCALHOST", " 127.0.0.1 ", "[::1]"] {
+            let result = probe_tcp(spelling.to_string(), port).unwrap_or_else(|error| {
+                panic!("{spelling} 应当被当作回环放行，实际报错：{error}");
+            });
+            // `::1` 在只绑了 v4 回环的机器上连不上是正常的，这里**只断言没被拒**：
+            // 被拒会走 Err（PROBE_HOST_NOT_ALLOWED），而合法性判断正是本用例要证的。
+            assert_eq!(result.port, port);
+            assert!(
+                result.alive || result.error_kind.is_some(),
+                "非 alive 时必须给出错误类型：{result:?}"
+            );
+        }
+
+        drop(listener);
+    }
+
+    #[test]
+    fn probe_tcp_rejects_non_loopback_hosts() {
+        // 这是 v0.1.6 的安全边界：配置文件是普通 JSON，能被诱导改成内网/外网地址。
+        // 探针若接受任意 host，就变成"客户端本机发出"的端口扫描器。
+        for host in [
+            "192.168.1.1",
+            "10.0.0.5",
+            "example.com",
+            "localhost.evil.com",
+            "127.0.0.1.nip.io",
+            "",
+            " ",
+        ] {
+            match probe_tcp(host.to_string(), 8000) {
+                Err(ShellError::ProbeHostNotAllowed { host: echoed, .. }) => {
+                    assert_eq!(echoed, host, "错误里要回显收到的原值，便于排查配置");
+                }
+                other => panic!("{host:?} 不该被放行，实际 {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn probe_tcp_rejects_port_zero() {
+        // u16 已经卡住上界；0 是"没填"的常见误值，必须明确拒绝而不是当作 1
+        assert!(probe_tcp("127.0.0.1".to_string(), 0).is_err());
+    }
+
+    #[test]
+    fn normalize_probe_host_only_normalizes_case_and_brackets() {
+        assert_eq!(normalize_probe_host("  127.0.0.1  ").as_deref(), Some("127.0.0.1"));
+        assert_eq!(normalize_probe_host("LocalHost").as_deref(), Some("localhost"));
+        assert_eq!(normalize_probe_host("[::1]").as_deref(), Some("::1"));
+        // 不做 DNS 解析：带了域名后缀就不能因为"前面像回环"而放行
+        assert_eq!(normalize_probe_host("127.0.0.1.evil.com"), None);
+        assert_eq!(normalize_probe_host("::ffff:127.0.0.1"), None, "映射地址不在白名单里，宁可拒");
     }
 
     #[test]

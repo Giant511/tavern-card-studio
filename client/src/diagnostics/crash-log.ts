@@ -257,7 +257,7 @@ export function buildDiagnosticsText(input: DiagnosticsInput): string {
     lines.push(`（读不到日志文件：${input.logError ?? '未知原因'}）`);
     lines.push('这是有信息量的结论：说明日志从未写入，或应用配置目录不可写。');
   } else if (input.logText.trim() === '') {
-    lines.push('（日志为空：本次会话没有捕获到渲染层异常）');
+    lines.push('（日志为空：本次使用期间没有捕获到界面异常）');
   } else {
     // 原样贴，不重排：用户/开发者可能要靠行号对上堆栈
     lines.push(input.logText.replace(/\r\n/g, '\n').trimEnd());

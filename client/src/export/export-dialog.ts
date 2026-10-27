@@ -117,7 +117,7 @@ export class ExportDialog {
 
     const formatRow = el('div', 'format-row');
     for (const [value, label, desc] of [
-      ['json', 'SillyTavern JSON', '原生角色卡结构，可导入 ST / Chub 等平台；服务端存档用这个'],
+      ['json', 'SillyTavern 角色卡', '标准角色卡文件，可导入 SillyTavern 等平台；继续编辑请用这个'],
       ['png', 'PNG 角色卡', '图片 + 卡数据块，SillyTavern 可直接拖入；先选一张卡面'],
       ['txt', 'TXT 文本', '按当前预设拼装标题与分隔符，便于人工核对与粘贴'],
     ] as Array<[ExportFormat, string, string]>) {
@@ -420,8 +420,8 @@ export class ExportDialog {
       this.renderReceipt(receipt, artifact);
       this.callbacks.onExported?.(artifact, receipt);
       this.callbacks.notify(
-        `已导出 ${artifact.fileName}：${receipt.bytesWritten} 字节，sha256 ${receipt.sha256.slice(0, 12)}…` +
-          (receipt.verified ? '（回读一致）' : '（回读不一致！）'),
+        `已导出 ${artifact.fileName}（${String(receipt.bytesWritten)} 字节）` +
+          (receipt.verified ? '（已校验）' : '（校验未通过！）'),
         receipt.verified ? 'ok' : 'bad',
       );
     } catch (error) {
@@ -446,7 +446,7 @@ export class ExportDialog {
       el(
         'span',
         receipt ? (receipt.verified ? 'receipt-badge ok' : 'receipt-badge bad') : 'receipt-badge warn',
-        receipt ? (receipt.verified ? '回读一致' : '回读不一致') : '未写盘',
+        receipt ? (receipt.verified ? '已校验' : '校验未通过') : '未写入文件',
       ),
     );
     this.receiptBox.append(head);

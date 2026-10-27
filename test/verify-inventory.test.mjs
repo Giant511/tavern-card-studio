@@ -20,7 +20,11 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { VERIFY_INVENTORY, OFFLINE_WITH_ASSERTIONS } from '../scripts/lib/verify-inventory.mjs';
+import {
+  OFFLINE_WITH_ASSERTIONS,
+  VERIFY_INVENTORY,
+  VERIFY_STATUSES,
+} from '../scripts/lib/verify-inventory.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -104,4 +108,25 @@ test('清点表里 server 侧相关脚本都被标成需要真实服务端（不
     assert.ok(entry, `${file} 未登记`);
     assert.equal(entry.status, 'live-server', `${file} 应标 live-server`);
   }
+});
+
+test('②b status 必须是那五个值之一（写错不许静默通过）', () => {
+  /*
+   * 这条是补上去的，因为我自己撞了：给一条登记写了 `needs-browser`，
+   * 而表里只有 offline / browser-dump / live-browser / live-server / elevated。
+   *
+   * 为什么当时全绿：清点表的校验按**具体值**匹配（不是 `offline` 就不要求被导入，
+   * 不在任何 capture 列表里就不检查抓取），一个不认识的值恰好谁都不匹配 ——
+   * 于是它既不被检查、也不报错，等于这一格不存在。
+   *
+   * 而 status 决定了这条脚本"该进哪道门"：写错就意味着**它永远不会被跑**。
+   */
+  const invalid = VERIFY_INVENTORY.filter((entry) => !VERIFY_STATUSES.has(entry.status)).map(
+    (entry) => `${entry.file} → ${String(entry.status)}`,
+  );
+  assert.deepEqual(
+    invalid,
+    [],
+    `这些登记的 status 不在合法值里（${[...VERIFY_STATUSES].join(' / ')}）：\n  ${invalid.join('\n  ')}`,
+  );
 });

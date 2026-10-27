@@ -59,7 +59,7 @@ export async function decodeBinaryFile(file: BinaryFile): Promise<{
   if (bytes.length !== file.bytesLen) {
     throw new PngCardError(
       'TRUNCATED',
-      `读取到的字节数与契约声明不符（声明 ${String(file.bytesLen)}，实际 ${String(bytes.length)}）——` +
+      `读取到的文件大小与记录不符（记录 ${String(file.bytesLen)} 字节，实际 ${String(bytes.length)} 字节）——` +
         '文件可能在读取过程中被改动',
     );
   }

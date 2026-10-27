@@ -16,6 +16,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { checkDecisionTable } from '../../scripts/check-decision-table.mjs';
+import { checkVersionLiterals } from '../../scripts/check-version-literal.mjs';
 
 const require = createRequire(import.meta.url);
 const Ajv = require('ajv');
@@ -105,6 +106,31 @@ for (const file of capFiles) {
   // 项目约定：不授予任意路径 fs 写权限（见 docs/11 §7）
   const forbidden = ids.filter((id) => typeof id === 'string' && /^fs:allow-(write|remove|rename|mkdir|copy)/.test(id));
   check(`${file} 未授予任意路径 fs 写/删权限`, forbidden.length === 0, forbidden.join(', '));
+}
+
+// ── 2.5 CSP（新增攻击面的准入检查）────────────────────────
+/*
+ * `frame-src` 是 v0.1.6 / T14.1 唯一新增的 CSP 放宽项：面板要把本机 ST 嵌进来。
+ *
+ * 这条检查存在的理由不是"少写漏写"，而是**宽 CSP 的启用条件**（决策 #223）：
+ * 只允许回环 + 任意端口。端口必须放开（内核分配的，写死会和端口占用打架），
+ * 但主机绝不能放开 —— 一旦 `frame-src` 出现 `*` 或非回环主机，这个 iframe
+ * 就是一扇到任意站点的窗。
+ */
+const csp = config?.app?.security?.csp ?? '';
+const frameSrc = /(?:^|;)\s*frame-src\s+([^;]*)/.exec(csp);
+if (!frameSrc) {
+  check('CSP 有 frame-src（面板内嵌 ST 的前提）', false, '没有 frame-src 时回落 default-src \'self\'，iframe 会被直接拦掉');
+} else {
+  const sources = frameSrc[1].trim().split(/\s+/).filter(Boolean);
+  const allowed = ['http://127.0.0.1:*', 'http://localhost:*', 'http://[::1]:*'];
+  const extras = sources.filter((item) => !allowed.includes(item));
+  const missing = allowed.filter((item) => !sources.includes(item));
+  check(
+    `CSP frame-src 只放开回环（${sources.length} 项）`,
+    extras.length === 0 && missing.length === 0,
+    extras.length > 0 ? `多出来的：${extras.join(' ')}` : missing.length > 0 ? `缺少：${missing.join(' ')}` : '',
+  );
 }
 
 // ── 3. 引用路径存在性 ─────────────────────────────────────
@@ -236,6 +262,20 @@ check(
   'PLAN.md 决策表序号严格递增且无缺号',
   decisionResult.ok,
   decisionResult.detail,
+);
+
+// ── 7. 版本号载体一致性（v0.1.6）─────────────────────────────
+//
+// 判据不是"某个文件里有没有 v0.1.5"（那样下次升版就失效），而是"每个版本载体
+// 是否都等于根 package.json 那一个值"。实现与单测在 scripts/check-version-literal.mjs，
+// `npm run check:version` 是同一个入口 —— 这里并进汇总，打包前的静态校验就能拦住
+// "改了三处、漏了 Cargo.lock / SERVER_VERSION / 安装说明页"这种情况
+// （v0.1.5 实际就是漏的：包名 v0.1.5、服务端内部 v0.1.3、说明页 v0.1.2）。
+const versionResult = checkVersionLiterals(REPO);
+check(
+  `版本号载体全部等于 ${versionResult.current ?? '?'}（${versionResult.carriers.length} 处）`,
+  versionResult.ok,
+  versionResult.problems.length > 0 ? versionResult.problems.join('；') : '',
 );
 
 // ── 汇总 ─────────────────────────────────────────────────

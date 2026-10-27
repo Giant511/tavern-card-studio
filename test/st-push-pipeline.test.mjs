@@ -33,8 +33,8 @@ import {
   probeStState,
   stCharactersDir,
   stPushFileName,
-  ST_BASE_URL,
 } from '../client/src/session/st-install.ts';
+import { parseStAddress, ST_DEFAULT_ADDRESS } from '../client/src/session/st-address.ts';
 import { createConnection } from 'node:net';
 
 /**
@@ -43,9 +43,9 @@ import { createConnection } from 'node:net';
  * 为什么测试里要自己实现一份而不是桩掉：这条判据的价值就在于"真的去连一次"，
  * 桩掉之后测的就只剩 `classifyStProbe` 的分支，而"能不能连上"恰恰是线上那一层。
  */
-function tcpProbe(port) {
+function tcpProbe(host, port) {
   return new Promise((resolve) => {
-    const socket = createConnection({ host: '127.0.0.1', port });
+    const socket = createConnection({ host, port });
     const done = (facts) => {
       socket.removeAllListeners();
       socket.destroy();
@@ -217,11 +217,13 @@ test('运行状态探测：真实 http 服务可达即"运行中"，关掉即"�
   const baseUrl = `http://127.0.0.1:${actualPort}`;
 
   try {
-    const alive = await probeStState({ tcpProbe: tcpProbe, baseUrl });
+    const address = parseStAddress(`127.0.0.1:${String(actualPort)}`);
+    assert.equal(address.ok, true);
+    const alive = await probeStState({ address, tcpProbe });
     assert.equal(alive.outcome, 'running', '有服务应答时应当判为运行中');
 
     await new Promise((resolve) => server.close(resolve));
-    const dead = await probeStState({ tcpProbe: tcpProbe, baseUrl });
+    const dead = await probeStState({ address, tcpProbe });
     assert.equal(dead.outcome, 'no-answer', '服务关掉后应当判为没有应答');
     assert.equal(
       dead.tcp.errorKind,
@@ -232,8 +234,8 @@ test('运行状态探测：真实 http 服务可达即"运行中"，关掉即"�
     if (server.listening) await new Promise((resolve) => server.close(resolve));
   }
 
-  // 需求把端口写死成 8000：常量一旦被改动，UI 与文档会一起错
-  assert.equal(ST_BASE_URL, 'http://127.0.0.1:8000');
+  // 默认地址的端口：v0.1.6 起可配，但默认值仍是 8000（常量只在契约层定义一次）
+  assert.equal(parseStAddress(ST_DEFAULT_ADDRESS).port, 8000);
 });
 
 test('判据：只有 server.js 没有 package.json 的目录不算 ST（不会被推送）', () => {

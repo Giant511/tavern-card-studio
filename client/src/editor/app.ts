@@ -24,6 +24,7 @@ import {
   describeFieldPreset,
   effectiveGreetingFormat,
   importWorldbook,
+  normalizeOnArrival,
   refreshFieldBlockViews,
   parseStCard,
   renderWorldbookTextWith,
@@ -45,13 +46,21 @@ import {
   appendClientErrorLog,
   configGet,
   configPatch,
+  findStCandidates,
   isShellAvailable,
   pickCardFile,
   pickSavePath,
+  probeCardsDir,
+  probePaths,
+  probeTcp,
   readBinaryFile,
   readPresetLibrary,
   readTextExact,
+  scanCardsDir,
   shellInfo,
+  stProxyStart,
+  stProxyStatus,
+  stProxyStop,
   writeBinaryFileAtomic,
   writeFileAtomic,
   writePresetLibrary,
@@ -109,6 +118,17 @@ import {
   type SyncGateState,
 } from '../auth/entry-policy';
 import { SettingsDialog } from '../settings/settings-dialog';
+import { appVersion } from '../settings/app-version';
+import { CardInfoDialog } from '../settings/card-info-dialog';
+import {
+  applyDefaults,
+  EMPTY_CARD_INFO_DEFAULTS,
+  readCardInfo,
+  sanitizeDefaults,
+  toDefaults,
+  type CardInfo,
+  type CardInfoDefaults,
+} from '../session/card-info';
 import { NewCardDialog } from '../session/new-card-dialog';
 import { decideShortcut } from './shortcuts';
 import { ImportDialog } from './import-dialog';
@@ -124,7 +144,10 @@ import { PresetPersistence } from '../rules/preset-persist';
 import type { PresetKind, PresetLibraryItem } from '../rules/preset-store';
 import { SaveFormatDialog, type SaveFormatDialogResult } from '../session/save-format-dialog';
 import { StDialog } from '../session/st-dialog';
-import { stStatusText } from '../session/st-install';
+import { isPaneWidthUsable } from '../session/st-pane-layout';
+import { pushCardToSt } from '../session/st-push';
+import { StPane } from '../session/st-pane';
+import { locateSt, stStatusText } from '../session/st-install';
 import {
   saveFormatNote,
   saveFormatOption,
@@ -141,8 +164,7 @@ import {
   suggestDiagnosticsFileName,
   type CrashLogger,
 } from '../diagnostics/crash-log';
-// 版本号从 package.json 内联（Vite 构建期处理），不硬编码 —— 见 appVersion()
-import clientPackage from '../../package.json';
+// 版本号不在这里读：唯一实现在 settings/app-version.ts（诊断导出与设置页共用一份）
 import { CardSession } from '../session/card-session';
 import { decodeBinaryFile, inspectPng, toPngSource } from '../session/png-source';
 import { effectiveCardsDir, suggestCardFileName } from '../session/cards-dir';
@@ -181,6 +203,31 @@ interface BlockRuntime {
   expanded: boolean;
   previewOn: boolean;
 }
+
+/**
+ * 取证用的"自定义写法"世界书预设（v0.1.6 / 缺陷一）。
+ *
+ * 与 `DEFAULT_WORLDBOOK_FORMAT`（`@@ENTRY` / `@@CONTENT` / `@@END`）是**两套完全
+ * 不同的标记**，这正是现场的分叉来源：卡里的世界书是按标准写法存的，而用户
+ * 把预设换成了这种写法 ⇒ 旧代码渲染用前者、解析用后者，一个标记都认不出来。
+ *
+ * 放在源码里而不是夹具文件里：它只是一套**格式参数**，不含任何用户内容。
+ */
+const ARRIVAL_DEMO_PRESET = {
+  schemaVersion: 1,
+  id: 'demo-custom-worldbook',
+  name: '自定义写法示例',
+  version: '1.0.0',
+  format: {
+    entryOpen: '【条目{id}：',
+    entryClose: '【条目{id}结束】',
+    contentMark: '内容：',
+    fieldPrefix: '',
+    entrySeparator: '\n\n',
+    listSeparator: ', ',
+    idPrefix: '条目',
+  },
+};
 
 class EditorApp {
   /**
@@ -320,6 +367,10 @@ class EditorApp {
   private readonly statusBar = byId('status');
   private settings: SettingsDialog | null = null;
   private newCardDialog: NewCardDialog | null = null;
+  /** 卡片级信息对话框（v0.1.6）：作者 / 版本 / 创作说明 / 标签 / 系统提示 / 世界书说明 */
+  private cardInfoDialog: CardInfoDialog | null = null;
+  /** 读一次缓存；新建卡时套用。「设为新卡默认值」写完会刷新它 */
+  private cardDefaults: CardInfoDefaults = { ...EMPTY_CARD_INFO_DEFAULTS };
   /** 另存为的格式选择对话框（v0.1.5 / G6） */
   private saveFormatDialog: SaveFormatDialog | null = null;
   /**
@@ -329,6 +380,16 @@ class EditorApp {
    * 而绝大多数会话根本不碰 ST —— 启动时白跑一趟只会拖慢首屏。
    */
   private stDialog: StDialog | null = null;
+  /**
+   * 右侧常驻的 ST 面板（v0.1.6 / T14.3）。
+   *
+   * 与上面那个对话框分工不同：对话框管"ST 装在哪 / 要不要装 / 要不要启动"这类
+   * 一次性配置，面板管"边写卡边看效果"。两者共用同一套判据与同一条推送链路。
+   *
+   * 懒构造：构造它不花什么，但 `open()` 会起代理（占一个回环端口），
+   * 而绝大多数会话根本不碰 ST。
+   */
+  private stPane: StPane | null = null;
   private connection: ProbeResult | null = null;
   /** 最近一次审计的等级计数（切规则后要给用户一句话结论） */
   private lastSummary = { error: 0, warning: 0, info: 0 };
@@ -455,6 +516,8 @@ class EditorApp {
     this.wireShortcuts();
     this.wireSettings();
     this.wireRules();
+    this.wireCardInfo();
+    void this.loadCardDefaults();
     this.wireExportAndSync();
     this.wireAccount();
     this.wireImport();
@@ -563,6 +626,31 @@ class EditorApp {
     }
 
     /*
+     * 常驻 ST 面板调试入口（v0.1.6 / T14.3）：`?stPane=1`（收起态用 `&collapsed=1`）。
+     *
+     * 浏览器里它**必然**走到"代理启动失败"那一支（`stProxyStart` 是壳能力）——
+     * 这不是伪造的失败，是真实的失败，正好用来核对失败态的版面与文案。
+     * "运行中"那一态需要真机（代理 + ST 都在），列在 T14.7 验收清单里。
+     *
+     * 位置仍在 `start()` 尾部：面板要读"当前卡的角色名"，会话必须先挂上。
+     */
+    if (exportFaceParams.get('stPane') === '1') {
+      void this.toggleStPane().then(() => {
+        if (exportFaceParams.get('collapsed') === '1') this.stPane?.collapse();
+        /*
+         * 收起/展开往返（v0.1.6 真机缺陷四）：`&collapseRoundTrip=1`
+         *
+         * **真点按钮**（不是调 setCollapsed）：缺陷四恰恰是"按钮绑定写死方向"，
+         * 直接调状态函数会绕过那条错误的绑定，就抓不到它了。
+         * 点完把结论写进状态栏，截图可读、--dump-dom 也能断言。
+         */
+        if (exportFaceParams.get('collapseRoundTrip') === '1') {
+          void this.runCollapseRoundTrip();
+        }
+      });
+    }
+
+    /*
      * 世界书"常驻"误报取证（v0.1.5 / G7）：`?auditDemo=before` / `?auditDemo=after`
      *
      * 夹具由 `scripts/gen-g7-fixtures.mjs` 只写进 `client/dist/g7/`（用户真实内容，
@@ -575,6 +663,33 @@ class EditorApp {
     const auditDemo = exportFaceParams.get('auditDemo');
     if (auditDemo === 'before' || auditDemo === 'after') {
       void this.runAuditDemo(auditDemo);
+    }
+
+    /*
+     * 到达规范化取证（v0.1.6 / 缺陷一）：`?arrivalDemo=before` / `?arrivalDemo=after`
+     *
+     * before 精确复现旧代码的两条路（解析不传格式 + 跳过规范化），after 走现行路径。
+     * 两者都真解析、真审计，所以截图上的"1 错误 / 0 错误"是算出来的。
+     */
+    const arrivalDemo = exportFaceParams.get('arrivalDemo');
+    if (arrivalDemo === 'before' || arrivalDemo === 'after') {
+      void this.runArrivalDemo(arrivalDemo);
+    }
+
+    /*
+     * 卡片信息取证（v0.1.6）：`?sample=1&cardInfo=1`
+     *
+     * 用示例卡打开对话框，正好能截到"这几个值是从示例卡带过来的"那条提示 ——
+     * 也就是用户现场遇到的那张卡的状态。
+     *
+     * 走的是**真实入口** `openCardInfo()`，不是直接摆 DOM：
+     * 缺陷本身就是"这个入口不存在"，造一份假的界面截图证明不了它有。
+     */
+    if (exportFaceParams.get('cardInfo') === '1') {
+      // 等一帧：示例卡是异步载入的，立刻开会读到空卡
+      requestAnimationFrame(() => {
+        this.openCardInfo();
+      });
     }
 
     /*
@@ -689,6 +804,105 @@ class EditorApp {
       this.applyConnection(result);
     } catch {
       // 浏览器模式读不到配置，忽略
+    }
+  }
+
+  // ── 卡片信息（v0.1.6）──────────────────────────────────────
+  //
+  // 为什么必须单开一个入口：八个板块覆盖的是正文，而 作者 / 版本 / 创作说明 /
+  // 标签 / 系统提示 / 历史后指令 / 世界书名称与说明 这一层**从来没有编辑入口**。
+  // 用户从示例卡起手时，这些值会一路被导出成别人的文案
+  // （现场：creator_notes 导出了「示例卡片，用于 round-trip 与规则联动测试。」）。
+  //
+  // 这与 F10 修角色名是同一类问题，区别只是这次一次漏了八个字段。
+  private wireCardInfo(): void {
+    const button = byId<HTMLButtonElement>('btn-card-info');
+    /*
+     * 选项只在**这里**写一份，构造时注入。
+     * 曾经在"接线"和"打开"两个方法里各写一遍，两份 options 迟早分叉 ——
+     * 改了一处忘另一处，症状是"从按钮进去和从调试入口进去行为不一样"。
+     */
+    this.cardInfoDialog = new CardInfoDialog({
+      getCard: () => this.card,
+      onSave: (info) => this.applyCardInfo(info),
+      onSaveAsDefaults: (info) => this.storeCardDefaults(info),
+      logError: (line) => this.crashLogger?.record('error', new Error(line), this.sessionSummary()),
+    });
+    button.addEventListener('click', () => this.openCardInfo());
+  }
+
+  /**
+   * 取当前卡的导出 JSON 文本（**给验收脚本用**，不参与业务逻辑）。
+   *
+   * 为什么要有它：卡片信息的验收判据是「导出的 JSON 里那几个字段对不对」，
+   * 而导出产物在正常路径上直接写盘/写剪贴板。验收脚本若自己拼 JSON，
+   * 验的就是脚本而不是产品 —— 所以这里复用**同一条** `buildExportAsync`。
+   *
+   * 命名带 ForTest 是刻意的：它只应被调试入口与截图脚本调用。
+   */
+  async buildExportForTest(format: 'json' = 'json'): Promise<string> {
+    const preset = this.rules?.preset ?? null;
+    const artifact = await buildExportAsync(this.card, preset, format, this.greetingFormat().format);
+    if (artifact.format === 'png') throw new Error('内部错误：这里只要文本产物');
+    return artifact.text;
+  }
+
+  /** 打开卡片信息对话框（按钮与调试入口共用同一条路） */
+  openCardInfo(): void {
+    if (!this.hasSession) {
+      this.setStatus('先打开或新建一张卡', 'warn');
+      return;
+    }
+    this.cardInfoDialog?.open();
+  }
+
+  /**
+   * 把卡片信息写回当前会话。
+   *
+   * 反馈必须说出来：这一层不在任何板块里，用户看不见正文变化 ——
+   * 不给提示他会以为没生效，然后重复点。
+   */
+  private applyCardInfo(info: CardInfo): void {
+    const changed = this.session.updateCardInfo(info);
+    if (!changed) {
+      this.setStatus('卡片信息没有改动', 'info');
+      return;
+    }
+    this.setStatus('已更新卡片信息（记得保存或导出）', 'ok');
+    this.refreshStats();
+    this.scheduleValidate(0);
+  }
+
+  /** 存成"新建卡的默认值"（不动当前卡） */
+  private async storeCardDefaults(info: CardInfo): Promise<void> {
+    const defaults = toDefaults(info);
+    await configPatch({ cardDefaults: defaults });
+    this.cardDefaults = defaults;
+    this.setStatus('已存为新建卡的默认值', 'ok');
+  }
+
+  /**
+   * 读一次新卡默认值（启动时调一次）。
+   *
+   * 读失败不影响任何功能：默认值只是"省得每次重填"，读不到就当没有。
+   * 但**不许静默** —— 落一条日志，否则用户报"我设的默认值没生效"时无从查起。
+   *
+   * 每个字段都做类型校验而不用 `as`：这份值来自磁盘，可能被旧版本或人手工改过，
+   * 一个 `tags: "日常"`（字符串而不是数组）就能让新建卡直接抛异常。
+   */
+  private async loadCardDefaults(): Promise<void> {
+    if (!isShellAvailable()) return;
+    try {
+      const config = await configGet();
+      const stored = config.cardDefaults as Partial<CardInfoDefaults> | undefined;
+      this.cardDefaults = sanitizeDefaults(stored);
+    } catch (error) {
+      const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      this.crashLogger?.record(
+        'error',
+        new Error(`[card-info] 读新卡默认值失败：${message}`),
+        this.sessionSummary(),
+      );
     }
   }
 
@@ -1295,10 +1509,10 @@ class EditorApp {
     const importButton = el('button', 'btn small', '导入世界书…') as HTMLButtonElement;
     importButton.type = 'button';
     importButton.dataset['role'] = 'worldbook-import';
-    importButton.title = '支持 character_book JSON 与世界书 TXT（自动识别）';
+    importButton.title = '支持世界书文件与纯文本，会自动识别格式';
     importButton.addEventListener('click', () => void this.pickAndImportWorldbook());
 
-    const exportJson = el('button', 'btn small ghost', '导出 JSON…') as HTMLButtonElement;
+    const exportJson = el('button', 'btn small ghost', '导出文件…') as HTMLButtonElement;
     exportJson.type = 'button';
     exportJson.dataset['role'] = 'worldbook-export-json';
     exportJson.addEventListener('click', () => void this.exportWorldbookFile('json'));
@@ -1377,6 +1591,12 @@ class EditorApp {
     try {
       const parsed = parseStCard(JSON.parse(text) as unknown, {
         greetingFormat: this.greetingFormat().format,
+        /*
+         * 世界书必须按**当前激活预设**渲染（v0.1.6 缺陷一）。
+         * 不传的话这里会用内置默认格式渲染文本，而审计用当前预设解析 ——
+         * 两套格式分叉就是现场那条 `worldbook-no-entry-marker` 的来源。
+         */
+        worldbookFormat: this.worldbookPreset.format,
       });
 
       /*
@@ -1961,7 +2181,7 @@ class EditorApp {
     const { error, warning } = this.lastSummary;
     this.setStatus(
       `导出格式已切换为「${preset.name}」：原文未改动（要重排请点「应用预设」）` +
-        ` · 按新口径重检：错误 ${error} 警告 ${warning}`,
+        ` · 按当前规则重新检查：错误 ${error} 警告 ${warning}`,
       error > 0 ? 'bad' : warning > 0 ? 'warn' : 'ok',
     );
     // 记下选择（v0.1.5 / G5）
@@ -2129,6 +2349,31 @@ class EditorApp {
         if (params.get('probe') === '1') {
           await this.settings?.runProbe();
         }
+      })();
+    }
+
+    /*
+     * ST 地址四种显示状态的取证入口（v0.1.6 / T14.0）：`?settings=1&stAddrDemo=ok|refused|timeout|other|format|skip`
+     *
+     * 注入的是**传输结果**，不是"检测通过"这个结论 —— 每一句话仍由
+     * `describeTcpFailure` / `parseStAddress` 生成。三态判定与真实 TCP 的对应
+     * 由 `.verify/t140-three-states.mjs` 跑真 socket 证明，不靠截图。
+     *
+     * 位置仍在 `start()` 尾部（第六次踩这个坑的同一个判据）：依赖 `settings` 已构造，
+     * 写早了 `?.` 会静默跳过，截出来是普通编辑器页面。
+     */
+    const stAddrDemo = params.get('stAddrDemo');
+    if (
+      stAddrDemo === 'ok' ||
+      stAddrDemo === 'refused' ||
+      stAddrDemo === 'timeout' ||
+      stAddrDemo === 'other' ||
+      stAddrDemo === 'format' ||
+      stAddrDemo === 'skip'
+    ) {
+      void (async () => {
+        await this.settings?.open();
+        this.settings?.previewStAddressState(stAddrDemo);
       })();
     }
 
@@ -2542,6 +2787,78 @@ class EditorApp {
    *     本取证无关的警告，掩盖真正要看的那几个数字；
    *   · 世界书面板展开，否则截图只能看到折叠标题。
    */
+  /**
+   * 「格式不匹配被误报成解析不出」取证（v0.1.6 / 缺陷一，决策 #235–#237）。
+   *
+   * 两张图对同一张卡、同一个自定义世界书预设，只差"有没有做到达规范化"：
+   *
+   *   `?arrivalDemo=before`  复现旧行为：解析时**不传**当前世界书格式（
+   *                          文本按内置默认写法渲染），且**跳过** arriveCard ——
+   *                          于是世界书块显示 `@@ENTRY …`、审计按自定义预设解析
+   *                          ⇒ `worldbook-no-entry-marker`（1 错误）
+   *   `?arrivalDemo=after`   走现行路径：`parseStCard(…, { worldbookFormat })`
+   *                          + `arriveCard` 规范化 ⇒ 文本已按当前预设重排，0 错误
+   *
+   * 为什么 before 要绕过 `replaceCard`：那不是"伪造界面"，而是**精确复现旧代码
+   * 的那两条路**（旧 `parseStCard` 调用不传格式、旧 `replaceCard` 没有规范化）。
+   * 用假数据摆一张"报错截图"才叫伪造；这里每一步都是真的在跑解析与审计。
+   *
+   * 卡本身取自 `examples/`（标准 ST 卡，仓库里的公开样本），不涉及用户内容。
+   */
+  private async runArrivalDemo(kind: 'before' | 'after'): Promise<void> {
+    try {
+      const response = await fetch('arrival/standard-card.json', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`取不到内置卡片（服务返回 ${String(response.status)}）`);
+      const raw = await response.json();
+
+      // 1. 导入一份"自定义写法"的世界书预设并切到它 —— 现场的前提条件
+      this.demoQuiet = true;
+      const outcome = this.importWorldbookPresetText(JSON.stringify(ARRIVAL_DEMO_PRESET));
+      if (!outcome.ok) throw new Error(`世界书预设导入失败：${outcome.issues[0]?.message ?? ''}`);
+      if (outcome.id) this.selectWorldbookPreset(outcome.id);
+      this.demoQuiet = false;
+
+      // 2. 解析这张卡：before 不给格式（旧行为），after 给当前预设（现行）
+      const parsed =
+        kind === 'before'
+          ? /* no-worldbook */ parseStCard(raw as unknown, {
+              greetingFormat: this.greetingFormat().format,
+            })
+          : parseStCard(raw as unknown, {
+              greetingFormat: this.greetingFormat().format,
+              worldbookFormat: this.worldbookPreset.format,
+            });
+
+      // 3. 落地：before 直接进会话（跳过去达规范化），after 走真实入口
+      if (kind === 'before') {
+        this.session.replaceCard(parsed.card);
+        this.session.markSaved(this.session.filePath);
+        this.reloadBlocksFromCard();
+      } else {
+        this.replaceCard(parsed.card);
+      }
+      this.validate();
+
+      const runtime = this.blocks.find((item) => item.snapshot.id === 'worldbook');
+      if (runtime !== undefined) this.expand(runtime, true);
+
+      const report = this.report;
+      const worldbookIssues =
+        report?.issues.filter((issue) => issue.location.blockId === 'worldbook') ?? [];
+      const errors = worldbookIssues.filter((issue) => issue.severity === 'error').length;
+      this.setStatus(
+        `对比（${kind === 'before' ? '修复前' : '修复后'}）` +
+          ` · 世界书错误 ${String(errors)} 条 · 条目 ${String(this.session.card.worldbook.entries.length)} 条` +
+          ` · 文本 ${String(this.session.card.worldbook.text.length)} 字` +
+          ` · 当前预设「${this.worldbookPreset.name}」`,
+        errors > 0 ? 'bad' : 'ok',
+      );
+    } catch (error) {
+      this.demoQuiet = false;
+      this.setStatus(`对比检查失败：${describe(error)}`, 'bad');
+    }
+  }
+
   private async runAuditDemo(kind: 'before' | 'after'): Promise<void> {
     try {
       const response = await fetch(`g7/${kind}.json`, { cache: 'no-store' });
@@ -2582,7 +2899,7 @@ class EditorApp {
       const report = this.report;
       const wb = this.session.card.worldbook;
       this.setStatus(
-        `取证演示（${demo.label}）：错误 ${String(report?.summary.error ?? 0)} · ` +
+        `检查结果（${demo.label}）：错误 ${String(report?.summary.error ?? 0)} · ` +
           `警告 ${String(report?.summary.warning ?? 0)} · 提示 ${String(report?.summary.info ?? 0)}` +
           ` · 世界书域 ${String(report?.issues.filter((i) => i.location.blockId === 'worldbook').length ?? 0)} 条` +
           ` · 世界书文本 ${String(wb.text.length)} 字 / 条目 ${String(wb.entries.length)} 条`,
@@ -2590,7 +2907,7 @@ class EditorApp {
       );
     } catch (error) {
       this.demoQuiet = false;
-      this.setStatus(`取证演示失败：${describe(error)}`, 'bad');
+      this.setStatus(`检查失败：${describe(error)}`, 'bad');
     }
   }
 
@@ -2880,14 +3197,14 @@ class EditorApp {
         logError = describe(error);
       }
     } else {
-      logError = '本次会话还没有写入过错误日志（没有捕获到异常，或日志落盘失败）';
+      logError = '本次使用期间还没有记录到错误（没有出现异常，或日志文件写入失败）';
     }
 
     const info = await shellInfo().catch(() => null);
     const text = buildDiagnosticsText({
       logText,
       ...(logError === undefined ? {} : { logError }),
-      appVersion: this.appVersion(),
+      appVersion: appVersion(),
       shellVersion: info?.version ?? '(不可用)',
       shellMode: info?.mode ?? '(不可用)',
       connection: this.connectionChipText(),
@@ -2906,21 +3223,6 @@ class EditorApp {
       return `导出失败：写入被拒绝（${describe(error)}）`;
     }
     return `诊断日志已导出：${target}（${String(text.length)} 字符）`;
-  }
-
-  /**
-   * 应用版本。
-   *
-   * 从 `client/package.json` 读（Vite 在构建期把它内联进来），**不硬编码**——
-   * 硬编码的版本号一定会漂，而诊断日志里版本错了等于白导。
-   *
-   * 为什么不用 `<html data-version>`：那需要在构建期改写 index.html，
-   * 而内联脚本会被 CSP 的 `script-src 'self'` 拦掉（本项目刻意不开 unsafe-inline）。
-   * 走 import 就没有这个约束，也不引入新的构建期插件。
-   */
-  private appVersion(): string {
-    const version = (clientPackage as { version?: unknown }).version;
-    return typeof version === 'string' && version !== '' ? version : '未知';
   }
 
   /** 顶栏状态胶囊当前那句话（诊断日志里要的是用户看到的那句，不是另造一套） */
@@ -3087,7 +3389,182 @@ class EditorApp {
       stButton.dataset['browserDisabled'] = '1';
       stButton.title = '浏览器模式：请把本地 SillyTavern 推送到桌面客户端里用';
     }
-    stButton.addEventListener('click', () => void this.openStDialog());
+    /*
+     * 顶栏按钮 → 右侧常驻面板（v0.1.6 / T14.3）。
+     *
+     * v0.1.5 时它打开的是四状态对话框（"装没装 / 起没起"）。现在主入口换成面板：
+     * 用户点这个按钮的意图十有八九是"我要边写边看"，而不是"我要配置"。
+     * 配置那条路没丢 —— 面板底部的「安装 / 启动向导」还是那个对话框。
+     */
+    stButton.addEventListener('click', () => void this.toggleStPane());
+  }
+
+  /**
+   * 右侧 ST 面板（懒构造）。
+   *
+   * 回调都很薄：地址只从壳拿、推送走 `st-push.ts` 那唯一一条链路、
+   * 宽度记忆进配置（C5）。这里不放 ST 相关判断 —— 那些在可单测的纯逻辑里。
+   */
+  private ensureStPane(): StPane {
+    if (this.stPane !== null) return this.stPane;
+
+    const pane = new StPane({
+      /*
+       * 地址只来自壳。**不**在这里拼 `http://127.0.0.1:…`：
+       * 拼错的后果不是"打不开"，而是"这扇窗指向了别处"。
+       */
+      startProxy: async () => {
+        const info = await stProxyStart();
+        return { baseUrl: info.baseUrl, target: info.target, port: info.port };
+      },
+      // 端口要传下去：迟到的停止请求不该杀掉后来新起的代理（缺陷二）
+      stopProxy: (port) => stProxyStop(port),
+      /*
+       * 代理存活判据走壳侧 TCP 探测（`probe_tcp`），**不用 iframe 的 onerror**：
+       * 跨源 iframe 在连不上时不保证触发 error 事件，也拿不到原因；
+       * 而同进程探测回环端口不受系统代理干扰（F15 的结论）。
+       */
+      probePort: async (port) => {
+        const probe = await probeTcp('127.0.0.1', port);
+        return probe.alive;
+      },
+      /*
+       * 决定性诊断（v0.1.6 真机缺陷二）：问壳"代理端口进来过几条连接"。
+       * 0 条 ⇒ 请求从未离开浏览器网络层（环境拦了回环），壳内修不了。
+       */
+      queryProxyStats: async () => {
+        const status = await stProxyStatus();
+        return {
+          alive: status.running && status.alive,
+          accepted: status.stats.accepted,
+          probeHits: status.stats.probeHits,
+        };
+      },
+      logError: (line) => this.crashLogger?.record('error', new Error(line), this.sessionSummary()),
+      loadWidth: async () => {
+        const config = await configGet();
+        const width = config.stPaneWidth;
+        return isPaneWidthUsable(width) ? width : null;
+      },
+      saveWidth: async (width) => {
+        await configPatch({ stPaneWidth: width });
+      },
+      push: async () => {
+        const located = await this.locateStCharactersDir();
+        if ('error' in located) return { error: located.error };
+        const outcome = await pushCardToSt({
+          charactersDir: located.dir,
+          cardName: this.session.card.meta.name,
+          build: () => this.buildStPushArtifact(),
+          deps: {
+            probeDir: (dir, options) => probeCardsDir(dir, options),
+            scanDir: (dir, limit, extensions) => scanCardsDir(dir, limit, extensions),
+            writeBinary: (path, base64, sha256) => writeBinaryFileAtomic(path, base64, sha256),
+          },
+        });
+        if (!outcome.ok) return { error: outcome.reason };
+        if (outcome.staleNote !== '') this.setStatus(outcome.staleNote, 'info');
+        return { fileName: outcome.fileName };
+      },
+      notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
+      hasCard: () => this.hasSession,
+      openWizard: () => void this.openStDialog(),
+      hasShell: () => isShellAvailable(),
+    });
+
+    const layout = document.querySelector('.layout');
+    if (layout instanceof HTMLElement) pane.mount(layout);
+    void pane.restoreWidth();
+    this.stPane = pane;
+    return pane;
+  }
+
+  /** 顶栏按钮：开着就收起，收起/关着就打开 */
+  private async toggleStPane(): Promise<void> {
+    if (!this.hasSession) {
+      this.setStatus('先打开一张角色卡，再在 SillyTavern 里看效果', 'warn');
+      return;
+    }
+    const pane = this.ensureStPane();
+    await pane.toggle();
+    // 代理状态在壳里是单例，这里同步一次是为了"面板被外部关掉后按钮仍准确"
+    if (!pane.isOpen) return;
+    try {
+      const status = await stProxyStatus();
+      if (!status.running) this.setStatus('本地代理没在跑：点「重新加载」再试一次', 'warn');
+    } catch {
+      // 状态查询失败不该拦住"面板已经开了"这个事实
+    }
+  }
+
+  /**
+   * 收起 / 展开往返取证（v0.1.6 真机缺陷四）。
+   *
+   * 走**真实按钮**（`[data-role="st-pane-toggle"]` 的 click 事件），
+   * 而不是直接调 `setCollapsed` —— 缺陷就是按钮绑定写死方向，
+   * 绕过按钮等于绕过缺陷，那样截出来的图永远是对的。
+   *
+   * 断言三件事：折叠后是条宽、点一下能展开、展开宽度回到记忆值。
+   */
+  private async runCollapseRoundTrip(): Promise<void> {
+    const pane = this.stPane;
+    if (pane === null) return;
+    const button = document.querySelector<HTMLButtonElement>('[data-role="st-pane-toggle"]');
+    if (button === null) {
+      this.setStatus('检查折叠按钮失败：没有找到按钮', 'bad');
+      return;
+    }
+
+    const nextFrame = (): Promise<void> =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+
+    const beforeWidth = pane.currentWidth;
+    pane.collapse();
+    await nextFrame();
+    const collapsedWidth = pane.currentWidth;
+    const collapsedGlyph = button.textContent ?? '';
+
+    button.click(); // ← 就是这一步在真机里没反应
+    await nextFrame();
+    const expanded = !pane.isCollapsed;
+    const expandedWidth = pane.currentWidth;
+
+    const ok = collapsedWidth !== beforeWidth && expanded && expandedWidth === beforeWidth;
+    this.setStatus(
+      `折叠宽度 ${String(collapsedWidth)}（图标「${collapsedGlyph}」）` +
+        ` → 点击后 ${expanded ? '已展开' : '仍是折叠'}，宽 ${String(expandedWidth)}` +
+        `（记忆值 ${String(beforeWidth)}）`,
+      ok ? 'ok' : 'bad',
+    );
+  }
+
+  /**
+   * ST 的 characters 目录（推送落点）。
+   *
+   * 与四状态对话框共用 `locateSt`：检测规则写两份的下场是"对话框说装了、
+   * 面板说没装"，而两边各自的单测都绿（F15 期间踩过同类）。
+   */
+  private async locateStCharactersDir(): Promise<{ dir: string } | { error: string }> {
+    if (!isShellAvailable()) {
+      return { error: '推送需要桌面客户端（浏览器模式没有写本机目录的能力）' };
+    }
+    const located = await locateSt({
+      findCandidates: () => findStCandidates(),
+      readConfig: async () => {
+        const config = await configGet();
+        return { stPath: config.stPath, stAddress: config.stAddress };
+      },
+      probePaths: (paths) => probePaths(paths),
+      readText: (path, maxBytes) => readTextExact(path, maxBytes),
+    });
+    if (located.chosen === null) {
+      return {
+        error: '没找到本地 SillyTavern：先点面板底部的「安装 / 启动向导」指定它的位置',
+      };
+    }
+    return { dir: located.chosen.charactersDir };
   }
 
   /**
@@ -3268,7 +3745,7 @@ class EditorApp {
    */
   private setCardActionEnabled(enabled: boolean): void {
     // btn-st 是 v0.1.5 / F15 的 ST 入口：零标签时同样没有"当前卡"可推
-    for (const id of ['btn-save', 'btn-preview', 'btn-export', 'btn-rules', 'btn-st']) {
+    for (const id of ['btn-save', 'btn-preview', 'btn-export', 'btn-rules', 'btn-st', 'btn-card-info']) {
       const node = document.getElementById(id) as HTMLButtonElement | null;
       if (node && !node.dataset['browserDisabled']) node.disabled = !enabled;
     }
@@ -3426,7 +3903,7 @@ class EditorApp {
     });
     if (result !== null) {
       this.setStatus(
-        `演示：已选择 ${saveFormatOption(result.format).label}${result.remember ? '（并记住此格式）' : ''}`,
+        `已选择 ${saveFormatOption(result.format).label}${result.remember ? '（并记住此格式）' : ''}`,
         'ok',
       );
     }
@@ -3497,8 +3974,8 @@ class EditorApp {
 
       this.setStatus(
         `已保存（${saveFormatOption(choice.format).label}）：${receipt.pathDisplay ?? '(非 UTF-8 路径)'} · ` +
-          `${receipt.bytesWritten} 字节 · sha256 ${receipt.sha256.slice(0, 12)}… · ` +
-          `回读${receipt.verified ? '一致' : '不一致！'}` +
+          `${String(receipt.bytesWritten)} 字节 · ` +
+          `文件${receipt.verified ? '校验通过' : '校验未通过！'}` +
           (notes.length === 0 ? '' : ` —— ${notes.join('；')}`),
         receipt.verified ? 'ok' : 'bad',
       );
@@ -3574,7 +4051,15 @@ class EditorApp {
     // createEmptyCard 给出八板块骨架（从 BLOCK_IDS 派生）；预设决定导出时的标题与顺序（docs/15 §1），
     // 但空卡阶段没有正文，所以这里只需要把骨架建出来。
     const blank = createEmptyCard(request.name);
-    const withId = withCardId(blank, request.cardId);
+    /*
+     * 套用「新卡默认值」（v0.1.6）。
+     *
+     * 位置在 `createEmptyCard` 之后、`withCardId` 之前：默认值只补元数据
+     * （作者 / 版本 / 创作说明 / 标签 / 系统提示），不碰 name 与世界书字段，
+     * 所以先有一张完整的卡，再给它身份，顺序上更直观。
+     */
+    const withDefaults = applyDefaults(blank, this.cardDefaults);
+    const withId = withCardId(withDefaults, request.cardId);
 
     // 新建 = 追加一个会话（而不是替换当前卡）。这是 F1 与 F2 的结合点：
     // 用户点「+」是想再开一张，不是想把手上这张扔掉。
@@ -3662,7 +4147,10 @@ class EditorApp {
         return;
       }
 
-      const parsed = parseStCard(file.text, { greetingFormat: this.greetingFormat().format });
+      const parsed = parseStCard(file.text, {
+        greetingFormat: this.greetingFormat().format,
+        worldbookFormat: this.worldbookPreset.format,
+      });
       this.replaceCard(parsed.card);
       /*
        * 打开了 JSON 卡 ⇒ 这张卡的原图来源失效。
@@ -3730,7 +4218,10 @@ class EditorApp {
       return;
     }
 
-    const parsed = parseStCard(inspected.jsonText, { greetingFormat: this.greetingFormat().format });
+    const parsed = parseStCard(inspected.jsonText, {
+      greetingFormat: this.greetingFormat().format,
+      worldbookFormat: this.worldbookPreset.format,
+    });
     const created = this.hasSession ? null : this.createSessionFromFile(path);
     this.replaceCard(parsed.card);
     /*
@@ -3762,7 +4253,11 @@ class EditorApp {
    */
   private createSessionFromFile(path: string): string {
     const name = deriveCardNameFromFile(path, this.sessions.map((item) => item.card.meta.name));
-    return this.createSessionWithCard(createEmptyCard(name), generateCardId(name));
+    // 同一个规则：从「打开文件」进来的新卡也该带作者名等元数据
+    return this.createSessionWithCard(
+      applyDefaults(createEmptyCard(name), this.cardDefaults),
+      generateCardId(name),
+    );
   }
 
   /**
@@ -3780,7 +4275,8 @@ class EditorApp {
    */
   private createSessionWithCard(card: UnifiedCard, cardId: string): string {
     const preset = this.rules?.preset ?? null;
-    const stamped = withCardId(card, cardId);
+    // 零标签取回/打开也走同一条到达规范化（缺陷一）
+    const stamped = withCardId(this.arriveCard(card), cardId);
 
     const session = new CardSession({
       card: stamped,
@@ -3880,7 +4376,13 @@ class EditorApp {
       return;
     }
 
-    this.session.replaceCard(decision.card);
+    /*
+     * TXT 导入是**第三条到达路径**：`import-flow` 交回来的已经是卡对象，
+     * 不经过 `replaceCard`（那条路会 markSaved，而导入是"改当前卡"）。
+     * 所以这里必须显式过一遍到达规范化 —— 否则"用自定义世界书预设导入
+     * 一份标准写法的 TXT"仍然会报 no-entry-marker，正是缺陷一本身。
+     */
+    this.session.replaceCard(this.arriveCard(decision.card));
     this.reloadBlocksFromCard();
     this.scheduleValidate(0);
 
@@ -3946,7 +4448,7 @@ class EditorApp {
         `已导出世界书：${path}（${String(receipt.bytesWritten)} 字节）` +
           (result.verbatim
             ? ' —— 内容未改动，逐字节写回原文'
-            : ` —— ${result.reason ?? '已按规范重新序列化'}`),
+            : ` —— ${result.reason ?? '已按当前设置重新生成'}`),
         result.verbatim ? 'ok' : 'warn',
       );
     } catch (error) {
@@ -3954,10 +4456,58 @@ class EditorApp {
     }
   }
 
+  /**
+   * 卡片到达的唯一规范化入口（v0.1.6 生产缺陷一 / 决策 #236）。
+   *
+   * ## 它修的是什么
+   *
+   * 服务器取回一张标准格式的卡（世界书是 `@@ENTRY … @@CONTENT`），而当前激活的
+   * 世界书预设是用户自定义那份（`【条目N：…】`）时，界面报
+   * `worldbook-no-entry-marker`（"这段文字未被解析成条目，写回会清空原有条目"）。
+   * 文本里明明有条目标记 —— **视图用了默认格式、判据用了当前预设**。
+   *
+   * ## 三步（与拍板的方案一一对应）
+   *
+   * 1. 结构化条目优先：`character_book.entries` 是结构化的，直接以条目为中间态，
+   *    按**当前预设**重新渲染文本 —— 不经过"文本 → 文本"，也就没有格式可言；
+   * 2. 只有文本时（TXT 卡）：先用当前预设解析，认不出再用**标准预设兜底**，
+   *    兜底能成 = "格式不匹配"，按当前预设重排并给 info；
+   * 3. 两套都认不出 = "解析不出"，报 error（导出闸门照旧硬挡）。
+   *
+   * ## 为什么放在这里
+   *
+   * 三条到达路径（服务器取回/回滚、打开本地文件、导入）最后都落到
+   * `replaceCard` / `createSessionWithCard`。放在这两个入口上，就不存在
+   * "某条路忘了调"（用户明确要求不接受只修一个入口）。
+   */
+  private arriveCard(card: UnifiedCard): UnifiedCard {
+    const result = normalizeOnArrival(card, {
+      worldbook: this.worldbookPreset.format,
+      greeting: this.greetingFormat().format,
+    });
+
+    /*
+     * "格式不匹配"与"解析不出"是两种状态，措辞必须分开：
+     *   · 前者是 info —— 用户没做错任何事，卡是好的，只是写法不同；
+     *   · 后者是 bad —— 真的解析不出，导出会被硬闸门挡住。
+     * 把前者报成错误，就是现场这次"一张正常卡看起来坏了"。
+     */
+    const firstFailure = result.failures[0];
+    if (firstFailure !== undefined) {
+      this.setStatus(firstFailure.message, 'bad');
+    } else if (result.notes.length > 0) {
+      this.setStatus(result.notes.join('；'), 'info');
+    }
+    return result.card;
+  }
+
   private replaceCard(card: UnifiedCard): void {
+    // 到达规范化（v0.1.6 缺陷一）：所有"整张卡进来"的路都经过这里，
+    // 所以放在这里而不是在每个调用点各写一次 —— 少写一处就是少一个洞口。
+    const arrived = this.arriveCard(card);
     // 走 session：它会深拷贝，避免调用方后续改动这份卡数据时渗透进会话。
     // 但"打开文件/导入"应当重置脏标记 —— 刚载入的内容相对磁盘是干净的。
-    this.session.replaceCard(card);
+    this.session.replaceCard(arrived);
     this.session.markSaved(this.session.filePath);
     this.reloadBlocksFromCard();
     this.scheduleValidate(0);
@@ -4038,7 +4588,7 @@ class EditorApp {
   applyCustomTrackDemo(mode: 'rules' | 'audit' | 'warn'): void {
     // 零标签时先建一张卡：this.card 只在有活动会话时可用，
     // 直接写卡片状态会抛「当前没有活动会话」而整段演示静默中断。
-    if (!this.hasSession) this.createSessionFromFile('自定义路径演示.txt');
+    if (!this.hasSession) this.createSessionFromFile('未命名角色卡.txt');
     // warn 模式：删掉「关键词」行 + 触发深度写 88（越界），用来展示自定义规则的
     // 与内置默认规则集各自报什么（验收第 ③④ 条）。
     const sample =
@@ -4143,7 +4693,7 @@ class EditorApp {
     this.validate();
 
     if (mode === 'rules') this.rulesDialog?.open();
-    this.setStatus('演示：已导入自定义 TXT 预设 / 世界书预设 / 平台规则（走真实导入链路）', 'ok');
+    this.setStatus('已导入自定义预设与平台规则', 'ok');
   }
 
   /**
@@ -4178,7 +4728,7 @@ class EditorApp {
       (issue) => issue.location.blockId === 'chat-examples' || issue.location.blockId === 'initial-scene',
     );
     this.setStatus(
-      `演示：新板块产生 ${String(newBlockIssues.length)} 条问题（对话示例·原文缺失 / 初始场景·分隔行二义）`,
+      `新板块产生 ${String(newBlockIssues.length)} 条提示（对话示例·原文缺失 / 初始场景·分隔行二义）`,
       'warn',
     );
   }
@@ -4203,7 +4753,7 @@ class EditorApp {
     this.replaceCard(broken);
     this.validate();
     const { error } = this.lastSummary;
-    this.setStatus(`演示：已注入 ${error} 个错误级问题（name 为空 + 基本信息为空）`, 'warn');
+    this.setStatus(`已生成 ${String(error)} 个错误级问题（角色名称为空 + 基本信息为空）`, 'warn');
   }
 
   openExportForDemo(): void {
@@ -4264,12 +4814,12 @@ class EditorApp {
     const text = '【基本信息】\n姓名：{{char}}\n年龄：24';
     const result = importCardText(this.card, text, this.rules.preset, 'lenient');
     if (!result.card) {
-      this.setStatus(`演示导入被拒绝：${result.issues.map((i) => i.message).join('；')}`, 'bad');
+      this.setStatus(`导入被拒绝：${result.issues.map((i) => i.message).join('；')}`, 'bad');
       return;
     }
     this.replaceCard(result.card);
     this.setStatus(
-      `演示：宽松导入仅含「基本信息」的 TXT，其余板块按「原文缺失」标记（${result.issues.length} 条提示）`,
+      `宽松导入仅含「基本信息」的 TXT，其余板块按「原文缺失」标记（${String(result.issues.length)} 条提示）`,
       'warn',
     );
   }
@@ -4334,20 +4884,20 @@ class EditorApp {
     const text = texts[sample];
     if (text === undefined) return;
     // 零标签时先按文件名建会话 —— 与「打开…」走同一条路径（T10.28）
-    if (!this.hasSession) this.createSessionFromFile(`演示-${sample}.txt`);
-    await this.importCardTextFile(`演示-${sample}.txt`, text, null, true);
+    if (!this.hasSession) this.createSessionFromFile(`${sample}.txt`);
+    await this.importCardTextFile(`${sample}.txt`, text, null, true);
   }
 
   /** 演示/截图入口：只打开导入对话框（不确认），用于截"导入前"那两张图 */
   async previewSampleForDemo(sample: string): Promise<void> {
-    if (!this.hasSession) this.createSessionFromFile(`演示-${sample}.txt`);
+    if (!this.hasSession) this.createSessionFromFile(`${sample}.txt`);
     const texts: Record<string, string> = {
       zero: '条目1：这是一段完全自由的设定文本\n它没有使用任何【】或 ## 标题，所以整篇都不会被切分。\n\n条目2：第二段\n  缩进与空行都是原文的一部分\n\n条目3：结尾',
       mixed: '【基本信息】\n姓名：林晚照\n年龄：27\n\n【性格】\n冷静，话少。\n\n## 战斗系统\n条目1：先攻按敏捷排序\n条目2：暴击倍率 1.5\n\n【其他设定】\n这是已识别到的其他设定内容。\n\n## 招式表\n条目甲：斩击\n条目乙：突刺',
     };
     const text = texts[sample];
     if (text === undefined) return;
-    await this.importDialog?.openCardText(`演示-${sample}.txt`, text);
+    await this.importDialog?.openCardText(`${sample}.txt`, text);
   }
 
   /**
@@ -4362,7 +4912,7 @@ class EditorApp {
   injectCrashForDemo(): void {
     window.dispatchEvent(
       new ErrorEvent('error', {
-        message: '演示注入：Uncaught TypeError: demo is not a function',
+        message: '模拟异常：Uncaught TypeError: demo is not a function',
         error: new TypeError('demo is not a function'),
       }),
     );
@@ -4381,7 +4931,7 @@ class EditorApp {
    * `initial-scene` 要出现多条开场白的分隔行。用样例卡会碰运气。
    */
   demoHighlightBlock(blockId: string): void {
-    if (!this.hasSession) this.createSessionFromFile('高亮演示.txt');
+    if (!this.hasSession) this.createSessionFromFile('高亮示例.txt');
 
     const demoWorldbookText = [
       '@@ENTRY 0',
@@ -4456,7 +5006,7 @@ class EditorApp {
       if (runtime.snapshot.id === blockId) this.expand(runtime, true);
       else if (runtime.expanded) this.collapse(runtime);
     }
-    this.setStatus(`高亮演示：${blockId}（当前方案 ${this.rules?.highlightId ?? '—'}）`, 'info');
+    this.setStatus(`高亮检查：${blockId}（当前方案 ${this.rules?.highlightId ?? '—'}）`, 'info');
   }
 
   /**
@@ -4545,7 +5095,10 @@ async function boot(): Promise<void> {
   let card: UnifiedCard | null = null;
   if (params.get('sample') === '1') {
     try {
-      card = parseStCard(sampleCardJson as unknown).card;
+      // 样本卡同样要按当前预设渲染世界书（缺陷一那条静态断言盯着所有调用点）
+      card = parseStCard(sampleCardJson as unknown, {
+        worldbookFormat: DEFAULT_WORLDBOOK_PRESET.format,
+      }).card;
     } catch {
       card = null; // 样例卡坏了也不该让启动失败，退化成空工作台
     }

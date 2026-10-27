@@ -504,6 +504,62 @@ function parseBool(value: string): boolean | null {
 export const BOOL_VALUE_HINT = '是/否、true/false、1/0';
 
 /** 补 id：缺失或非数字时按「当前已用编号 +1」补齐，返回新数组（不改动入参） */
+/**
+ * 世界书条目的「显示名」在 ST 里叫 `comment`，我们自己叫 `name` ——
+ * 这里放两者的桥，**只在一处实现**。
+ *
+ * ## 为什么必须有这座桥（2026-10-27 用户报「条目名字反而缺失了」）
+ *
+ * ST 的前端导入 `character_book` 时是这么读的（`public/scripts/world-info.js`）：
+ *
+ * ```js
+ * comment: entry.comment || '',
+ * addMemo: !!entry.comment,
+ * ```
+ *
+ * 也就是说 **ST 只认 `comment`，完全不读 `name`**，连"有备注"的开关
+ * `addMemo` 也是按 `comment` 判的。而我们的 TXT 格式把「条目显示名」写成 `name`
+ * （docs/04 §3.2 第 1 个字段）—— 于是从我们的 TXT 起手、导出成卡、再导进 ST，
+ * 条目标题**整片空白**：数据在，只是写在 ST 不看的那一格。
+ *
+ * 用户的原话是"我们给的这套自定义的设计里面应该是可以让用户导入的自定义设置
+ * 对应上标准 ST 的各个字段"—— 说的就是这件事：自定义字段名必须能落到 ST 的字段上。
+ *
+ * ## 为什么是单向补齐，而不是两个方向都改
+ *
+ * - **写出到 ST 时**：`comment` 为空而 `name` 有值 → 用 `name` 补上 `comment`。
+ * - **从 ST 读入时**：**不动**。ST 的卡里本来就只有 `comment`；
+ *   我们在读入时凭空加一个 `name`，会让「原样再导出」的字节发生变化，
+ *   破坏 round-trip 无损这个已有的硬约束（`exportWorldbook` 的 verbatim 分支依赖它）。
+ *
+ * 补齐后的条目同时带着 `name` 与 `comment`，再导出是稳定的 —— 不会每导一次多一个键。
+ */
+export function stEntryTitle(entry: StWorldbookEntry): string {
+  const comment = typeof entry.comment === 'string' ? entry.comment.trim() : '';
+  if (comment !== '') return entry.comment as string;
+  const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+  return name === '' ? '' : (entry.name as string);
+}
+
+/**
+ * 给一条条目补上 ST 认的 `comment`（有值则原样返回同一个对象引用）。
+ *
+ * 返回原引用是有意的：调用方常常要判断"有没有改过"，
+ * 用引用相等比逐字段比对更便宜，也不会因为克隆把 `extensions` 之类的嵌套弄坏。
+ */
+export function withStEntryComment(entry: StWorldbookEntry): StWorldbookEntry {
+  const comment = typeof entry.comment === 'string' ? entry.comment.trim() : '';
+  if (comment !== '') return entry;
+  const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+  if (name === '') return entry;
+  return { ...entry, comment: entry.name };
+}
+
+/** 批量版本（导出到 ST 的每条路径都用它，免得漏一处） */
+export function withStEntryComments(entries: readonly StWorldbookEntry[]): StWorldbookEntry[] {
+  return entries.map((entry) => withStEntryComment(entry));
+}
+
 export function ensureEntryIds(entries: readonly StWorldbookEntry[]): {
   entries: StWorldbookEntry[];
   changed: boolean;

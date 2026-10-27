@@ -35,9 +35,32 @@ export function checkDecisionTable(readmePath) {
   // 若只按 '\n' 切，行尾会残留 '\r'，导致分隔行 /^\|[\s:|-]+\|$/ 匹配不上。
   const lines = readFileSync(readmePath, 'utf8').split(/\r?\n/);
 
-  // 定位表头：首列表头为「#」的那张表
-  const headerIndex = lines.findIndex((line) => /^\|\s*#\s*\|/.test(line));
-  if (headerIndex === -1) {
+  /*
+   * 定位决策表：**首列表头为 `#` 的表不止一张**（PLAN.md 里「发布流程动作表」也是）。
+   *
+   * 所以不能取"第一张"。2026-10-27 实测过一次假绿：新加的一张 §0.1 六条规程表
+   * （表头 `| # | 规程 | 落地方式 |`）插在决策表之前，脚本抓到它后报了
+   * 「✔ 共 6 条（#1–#6）」并退出 0 —— **真正的决策表一行都没检查**。
+   * 守卫失效却不报错，比守卫报错严重得多。
+   *
+   * 现在的规则：把所有 `#` 开头表都解析出来，**取编号行最多的那张**（决策表 200+ 行，
+   * 其它同类表都只有个位数）。并且在 detail 里带上行号，误判时看得见。
+   */
+  const candidates = [];
+  for (let headerIndex = 0; headerIndex < lines.length; headerIndex += 1) {
+    if (!/^\|\s*#\s*\|/.test(lines[headerIndex])) continue;
+    const numbers = [];
+    for (let i = headerIndex + 1; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (!line.startsWith('|')) break; // 表格结束
+      if (/^\|[\s:|-]+\|$/.test(line)) continue; // 分隔行 |---|---|
+      const match = /^\|\s*(\d+)\s*\|/.exec(line);
+      if (match) numbers.push(Number(match[1]));
+    }
+    candidates.push({ headerIndex, numbers });
+  }
+
+  if (candidates.length === 0) {
     return {
       ok: false,
       numbers: [],
@@ -46,14 +69,15 @@ export function checkDecisionTable(readmePath) {
     };
   }
 
-  const numbers = [];
-  for (let i = headerIndex + 1; i < lines.length; i += 1) {
-    const line = lines[i];
-    if (!line.startsWith('|')) break; // 表格结束
-    if (/^\|[\s:|-]+\|$/.test(line)) continue; // 分隔行 |---|---|
-    const match = /^\|\s*(\d+)\s*\|/.exec(line);
-    if (match) numbers.push(Number(match[1]));
-  }
+  const chosen = candidates.reduce((best, item) =>
+    item.numbers.length > best.numbers.length ? item : best,
+  );
+  const numbers = chosen.numbers;
+  // 行号从 1 开始给人看（headerIndex 是 0 基）
+  const where =
+    candidates.length > 1
+      ? `第 ${chosen.headerIndex + 1} 行那张（共 ${candidates.length} 张 # 开头的表，取编号行最多的一张）`
+      : `第 ${chosen.headerIndex + 1} 行`;
 
   if (numbers.length === 0) {
     return { ok: false, numbers, problems: ['决策表里没有解析到任何编号行'], detail: '无编号行' };
@@ -72,8 +96,8 @@ export function checkDecisionTable(readmePath) {
   }
 
   const detail = problems.length
-    ? problems.join('；')
-    : `共 ${numbers.length} 条（#1–#${numbers[numbers.length - 1]}）`;
+    ? `${problems.join('；')}（检查的是${where}）`
+    : `共 ${numbers.length} 条（#1–#${numbers[numbers.length - 1]}，${where}）`;
 
   return { ok: problems.length === 0, numbers, problems, detail };
 }
