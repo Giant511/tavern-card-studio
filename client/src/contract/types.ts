@@ -203,12 +203,82 @@ export interface PortProbe {
   errorMessage: string | null;
 }
 
-/** 解压回执（F15 / T13.3 一键安装的 c 步） */export interface ExtractReceipt {
+/**
+ * 本地回环反向代理的运行信息（v0.1.6 / T14.1）。
+ *
+ * `baseUrl` 是 iframe 地址的**唯一合法来源**：它由壳按内核分配的端口生成，
+ * 渲染层不能自己拼（`test/st-proxy.test.mjs` 有静态断言守着）。
+ * 拼出来的后果不是"样式错位"，而是"iframe 指着别处"，那正是这个代理
+ * 设计上要排除的东西。
+ */
+export interface ProxyInfo {
+  /** 内核分配的端口（不写死，避免多开/占用打架） */
+  port: number;
+  /** `http://127.0.0.1:<port>` */
+  baseUrl: string;
+  /** 代理指向的 ST 地址（`host:port`），如实显示给用户 */
+  target: string;
+}
+
+/**
+ * 代理当前状态。用不着 `ProxyInfo | null` 是因为渲染层需要"为什么没起"
+ * —— 四个字段一起 null 比一个 null 更能说明"确实没在跑"。
+ */
+export interface ProxyStatus {
+  running: boolean;
+  /**
+   * 监听器是否还活着（v0.1.6 生产缺陷追加）。
+   *
+   * `running` 说的是"壳里有没有这条记录"，`alive` 说的是"那个 accept 循环还在不在"。
+   * 两者会分叉：task 已经退出、端口已释放，而记录还在（见决策 #233）。
+   * 分叉时 `running === true && alive === false` —— 这时候拿 `baseUrl` 去设
+   * iframe 就是一定打不开的地址。
+   */
+  alive: boolean;
+  /**
+   * 连接计数（v0.1.6 真机缺陷二的决定性诊断）。
+   *
+   * `accepted === 0` 且 `alive === true` 只有一个含义：**流量从未到达壳的监听端口**
+   * —— 那是环境层拦了回环（代理工具/安全软件/防火墙），壳内怎么改都没用。
+   * `accepted > 0` 则说明请求进来了，问题在转发链路。
+   */
+  stats: {
+    accepted: number;
+    /**
+     * 面板自检探测被收到的次数（专用路径 `/__tcs_probe__`，不转发给 ST）。
+     *
+     * **判据只用它，不用 `accepted`**：`accepted` 是累计值，iframe 正常加载一次
+     * 就会涨几十，一次成功之后再也不是 0 —— 拿它判断"请求没发出"只在全新代理上
+     * 成立一次（2026-10-27 真机复发就是这么被污染的）。
+     */
+    probeHits: number;
+    lastPeer: string | null;
+    lastAcceptedMs: number | null;
+  };
+  port: number | null;
+  baseUrl: string | null;
+  target: string | null;
+}
+
+/** 解压回执（F15 / T13.3 一键安装的 c 步） */
+export interface ExtractReceipt {
   /** 解压到的目录（壳给的展示路径） */
   destPath: string | null;
   /** 解压后该目录是否已经像 SillyTavern（判据与检测一致） */
   hasStStructure: boolean;
 }
+
+/**
+ * ST 默认地址（v0.1.6 / T14.0）：**这个字面量在全仓库只允许出现这一次**。
+ *
+ * 需求原文："静态断言守护：代码中不得出现独立的 `127.0.0.1:8000` 字面量
+ * （唯一允许出现在默认值定义处）"。`test/st-address.test.mjs` 会扫源码来守它，
+ * 所以别处要用地址就 `resolveStAddress(config.stAddress)`，不要抄这个串。
+ *
+ * 为什么把它放在契约层而不是 `session/st-address.ts`：能对拍它的地方包括
+ * 契约测试与 Rust 侧常量，放在类型文件里两侧都好引用，也不引入循环依赖。
+ */
+export const ST_DEFAULT_ADDRESS = '127.0.0.1:8000';
 
 /** 客户端持久化配置（T6.8） */
 export interface ClientConfig {
@@ -313,6 +383,38 @@ export interface ClientConfig {
    * 这里只存原文，不做归一化，坏值在下载时给出明确报错。
    */
   stMirrorPrefix: string | null;
+  /**
+   * SillyTavern 的访问地址（v0.1.6 / T14.0）：`主机:端口`，**host 只能是回环**。
+   *
+   * `''` / null = 没配过，用 [`ST_DEFAULT_ADDRESS`]。非法值（手改配置文件填了
+   * 内网地址）会在读取时被 `resolveStAddress()` 回落成默认值，并由设置面板标出来 ——
+   * 不让整块功能瘫掉，但也绝不悄悄把它当成有效配置用。
+   *
+   * 存字符串而不是 `{host, port}`：C5（plugin-store）逐键回落，多一层对象
+   * 迁移就多一个"旧配置缺字段"的坑；字符串也让用户手改配置文件时看得懂。
+   */
+  stAddress: string;
+  /**
+   * 右侧 ST 面板的宽度（v0.1.6 / T14.3），单位 px；`null` = 没拖过，用默认值。
+   *
+   * 存下来是因为"写卡区该占多少、聊天区该占多少"只有用户自己知道，而他会在
+   * 两种状态之间来回切 —— 每次打开都复位成默认宽度，等于每次都要重拖一遍。
+   * 取值区间由 `session/st-pane-layout.ts` 钳制（读的时候会 clamp，坏值不报错）。
+   */
+  stPaneWidth: number | null;
+  /**
+   * 新建卡时套用的卡片级默认值（v0.1.6）。
+   *
+   * 用户原话是「最好是用户可以自定义」—— 光有编辑器只满足「这张卡能改」，
+   * 而作者名、创作说明这类值每张卡都一样，不该每次重填。存在配置里而不是
+   * 跟着卡走，是因为它属于「我的习惯」，不属于任何一张卡。
+   *
+   * 类型声明成 unknown 而非强类型：配置来自磁盘，可能是旧版本或人手工改过的。
+   * 读取方必须走 `session/card-info.ts` 的 `sanitizeDefaults()` 清洗 ——
+   * 一个 `tags: '日常'`（字符串而非数组）就足以让新建卡抛异常，而新建卡
+   * 是用户最常用的入口，崩在那里等于整个客户端不能用。
+   */
+  cardDefaults: unknown;
 }
 
 export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
@@ -337,4 +439,8 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
   lastFaceChoice: null,
   stPath: null,
   stMirrorPrefix: null,
+  stAddress: '',
+  stPaneWidth: null,
+  // 空对象 = 没有自定义默认值（不用 null，省掉一处判空）
+  cardDefaults: {},
 };

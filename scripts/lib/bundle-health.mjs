@@ -294,13 +294,44 @@ export function findWixDark() {
  *   dark: string|null,
  * }}
  */
-export function auditMsiShellAssets(msiPath, distDir) {
+/**
+ * 在一份 exe 的字节里找"必须存在"的壳侧字符串，返回**缺了哪些**。
+ *
+ * 为什么要转 latin1：Node 的 `Buffer.includes(string)` 默认按 utf8 编码去找，
+ * 而读进来的 `Buffer` 里非 ASCII 字节已经"碎了" —— 对纯 ASCII 的字面量没问题，
+ * 但用 `toString('latin1')` 转成"一字节一字符"的字符串后再 `includes`，
+ * 匹配语义与字节级完全一致，也不会因为编码猜错而漏。
+ *
+ * 反过来：**不要**拿它去找中文。latin1 会把多字节拆成单字节，中文永远匹配不上；
+ * 需要找中文时用 `bytes.includes(Buffer.from(s, 'utf8'))`。这里的调用方
+ * （`x-frame-options` / `frame-ancestors` / `SameSite=None`）全是 ASCII，
+ * 所以刻意只支持这套用法，并在测试里把这条约束钉住。
+ */
+export function findMissingStrings(bytes, needles) {
+  const text = bytes.toString('latin1');
+  return needles.filter((needle) => !text.includes(needle));
+}
+
+export function auditMsiShellAssets(msiPath, distDir, options = {}) {
+  /*
+   * `options.strings`：要在这份 exe 里找到的**壳侧（Rust）**字符串。
+   *
+   * 为什么需要：功能哨兵只扫前端产物（dist），而有些修复完全发生在壳里 ——
+   * v0.1.6 的 `SameSite=None` / `frame-ancestors` 都是 Rust 常量，永远不会出现在
+   * dist 里。若给它们写前端哨兵，那条断言必然假红；不写又没有任何东西盯着
+   * "这版包里的壳到底是不是带修复的那个"。
+   *
+   * 判据是**内容级**的：在出厂 exe 的字节里找这些字面量。Rust 的字符串常量
+   * 以 UTF-8 落在只读数据段，`includes` 就能命中（2026-10-27 实测）。
+   */
+  const needles = Array.isArray(options.strings) ? options.strings : [];
   const skippedResult = (reason) => ({
     ok: false,
     skipped: true,
     reason,
     checked: 0,
     missing: [],
+    missingStrings: needles.slice(),
     exeBytes: 0,
     exeSha256: '',
     dark: null,
@@ -334,11 +365,13 @@ export function auditMsiShellAssets(msiPath, distDir) {
 
     const bytes = readFileSync(main.path);
     const audit = auditShellAssets(main.path, distDir);
+    const missingStrings = findMissingStrings(bytes, needles);
     return {
-      ok: audit.ok,
+      ok: audit.ok && missingStrings.length === 0,
       skipped: false,
       checked: audit.checked,
       missing: audit.missing,
+      missingStrings,
       exeBytes: main.bytes,
       exeSha256: createHash('sha256').update(bytes).digest('hex'),
       dark,

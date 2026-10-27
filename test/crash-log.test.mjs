@@ -239,7 +239,7 @@ test('诊断文本：日志为空时说清"没有捕获到异常"，不要让人
     session: { openCards: 1, activeCardId: 'id' },
     now: new Date('2026-10-24T03:00:00.000Z'),
   });
-  assert.match(text, /日志为空：本次会话没有捕获到渲染层异常/);
+  assert.match(text, /日志为空：本次使用期间没有捕获到界面异常/);
 });
 
 test('诊断文件名：带秒级时间戳，连续导出不会互相覆盖', () => {

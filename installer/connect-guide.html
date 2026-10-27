@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tavern Card Studio 服务端 0.1.2 · 如何连接</title>
+<title>Tavern Card Studio 服务端 0.1.6 · 如何连接</title>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
@@ -78,7 +78,7 @@
 <main>
   <h1>服务端已安装 · 如何连接</h1>
   <p class="sub">
-    Tavern Card Studio Server <b>0.1.2</b>（多账户版）。按 1 → 4 的顺序做完即可连通；
+    Tavern Card Studio Server <b>0.1.6</b>（多账户版）。按 1 → 4 的顺序做完即可连通；
     放在公网上再加做第 5 节。
   </p>
 
@@ -96,7 +96,7 @@
     <p>以管理员身份打开 PowerShell，<strong>在安装目录里</strong>执行：</p>
 <pre><span class="c">cd "C:\Program Files\Tavern Card Studio Server"
 
-# $tcs 代表"服务端 CLI"：这几样文件任何 0.1.2 安装都有，不依赖额外脚本
+# $tcs 代表"服务端 CLI"：这几样文件任何 0.1.6 安装都有，不依赖额外脚本
 $tcs = ".\node.exe", ".\app\server\dist\index.js",
        "--config", "C:\ProgramData\TavernCardStudio\config.json"
 
@@ -196,7 +196,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
     <ol>
       <li>打开 Tavern Card Studio 客户端，进入「设置」。</li>
       <li>「服务端地址」填 <span class="addr">http://127.0.0.1:8730</span>（是 8730，不是面板的 8731）。</li>
-      <li>点「测试连接」，看到「已连接（服务端 0.1.2），token 有效」说明网络与令牌都通了。</li>
+      <li>点「测试连接」，看到「已连接（服务端 0.1.6），token 有效」说明网络与令牌都通了。</li>
       <li>再点「登录」，用第 1 节建的账户登录 —— 登录后才会以账户身份看自己的卡片与仓库。</li>
     </ol>
     <h3>「连接本机服务端」按钮</h3>
@@ -262,7 +262,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
         <td>
           看 <code class="path">C:\ProgramData\TavernCardStudio\logs\tcs-service-host.err.log</code>。
           若出现 <code>Cannot find package</code>，说明安装包缺运行时依赖 ——
-          用 0.1.2 的修复版重装；也可在安装目录跑
+          用 0.1.6 的修复版重装；也可在安装目录跑
           <code>&amp; $tcs selfcheck --bundle-root "$PWD\app"</code> 离线核对依赖（<code>$tcs</code> 见第 1 节）。
         </td>
       </tr>
@@ -284,13 +284,13 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
       <tr>
         <td>装完发现安装目录里<br><strong>没有 <code>tcs-server.cmd</code></strong><br>（或说明页还是旧版）</td>
         <td>
-          你装的是本页之前打出来的 0.1.2 包，或者<strong>同版本覆盖安装没有替换已有文件</strong>
+          你装的是本页之前打出来的 0.1.6 包，或者<strong>同版本覆盖安装没有替换已有文件</strong>
           —— Windows Installer 对"版本号相同"的安装只做维护，不会重新铺一遍文件。
           两种办法：<br>
           ① <strong>不用管它</strong>：第 1 节的 <code>$tcs</code> 写法只依赖
           <code>node.exe</code> 与 <code>app\</code>，旧包一样能用；<br>
           ② 想拿到本页与 <code>tcs-server.cmd</code>，用强制重装（管理员 PowerShell）：
-          <code>msiexec /i "TavernCardStudioServer-0.1.2.msi" REINSTALL=ALL REINSTALLMODE=amus</code>
+          <code>msiexec /i "TavernCardStudioServer-0.1.6.msi" REINSTALL=ALL REINSTALLMODE=amus</code>
         </td>
       </tr>
       <tr>

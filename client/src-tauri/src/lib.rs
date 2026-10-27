@@ -6,6 +6,7 @@
 mod commands;
 mod error;
 mod paths;
+mod proxy;
 
 use tauri::Manager;
 
@@ -26,6 +27,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .manage(commands::ProxyState::default())
         .invoke_handler(tauri::generate_handler![
             commands::shell_info,
             commands::read_text_exact,
@@ -45,11 +47,23 @@ pub fn run() {
             // v0.1.5 / F15：本地 SillyTavern 联动（探测 / 启动 / 打开链接）
             commands::probe_paths,
             commands::find_st_candidates,
-            commands::probe_st_alive,
+            commands::probe_tcp,
             commands::extract_zip_to,
             commands::spawn_detached,
             commands::open_external,
+            // v0.1.6 / T14.1：本地回环反向代理（面板内嵌 ST）
+            commands::st_proxy_start,
+            commands::st_proxy_stop,
+            commands::st_proxy_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("启动 Tauri 应用失败：请检查 tauri.conf.json 与 icons");
+        .build(tauri::generate_context!())
+        .expect("启动 Tauri 应用失败：请检查 tauri.conf.json 与 icons")
+        .run(|app, event| {
+            // 退出时把代理端口收掉（决策 #222）：进程退出本身会关 socket，
+            // 但显式收一次才能保证"面板已关/应用已退 ⇒ 端口不再监听"这条判据
+            // 在将来加托盘驻留时依然成立。
+            if let tauri::RunEvent::Exit = event {
+                commands::stop_proxy_blocking(app);
+            }
+        });
 }

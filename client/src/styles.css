@@ -81,6 +81,16 @@ body {
   padding: 10px 16px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
+  /*
+   * v0.1.6：按钮从 8 个涨到 9 个（多了「卡片信息…」），1080 宽的窗口放不下。
+   *
+   * 第一版只给 `.actions` 加了 `flex-wrap`，结果**标题区先被牺牲**：
+   * `.actions` 是 `flex-shrink: 0`（宽度由内容决定、不换行），而标题区能收缩，
+   * flex 就把多余的压力全给它 —— 截图里"八板块 937 字"被压成一列竖排，
+   * 按钮一个都没换行。换行必须发生在**能决定整行宽度的那个容器**上。
+   */
+  flex-wrap: wrap;
+  row-gap: 8px;
 }
 
 .brand {
@@ -248,6 +258,28 @@ body {
   display: flex;
   gap: 8px;
   flex-shrink: 0;
+  /*
+   * v0.1.6 加了「卡片信息…」之后按钮多了一个。
+   *
+   * 第一版给了 `flex-wrap: wrap` —— 结果是**左侧标题区被挤窄**：
+   * flex 的收缩只发生在能收缩的项上，`.actions` 声明了 `flex-shrink: 0`，
+   * 而标题区能收缩，于是先牺牲标题（"八板块 937 字" 被压成竖排），
+   * 按钮自己并没有换行。改法是把按钮的字号与内边距调紧一点，
+   * 让它在同样宽度下放得下 —— 不去动标题区的伸缩行为。
+   */
+  align-items: center;
+  /*
+   * 这里**不**换行：按钮区自己的换行会让"最后一行只剩一两个按钮"，
+   * 看起来像布局坏了。整行放不下时由 `.topbar` 的 flex-wrap 把整个按钮区
+   * 移到第二行，视觉上是"顶栏变高"，语义清楚得多。
+   */
+  margin-left: auto;
+}
+
+.actions .btn {
+  /* 顶栏按钮只在这里收一点，不影响正文里的按钮 */
+  padding: 6px 10px;
+  white-space: nowrap;
 }
 
 .btn {
@@ -3311,3 +3343,384 @@ body {
   border-top: 1px dashed var(--border);
   padding-top: 10px;
 }
+
+/* ── 设置面板 › SillyTavern 地址（v0.1.6 / T14.0）──────────────
+   「跳过检测」那一行与上面的输入框同属这一项，所以贴着它排、比 hint 略高：
+   读起来是"这个字段的一个选项"，而不是另一个设置项。 */
+.st-skip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: var(--app-fg);
+  cursor: pointer;
+  user-select: none;
+}
+
+.st-skip-row input {
+  flex: none;
+  margin: 0;
+  cursor: pointer;
+}
+
+/* 勾选后这一行要有点"我已经做了个决定"的份量 —— 它不是默认状态 */
+.st-skip-row input:checked + span {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* ── 右侧常驻 ST 面板（v0.1.6 / T14.3 T14.4）────────────────────
+   布局靠 `:has()` 把第三列加上：面板 hidden 时布局与以前逐像素相同 ——
+   这是"不打开就不存在"的判据，比给 .layout 加一个 --has-pane 类更省心
+   （类要记得两处一起改，忘了就是"面板关了还留着一条空白列"）。 */
+.layout:has(> .st-pane:not([hidden])) {
+  /*
+   * 第三列用 `auto`，**宽度由 `.st-pane` 自己的 `width` 决定**。
+   *
+   * 第一版写成 `... var(--st-pane-width, 460px)`，而那个变量是设在 `.st-pane`
+   * 上的 —— 父级 `.layout` 读不到子元素的变量，于是永远走 fallback（460px），
+   * 折叠成 44px 时**列宽还是 460**：截图上就是"面板收起了，右边仍留一大片空白"。
+   * 变量跨元素不可继承这件事不报错，只体现在像素上。
+   */
+  grid-template-columns: minmax(0, 1fr) 340px auto;
+}
+
+/* 收起：TS 会把 --st-pane-width 改成 44px（见 st-pane.ts 的 setCollapsed），
+   所以这里不需要第二条 grid 规则 —— 两处各写一份宽度就会分叉。 */
+
+.st-pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  /* 宽度唯一来源：TS 写 `--st-pane-width`（展开是记忆宽度、折叠是条宽） */
+  width: var(--st-pane-width, 460px);
+  min-width: 0;
+  min-height: 0;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+}
+
+.st-pane[hidden] {
+  display: none;
+}
+
+/* 拖宽手柄：贴在左边界上，比边框宽一点才好抓 */
+.st-pane-resizer {
+  position: absolute;
+  top: 0;
+  left: -3px;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 3;
+}
+
+.st-pane-resizer:hover,
+.st-pane-resizer:focus-visible {
+  background: var(--accent-weak, #dbe6ff);
+  outline: none;
+}
+
+body.st-pane-resizing {
+  cursor: col-resize;
+  /* 拖的时候不要选中正文：指针扫过编辑器会带走一片高亮 */
+  user-select: none;
+}
+
+.st-pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.st-pane-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.st-pane-target {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono, ui-monospace, Consolas, monospace);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.st-pane-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.st-pane-icon {
+  padding: 2px 7px;
+  font-size: 12px;
+}
+
+.st-pane-hint {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--danger);
+  background: var(--danger-bg);
+  border-bottom: 1px solid #f5c2bd;
+}
+
+.st-pane-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.st-pane-frame {
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--app-bg);
+}
+
+.st-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  /* 面板底色是浅色，ST 自己会铺满，这里只兜"加载中"那一瞬 */
+  background: #fff;
+}
+
+.st-pane-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
+
+/* 收起态：只留头部（换成竖排的三个小按钮），主体与底栏不显示 */
+.st-pane--collapsed .st-pane-body,
+.st-pane--collapsed .st-pane-hint {
+  display: none;
+}
+
+.st-pane--collapsed .st-pane-head {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 8px 4px;
+}
+
+/* 折叠后只剩一条竖边：状态标记与地址都放不下，按钮也必须换成符号 */
+.st-pane--collapsed .st-pane-title,
+.st-pane--collapsed .st-pane-target {
+  display: none;
+}
+
+.st-pane--collapsed .st-pane-actions {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.st-pane--collapsed .st-pane-icon {
+  padding: 3px 0;
+  font-size: 13px;
+  line-height: 1.2;
+  text-align: center;
+}
+
+/* ── 卡片信息对话框（v0.1.6）──────────────────────────────── */
+/*
+ * 布局契约（2026-10-27 第二版，第一版被用户指出"不美观"）：
+ *
+ *   头部（固定）
+ *   ├ 滚动区 ── 说明 / 继承提示 / 字段网格      ← 只有这里滚
+ *   状态行（固定，有内容才显示）
+ *   底部按钮（固定）
+ *
+ * 第一版的问题：`.modal` 自己 `overflow: auto`，字段区又 `max-height: 56vh`，
+ * 两层滚动条叠着；滚到中间时底部按钮跟着内容跑出视口，截图里按钮就贴在窗口下沿。
+ * 现在的做法是把滚动**只**交给中间那层，头部与按钮永远可见。
+ */
+
+.card-info-modal {
+  /* 比默认的 560px 宽一些：字段有长说明，560 一行放不下几个字就折行 */
+  width: min(680px, 100%);
+  max-height: 84vh;
+  overflow: hidden;
+}
+
+.card-info-scroller {
+  flex: 1;
+  /* flex 子项默认 min-height: auto，不配这一行它不会真的收缩，滚动条也出不来 */
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 20px 4px;
+}
+
+.card-info-intro {
+  margin: 0 0 12px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* 字段网格：两列；`.card-info-row--half` 并排，其余整行 */
+.card-info-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px 18px;
+}
+
+.card-info-row {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.card-info-row--half {
+  grid-column: span 1;
+}
+
+.card-info-label {
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--text, #1f2430);
+}
+
+.card-info-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  background: #fff;
+  color: inherit;
+  resize: vertical;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.card-info-input:hover {
+  border-color: #b6bdc9;
+}
+
+.card-info-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  /* 用两层光晕代替 outline：outline 会盖住相邻元素，视觉上像"框串了" */
+  box-shadow: 0 0 0 3px rgba(47, 111, 235, 0.16);
+}
+
+.card-info-input::placeholder {
+  color: #9aa2b1;
+}
+
+.card-info-field-hint {
+  font-size: 11.5px;
+  line-height: 1.55;
+  /* 与输入框拉开一点：第一版只差 4px，说明文字像贴在框里的 */
+  margin-top: 1px;
+}
+
+.card-info-field-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--warn);
+}
+
+/*
+ * 继承提示。用 --warn 系而不是 --danger：这是"你可能想改"，不是错误。
+ * 用错误色会让用户以为卡坏了（本项目已经因为"误报错误"吃过两次亏）。
+ */
+.card-info-hint {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid #f0d9a8;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.card-info-hint-title {
+  font-size: 12.5px;
+}
+
+.card-info-hint-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.card-info-hint-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.card-info-hint-label {
+  /*
+   * 固定宽度让「作者」「创作说明」这些标签左对齐成一列，值才好扫。
+   *
+   * 宽度按最长标签（「世界书名称」5 字 / 「世界书说明」5 字）给足：
+   * 第一版给了 4.6em，5 个字的标签被拆成两行（"世界书名" / "称"），
+   * 看着像排版坏了。允许换行的同时给它 5.5em，5 字一行正好放得下。
+   */
+  flex: 0 0 5.5em;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+.card-info-hint-value {
+  font-family: inherit;
+  font-size: 11.5px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: rgba(181, 71, 8, 0.1);
+  word-break: break-all;
+}
+
+.card-info-hint-foot {
+  opacity: 0.85;
+}
+
+.card-info-status {
+  padding: 0 20px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+/*
+ * 底部按钮：次要动作（设为默认值）靠左，取消 / 保存靠右。
+ * 第一版三个按钮挤在一起，会把"保存"和"设为新卡默认值"看成同级别的动作 ——
+ * 而它们的落点完全不同（一个改这张卡，一个改以后的卡）。
+ */
+.card-info-modal .modal-foot {
+  padding: 12px 20px 16px;
+  gap: 8px;
+}
+
+.card-info-modal .modal-foot .card-info-defaults {
+  margin-right: auto;
+}
+

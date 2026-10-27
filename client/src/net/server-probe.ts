@@ -208,7 +208,7 @@ export async function probeServer(
   try {
     healthBody = (await health.response.json()) as Record<string, unknown>;
   } catch {
-    return failure('health', '响应不是 JSON（该地址可能不是 Tavern Card Studio 服务端）', {
+    return failure('health', '这个地址返回的内容无法识别（可能不是 Tavern Card Studio 服务端）', {
       url: base,
       latencyMs: health.elapsed,
     });
@@ -287,7 +287,7 @@ export async function probeServer(
       isolationEnforced: null,
       latencyMs: health.elapsed,
       url: base,
-      message: '已连接，但 token 无效（401）——请从服务端配置或管理面板重新获取',
+      message: '已连接，但访问令牌无效 —— 请从服务端配置或管理面板重新获取',
       stage: 'auth',
     };
   }

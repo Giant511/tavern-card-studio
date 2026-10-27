@@ -268,7 +268,7 @@ export class SyncDialog {
       el(
         'p',
         'field-hint',
-        '服务端按「角色卡 ID」归档：该 ID 已存在则追加新版本，不存在则新建。上传内容与「导出 JSON」完全一致（同样 2 空格缩进 + 结尾换行）。',
+        '服务端按「角色卡 ID」归档：已存在则追加新版本，不存在则新建。上传的内容与你导出的角色卡一致。',
       ),
     );
 
@@ -930,7 +930,7 @@ export class SyncDialog {
         // 未显示下拉（legacy / 仓库令牌）时不传 —— 后者的仓库由令牌绑定，
         // 传了也会被服务端忽略，不如不传（避免出现"我选了却没生效"的错觉）。
         ...(this.repoRow.hidden ? {} : { repo: this.repoSelect.selectedOptions[0]?.dataset['repoName'] ?? null }),
-        message: `客户端上传 ${new Date().toISOString()}`,
+        message: `在客户端上传（${new Date().toLocaleString('zh-CN')}）`,
         author: 'tavern-card-studio',
       });
 
@@ -958,7 +958,7 @@ export class SyncDialog {
       this.callbacks.notify(
         result.created
           ? `已在服务端新建「${target.cardId}」· 版本 v${result.seq}`
-          : `已上传新版本：v${result.seq}（sha256 ${result.sha256.slice(0, 12)}…）`,
+          : `已上传新版本：v${String(result.seq)}`,
         'ok',
       );
     } catch (error) {

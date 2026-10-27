@@ -105,7 +105,7 @@ export function checkWorldbookExportSafety(
   if (card.worldbook.entries.length === 0) {
     reasons.push(
       `世界书有 ${String(text.length)} 字文本，但一个条目都没解析出来（0 条）—— ` +
-        '导出会把 character_book.entries 写成空数组，这 ' +
+        '导出后世界书会是空的，这 ' +
         `${String(text.length)} 字内容会丢失。请先修复世界书格式：` +
         `${markHint}；也可以在「规则与预设 → 世界书预设」里换一个匹配你写法的格式。`,
     );
@@ -229,9 +229,24 @@ export function buildJsonExport(
   greetingFormat?: GreetingFormatParams,
 ): ExportArtifactText {
   const options = preset ? presetAssembleOptions(preset) : {};
-  // v0.1.3 追加项一：初始场景预设决定"多条开场白用哪个分隔行"。
-  // 只影响 dirty 板块的回写切分（未编辑的板块用原字段值，不重算）。
-  const payload = serializeStCard(card, greetingFormat ? { ...options, greetingFormat } : options);
+  /*
+   * v0.1.6 / 用户「这个世界书的条目名字反而缺失了」：
+   * ST 的世界书面板把条目标题读的是 `comment`，而我们的 TXT 把显示名写成 `name`
+   * —— 不补的话，从 TXT 起手的卡导进 ST 后每条标题都是空白。
+   *
+   * 只在**导出**这一层打开：`serializeStCard` 的默认必须保持无损
+   * （`test/roundtrip.test.mjs` 守着"导入什么都不改、导出字节要一致"）。
+   * 这里才是"这份文件是给 ST 用的"这句话成立的地方。
+   */
+  const payload = serializeStCard(card, {
+    ...options,
+    ...(greetingFormat ? { greetingFormat } : {}),
+    entryTitleToComment: true,
+  });
+  // 有多少条是"靠 name 补出来"的（原本没有 comment）——只用于说明，不影响产物
+  const titledEntryCount = card.worldbook.entries.filter(
+    (entry) => (entry.comment ?? '') === '' && (entry.name ?? '') !== '',
+  ).length;
   const text = `${JSON.stringify(payload, null, 2)}\n`;
 
   return {
@@ -243,7 +258,14 @@ export function buildJsonExport(
     notes: [
       `目标规格：${card.meta.spec}${card.meta.specVersion ? ` ${card.meta.specVersion}` : ''}`,
       preset ? `标题与顺序按预设「${preset.name}」拼装` : '按默认标题拼装',
-      '缩进 2 空格 + 结尾换行，与服务端存储口径一致',
+      '格式与 SillyTavern 兼容，可直接导入',
+      /*
+       * 只在真的补了条数时才说。导出里做了一次"内容对齐"却一声不吭，
+       * 用户下次看到 JSON 多出 comment 会以为是编辑器自己长出来的。
+       */
+      ...(titledEntryCount > 0
+        ? [`世界书 ${titledEntryCount} 条条目的标题已一并写入，导入 SillyTavern 后可直接看到`]
+        : []),
     ],
   };
 }
@@ -397,7 +419,12 @@ export function buildPngExport(
   greetingFormat?: GreetingFormatParams,
 ): ExportArtifactPng {
   const options = preset ? presetAssembleOptions(preset) : {};
-  const payload = serializeStCard(card, greetingFormat ? { ...options, greetingFormat } : options);
+  // 与 JSON 导出同一套对齐：PNG 里嵌的是同一份卡 JSON，漏了就等于漏一半
+  const payload = serializeStCard(card, {
+    ...options,
+    ...(greetingFormat ? { greetingFormat } : {}),
+    entryTitleToComment: true,
+  });
   const jsonText = `${JSON.stringify(payload, null, 2)}\n`;
 
   const spec: PngCardSpec = card.meta.spec === 'v3' ? 'v3' : 'v2';
@@ -413,7 +440,7 @@ export function buildPngExport(
     throw new Error(`PNG 产物自检失败：keyword 应为 ${keyword}，实际 ${reread.keyword}`);
   }
   if (reread.jsonText !== jsonText) {
-    throw new Error('PNG 产物自检失败：读回的卡 JSON 与写入的不一致');
+    throw new Error('导出图片自检未通过：写入的角色卡数据读回后不一致');
   }
 
   const summary = summarizePng(png);
@@ -430,7 +457,7 @@ export function buildPngExport(
       `${spec === 'v3' ? 'V3' : 'V2'} 卡写入 ${keyword} 数据块`,
       `${faceSize}（图像字节未重新编码）`,
       '旧 ccv3/chara 数据块已剥离，导出不会累积重复块',
-      '缩进 2 空格 + 结尾换行，与 JSON 导出同一份序列化',
+      '与「导出」产出的角色卡数据完全一致',
     ],
   };
 }
