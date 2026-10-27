@@ -62,6 +62,14 @@ pub enum ShellError {
     #[error("拒绝启动：{reason}（目标 {target}）")]
     SpawnRejected { target: String, reason: String },
 
+    /// 探测目标主机不在回环白名单内（v0.1.6 / T14.0）。
+    ///
+    /// 单独一个码而不是复用 `SPAWN_REJECTED`：前者是"这个地址不允许被探测"
+    /// （配置被改坏的典型症状），后者是"这个目录不是 ST"。UI 要分别给话说 ——
+    /// 前者要指引用户去看配置，后者要指引用户去选目录。
+    #[error("只允许探测本机回环地址（{allowed}），收到：{host}")]
+    ProbeHostNotAllowed { host: String, allowed: String },
+
     #[error("IO 失败（{path}）：{message}")]
     Io { path: String, message: String },
 }
@@ -83,6 +91,7 @@ impl ShellError {
             Self::PathNotAllowed { .. } => "PATH_NOT_ALLOWED",
             Self::TooManyPaths { .. } => "TOO_MANY_PATHS",
             Self::SpawnRejected { .. } => "SPAWN_REJECTED",
+            Self::ProbeHostNotAllowed { .. } => "PROBE_HOST_NOT_ALLOWED",
             Self::Io { .. } => "IO_ERROR",
         }
     }
@@ -125,6 +134,10 @@ impl ShellError {
             Self::SpawnRejected { target, reason } => {
                 map.insert("target".to_string(), target.clone().into());
                 map.insert("reason".to_string(), reason.clone().into());
+            }
+            Self::ProbeHostNotAllowed { host, allowed } => {
+                map.insert("host".to_string(), host.clone().into());
+                map.insert("allowed".to_string(), allowed.clone().into());
             }
             Self::UnknownRuleKind { kind } => {
                 map.insert("kind".to_string(), kind.clone().into());

@@ -52,7 +52,12 @@
         -->
         <button id="btn-st" type="button" class="btn ghost" title="把当前卡推送到本地 SillyTavern">在 SillyTavern 中测试</button>
         <button id="btn-preview" type="button" class="btn ghost">渲染预览</button>
-        <button id="btn-rules" type="button" class="btn ghost">规则与预设…</button>
+        <button id="btn-rules" type="button" class="btn ghost">规则与预设…</button>
+        <!--
+          v0.1.6：卡片级元数据（作者 / 版本 / 创作说明 / 标签 / 系统提示 / 世界书名称）。
+          这些字段原来一个编辑入口都没有，从示例卡起手时会一路导出别人的文案。
+        -->
+        <button id="btn-card-info" type="button" class="btn ghost" title="作者 / 版本 / 创作说明 / 标签 / 系统提示 / 世界书说明">卡片信息…</button>
         <span id="conn-chip" class="conn-chip off" title="服务端连接状态">
           <span class="conn-dot"></span><span id="conn-text">未连接</span>
         </span>

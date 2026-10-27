@@ -24,6 +24,8 @@ import {
   type DirProbe,
   type ExtractReceipt,
   type PathProbe,
+  type ProxyInfo,
+  type ProxyStatus,
   type PortProbe,
   type RuleDirScan,
   type RuleKind,
@@ -155,16 +157,55 @@ export function findStCandidates(): Promise<StCandidates> {
 }
 
 /**
- * 探测本机回环端口有没有人在听（F15 / v0.1.5 生产反馈追加）。
+ * 探测本机回环某个端口有没有人在听（v0.1.5 引入，v0.1.6 / T14.0 泛化为 `probe_tcp`）。
  *
  * 判定"ST 在不在跑"只该问这一条：webview 的 fetch 受系统代理、安全软件、
  * 本地网络权限影响，它说"不通"不等于端口没开（线上就这么误报过）。
- * 壳侧走 `TcpStream::connect_timeout(127.0.0.1:port)`，不经过任何 HTTP 中间层。
+ * 壳侧走 `TcpStream::connect_timeout`，不经过任何 HTTP 中间层。
  *
- * 失败**不抛错**：连不上是正常结论（`alive: false` + `errorKind`），不是命令错误。
+ * **`host` 只能是 `127.0.0.1` / `localhost` / `::1`**（壳侧白名单，
+ * 不在名单里报 `PROBE_HOST_NOT_ALLOWED`）。这条边界与内嵌代理的目标限制是同一条：
+ * 允许任意 host 的话，它就是一台"客户端本机发出"的端口扫描器。
+ * 所以这条能力**不叫** `probePort(host, port)` 那种通用名字，注释里也不许
+ * 让人误以为能探任意主机。
+ *
+ * 连不上**不抛错**（`alive: false` + `errorKind`）；参数不合法才抛。
  */
-export function probeStAlive(port?: number): Promise<PortProbe> {
-  return call<PortProbe>('probe_st_alive', { port: port ?? null });
+export function probeTcp(host: string, port: number): Promise<PortProbe> {
+  return call<PortProbe>('probe_tcp', { host, port });
+}
+
+// ─────────────────────────────────────────────────────────────
+// 本地回环反向代理（v0.1.6 / T14.1）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 起代理，返回它的地址。
+ *
+ * **不接受任何目标参数**：目标由壳自己从配置读、再按回环白名单复核
+ * （决策 #221）。渲染层能指定目标的那一刻，这个端口就成了一台到任意主机的
+ * 代理 —— 而被注入的脚本也在渲染层里。
+ *
+ * 重复调用返回同一端口（壳内有单例状态）：换端口会让 iframe 整页重载。
+ */
+export function stProxyStart(): Promise<ProxyInfo> {
+  return call<ProxyInfo>('st_proxy_start');
+}
+
+/**
+ * 停代理并等端口真的释放（面板关闭 / 应用退出）。
+ *
+ * `port` = 调用方**认为自己拥有的那个端口**。壳只在端口对得上时才停 ——
+ * 迟到的停止请求不该杀掉后来新起的代理（v0.1.6 生产缺陷二，决策 #233）。
+ * 不传 = 停当前那条（应用退出走这条，是目前唯一的无参调用方）。
+ */
+export function stProxyStop(port?: number): Promise<void> {
+  return call<void>('st_proxy_stop', port === undefined ? {} : { port });
+}
+
+/** 代理现在什么状态（刷新面板时决定要不要重新起）。 */
+export function stProxyStatus(): Promise<ProxyStatus> {
+  return call<ProxyStatus>('st_proxy_status');
 }
 
 /**

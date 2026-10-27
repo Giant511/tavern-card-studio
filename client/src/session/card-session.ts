@@ -24,6 +24,12 @@ import {
 } from '@tcs/shared';
 
 import { reparseWorldbook as reparseWorldbookCard, serializeCard, setBlockText } from '../editor/block-doc.ts';
+import {
+  applyCardInfo,
+  readCardInfo,
+  sameCardInfo,
+  type CardInfo,
+} from './card-info.ts';
 import { generateCardId, readCardIdFromCard, validateCardId } from './card-id.ts';
 import type { PngSource } from './png-source.ts';
 import type { SaveFormat } from './save-format.ts';
@@ -355,6 +361,25 @@ export class CardSession {
     if (this.#card.meta.name === name) return;
     this.#card = { ...this.#card, meta: { ...this.#card.meta, name } };
     this.#onContentChanged();
+  }
+
+  /**
+   * 改卡片级信息（作者 / 角色版本 / 创作说明 / 标签 / 系统提示 / 历史后指令 /
+   * 世界书名称与说明）。v0.1.6 / 用户反馈「导出的 creator_notes 是示例卡的话」。
+   *
+   * 与 `setName` 同一条规矩：这些字段都属于**导出内容**，改了就要置脏 ——
+   * 否则用户改完直接关窗口，改动就无声消失了。
+   *
+   * 写回规则放在 `card-info.ts` 的纯函数 `applyCardInfo` 里，这里只做
+   * "判重 → 换引用 → 通知"。同一套规则只在那一处实现，对话框与会话层不会分叉。
+   *
+   * @returns 是否真的改了（没变就不置脏，避免"点开又保存"被记成一次内容变更）
+   */
+  updateCardInfo(info: CardInfo): boolean {
+    if (sameCardInfo(readCardInfo(this.#card), info)) return false;
+    this.#card = applyCardInfo(this.#card, info);
+    this.#onContentChanged();
+    return true;
   }
 
   // ── 写：落盘状态 ────────────────────────────────────────

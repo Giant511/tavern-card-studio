@@ -1,0 +1,44 @@
+{
+  "$comment": [
+    "ST 地址解析的**两侧共用**用例表（v0.1.6 / T14.0+T14.1）。",
+    "TS: client/src/session/st-address.ts 的 parseStAddress（test/st-proxy.test.mjs 读它）",
+    "RS: client/src-tauri/src/proxy.rs 的 parse_st_address（include_str! 进来，cargo test 读它）",
+    "",
+    "为什么要一份共享文件：这两个实现一个是设置面板的判据、一个是代理目标的判据。",
+    "它们分叉的症状极难查 —— 设置里存得进去（TS 认为合法），面板永远连不上（壳认为非法），",
+    "而两边各自的单测都是绿的。所以规则本身写在这里，两边都只是它的执行者。",
+    "",
+    "字段只放**两侧语义相同**的东西：input / ok / reason / host / port。",
+    "显示形态（TS 的 baseUrl、Rust 的 authority）是各自的展示问题，各测各的。"
+  ],
+  "default": "127.0.0.1:8000",
+  "allowedHosts": ["127.0.0.1", "localhost", "::1"],
+  "cases": [
+    { "input": "127.0.0.1:8000", "ok": true, "host": "127.0.0.1", "port": 8000 },
+    { "input": "  127.0.0.1:8001  ", "ok": true, "host": "127.0.0.1", "port": 8001 },
+    { "input": "http://127.0.0.1:8000/", "ok": true, "host": "127.0.0.1", "port": 8000 },
+    { "input": "HTTP://LOCALHOST:8080", "ok": true, "host": "localhost", "port": 8080 },
+    { "input": "localhost:8000", "ok": true, "host": "localhost", "port": 8000 },
+    { "input": "[::1]:8000", "ok": true, "host": "::1", "port": 8000 },
+    { "input": "::1:9000", "ok": true, "host": "::1", "port": 9000 },
+
+    { "input": "", "ok": false, "reason": "empty" },
+    { "input": "   ", "ok": false, "reason": "empty" },
+    { "input": "https://127.0.0.1:8000", "ok": false, "reason": "format" },
+    { "input": "127.0.0.1:8000/chat", "ok": false, "reason": "format" },
+    { "input": "127.0.0.1", "ok": false, "reason": "format" },
+    { "input": ":8000", "ok": false, "reason": "format" },
+
+    { "input": "192.168.1.5:8000", "ok": false, "reason": "not-loopback" },
+    { "input": "8.8.8.8:8000", "ok": false, "reason": "not-loopback" },
+    { "input": "0.0.0.0:8000", "ok": false, "reason": "not-loopback" },
+    { "input": "localhost.evil.com:8000", "ok": false, "reason": "not-loopback" },
+    { "input": "127.0.0.1.nip.io:8000", "ok": false, "reason": "not-loopback" },
+
+    { "input": "127.0.0.1:0", "ok": false, "reason": "bad-port" },
+    { "input": "127.0.0.1:65536", "ok": false, "reason": "bad-port" },
+    { "input": "127.0.0.1:abc", "ok": false, "reason": "bad-port" },
+    { "input": "127.0.0.1:-1", "ok": false, "reason": "bad-port" },
+    { "input": "127.0.0.1:", "ok": false, "reason": "bad-port" }
+  ]
+}

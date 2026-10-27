@@ -33,7 +33,6 @@ import {
   stInstallTargetDir,
   stPushFileName,
   stStatusText,
-  ST_BASE_URL,
   ST_LAUNCH_FAILURE_HINTS,
   ST_PROBE_TIMEOUT_MS,
   ST_RELEASE,
@@ -41,6 +40,10 @@ import {
   toBase64Chunked,
   waitForStReady,
 } from '../client/src/session/st-install.ts';
+import { parseStAddress, ST_DEFAULT_ADDRESS } from '../client/src/session/st-address.ts';
+
+/** 探测用的地址（默认值）：T14.0 起地址从配置来，测试里显式给它，不靠隐式默认 */
+const ADDRESS = parseStAddress(ST_DEFAULT_ADDRESS);
 
 const ROOT = join(import.meta.dirname, '..');
 const COMMANDS_RS = readFileSync(join(ROOT, 'client/src-tauri/src/commands.rs'), 'utf8');
@@ -338,8 +341,10 @@ test('tailOfLog：取末尾、丢空行、统一 CRLF', () => {
   assert.equal(tailOfLog(''), '');
 });
 
-test('ST_BASE_URL 与需求写死的一致', () => {
-  assert.equal(ST_BASE_URL, 'http://127.0.0.1:8000');
+test('默认 ST 地址：可解析、端口 8000（v0.1.6 起由配置决定，常量只是默认值）', () => {
+  assert.equal(ADDRESS.ok, true);
+  assert.equal(ADDRESS.port, 8000);
+  assert.equal(ADDRESS.baseUrl, 'http://127.0.0.1:8000');
 });
 
 // ── 探测（v0.1.5 生产反馈：ST 在跑却报"未运行"）─────────────
@@ -351,28 +356,53 @@ test('ST_BASE_URL 与需求写死的一致', () => {
  * 注意"修前/修后"到底差在哪，这里必须说清楚，否则这条测试会变成自我安慰：
  * `mode:'no-cors'` 在 26407bd 里**本来就是**（不是这次才改的），
  * 实测对无 CORS 头的服务也能 resolve（见 `scripts/verify-f15-probe.mjs`）。
- * 真正变了的是**判定依据从"浏览器 fetch 成功"改成"壳侧 TCP 能连上"** ——
- * 线上 ST 的访问日志里没有任何来自 webview 的连接，说明请求在浏览器网络层
- * 就没出去（代理/安全软件/本地网络权限），fetch 怎么写都救不了。
- * 所以这条用例把 fetch 桩成 reject，正是复现线上现场。
+ * 真正变了的是**判定依据从"浏览器 fetch 成功"改成"壳侧 TCP 能连上"**。
+ *
+ * ## 2026-10-27 更正：fetch 失败的原因是响应头，不是网络
+ *
+ * 这条用例原来附带的解释是"请求在浏览器网络层就没出去（代理/安全软件/本地网络权限）"，
+ * **那个解释已被实测推翻**：SillyTavern 的响应带
+ *
+ * ```text
+ * Cross-Origin-Resource-Policy: same-origin
+ * ```
+ *
+ * 浏览器对它的执行方式是"跨源 `no-cors` 读取一律失败"，抛 `TypeError: Failed to fetch` ——
+ * 请求发出去了、响应也回来了，fetch 仍然 reject。三组对照（页面源 127.0.0.1:8977）：
+ * ST:8000（有 CORP）失败 / 反代剥 XFO 留 CORP 失败 / 反代两者都剥 **成功**。
+ *
+ * 结论没变（TCP 说了算），但**理由变了**，而理由决定这条测试该断言什么：
+ * 不能再断言"webview 里连不上"这种把原因说成网络的话。
  */
 test('回归：TCP 通、浏览器 fetch 被挡 → 必须判"运行中"（生产缺陷复现）', async () => {
   const blockedFetch = async () => {
     throw new TypeError('Failed to fetch');
   };
   const result = await probeStState({
+    address: ADDRESS,
     tcpProbe: async () => ({ alive: true, errorKind: null, errorMessage: null }),
     fetchImpl: blockedFetch,
-    baseUrl: 'http://127.0.0.1:8000',
   });
 
   assert.equal(result.outcome, 'running', '端口在应答就必须判运行中 —— 修前这里会判未运行');
-  assert.equal(result.browserBlocked, true, '要能指出"浏览器那侧被挡了"（诊断信息，不参与判定）');
-  assert.match(describeProbe(result), /webview 里连不上/);
+  assert.equal(result.browserBlocked, true, '要能指出"浏览器那侧读不到"（诊断信息，不参与判定）');
+
+  /*
+   * 断言的是**语义**而不是某句原文：必须说明"这是响应头策略、不影响使用"，
+   * 并且**不许**把原因说成网络不通（那句错话让排查方向偏过一整轮）。
+   * 写成 `/webview 里连不上/` 就是把当时的措辞钉成了期望值 —— 与本项目
+   * connect-guide 那条测试同一种病（测试给错误作保）。
+   */
+  const text = describeProbe(result);
+  assert.match(text, /在应答/, 'TCP 通就要说在应答');
+  assert.match(text, /响应头|策略/, '要说清是被响应头策略拦的');
+  assert.doesNotMatch(text, /连不上|网络不通|被挡/, '不许把原因说成网络问题（已证伪）');
+  assert.match(text, /不受影响/, '要说明这不影响推送/浏览器打开');
 });
 
 test('回归：TCP 没人听 → 判"没有应答"，且原始错误类型带出来', async () => {
   const result = await probeStState({
+    address: ADDRESS,
     tcpProbe: async () => ({
       alive: false,
       errorKind: 'ConnectionRefused',
@@ -381,7 +411,6 @@ test('回归：TCP 没人听 → 判"没有应答"，且原始错误类型带出
     fetchImpl: async () => {
       throw new TypeError('Failed to fetch');
     },
-    baseUrl: 'http://127.0.0.1:8000',
   });
 
   assert.equal(result.outcome, 'no-answer');
@@ -391,6 +420,7 @@ test('回归：TCP 没人听 → 判"没有应答"，且原始错误类型带出
 
 test('TCP 到点没回（TimedOut）与"没人听"是两种结局', async () => {
   const timed = await probeStState({
+    address: ADDRESS,
     tcpProbe: async () => ({ alive: false, errorKind: 'TimedOut', errorMessage: 'timed out' }),
     fetchImpl: async () => {
       throw new TypeError('Failed to fetch');
@@ -404,6 +434,7 @@ test('探测判定只看 TCP：fetch 成功但 TCP 不通仍是"没有应答"', 
   // 反过来也要钉：别让"fetch 恰好成功"把结论翻成运行中（那说明有人在中转，
   // 而我们探测的是本机端口 —— 以 TCP 为准才自洽）
   const result = await probeStState({
+    address: ADDRESS,
     tcpProbe: async () => ({ alive: false, errorKind: 'ConnectionRefused', errorMessage: 'refused' }),
     fetchImpl: async () => new Response('ok'),
   });
@@ -462,6 +493,7 @@ test('classifyStProbe：三种结局的映射表', () => {
 
 test('探测：壳侧探测函数抛错时按"没有应答"处理，不把异常漏给界面', async () => {
   const result = await probeStState({
+    address: ADDRESS,
     tcpProbe: async () => {
       throw new Error('IPC 断了');
     },
@@ -494,12 +526,17 @@ test('启动失败：其它错误原样透传（不猜原因）', () => {
   assert.equal(describeLaunchFailure('start.bat', raw), `启动失败：${raw}`);
 });
 
-test('端口探测契约：TS 与 Rust 的默认端口、超时同值', () => {
-  const rustPort = /pub const ST_DEFAULT_PORT: u16 = (\d+);/.exec(COMMANDS_RS);
+test('端口探测契约：超时两侧同值；默认端口只由 TS 定义（壳不持有）', () => {
   const rustTimeout = /pub const PORT_PROBE_TIMEOUT_MS: u64 = (\d+);/.exec(COMMANDS_RS);
-  assert.notEqual(rustPort, null, 'Rust 侧没有 ST_DEFAULT_PORT');
   assert.notEqual(rustTimeout, null, 'Rust 侧没有 PORT_PROBE_TIMEOUT_MS');
-  assert.equal(Number(rustPort[1]), 8000);
   assert.equal(Number(rustTimeout[1]), ST_PROBE_TIMEOUT_MS, '两侧超时不一致会导致"TS 说超时、壳说没超时"');
-  assert.ok(ST_BASE_URL.endsWith(`:${rustPort[1]}`), 'TS 的 ST_BASE_URL 端口与 Rust 默认端口不一致');
+
+  /*
+   * v0.1.6 / T14.0：**壳里不该再有"默认端口"这个概念**。
+   *
+   * 地址是配置项，壳只接受调用方传进来的 host/port。壳里留一份默认端口，
+   * 就多一个"配置文件说 8001、壳偷偷按 8000 探"的分叉点 —— 而这种分叉
+   * 表现为"检测通过但推送失败"，极难归因。
+   */
+  assert.ok(!COMMANDS_RS.includes('ST_DEFAULT_PORT'), '壳里还留着 ST_DEFAULT_PORT —— 默认值只允许在 TS 的契约层');
 });

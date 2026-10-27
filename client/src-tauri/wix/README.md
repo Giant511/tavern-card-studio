@@ -35,6 +35,24 @@
 
 除此之外没有动 Tauri 原有的任何一行 —— 升级对齐时可以按这三处重新打补丁。
 
+## 一个**配置**级的改动（v0.1.6，不在 wxs 里）
+
+`tauri.conf.json` 里显式写了 `"wix": { "allowDowngrades": false }`。
+
+Tauri 2 这个字段的默认值是 **true**（官方 schema 的 `WindowsConfig.allowDowngrades`），
+于是渲染出来的模板走 `{{#if allow_downgrades}}` 分支：
+`<MajorUpgrade AllowDowngrades="yes" />`，Upgrade 表只有一行 `VersionMin=0`、
+`VersionMax` 留空 —— **装回旧版会被当成升级执行**，静默替换掉已装的新版。
+
+对本项目这是危险的：0.1.6 起服务端数据库与客户端配置都往前走了，程序回退到旧版
+却配着新结构的数据/配置，症状比"装不上"难查得多。改成 `false` 后走 else 分支：
+`DowngradeErrorMessage="!(loc.DowngradeErrorMessage)"`（en-US 文案见 Tauri 的
+`locale.wxl`），Upgrade 表变成 `VersionMax=<当前版本>` + 一行 OnlyDetect 的降级行。
+
+判据不要只看源码：`msiexec` 的行为由 **MSI 里的 `Upgrade` 表**决定，
+用 `WindowsInstaller.Installer` COM 读 `SELECT * FROM Upgrade` 才是硬证据
+（本项目 v0.1.5 客户端实测 `Attributes=257`、`VersionMax` 空 = 允许降级）。
+
 ## 升级 Tauri 之后必须做的事
 
 模板来自 `tauri-apps/tauri` 仓库的

@@ -28,7 +28,7 @@
 
 import type { StCharacterBook, StWorldbookEntry } from '../model/sillytavern.js';
 import { offsetToLineColumn } from '../text/count.js';
-import { parseWorldbookTextWith, renderWorldbookTextWith } from './worldbook.js';
+import { parseWorldbookTextWith, renderWorldbookTextWith, withStEntryComments } from './worldbook.js';
 import { DEFAULT_WORLDBOOK_FORMAT, type WorldbookFormatParams } from './worldbook-preset.js';
 
 /** 复述一遍形状，供本文件内部的 `location` 变量使用（列号按码点，见 text/count） */
@@ -605,11 +605,29 @@ export function parseWorldbookJson(text: string): ParseWorldbookJsonResult {
 }
 
 /** 规范序列化：2 空格缩进 + 固定键顺序（只为"改过的内容"准备，未改动的走原文写回） */
+export interface RenderWorldbookJsonOptions {
+  /**
+   * 把条目显示名补进 ST 认的 `comment`（缺省 **false**）。
+   *
+   * 与 `serializeStCard` 的同名选项一个道理：纯序列化要**无损**
+   * （`verify-export-roundtrip` 会逐条比对可见字段），
+   * 字段对齐属于"交给 ST 用的产物"，由 `exportWorldbook` 打开。
+   */
+  entryTitleToComment?: boolean;
+}
+
 export function renderWorldbookJson(
   entries: readonly StWorldbookEntry[],
   meta: Record<string, unknown> = {},
+  options: RenderWorldbookJsonOptions = {},
 ): string {
-  const normalized = entries.map((entry) => {
+  /*
+   * 世界书单独导出也补 `comment`：用户完全可能把这个 JSON 直接导入 ST，
+   * 而 ST 的标题只认 `comment`（见 `withStEntryComment`）。
+   * 两条导出路径（整卡 / 世界书）都要补，漏一条就等于漏一半。
+   */
+  const source = options.entryTitleToComment === true ? withStEntryComments(entries) : entries;
+  const normalized = source.map((entry) => {
     const ordered: Record<string, unknown> = {};
     if (typeof entry.id === 'number') ordered['id'] = entry.id;
     ordered['keys'] = entry.keys ?? [];
@@ -763,7 +781,8 @@ export function exportWorldbook(input: WorldbookExportInput): WorldbookExportRes
   }
 
   return {
-    text: renderWorldbookJson(input.entries, meta),
+    // 用户点「导出世界书」时目标是 ST，所以要开字段对齐（默认关闭以保无损）
+    text: renderWorldbookJson(input.entries, meta, { entryTitleToComment: true }),
     verbatim: false,
     reason: source ? '条目或周边字段有改动，已按规范重新序列化' : '没有导入来源，按规范序列化',
   };

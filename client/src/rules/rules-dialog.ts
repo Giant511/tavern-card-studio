@@ -254,7 +254,7 @@ export class RulesDialog {
     const wbHint = el(
       'p',
       'field-hint',
-      '决定世界书 TXT 怎么写：条目开闭标记、字段标签、字段顺序、分隔符。切换后世界书的导出/导入与格式检查都按它走；内置「标准世界书」等价于 v1.0 冻结格式。',
+      '决定世界书文本的写法：条目如何分隔、每项叫什么、按什么顺序排列。切换后世界书的导出、导入与格式检查都按它走。',
     );
 
     this.worldbookSelect = el('select', 'select wide') as HTMLSelectElement;
@@ -489,7 +489,7 @@ export class RulesDialog {
     }
     for (const [key, value] of [
       ['格式', preset.summary],
-      ['字段标签', preset.builtin ? '与字段名相同（name / keys / …）' : '见预设的 labelMap'],
+      ['项目名称', preset.builtin ? '使用默认名称' : '由该预设自行定义'],
     ] as Array<[string, string]>) {
       const row = el('div', 'preview-row');
       row.append(el('span', 'preview-key', key), el('code', 'preview-value', value));

@@ -1,6 +1,6 @@
 [package]
 name = "tcs-shell"
-version = "0.1.5"
+version = "0.1.6"
 description = "酒馆角色卡审计编辑工具链 · 桌面客户端壳（Tauri 2）"
 authors = ["Tavern Card Studio"]
 edition = "2021"
@@ -36,6 +36,21 @@ tauri-plugin-log = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-window-state = "2"
 tauri-plugin-single-instance = "2"
+
+# ── 本地回环反向代理（v0.1.6 / T14.1）──────────────────────────
+# 这四个包**本来就在依赖树里**（tauri → reqwest → hyper），这里只是显式声明
+# 以便直接 `use` —— 不引入新的第三方代码，也不改 lock 里的版本。
+#
+# **只开 http1**：SillyTavern 是 HTTP/1.1，开 http2 纯粹是给可执行文件加体积。
+# 需求给的体积红线是「客户端 +200 KB 内」，关掉 http2 是第一刀（决策 #224），
+# 所以它不是"以后再说"的选项，而是默认就不开。
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "rt-multi-thread", "macros"] }
+# 代理的失败要能落到 client-error.log 同级（tauri-plugin-log 已注册）
+log = "0.4"
 
 # ── 仅用于特性合并，代码里不使用 ──────────────────────────────
 # indexmap 1.9.x 的 [features] 里没有 `default = ["std"]`（上游疏漏），

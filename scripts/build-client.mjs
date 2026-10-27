@@ -65,6 +65,7 @@ import {
   rel,
 } from './lib/bundle-health.mjs';
 import { checkSentinels, validateRegistry } from './lib/feature-sentinels.mjs';
+import { checkVersionLiterals, versionBasisText } from './check-version-literal.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const CLIENT = join(ROOT, 'client');
@@ -106,6 +107,21 @@ if (registryProblems.length > 0) {
   for (const problem of registryProblems) say(`  ✘ ${problem}`);
   die('哨兵表不合格 —— 先修 scripts/lib/feature-sentinels.mjs');
 }
+
+// 版本号载体一致性（v0.1.6）：MSI 文件名由 package.json 的 version 决定，
+// 但版本号还散落在 tauri.conf / Cargo.toml / Cargo.lock / SERVER_VERSION /
+// 服务端打包脚本 / 安装说明页里。打出来的包名对、里面印的版本不对，是
+// "版本号骗人"这一类事故（v0.1.5 实测：包名 v0.1.5、服务端内部 v0.1.3、
+// 说明页 0.1.2）。放在最前面：这一步不过，后面几步的产物都不用看。
+const versionCheck = checkVersionLiterals(ROOT);
+if (!versionCheck.ok) {
+  for (const problem of versionCheck.problems) say(`  ✘ ${problem}`);
+  die('版本号载体不一致 —— 先跑 npm run check:version 看清单');
+}
+say(`  ✔ ${versionCheck.carriers.length} 处版本载体都等于 ${versionCheck.current}`);
+// 载体一致只证明"改全了"，不证明"这个版本号该存在"。升不升由需求文档决定（决策 #232），
+// 脚本看不到文档，所以把「当前版本 vs 最新 tag」摆出来，让人自己核对一眼。
+say(`  · ${versionBasisText(versionCheck.current, ROOT)}`);
 
 // ── 0. clean ─────────────────────────────────────────────
 /*
@@ -204,7 +220,20 @@ if (embed.ok) {
 
 // ── 7. 出厂件（MSI 里那个 exe）────────────────────────────
 step(7, '出厂件校验（解开 MSI，审计里面那个 exe）');
-const shipped = auditMsiShellAssets(bundleMsi, DIST);
+/*
+ * 壳侧（Rust）哨兵：这些字面量必须出现在**出厂 exe** 里。
+ *
+ * 前端哨兵（脚本/lib/feature-sentinels.mjs）只能守 dist，而 v0.1.6 三个真因
+ * 全都修在壳里：`X-Frame-Options` 剥离、`frame-ancestors` 剥离、会话 cookie 改
+ * `SameSite=None`。它们不进 dist，只能在这里守 —— 否则"包装上了但壳是旧的"
+ * 这类事故没有任何东西能发现（版本号照样对、体积照样正常）。
+ */
+const SHELL_STRINGS = [
+  'x-frame-options',        // 剥 XFO：面板 iframe 才显示得出来
+  'frame-ancestors',        // 剥 CSP 的那条指令
+  'SameSite=None',          // 会话 cookie 跨站可发：否则卡在「正在初始化…」
+];
+const shipped = auditMsiShellAssets(bundleMsi, DIST, { strings: SHELL_STRINGS });
 if (shipped.skipped) die(`无法审计出厂件：${shipped.reason}`);
 if (!shipped.ok) {
   die(
@@ -213,6 +242,13 @@ if (!shipped.ok) {
   );
 }
 ok(`MSI 内的 exe 内嵌了全部 ${shipped.checked} 个 dist 资源键`);
+if (shipped.missingStrings.length > 0) {
+  die(
+    `MSI 内的 exe 缺 ${shipped.missingStrings.length}/${SHELL_STRINGS.length} 个壳侧关键字符串` +
+      `（${shipped.missingStrings.join('、')}）—— 这个包的壳不是带修复的那一版`,
+  );
+}
+ok(`壳侧关键字符串 ${SHELL_STRINGS.length}/${SHELL_STRINGS.length} 命中`);
 note(`出厂件 exe ${shipped.exeBytes} 字节 sha256 ${shipped.exeSha256.slice(0, 16)}…`);
 const treeSha = createHash('sha256').update(readFileSync(EXE)).digest('hex');
 if (treeSha !== shipped.exeSha256) {

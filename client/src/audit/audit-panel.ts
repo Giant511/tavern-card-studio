@@ -378,14 +378,21 @@ export class AuditPanel {
     }
     this.wordSection.append(chart);
 
-    // 落盘字段口径（与平台长度规则同一口径，容易和"八板块合计"混淆，所以单列）
+    /*
+     * 三个"按写入字段统计"的字数（与平台长度规则同一口径，容易和"八板块合计"混淆，
+     * 所以单列）。
+     *
+     * 标签必须是**中文界面名**，不能直接印 `description` / `personality` /
+     * `character_book`：这三个是导出文件里的键名，用户在自己写的卡里从来没见过它们，
+     * 摆一排英文只会让人猜"这是我哪一段"。
+     */
     const byField = report.wordCount.byField;
     const fieldRow = el('div', 'words-fields');
-    fieldRow.append(el('span', 'words-fields-title', '落盘字段口径'));
+    fieldRow.append(el('span', 'words-fields-title', '各字段字数'));
     fieldRow.append(
-      el('span', 'words-field', `description ${byField.description.totalWords}`),
-      el('span', 'words-field', `personality ${byField.personality.totalWords}`),
-      el('span', 'words-field', `character_book ${byField.character_book.totalWords}`),
+      el('span', 'words-field', `角色设定 ${byField.description.totalWords}`),
+      el('span', 'words-field', `性格 ${byField.personality.totalWords}`),
+      el('span', 'words-field', `世界书 ${byField.character_book.totalWords}`),
     );
     this.wordSection.append(fieldRow);
   }

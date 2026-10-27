@@ -18,11 +18,13 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { join } from 'node:path';
 
 import { runAuditDualSample } from '../scripts/verify-audit-dual-sample.mjs';
 import { runExportRoundtrip } from '../scripts/verify-export-roundtrip.mjs';
 import { runImportAtomic } from '../scripts/verify-import-atomic.mjs';
 import { runT1034Custom } from '../scripts/verify-t1034-custom.mjs';
+import { runUiCopyCheck } from '../scripts/verify-ui-copy.mjs';
 
 /** 把脚本的 checks 结构转成断言失败信息（比 assert.equal(failures, 0) 好排查） */
 function assertAllPassed(label, { checks, failures }) {
@@ -78,4 +80,17 @@ test('verify-audit-dual-sample：六板块旧卡可审计，八板块新卡正�
    * 现在拆成两张样本：真旧卡（字段全空，仍必须报 info）+ 标准 ST 卡（有内容，不许报）。
    */
   assert.equal(result.checks.length, 28, `断言数从 28 变成 ${String(result.checks.length)}，确认是有意改动`);
+});
+
+test('verify-ui-copy：界面文案里没有测试性 / 开发性措辞', () => {
+  /*
+   * 判据是"用户看到的字"。功能测试永远抓不到这类问题 ——
+   * 按钮能点、导出能用，只是文案在跟开发者说话。
+   */
+  const result = runUiCopyCheck(join(import.meta.dirname, '..'));
+  const detail = result.problems
+    .map((item) => `${item.file}:${String(item.line)} 「${item.literal.slice(0, 40)}」— ${item.why}`)
+    .join('\n  ');
+  assert.deepEqual(result.problems, [], `UI 文案体检 ${String(result.problems.length)} 处：\n  ${detail}`);
+  assert.ok(result.scanned > 50, `只扫到 ${String(result.scanned)} 个文件，路径不对？`);
 });

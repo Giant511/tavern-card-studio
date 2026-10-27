@@ -39,6 +39,13 @@ export type ShellErrorCode =
    * 混在一起会让 UI 把"还没装 ST"报成安全错误。
    */
   | 'SPAWN_REJECTED'
+  /**
+   * 探测目标主机不在回环白名单（details.host / details.allowed）。
+   *
+   * 与 `SPAWN_REJECTED` 分开：这个码指向"配置被改坏了，去看 SillyTavern 地址"，
+   * 那个指向"这个目录不是 SillyTavern，去选目录"。混在一起用户不知道该改哪里。
+   */
+  | 'PROBE_HOST_NOT_ALLOWED'
   /** 其它 IO 失败 */
   | 'IO_ERROR'
   /** 非壳错误（前端参数错误、插件异常等） */

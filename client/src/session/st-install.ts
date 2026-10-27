@@ -15,9 +15,7 @@
  */
 
 import { joinPath, nextAvailableFileName, sanitizeFileBase } from './cards-path.ts';
-
-/** ST 默认端口（需求写死：`http://127.0.0.1:8000` 可达即视为运行中） */
-export const ST_BASE_URL = 'http://127.0.0.1:8000';
+import { resolveStAddress, type StAddressOk } from './st-address.ts';
 
 /** 角色卡在 ST 里的落点（相对 ST 根目录） */
 export const ST_CHARACTERS_SUBDIR = 'data/default-user/characters';
@@ -212,11 +210,19 @@ export function stPushFileName(cardName: string, existing: readonly string[]): s
  * 那用户就无从知道推过去的那张封面是哪来的。说清楚来源，他才能判断
  * "为什么这张卡的封面不是我刚在导出里挑的那张"（那次选择不写进记忆）。
  */
-export function describePushFace(face: {
+/**
+ * 推送时用的卡面来源（决策 #167 的优先级链：原图 → 记住的图库封面 → 内置默认）。
+ *
+ * 单独列成具名类型是因为它现在跨两个模块（`st-push.ts` 的产物类型、
+ * `st-dialog.ts` 的展示），而匿名内联类型会让两边各写一份、慢慢长歪。
+ */
+export interface StPushFace {
   from: 'source' | 'library' | 'default';
   fileName: string | null;
   note: string;
-}): string {
+}
+
+export function describePushFace(face: StPushFace): string {
   if (face.note !== '') return `卡面：${face.note}`;
   switch (face.from) {
     case 'source':
@@ -247,14 +253,17 @@ export function staleJsonSiblings(cardName: string, existing: readonly string[])
  * 下一步动作（去装 / 帮你启动 / 直接推 / 已经好了），所以这里宁可长一点。
  * `pushed` 那条是需求原话，逐字保留。
  */
-export function stStatusText(state: StState, context: { root?: string; fileName?: string } = {}): string {
+export function stStatusText(
+  state: StState,
+  context: { root?: string; fileName?: string; address?: string } = {},
+): string {
   switch (state) {
     case 'missing':
       return '未检测到本地 SillyTavern：可在「在 SillyTavern 中测试」里看安装步骤或一键安装';
     case 'installed-idle':
       return `已找到 SillyTavern（${context.root ?? '路径未知'}），但它没有运行 —— 点「启动 SillyTavern」后再推送`;
     case 'running':
-      return 'SillyTavern 正在运行（127.0.0.1:8000）：可以把当前卡推送过去';
+      return `SillyTavern 正在运行（${context.address ?? '配置的地址'}）：可以把当前卡推送过去`;
     case 'pushed':
       /*
        * 文案在 G8 改过（决策 #212）。原句是需求 T13.6 写的「已在 SillyTavern 中就绪，
@@ -342,7 +351,7 @@ export async function waitForStReady(
  */
 export type StProbeOutcome = 'running' | 'timeout' | 'no-answer';
 
-/** 壳侧 TCP 探测的结论（`contract.probeStAlive` 的返回值，这里只取需要的字段） */
+/** 壳侧 TCP 探测的结论（`contract.probeTcp` 的返回值，这里只取需要的字段） */
 export interface TcpProbeFacts {
   alive: boolean;
   /** `io::ErrorKind` 的可读名：ConnectionRefused / TimedOut / PermissionDenied … */
@@ -359,11 +368,31 @@ export interface StProbeResult {
   browserErrorName: string | null;
   browserErrorMessage: string | null;
   /**
-   * TCP 通、但浏览器 fetch 不通 = **浏览器网络层被挡**（系统代理 / 安全软件 / LNA）。
+   * TCP 通、但浏览器 fetch 失败。
    *
-   * 这件事值得单独记：它不影响推送（写盘是壳的事）、也不影响打开 ST（走系统浏览器），
-   * 只说明"webview 里连不上"。生产缺陷里 ST 访问日志从头到尾**没有一条来自 webview
-   * 的连接**，说明当时就是卡在这一层 —— 而不是 ST 没运行。
+   * ## 名字是历史遗留，含义已被证伪过一次（2026-10-27 实测）
+   *
+   * 它原来被解释成"浏览器网络层被挡（系统代理 / 安全软件 / LNA）"。实测下来
+   * **不是网络问题**：SillyTavern 的响应里带
+   *
+   * ```text
+   * Cross-Origin-Resource-Policy: same-origin
+   * ```
+   *
+   * 浏览器对这个头的执行方式是"跨源 `no-cors` 读取一律失败"，抛出的正是
+   * `TypeError: Failed to fetch`。于是**请求明明发出去了、响应也回来了**，
+   * fetch 仍然 reject —— 与"连不上"长得一模一样。
+   *
+   * 同一台机器上的三组对照（页面源 `127.0.0.1:8977`）：
+   *
+   * | 目标 | CORP | `no-cors` fetch |
+   * |---|---|---|
+   * | ST `:8000` | `same-origin` | 失败 `TypeError: Failed to fetch` |
+   * | 反代，剥 XFO 但保留 CORP | `same-origin` | 失败（同上） |
+   * | 反代，XFO 与 CORP 都剥 | 无 | **成功** |
+   *
+   * 所以这个字段只能当"诊断线索"，**绝不能当"网络不通"的结论**。判定"ST 在不在跑"
+   * 依旧只看壳侧 TCP（见 `classifyStProbe` 的注释）。
    */
   browserBlocked: boolean;
 }
@@ -413,8 +442,15 @@ export function describeProbe(result: StProbeResult): string {
 
   switch (result.outcome) {
     case 'running':
+      /*
+       * 措辞刻意不说"被代理挡住" —— 那是我曾经据此判断成"环境拦回环"的原话，
+       * 而实测证明 webview 侧的失败主因是 ST 自己的 `Cross-Origin-Resource-Policy`
+       * （跨源 no-cors 读取一律失败），网络完全通。
+       * 现在只说事实：TCP 通、webview 内读不到；并说明不影响什么。
+       */
       return result.browserBlocked
-        ? `${result.baseUrl} 在应答（注意：webview 里连不上它，可能被代理/安全软件挡住；推送与打开浏览器不受影响）`
+        ? `${result.baseUrl} 在应答（webview 内读取被响应头策略拒绝，属正常现象；` +
+            `推送与用系统浏览器打开都不受影响）`
         : `${result.baseUrl} 在应答`;
     case 'timeout':
       return `${result.baseUrl} 在 ${String(ST_PROBE_TIMEOUT_MS)} 毫秒内没有应答${detail}`;
@@ -424,11 +460,11 @@ export function describeProbe(result: StProbeResult): string {
 }
 
 /**
- * 判断"ST 是否在运行"（`http://127.0.0.1:8000` 可达即视为运行中）。
+ * 判断"ST 是否在运行"（**配置地址**可达即视为运行中）。
  *
  * ## 两侧各探一次，只有一侧算数
  *
- * 1. **壳侧 TCP**（`tcpProbe` 注入，Rust 里 `TcpStream::connect_timeout` 到 127.0.0.1:port）
+ * 1. **壳侧 TCP**（`tcpProbe` 注入，Rust 里 `TcpStream::connect_timeout` 到 host:port）
  *    —— **唯一判定依据**。它只回答"这个端口有没有人 accept"这一个比特，不受 CORS、
  *    跨源策略、本地网络权限、系统代理影响。
  * 2. **浏览器侧 fetch（`mode:'no-cors'`）** —— 只用于诊断。
@@ -442,24 +478,30 @@ export function describeProbe(result: StProbeResult): string {
  * 实测见 `scripts/verify-f15-probe.mjs`），但它一个人兜不住这一层。
  *
  * 所以真正的判据放到壳里：TCP 能连上 = 活着。fetch 的错误名照原样带进诊断日志。
+ *
+ * ## v0.1.6 / T14.0：地址不再写死
+ *
+ * 端口可配（用户的 ST 可能改了 `listenPort`、也可能多开）。地址从
+ * `resolveStAddress(config.stAddress)` 取，这里没有默认值兜底 ——
+ * **默认值只允许存在于 `contract/types.ts`**（静态断言守着）。
  */
 export async function probeStState(options: {
-  /** 壳侧 TCP 探测（`contract.probeStAlive`）；测试里可注入假实现 */
-  tcpProbe: (port: number) => Promise<TcpProbeFacts>;
+  /** 目标地址（来自配置）；省缺时用默认地址，仅为便利，不鼓励省略 */
+  address?: StAddressOk;
+  /** 壳侧 TCP 探测（`contract.probeTcp`）；测试里可注入假实现 */
+  tcpProbe: (host: string, port: number) => Promise<TcpProbeFacts>;
   fetchImpl?: typeof fetch;
-  baseUrl?: string;
   timeoutMs?: number;
 }): Promise<StProbeResult> {
-  const baseUrl = options.baseUrl ?? ST_BASE_URL;
+  const address = options.address ?? resolveStAddress(null);
   const timeoutMs = options.timeoutMs ?? ST_PROBE_TIMEOUT_MS;
   const fetchImpl = options.fetchImpl ?? fetch;
-  const port = Number(new URL(baseUrl).port === '' ? '80' : new URL(baseUrl).port);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const fetchAttempt = (async (): Promise<{ name: string | null; message: string | null }> => {
     try {
-      await fetchImpl(baseUrl, { mode: 'no-cors', signal: controller.signal, cache: 'no-store' });
+      await fetchImpl(address.baseUrl, { mode: 'no-cors', signal: controller.signal, cache: 'no-store' });
       return { name: null, message: null };
     } catch (error) {
       return {
@@ -472,7 +514,7 @@ export async function probeStState(options: {
   })();
 
   const [tcp, browser] = await Promise.all([
-    options.tcpProbe(port).catch(
+    options.tcpProbe(address.host, address.port).catch(
       (error: unknown): TcpProbeFacts => ({
         alive: false,
         errorKind: error instanceof Error ? error.name : 'ProbeFailed',
@@ -483,7 +525,7 @@ export async function probeStState(options: {
   ]);
 
   return classifyStProbe({
-    baseUrl,
+    baseUrl: address.baseUrl,
     tcp,
     browserErrorName: browser.name,
     browserErrorMessage: browser.message,
@@ -605,4 +647,88 @@ export function toBase64Chunked(bytes: Uint8Array, chunkSize = 32 * 1024): strin
 export function tailOfLog(text: string, maxLines = 20): string {
   const lines = text.replace(/\r\n/g, '\n').split('\n').filter((line) => line.trim() !== '');
   return lines.slice(-maxLines).join('\n');
+}
+
+// ── ST 安装位置的整体定位（v0.1.6 / T14.3）──────────────────
+//
+// 这套流程原先写在 `st-dialog.ts` 的 `refresh()` 里。v0.1.6 多了右侧常驻面板，
+// 它也要同样的答案（"ST 在哪、characters 目录是哪"），于是抽到这里。
+//
+// **不是为了复用而复用**：检测规则要是写两份，就会出现"对话框说装了、面板说没装"
+// —— 而两边各自的单测都绿。这类分叉在 F15 期间已经踩过一次（审计传了预设、
+// 编辑器没传），代价是一个下午。
+
+export interface StLocateDeps {
+  /** 壳：列出候选目录（用户目录 + 各盘根） */
+  findCandidates: () => Promise<{ home: string | null; dirs: string[] }>;
+  /** 壳：读配置（记忆路径 + 地址） */
+  readConfig: () => Promise<{ stPath: string | null; stAddress: string | null }>;
+  /** 壳：批量存在性探测 */
+  probePaths: (paths: string[]) => Promise<{ path: string; exists: 'file' | 'dir' | 'none' }[]>;
+  /** 壳：严格读文本 */
+  readText: (path: string, maxBytes?: number) => Promise<{ text: string }>;
+}
+
+export interface StLocateResult {
+  home: string | null;
+  /** 配置里记住的路径（原样） */
+  remembered: string | null;
+  /** 解析后的 ST 访问地址（空/非法值都回落默认） */
+  address: StAddressOk;
+  /** 每个候选目录的判据结论 */
+  verdicts: StInstallVerdict[];
+  /** 选中的那个（null = 没装） */
+  chosen: StInstallVerdict | null;
+}
+
+/**
+ * 走一遍"ST 装在哪"。
+ *
+ * 顺序：候选目录 ∪ 记忆路径 → 批量探 `package.json`/`server.js` → 读 `package.json`
+ * 走判据 → `chooseStInstall`（记忆优先，但"活着"的优先于记忆，见 #207）。
+ *
+ * 地址也在同一处解析：两个入口都从配置读，读法只有这一份。
+ */
+export async function locateSt(deps: StLocateDeps): Promise<StLocateResult> {
+  const scan = await deps.findCandidates();
+  const config = await deps.readConfig();
+  const address = resolveStAddress(config.stAddress);
+  const remembered =
+    typeof config.stPath === 'string' && config.stPath.trim() !== '' ? config.stPath.trim() : null;
+
+  const dirs = new Set<string>(scan.dirs);
+  if (remembered !== null) dirs.add(remembered);
+
+  const list = [...dirs];
+  const probesFor: string[] = [];
+  for (const dir of list) {
+    probesFor.push(joinPath(dir, 'package.json'), joinPath(dir, 'server.js'));
+  }
+  const probes = await deps.probePaths(probesFor);
+  const byPath = new Map(probes.map((item) => [item.path.toLowerCase(), item.exists]));
+
+  const verdicts: StInstallVerdict[] = [];
+  for (const dir of list) {
+    const hasPackageJson = byPath.get(joinPath(dir, 'package.json').toLowerCase()) === 'file';
+    const hasServerJs = byPath.get(joinPath(dir, 'server.js').toLowerCase()) === 'file';
+    // 只有 package.json 真的是文件时才读它（读目录会报 NOT_A_FILE，
+    // 而"是个目录"与"不存在"在判据里都算没装，没必要制造噪声）
+    let packageJsonText: string | null = null;
+    if (hasPackageJson) {
+      try {
+        packageJsonText = (await deps.readText(joinPath(dir, 'package.json'), 1024 * 1024)).text;
+      } catch {
+        packageJsonText = null;
+      }
+    }
+    verdicts.push(judgeStInstall({ root: dir, hasPackageJson, packageJsonText, hasServerJs }));
+  }
+
+  return {
+    home: scan.home,
+    remembered,
+    address,
+    verdicts,
+    chosen: chooseStInstall(verdicts, remembered),
+  };
 }

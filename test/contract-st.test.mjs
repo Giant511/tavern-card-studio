@@ -81,7 +81,7 @@ test('六条命令都注册在 invoke_handler 里，且 TS 调用名一致', () 
   const pairs = [
     ['probe_paths', 'probePaths'],
     ['find_st_candidates', 'findStCandidates'],
-    ['probe_st_alive', 'probeStAlive'],
+    ['probe_tcp', 'probeTcp'],
     ['extract_zip_to', 'extractZipTo'],
     ['spawn_detached', 'spawnDetached'],
     ['open_external', 'openExternal'],
@@ -93,17 +93,28 @@ test('六条命令都注册在 invoke_handler 里，且 TS 调用名一致', () 
   }
 });
 
-test('probe_st_alive：只连回环，不接受主机名（不是端口扫描器）', () => {
-  const signature = /pub fn probe_st_alive\(([^)]*)\)/.exec(COMMANDS_RS);
-  assert.notEqual(signature, null, 'Rust 侧没有 probe_st_alive');
-  // 只允许 port 参数 —— 出现 host 参数就说明它能把探测打到别的机器上
-  assert.ok(signature[1].includes('port'), 'probe_st_alive 丢了 port 参数');
-  assert.ok(!/host\s*:/.test(signature[1]), 'probe_st_alive 不该接受 host 参数（只能探本机回环）');
+test('probe_tcp：接受 host 但走白名单，仍然是"只探回环"', () => {
+  // v0.1.6 / T14.0 把探针泛化成 probe_tcp(host, port)（端口可配），
+  // 但**"只能探本机"这条边界没变** —— 从"写死 127.0.0.1"改成了
+  // "白名单 + 规范化"，白名单内容由 st-address.test.mjs 与 TS 侧对拍。
+  const signature = /pub fn probe_tcp\(([^)]*)\)/.exec(COMMANDS_RS);
+  assert.notEqual(signature, null, 'Rust 侧没有 probe_tcp');
+  assert.ok(signature[1].includes('host: String'), 'probe_tcp 必须收 host 参数（地址可配）');
+  assert.ok(signature[1].includes('port: u16'), 'probe_tcp 必须收 port 参数');
 
-  const body = /pub fn probe_st_alive\([\s\S]*?\n\}/.exec(COMMANDS_RS);
+  const body = /pub fn probe_tcp\([\s\S]*?\n\}/.exec(COMMANDS_RS);
   assert.notEqual(body, null);
-  assert.ok(body[0].includes('127, 0, 0, 1'), '主机名必须写死 127.0.0.1');
+  assert.ok(
+    body[0].includes('normalize_probe_host') || body[0].includes('PROBE_ALLOWED_HOSTS'),
+    'probe_tcp 必须校验 host 白名单 —— 否则它就是一台"客户端本机发出"的端口扫描器',
+  );
   assert.ok(body[0].includes('connect_timeout'), '必须带超时，否则端口被黑洞吞掉时会挂死 UI');
+  // 规范化函数本身也要在：只做大小写/方括号归一，不做 DNS 解析
+  assert.ok(COMMANDS_RS.includes('fn normalize_probe_host('), '缺少 host 规范化函数');
+  assert.ok(
+    !/to_socket_addrs\(\)[\s\S]{0,200}?PROBE_ALLOWED_HOSTS/.test(COMMANDS_RS),
+    '解析发生在白名单之后才对（先校验再解析）',
+  );
 });
 
 test('spawn_detached 失败时必须写诊断日志（生产反馈：日志 0 字节）', () => {
@@ -192,10 +203,17 @@ test('顶栏有 F15 的入口按钮，且在零标签时会被禁用', () => {
   );
 });
 
-test('渲染层不自己拼 ST 的 URL 常量（统一从 st-install 取）', () => {
+test('渲染层不自己拼 ST 的 URL（统一走 resolveStAddress 的结果）', () => {
+  /*
+   * v0.1.6 / T14.0 起地址可配，`ST_BASE_URL` 这个常量被删了 ——
+   * 留一个"默认地址"常量在外面，迟早有人拿它当"当前地址"用。
+   * 现在唯一的来源是 `resolveStAddress(config.stAddress)` 的返回值。
+   */
   const dialog = readFileSync(join(ROOT, 'client/src/session/st-dialog.ts'), 'utf8');
-  assert.ok(!dialog.includes("'http://127.0.0.1:8000'"), 'st-dialog 里硬编码了 ST 地址，应当用 ST_BASE_URL');
-  assert.ok(dialog.includes('ST_BASE_URL'));
+  assert.ok(!dialog.includes('ST_BASE_URL'), 'ST_BASE_URL 已删除，不该再被引用');
+  assert.ok(!dialog.includes("'http://127.0.0.1:8000'"), 'st-dialog 里硬编码了 ST 地址');
+  assert.ok(dialog.includes('resolveStAddress'), '地址必须从配置解析');
+  assert.ok(dialog.includes('this.address.baseUrl'), '「打开 SillyTavern」等跳转要用解析出来的地址');
 });
 
 test('docs/11 登记了这六项能力（文档存在时校验）', () => {
@@ -203,7 +221,7 @@ test('docs/11 登记了这六项能力（文档存在时校验）', () => {
   for (const needle of [
     'probe_paths',
     'find_st_candidates',
-    'probe_st_alive',
+    'probe_tcp',
     'extract_zip_to',
     'spawn_detached',
     'open_external',

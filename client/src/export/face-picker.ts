@@ -212,7 +212,7 @@ export class FacePicker {
         this.bytesCache.set(`lib:${item.name}`, { bytes: item.bytes, width: 0, height: 0, note: '' });
       }
       this.libraryPathEl.textContent =
-        `图库：${this.libraryDir === '' ? '(演示)' : this.libraryDir}（${String(names.length)} 张 · 演示数据）`;
+        `图库：${this.libraryDir === '' ? '(默认)' : this.libraryDir}（${String(names.length)} 张 · 示意）`;
     }
 
     const hasSource = this.callbacks.getSourceBytes() !== null;
@@ -265,12 +265,12 @@ export class FacePicker {
       card.classList.toggle('is-active', sameChoice(candidate.choice, this.choice));
 
       /*
-       * 演示候选必须自曝身份：截图里看起来像"真的读到了 3 张图"，
+       * 示意候选必须自曝身份：截图里看起来像"真的读到了 3 张图"，
        * 而实际是注入的 —— 没有这个角标就是伪造。
        */
       const badge =
         candidate.badge === '' && candidate.choice.kind === 'library' && this.isDemoName(candidate.choice.name)
-          ? '演示'
+          ? '示意'
           : candidate.badge;
 
       const thumb = el('div', 'face-thumb');

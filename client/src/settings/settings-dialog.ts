@@ -16,15 +16,19 @@ import {
   openFolder,
   pickDirectory,
   probeCardsDir,
+  probeTcp,
+  type PortProbe,
 } from '../contract';
 import { decideCardsDir, resolveCardsDir } from '../session/cards-path';
 import { effectiveCardsDir } from '../session/cards-dir';
+import { describeTcpFailure, parseStAddress, resolveStAddress, ST_DEFAULT_ADDRESS } from '../session/st-address';
 import { faceLibraryDir } from '../export/face-library';
 import { isSyncReady, normalizeServerUrl, probeServer, type ProbeResult } from '../net/server-probe';
 import { connectLocalService, describeLocalSuccess, LOCAL_API_ORIGIN } from '../net/local-connect';
 import type { AuthPhase } from '../auth/session';
 import type { AuthUser } from '../auth/auth-client';
 import { identityLabel, resolveSyncGate, syncGateMessage } from '../auth/entry-policy';
+import { appVersion } from './app-version';
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -99,6 +103,20 @@ export class SettingsDialog {
   private readonly cardsDirInput: HTMLInputElement;
   private readonly cardsDirStatus: HTMLParagraphElement;
   private readonly chooseDirButton: HTMLButtonElement;
+
+  /** SillyTavern 地址（v0.1.6 / T14.0） */
+  private readonly stAddressInput: HTMLInputElement;
+  private readonly stTestButton: HTMLButtonElement;
+  private readonly stStatus: HTMLParagraphElement;
+  private readonly stSkipCheckbox: HTMLInputElement;
+  /**
+   * 本次打开面板时"检测已通过"的地址（归一后）。
+   *
+   * 只在**保存**时用来判断"这个值已经验过了吗"：用户点了「检测」通过后再点「保存」，
+   * 不该再连一次（也避免两次结果不一致时不知道该信哪个）。改了地址就清空 ——
+   * 不然会把旧地址的结论安在新地址头上。
+   */
+  private stVerifiedAddress = '';
   /** 卡面图库路径（只读展示）与"打开目录"按钮（v0.1.4 / T12.5） */
   private readonly faceDirValue: HTMLInputElement;
   private readonly openFaceDirButton: HTMLButtonElement;
@@ -296,6 +314,65 @@ export class SettingsDialog {
     this.syncNote = el('p', 'sync-note');
     serverSection.append(this.syncNote);
 
+    // ── SillyTavern 地址（v0.1.6 / T14.0 F0）──────────────
+    //
+    // 为什么要这一项：F15 与内嵌代理都把 ST 地址写死过 `127.0.0.1:8000`，
+    // 而用户可能改了 ST 的 listenPort、多开、或者只想确认自己连的是哪一份。
+    // 更重要的理由是**真实性校验**：填一个连不上的地址等于埋雷 —— 之后
+    // 推送、内嵌面板、启动按钮全都会在一个错误的前提上工作。
+    const stSection = el('section', 'form-section');
+    stSection.append(el('h3', 'form-title', 'SillyTavern 地址'));
+
+    const stField = el('label', 'field');
+    stField.append(el('span', 'field-label', '本机 SillyTavern 地址'));
+    const stRow = el('div', 'field-row');
+    this.stAddressInput = el('input', 'input mono');
+    this.stAddressInput.type = 'text';
+    this.stAddressInput.spellcheck = false;
+    this.stAddressInput.autocomplete = 'off';
+    this.stAddressInput.dataset['role'] = 'st-address';
+    this.stAddressInput.placeholder = ST_DEFAULT_ADDRESS;
+    this.stAddressInput.addEventListener('input', () => {
+      // 手改之后上一次的检测结论就作废了 —— 那是对旧地址说的
+      this.setStStatus('', 'info');
+    });
+    this.stTestButton = el('button', 'btn', '检测');
+    this.stTestButton.type = 'button';
+    this.stTestButton.dataset['role'] = 'st-test';
+    this.stTestButton.addEventListener('click', () => void this.testStAddress(true));
+    stRow.append(this.stAddressInput, this.stTestButton);
+    stField.append(stRow);
+    stField.append(
+      el(
+        'span',
+        'field-hint',
+        `格式 \`主机:端口\`，默认 ${ST_DEFAULT_ADDRESS}。只支持本机回环（127.0.0.1 / localhost / ::1）—— ` +
+          '内嵌 ST 面板的请求由客户端转发到本机，远程 ST 请用「打开 SillyTavern」在浏览器里访问。',
+      ),
+    );
+
+    /*
+     * 「跳过检测」旁路：需求要求**明确勾选**才能在没有 ST 的情况下保存。
+     *
+     * 为什么不是"检测失败自动放行"：那样这个校验就等于不存在 ——
+     * 用户会把一个打错的端口存下来，然后在三天后疑惑"为什么推送没反应"。
+     * 勾选是一个显式声明"我知道它现在连不上"，责任清楚。
+     */
+    const stSkipRow = el('label', 'st-skip-row');
+    this.stSkipCheckbox = el('input') as HTMLInputElement;
+    this.stSkipCheckbox.type = 'checkbox';
+    this.stSkipCheckbox.dataset['role'] = 'st-skip-probe';
+    stSkipRow.append(
+      this.stSkipCheckbox,
+      el('span', '', 'ST 没开，先保存地址再说（跳过检测）'),
+    );
+
+    this.stStatus = el('p', 'probe-status info', '');
+    this.stStatus.hidden = true;
+    this.stStatus.dataset['role'] = 'st-address-status';
+
+    stSection.append(stField, stSkipRow, this.stStatus);
+
     // ── 角色卡目录（T9.8 / F4）──────────────────────────
     //
     // 没有这一段的后果很具体：用户保存了卡，但下次打开不知道去哪找；
@@ -371,11 +448,17 @@ export class SettingsDialog {
     // 常用按钮就被稀释一次。位置紧邻「角色卡目录」—— 两者都是"文件去哪了"类问题。
     const diagSection = el('section', 'form-section');
     diagSection.append(el('h3', 'form-title', '诊断'));
+    // 版本号摆在这儿而不是只藏在诊断导出里：装完/升级后"这是不是我要的那一版"
+    // 是最常被问、也最容易答错的问题（v0.1.5 发出去时包名 v0.1.5、服务端内部还是
+    // 0.1.3、安装说明页写着 0.1.2，谁都说不清）。一行字，眼验成本降到零。
+    const versionLine = el('p', 'field-hint', `客户端版本 v${appVersion()}`);
+    versionLine.dataset['role'] = 'app-version';
+    diagSection.append(versionLine);
     const diagRow = el('div', 'field-row');
     this.diagnosticsButton = el('button', 'btn', '导出诊断日志…');
     this.diagnosticsButton.type = 'button';
     this.diagnosticsButton.dataset['role'] = 'export-diagnostics';
-    this.diagnosticsButton.title = '把渲染层错误日志、版本号与连接状态打包成一个 txt';
+    this.diagnosticsButton.title = '把界面异常日志、版本号与连接状态打包成一个 txt';
     this.diagnosticsButton.addEventListener('click', () => void this.exportDiagnostics());
     diagRow.append(this.diagnosticsButton);
     diagSection.append(
@@ -383,7 +466,7 @@ export class SettingsDialog {
       el(
         'span',
         'field-hint',
-        '渲染层的报错会自动记到应用配置目录的 logs/client-error.log。导出后可以直接发给维护者；' +
+        '界面报错会自动记录到 logs/client-error.log。导出后可以直接发给维护者；' +
           '文件里只有版本、连接状态与错误堆栈，不含角色卡正文。',
       ),
     );
@@ -406,7 +489,7 @@ export class SettingsDialog {
     cancel.addEventListener('click', () => this.close());
     foot.append(browserWarn, cancel, this.saveButton);
 
-    panel.append(head, serverSection, dirSection, diagSection, foot);
+    panel.append(head, serverSection, stSection, dirSection, diagSection, foot);
     this.overlay.append(panel);
 
     // 点遮罩关闭
@@ -444,6 +527,17 @@ export class SettingsDialog {
       this.cardsDirInput.placeholder = '（仅桌面客户端可用；默认 文档\\TavernCardStudio\\cards）';
       this.cardsDirInput.disabled = true;
       this.chooseDirButton.disabled = true;
+      /*
+       * ST 地址在浏览器里**不能存也不能测**：探测是壳能力（`probe_tcp`）。
+       * 输入框禁用而不是留一个能填的框 —— 填了保存不了，用户会以为是 bug；
+       * 而"能填不能存"比"直接说不支持"更让人困惑。
+       */
+      this.stAddressInput.value = '';
+      this.stAddressInput.placeholder = '（仅桌面客户端可用）';
+      this.stAddressInput.disabled = true;
+      this.stTestButton.disabled = true;
+      this.stSkipCheckbox.disabled = true;
+      this.setStStatus('浏览器模式无法探测本机端口，此设置仅在桌面客户端生效。', 'info');
       this.setDirStatus('浏览器模式无法读写本地目录，此设置仅在桌面客户端生效。', 'info');
       this.refreshIdentity();
       this.urlInput.focus();
@@ -462,6 +556,27 @@ export class SettingsDialog {
       if (prefill?.serverUrl === undefined) this.urlInput.value = config.serverUrl;
       if (prefill?.token === undefined) this.tokenInput.value = config.token;
       this.cardsDirInput.value = resolveCardsDir(config.cardsDir, this.defaultDir);
+
+      /*
+       * ST 地址回填（v0.1.6 / T14.0）。
+       *
+       * 显示**归一后的值**而不是配置原样：空串（没配过）显示默认地址，
+       * 用户一眼就知道"现在实际连的是哪"。非法值（手改配置文件）也回落成默认值，
+       * 但要标出来 —— 否则用户会以为自己配的 8001 生效了。
+       */
+      const stResolved = resolveStAddress(config.stAddress);
+      this.stAddressInput.value = stResolved.text;
+      const stRaw = (config.stAddress ?? '').trim();
+      const stConfigValid = stRaw === '' || parseStAddress(stRaw).ok;
+      this.stVerifiedAddress = '';
+      if (!stConfigValid) {
+        this.setStStatus(
+          `配置里存的地址「${stRaw}」不合法，已临时按 ${stResolved.text} 处理 —— 请重新填一次并保存`,
+          'bad',
+        );
+      } else {
+        this.setStStatus('', 'info');
+      }
 
       // 只探测现状、**不创建**：打开设置面板不该在磁盘上留下任何东西
       if (this.cardsDirInput.value) {
@@ -867,6 +982,135 @@ export class SettingsDialog {
     return { state: 'ok', value };
   }
 
+  /**
+   * 检测 ST 地址（v0.1.6 / T14.0）。
+   *
+   * `interactive` 决定要不要更新界面上的状态行与"已验过"标记：
+   * 保存时也会调它，那时不该把状态行来回改（用户看到的是"正在保存"）。
+   *
+   * 返回 `{ ok, text }`：`ok === true` 才算"验过"。格式错误、拒绝保存、
+   * 三态失败都返回 `ok: false` —— 调用方据此决定能不能落盘。
+   */
+  private async checkStAddress(raw: string, interactive: boolean): Promise<{ ok: boolean; text: string }> {
+    const parsed = parseStAddress(raw);
+    if (!parsed.ok) {
+      if (interactive) this.setStStatus(parsed.message, 'bad');
+      return { ok: false, text: parsed.message };
+    }
+
+    let probe: PortProbe;
+    try {
+      probe = await probeTcp(parsed.host, parsed.port);
+    } catch (error) {
+      // 参数被壳拒（PROBE_HOST_NOT_ALLOWED）或 IPC 出错 —— 原文给用户
+      const text = `检测失败：${errorText(error)}`;
+      if (interactive) this.setStStatus(text, 'bad');
+      return { ok: false, text };
+    }
+
+    if (probe.alive) {
+      this.stVerifiedAddress = parsed.text;
+      const text = `检测到 SillyTavern 在运行（${parsed.text}，${String(probe.elapsedMs)}ms）`;
+      if (interactive) this.setStStatus(text, 'ok');
+      return { ok: true, text };
+    }
+
+    // 三态：连接被拒 / 超时 / 其它，后附原始错误（用户要拿它去排查代理）
+    this.stVerifiedAddress = '';
+    const failure = describeTcpFailure(probe);
+    const text = `${failure.summary}（原始错误：${failure.detail}）`;
+    if (interactive) this.setStStatus(text, 'warn');
+    return { ok: false, text };
+  }
+
+  /** 「检测」按钮：显式动作，结果上屏 */
+  private async testStAddress(interactive: boolean): Promise<void> {
+    if (this.busy) return;
+    this.setBusy(true);
+    try {
+      await this.checkStAddress(this.stAddressInput.value, interactive);
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
+  private setStStatus(text: string, kind: 'ok' | 'warn' | 'bad' | 'info'): void {
+    this.stStatus.textContent = text;
+    this.stStatus.className = `probe-status ${kind}`;
+    this.stStatus.hidden = text === '';
+  }
+
+  /**
+   * 截取「ST 地址」四种显示状态的取证入口（`?stAddrDemo=`）。
+   *
+   * ## 它取证的是什么，不取证什么
+   *
+   * **取证**：面板把一条探测结论渲染成什么样子（状态行的颜色、文案、勾选项、
+   * 格式错误的位置）。那是纯显示逻辑，也是截图唯一能证明的东西。
+   *
+   * **不取证**：探测本身。三态判定与真实 TCP 结果的对应用
+   * `.verify/t140-three-states.mjs` 跑真 socket 证明，不靠截图。
+   *
+   * 所以这里**注入的是传输结果**（一个 `PortProbe` 形状的对象），而不是伪造
+   * "检测通过"这个结论 —— 后者就成了自欺。界面上每一句话都由
+   * `describeTcpFailure` / `parseStAddress` 这两个真函数生成。
+   *
+   * 为什么必须这么做：`probe_tcp` 是壳能力，浏览器里 `isShellAvailable()` 为假，
+   * 设置面板会把 ST 段整体置灰（那也是在如实报告"这里没有这个能力"）。
+   */
+  previewStAddressState(kind: 'ok' | 'refused' | 'timeout' | 'other' | 'format' | 'skip'): void {
+    // 取证时把字段整体解禁，否则输入框是灰的、看不到正常形态
+    this.stAddressInput.disabled = false;
+    this.stTestButton.disabled = false;
+    this.stSkipCheckbox.disabled = false;
+    this.stVerifiedAddress = '';
+    this.stSkipCheckbox.checked = false;
+
+    if (kind === 'format') {
+      // 非回环地址：走真实的解析函数得到真实的拒绝理由
+      this.stAddressInput.value = '192.168.1.5:8000';
+      const parsed = parseStAddress(this.stAddressInput.value);
+      this.setStStatus(parsed.ok ? '' : parsed.message, 'bad');
+      return;
+    }
+
+    this.stAddressInput.value = kind === 'other' ? 'localhost:8001' : ST_DEFAULT_ADDRESS;
+    if (kind === 'skip') {
+      this.stSkipCheckbox.checked = true;
+      this.setStStatus(
+        '已保存（未检测：按你的勾选跳过了）—— 下次打开面板会按"未运行"处理',
+        'warn',
+      );
+      return;
+    }
+
+    const port = 8000;
+    const probe: PortProbe = {
+      alive: kind === 'ok',
+      host: '127.0.0.1',
+      port,
+      elapsedMs: kind === 'ok' ? 4 : kind === 'timeout' ? 1501 : 1,
+      errorKind:
+        kind === 'ok' ? null : kind === 'refused' ? 'ConnectionRefused' : kind === 'timeout' ? 'TimedOut' : 'PermissionDenied',
+      errorMessage:
+        kind === 'ok'
+          ? null
+          : kind === 'refused'
+            ? 'No connection could be made because the target machine actively refused it. (os error 10061)'
+            : kind === 'timeout'
+              ? 'A connection attempt failed because the connected party did not properly respond (os error 10060)'
+              : 'An attempt was made to access a socket in a way forbidden by its access permissions',
+    };
+
+    if (probe.alive) {
+      this.stVerifiedAddress = `${probe.host}:${String(probe.port)}`;
+      this.setStStatus(`检测到 SillyTavern 在运行（${this.stVerifiedAddress}，${String(probe.elapsedMs)}ms）`, 'ok');
+      return;
+    }
+    const failure = describeTcpFailure(probe);
+    this.setStStatus(`${failure.summary}（原始错误：${failure.detail}）`, kind === 'timeout' ? 'warn' : 'bad');
+  }
+
   private async save(): Promise<void> {
     if (this.busy) return;
 
@@ -883,6 +1127,35 @@ export class SettingsDialog {
 
     this.setBusy(true);
     try {
+      /*
+       * ST 地址校验（v0.1.6 / T14.0 第 2 条）：**格式先过，再验真实性**。
+       *
+       * 顺序不能反：格式都不对的地址去连只会得到一个更迷惑的网络错误。
+       * 也没有"存了再慢慢验"—— 一个连不上的地址会让推送、内嵌面板、启动按钮
+       * 全部工作在一个错误前提上，而用户以为"我配好了"。
+       *
+       * 唯一的例外是**显式勾选**「跳过检测」：那时只校验格式，不连。
+       */
+      const stParsed = parseStAddress(this.stAddressInput.value);
+      if (!stParsed.ok) {
+        this.setStStatus(stParsed.message, 'bad');
+        this.setProbeStatus('未保存：SillyTavern 地址不合法（见上方提示）', 'bad');
+        this.setBusy(false);
+        return;
+      }
+      if (!this.stSkipCheckbox.checked && this.stVerifiedAddress !== stParsed.text) {
+        const checkedSt = await this.checkStAddress(this.stAddressInput.value, true);
+        if (!checkedSt.ok) {
+          this.setProbeStatus(
+            '未保存：SillyTavern 地址没能通过检测。确认地址后点「检测」重试，' +
+              '或勾选「ST 没开，先保存地址再说」。',
+            'bad',
+          );
+          this.setBusy(false);
+          return;
+        }
+      }
+
       // 目录校验放在写配置之前：建不出来就不该落盘（存了也用不了）
       const dirResult = await this.validateCardsDir(this.cardsDirInput.value);
       if (dirResult.state === 'blocked') {
@@ -895,10 +1168,20 @@ export class SettingsDialog {
         token: this.tokenInput.value.trim(),
         // 解析后的绝对路径；浏览器模式拿不到默认目录时保持 null
         cardsDir: dirResult.value === '' ? null : dirResult.value,
+        // 归一后的 `主机:端口`（不是用户原样输入的串）：去掉 http:// 与空白，
+        // 让"配置里存的"与"探测用的"逐字相同
+        stAddress: stParsed.text,
       });
       // 回写归一化后的地址，让用户看到最终存储值
       this.urlInput.value = saved.serverUrl;
       this.cardsDirInput.value = resolveCardsDir(saved.cardsDir, this.defaultDir);
+      this.stAddressInput.value = resolveStAddress(saved.stAddress).text;
+      this.setStStatus(
+        this.stSkipCheckbox.checked && this.stVerifiedAddress !== stParsed.text
+          ? '已保存（未检测：按你的勾选跳过了）—— 下次打开面板会按"未运行"处理'
+          : '地址已保存并通过检测',
+        this.stSkipCheckbox.checked && this.stVerifiedAddress !== stParsed.text ? 'warn' : 'ok',
+      );
       this.setProbeStatus(
         dirResult.state === 'warn' ? '已保存（卡片目录不可写，见下方提示）' : '已保存到应用配置目录',
         dirResult.state === 'warn' ? 'warn' : 'ok',

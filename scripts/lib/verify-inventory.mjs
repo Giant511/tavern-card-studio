@@ -35,7 +35,24 @@
  * 与没写一样。
  */
 
-/** @typedef {'offline' | 'browser-dump' | 'live-browser' | 'live-server' | 'elevated'} VerifyStatus */
+/** @typedef {'offline' | 'browser-dump' | 'live-browser' | 'live-server' | 'elevated'} VerifyStatus */
+
+/**
+ * 合法的 status 值，**运行时也要校验**。
+ *
+ * 只有 JSDoc 类型是不够的：这个文件是纯 JS，类型注释不参与运行。
+ * 2026-10-27 我给它写了一个 `needs-browser`（表里根本没有这个值），
+ * 而测试与清点校验**全都绿**—— 因为它既不是 `offline`（不要求被导入），
+ * 也不在任何 filter 的匹配范围内，等于静默地什么都不检查。
+ * 那一格本该写 `live-browser`（需要真实浏览器 + CDP）。
+ */
+export const VERIFY_STATUSES = new Set([
+  'offline',
+  'browser-dump',
+  'live-browser',
+  'live-server',
+  'elevated',
+]);
 
 /**
  * @type {ReadonlyArray<{
@@ -112,7 +129,26 @@ export const VERIFY_INVENTORY = [
     evidence:
       '2026-10-26 跑通 28 项（8 个方法×路径组合的预检均允许 / 改名路径预检含 PATCH / 中英文改名各一次且列表读回新名 / 只读仓库令牌改名为 403 FORBIDDEN 且文案不含「无法连接」/ 端口无人监听时才是 NETWORK「无法连接服务端」/ 三态文案两两不等）',
   },
+  {
+    file: 'scripts/fake-st.mjs',
+    status: 'offline',
+    run: 'node scripts/fake-st.mjs --port 8000',
+    why:
+      '最小的假 SillyTavern（页面 + WS 回显 + SSE 分片 + Host 回显），不发任何 CORS 头。' +
+      '它不是断言脚本而是**回归样本与排障工具**：真机验内嵌面板时不必先装一份真 ST；' +
+      'T14.7 改端口链路要有"8001 上确实有服务"才证明得了；WS/SSE 两条路径需要可断开可控的上游',
+    evidence:
+      '2026-10-27 与 proxy.rs 的 10 条边界单测配套使用；真机验收时由用户手动起在 8000/8001 两个端口',
+  },
   // ── browser-dump：断言读快照，抓取需要 headless Chrome ──
+  {
+    file: 'scripts/verify-t140-st-address.mjs',
+    status: 'offline',
+    run: 'node scripts/verify-t140-st-address.mjs',
+    why: '纯本地：只连回环（自己起一个监听、连一个刚释放的端口），不碰网络服务也不碰浏览器。它不是"断言脚本"而是"取证脚本" —— 打印四种探测结论对应的面板文案，给人核对',
+    evidence:
+      '2026-10-27 跑出四态（ok 4ms / refused ECONNREFUSED / timeout 注入 TimedOut 1501ms / other PermissionDenied），与 test/st-address.test.mjs 的 20 条断言互为印证',
+  },
   {
     file: 'scripts/verify-f15-probe.mjs',
     status: 'browser-dump',
@@ -219,6 +255,92 @@ export const VERIFY_INVENTORY = [
       'client/dist/g7/{before,after}.json 供 ?auditDemo= 读取。' +
       '**只写进 dist**（build:client 第 0 步会清掉），确保用户内容不进仓库、不进 MSI',
     evidence: '2026-10-26 生成 before 16427 / after 16829 字节；缺输入时退出码 2',
+  },
+
+  {
+    file: 'scripts/capture-v16-arrival.sh',
+    status: 'browser-dump',
+    run: 'npm run build:ui && bash scripts/capture-v16-arrival.sh',
+    why:
+      'v0.1.6 缺陷一的取证截图（assets/v016-0{1,2}-arrival-*.png）：同一张标准格式卡 + ' +
+      '同一个自定义世界书预设，只差"有没有做到达规范化"。样本卡取自仓库自带的 ' +
+      'examples/cards/lin-wanzhao-v3.json（公开样本，不是用户内容），运行时复制进 ' +
+      'client/dist/arrival/ 供 ?arrivalDemo= fetch；需要本机 Chrome 与 http.server',
+    evidence:
+      '2026-10-27 生成 2 张，字节不同（脚本自带哈希唯一性断言）：' +
+      'before 世界书错误 1 条（worldbook-no-entry-marker）、after 0 条',
+    coveredBy: 'test/arrival.test.mjs',
+  },
+
+  {
+    file: 'scripts/capture-v16-pane-collapse.sh',
+    status: 'browser-dump',
+    run: 'npm run build:ui && bash scripts/capture-v16-pane-collapse.sh',
+    why:
+      'v0.1.6 真机缺陷四（收起后无法展开）的取证截图（assets/v016-0{3,4}-pane-*.png）：' +
+      '两张图走同一个按钮的两种状态。第二张由 ?collapseRoundTrip=1 触发，走的是**真实 click**' +
+      '（不是直接调 setCollapsed）—— 缺陷就是按钮绑定写死方向，绕过按钮等于绕过缺陷。' +
+      '需要本机 Chrome 与 http.server',
+    evidence:
+      '2026-10-27 生成 2 张，字节不同（401177 / 450564，脚本自带哈希唯一性断言）：' +
+      '状态栏原文「折叠宽 56（符号「⟨」）→ 点击后 已展开，宽 460（记忆值 460）」',
+    coveredBy: 'test/st-pane-collapse.test.mjs',
+  },
+
+  {
+    file: 'scripts/capture-v16-iframe-xfo.sh',
+    status: 'browser-dump',
+    run: 'bash scripts/capture-v16-iframe-xfo.sh',
+    why:
+      'v0.1.6 缺陷二**真因**的取证截图（assets/v016-0{5,6}-iframe-xfo-*.png）：' +
+      'ST 响应带 X-Frame-Options: SAMEORIGIN，面板 iframe 与之不同源 ⇒ 浏览器拒绝渲染，' +
+      '错误页写作「127.0.0.1 拒绝连接」。两张图同机同 ST，只差反代有没有剥这个头：' +
+      'blocked 是灰底空白、stripped 是完整的 SillyTavern 1.19.0 界面。' +
+      '脚本自己先断言"对照组有头、实验组没头"，再截图并断言两图哈希不同 —— ' +
+      '否则截出来的可能只是两个都失败的页面。需要本机 ST 在 8000、Chrome 与 python',
+    evidence:
+      '2026-10-27 生成 4 张：v016-0{5,6} 为 XFO 对照（6 693 / 83 765 字节）；' +
+      'v016-0{7,8} 为会话 cookie 对照（74 625 / 24 033 字节）—— 后者 base 组卡在' +
+      '「正在初始化…」、fix 组渲染出 ST 欢迎页。CDP 侧对照：保留 XFO 时 ' +
+      'net::ERR_BLOCKED_BY_RESPONSE blocked=other，剥掉后无失败事件；' +
+      '日志侧对照：base 组 POST /api/settings/get cookie=NO -> 403、' +
+      'fix 组 cookie=yes -> 200（脚本对这两行直接断言）',
+    coveredBy:
+      'client/src-tauri/src/proxy.rs（strip_frame_blockers 3 条 + relax_cookie_same_site 3 条单测）',
+  },
+
+  {
+    file: 'scripts/verify-card-info-e2e.mjs',
+    status: 'live-browser',
+    run: 'npm run build:ui && python -m http.server 8892 --bind 127.0.0.1 -d client/dist && node scripts/verify-card-info-e2e.mjs',
+    why:
+      'v0.1.6 卡片信息的端到端验收：用户报的是「导出后这里明显不对」，' +
+      '所以判据只能是**导出 JSON 里的字段**。脚本走真实入口（openCardInfo、真实「保存」按钮）' +
+      '与真实导出链路（buildExportForTest → buildExportAsync），断言六个字段' +
+      '「改之前是示例卡的值、改之后是用户的值」—— 两个方向都验，' +
+      '否则一个"永远返回空串"的实现也能通过',
+    evidence:
+      '2026-10-27 跑通：before = Tavern Card Studio / 1.0 / 示例卡片… / 拾光书店 / [日常,治愈,书店]；' +
+      'after = 我的笔名 / 3.1 / 这是我自己写的创作说明。 / 临海城 / [赛博朋克,悬疑]',
+    coveredBy: 'test/card-info.test.mjs（26 条纯函数测试）',
+  },
+
+  {
+    file: 'scripts/verify-ui-copy.mjs',
+    status: 'offline',
+    run: 'node scripts/verify-ui-copy.mjs .',
+    why:
+      'v0.1.6 用户两次指明：面向用户的界面里不许出现测试性 / 开发性措辞。' +
+      '这类问题功能全对、只有措辞是给开发者看的 —— 单元测试抓不到（不检查文案），' +
+      '功能验收也抓不到（能点、能用）。只有把"措辞"本身当判据才会红。' +
+      '扫 client/src + server/public + client/index.html 里被引号包住的中文，' +
+      '排除注释；豁免靠精确文本与行内 `// ui-copy-allow: 理由`，不靠行号（行号会漂）',
+    evidence:
+      '2026-10-27 首轮跑出 132 处疑似，人工确认后改掉：卡片信息对话框 11 处（JSON 字段名、' +
+      '示例卡、字段）、导出回执的 sha256 与「回读」、审计面板的英文字段名、' +
+      'ST 面板的「壳侧 TCP」、服务端面板的「Electron」（本项目是 Tauri）、' +
+      'app.ts 20 处验收入口文案。最终 72 个文件 0 命中',
+    coveredBy: 'test/offline-verifiers.test.mjs',
   },
 
   // ── live-browser：需要 CDP 调试端口 + 运行中的应用 ──────

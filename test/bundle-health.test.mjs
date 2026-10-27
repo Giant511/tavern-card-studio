@@ -17,7 +17,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { auditDist, auditMsiSize, auditShellAssets, findPriorMsi } from '../scripts/lib/bundle-health.mjs';
+import { auditDist, auditMsiSize, auditShellAssets, findPriorMsi, findMissingStrings } from '../scripts/lib/bundle-health.mjs';
 
 /** 造一个临时工作区，测试结束自动删。 */
 function workspace(t) {
@@ -152,4 +152,47 @@ test('findPriorMsi：release 目录里只有当前版本 → null（跳过判定
   const dir = workspace(t);
   write(join(dir, 'TavernCardStudioServer-0.1.2.msi'), Buffer.alloc(10));
   assert.equal(findPriorMsi(dir, 'server', '0.1.2'), null);
+});
+
+// ── 壳侧字符串检查（v0.1.6 缺陷三：修复完全发生在 Rust，前端哨兵守不住）──
+
+test('findMissingStrings：ASCII 字面量在字节里能找到就不算缺', () => {
+  /*
+   * 这些是 build-client 的 SHELL_STRINGS，都是 Rust 里的字符串常量。
+   * 用 latin1 逐字节比对：字面量以 UTF-8 落在只读数据段，能直接命中。
+   */
+  const exe = Buffer.concat([
+    Buffer.from([0x00, 0x7f, 0x45, 0x4c, 0x46]), // 伪造的二进制头部
+    Buffer.from('frame-ancestors', 'utf8'),
+    Buffer.from([0x00, 0x00]),
+    Buffer.from('SameSite=None', 'utf8'),
+  ]);
+  assert.deepEqual(findMissingStrings(exe, ['frame-ancestors', 'SameSite=None']), []);
+});
+
+test('findMissingStrings：缺的那个必须被点名（不能只返回 true/false）', () => {
+  // 只说"红了"不够用：打包日志要能让下一个人知道该查哪个修复
+  const exe = Buffer.from('frame-ancestors only', 'utf8');
+  assert.deepEqual(findMissingStrings(exe, ['frame-ancestors', 'SameSite=None']), ['SameSite=None']);
+});
+
+test('findMissingStrings：空 bytes 与空 needles 都不抛', () => {
+  assert.deepEqual(findMissingStrings(Buffer.alloc(0), []), []);
+  assert.deepEqual(findMissingStrings(Buffer.alloc(0), ['x-frame-options']), ['x-frame-options']);
+});
+
+test('findMissingStrings：文档里那条"别用它找中文"的约束是真的', () => {
+  /*
+   * 这条测试守的是**注释的可信度**：文档说"latin1 会把多字节拆开，中文匹配不上"，
+   * 那就必须真的是这样 —— 否则将来有人拿它去找中文，会以为"中文没进包"，
+   * 白查一轮。与其让人踩，不如把限制写成断言。
+   */
+  const exe = Buffer.from('本机回环被拦截', 'utf8');
+  assert.deepEqual(
+    findMissingStrings(exe, ['本机回环被拦截']),
+    ['本机回环被拦截'],
+    'latin1 下中文应当匹配不上（这正是注释警告的那个限制）',
+  );
+  // 而按字节找就是对的 —— 真需要找中文时用这条路
+  assert.ok(exe.includes(Buffer.from('本机回环被拦截', 'utf8')));
 });
