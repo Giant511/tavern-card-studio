@@ -162,7 +162,21 @@ export const PLATFORM_RULE_ELEMENT_KEYS = [
 ] as const;
 
 /** 平台规则 rule.when 段（T10.33，同一条目内的跨字段条件） */
-export const PLATFORM_RULE_WHEN_KEYS = ['field', 'equals', 'notEquals', 'present'] as const;
+/**
+ * `when` 条件里认哪些键。
+ *
+ * `exists` / `absent` 是 v0.1.5 / G7 新增的存在性判定；`present` 是旧写法，
+ * 保留但不再推荐。三者都留着，是因为删掉 `present` 会让已经写好的规则文件
+ * 突然被报"未知键"，而它的行为其实没变。
+ */
+export const PLATFORM_RULE_WHEN_KEYS = [
+  'field',
+  'equals',
+  'notEquals',
+  'present',
+  'exists',
+  'absent',
+] as const;
 
 /** 平台规则 autoFix[] 元素 */
 export const PLATFORM_AUTOFIX_KEYS = [

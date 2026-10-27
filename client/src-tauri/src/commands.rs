@@ -275,9 +275,19 @@ pub fn shell_info(app: AppHandle) -> ShellResult<ShellInfo> {
 pub fn read_text_exact(path: String, max_bytes: Option<u64>) -> ShellResult<TextFile> {
     let target = paths::absolute_path(&path)?;
     let limit = max_bytes.unwrap_or(paths::MAX_TEXT_BYTES);
-    paths::ensure_readable_file(&target, limit)?;
+    read_text_impl(&target, limit)
+}
 
-    let bytes = fs::read(&target).map_err(|error| ShellError::io(&target, error))?;
+/// 严格读文本的唯一实现（v0.1.5 / G5 抽出）。
+///
+/// 抽出来是为了让"预设库"与"用户选的文件"走**同一条**读取路径：
+/// 严格 UTF-8（非法字节报 `NOT_UTF8` 而不是替换成 U+FFFD）、读后再量一次大小、
+/// sha256 覆盖原始字节。两处各写一份，迟早一处松一处紧 ——
+/// 而"预设读进来字符被替换掉了"这种问题几乎无法从现象反推。
+fn read_text_impl(target: &Path, limit: u64) -> ShellResult<TextFile> {
+    paths::ensure_readable_file(target, limit)?;
+
+    let bytes = fs::read(target).map_err(|error| ShellError::io(target, error))?;
     // metadata 与 read 之间文件可能变大，读完再量一次
     if bytes.len() as u64 > limit {
         return Err(ShellError::TooLarge {
@@ -293,7 +303,7 @@ pub fn read_text_exact(path: String, max_bytes: Option<u64>) -> ShellResult<Text
     })?;
 
     Ok(TextFile {
-        path_display: paths::display_path(&target),
+        path_display: paths::display_path(target),
         text,
         bytes_len,
         sha256,
@@ -343,6 +353,67 @@ pub fn open_folder(app: AppHandle, path: String) -> ShellResult<()> {
             path: target.display().to_string(),
             message: format!("打开目录失败：{error}"),
         })
+}
+
+/// 预设库路径：`<应用配置目录>/preset-library.json`。
+///
+/// **由 Rust 解析，渲染层无权指定** —— 与错误日志同一原则（见 `error_log_path`）：
+/// 契约只暴露语义化能力（"读/写我的预设库"），不给"给我一个路径，随便写"。
+/// 渲染层自己拼 `%APPDATA%\<identifier>\...` 的话，一旦 Tauri 的标识符或
+/// 版本升级策略变化，表现是"预设又丢了"，而没人会想到去查路径。
+fn preset_library_path(app: &AppHandle) -> Result<PathBuf, ShellError> {
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| ShellError::Io {
+            path: "<app_config_dir>".to_string(),
+            message: error.to_string(),
+        })?;
+    Ok(config_dir.join("preset-library.json"))
+}
+
+/// 读用户预设库（v0.1.5 / G5）。
+///
+/// 文件不存在 → 返回 `None`，**不是错误**：首次运行本来就没有这个文件，
+/// 让调用方去区分"没文件"与"读失败"只会多一条误导性的错误提示。
+///
+/// 读失败（权限 / 非 UTF-8 / 超大）仍报错 —— 那说明**有文件但读不动**，
+/// 属于用户需要知道的异常。
+#[tauri::command]
+pub fn read_preset_library(app: AppHandle) -> ShellResult<Option<TextFile>> {
+    let target = preset_library_path(&app)?;
+    if !target.exists() {
+        return Ok(None);
+    }
+    read_text_impl(&target, paths::MAX_TEXT_BYTES).map(Some)
+}
+
+/// 写用户预设库（v0.1.5 / G5）。原子写 + 写后回读自证。
+///
+/// 与文本保存**共用** `write_atomic_impl`：原子性、写前摘要断言、写后回读
+/// 三条保证不可能在其中一条路径上退化。
+///
+/// 这里比 `write_file_atomic` 多做一件小事：**按需创建父目录**。
+/// `app_config_dir` 在首次运行、或用户清过配置后可能不存在，而
+/// `write_atomic_impl` 要求父目录已存在（对用户选定的保存路径，那个要求是对的 ——
+/// 不该悄悄替用户建目录）。这里的目录是本应用的私有配置目录，创建它是本职。
+#[tauri::command]
+pub fn write_preset_library(
+    app: AppHandle,
+    text: String,
+    expected_sha256: Option<String>,
+) -> ShellResult<WriteReceipt> {
+    let target = preset_library_path(&app)?;
+    if let Some(parent) = target.parent() {
+        if !parent.is_dir() {
+            fs::create_dir_all(parent).map_err(|error| ShellError::io(parent, error))?;
+        }
+    }
+    write_atomic_impl(
+        &target.to_string_lossy(),
+        text.into_bytes(),
+        expected_sha256,
+    )
 }
 
 /// 读二进制文件的唯一实现（任意路径 / 内置资源共用）
@@ -865,6 +936,658 @@ pub fn scan_cards_dir(
 }
 
 // ─────────────────────────────────────────────────────────────
+// SillyTavern 联动（v0.1.5 / F15 · T13.1）
+// ─────────────────────────────────────────────────────────────
+//
+// 这一组能力的共同点：**它们都碰本地其它程序**，所以每一条都刻意窄：
+//   · `probe_paths` 只回答"存不存在、是文件还是目录"，不读内容、不列目录；
+//   · `find_st_candidates` 只在用户主目录下找 `SillyTavern*` 这一族名字，
+//     不接受路径参数，也没有"列任意目录"的能力；
+//   · `spawn_detached` 只启动**已通过 ST 判据的目录**里的三个固定目标；
+//   · `open_external` 只放行 http/https。
+//
+// 为什么探测与判定要分家（Rust 判存在，TS 判"算不算 ST"）：
+// 判据（package.json 的 scripts.start / server.js）属于**业务规则**，需要矩阵单测，
+// 而 Rust 侧这份代码没有测试宿主（`cargo test` 只能覆盖不依赖 AppHandle 的部分）。
+// 所以 Rust 只做"能拿到的原始事实"，判断留给 `client/src/session/st-install.ts`。
+// 唯一的例外是 `spawn_detached`：它必须**在真正拉起进程前**再验一次判据，
+// 否则"前端传个任意目录 + start.bat"就能启动任意批处理 —— 那是最该防的口子。
+
+/// 一次 `probe_paths` 允许的条数上限。
+///
+/// 没有上限的话，这条命令等于"批量探测整台机器上哪些路径存在"的扫描器。
+/// 64 足够覆盖 ST 检测（实际用 2~10 条），又不至于变成侦察工具。
+pub const MAX_PROBE_PATHS: usize = 64;
+
+/// 允许被启动的目标（白名单，**写死**）。
+///
+/// 三个目标对应 ST 的两种启动方式：
+///   · `start.bat`  —— 官方 Windows 入口（ST 1.12/1.13 都叫 `Start.bat`，
+///                     大小写不一致，见 `resolve_child_script`）；
+///   · `server.js` / `node.exe` —— 直接跑 `node server.js`，用于没有 bat
+///                     或 bat 里带交互的环境。两者语义相同（都以 server.js
+///                     为入口），保留两个名字是因为 UI 上"用 node 启动"
+///                     与"用脚本启动"是两件用户看得懂的事。
+///
+/// 这份清单是 `spawn_detached` 的**唯一**依据：不在表里的一律拒绝，
+/// 不做"看起来像不像可执行文件"的猜测。
+pub const SPAWN_TARGETS: [&str; 3] = ["start.bat", "node.exe", "server.js"];
+
+/// 路径探测结果（对应 client/src/contract/types.ts 的 PathProbe）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathProbe {
+    pub path: String,
+    /// `"file"` / `"dir"` / `"none"` —— **不读内容、不列目录**
+    pub exists: String,
+}
+
+/// SillyTavern 候选目录（对应 StCandidates）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StCandidates {
+    /// 用户主目录（展示用）；拿不到时为 null
+    pub home: Option<String>,
+    /// 候选目录的绝对路径（**可能不存在**，由前端逐条探测）
+    pub dirs: Vec<String>,
+}
+
+/// 启动回执（对应 SpawnReceipt）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnReceipt {
+    pub pid: u32,
+    /// 子进程输出的落点（诊断日志，同一目录下还有 client-error.log）
+    pub log_path: Option<String>,
+}
+
+/// 探测一批路径的存在形态。
+///
+/// 为什么批量：ST 检测一次要问 2~10 条（候选目录的 package.json / server.js），
+/// 逐条 IPC 会让面板打开时出现肉眼可见的延迟。
+///
+/// 为什么会话内不缓存：这东西的答案随时会变（用户正在装 ST），
+/// 缓存只会让"装好了但界面还说没装"变成一个新的支持问题。
+#[tauri::command]
+pub fn probe_paths(paths: Vec<String>) -> ShellResult<Vec<PathProbe>> {
+    if paths.len() > MAX_PROBE_PATHS {
+        return Err(ShellError::TooManyPaths {
+            count: paths.len(),
+            limit: MAX_PROBE_PATHS,
+        });
+    }
+
+    let mut out: Vec<PathProbe> = Vec::with_capacity(paths.len());
+    for raw in paths {
+        // 非绝对路径整批报错（而不是静默跳过）：调用方算错了路径，
+        // 静默跳过会表现为"这些候选都不存在"，指向完全错误的方向。
+        let target = paths::absolute_path(&raw)?;
+        let exists = if target.is_dir() {
+            "dir"
+        } else if target.is_file() {
+            "file"
+        } else {
+            // 含：不存在、无权限、符号链接断链、设备文件。
+            // 探测不该因为其中一条失败就整批失败 —— 用户装机装到一半时
+            // 半截目录很常见，那不是错误，是"还没装完"。
+            "none"
+        };
+        out.push(PathProbe {
+            path: raw,
+            exists: exists.to_string(),
+        });
+    }
+
+    Ok(out)
+}
+
+/// 列出 `SillyTavern*` 候选目录（**只扫用户主目录与各盘符根，不递归、不接受路径参数**）。
+///
+/// 标准位置 `%USERPROFILE%\SillyTavern` **无论存不存在都会出现在结果里**：
+/// 它的作用是"让前端把标准位置也探一遍"，而不是"报告它存在"。
+/// 少了这一条，"用户把 ST 装在默认位置"这种最常见的情况反而要靠猜。
+///
+/// ## 为什么要扫盘符根（2026-10-26 生产反馈追加）
+///
+/// 用户的 ST 装在 **`F:\SillyTavern`** —— 只扫 `%USERPROFILE%` 的话它永远扫不到，
+/// 面板会报"未安装"，而用户明明正开着 ST 用得好好的（决策 #207 现场）。
+/// 把 ST 放在空间最大的盘根目录是很常见的选择，所以盘符根必须看一眼。
+///
+/// 代价与边界：
+///   · 只看根目录**下一层**、只认 `SillyTavern*` 前缀、只收目录 —— 不递归、不读内容；
+///   · 盘符有上限（A–Z 最多 26 次 `read_dir`，不存在的盘会立刻返回），实测无感；
+///   · 可移动盘未挂载时 `read_dir` 失败，**静默跳过**（那不是错误，是盘不在）。
+#[tauri::command]
+pub fn find_st_candidates(app: AppHandle) -> ShellResult<StCandidates> {
+    let home = app.path().home_dir().ok();
+
+    let mut dirs: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    // 闭包本身不需要 mut（它改的是捕获的 &mut 引用指向的数据）
+    let push = |dirs: &mut Vec<String>, seen: &mut Vec<String>, path: PathBuf| {
+        let key = path.display().to_string().to_ascii_lowercase();
+        if seen.contains(&key) {
+            return;
+        }
+        seen.push(key);
+        if let Some(display) = paths::display_path(&path) {
+            dirs.push(display);
+        }
+    };
+
+    if let Some(home) = home.as_ref() {
+        push(&mut dirs, &mut seen, home.join("SillyTavern"));
+        // 1.13 起官方压缩包解压出的是 `SillyTavern-1.13.2` 这类带版本号的目录，
+        // 也常见用户自己建的 `SillyTavern-test`。只按前缀匹配，不看别的名字。
+        for path in collect_st_dirs(home) {
+            push(&mut dirs, &mut seen, path);
+        }
+    }
+
+    // 各盘符根（用户的 ST 可能装在任意盘 —— 现场就有一份在 F:\SillyTavern）
+    for letter in b'A'..=b'Z' {
+        let root = PathBuf::from(format!("{}:\\", letter as char));
+        for path in collect_st_dirs(&root) {
+            push(&mut dirs, &mut seen, path);
+        }
+    }
+
+    dirs.sort();
+    Ok(StCandidates {
+        home: home.as_deref().and_then(paths::display_path),
+        dirs,
+    })
+}
+
+/// 列出某个目录**下一层**里名字以 `sillytavern` 开头的目录（大小写不敏感）。
+///
+/// 抽成独立函数是为了能单测：它决定"扫不扫得到用户的 ST"，而 `find_st_candidates`
+/// 需要 `AppHandle`（cargo test 造不出来）。
+///
+/// 读不到目录（盘不存在 / 无权限 / 可移动盘没挂）返回空集，**不报错** ——
+/// 那不是错误，是"这个位置没有"。
+fn collect_st_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.to_ascii_lowercase().starts_with("sillytavern") {
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+        found.push(entry.path());
+    }
+    found.sort();
+    found
+}
+
+/// ST 根的原始事实（判据由前端合成，见文件头说明）
+struct StRootFacts {
+    package_json: bool,
+    start_script: bool,
+    server_js: bool,
+}
+
+fn st_root_facts(dir: &Path) -> StRootFacts {
+    let package_json_path = dir.join("package.json");
+    let package_json = package_json_path.is_file();
+    let mut start_script = false;
+    if package_json {
+        // 解析失败按"没有 start"处理：坏掉的 package.json 本来也跑不起来，
+        // 而且这里只用于"要不要允许启动"的放行判断 —— 宁可拒绝。
+        if let Ok(text) = fs::read_to_string(&package_json_path) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                start_script = value
+                    .get("scripts")
+                    .and_then(|scripts| scripts.get("start"))
+                    .map(|start| start.is_string())
+                    .unwrap_or(false);
+            }
+        }
+    }
+    StRootFacts {
+        package_json,
+        start_script,
+        server_js: dir.join("server.js").is_file(),
+    }
+}
+
+/// 与前端 `judgeStInstall` 同一条判据：**package.json 存在 且（scripts.start 或 server.js）**。
+fn looks_like_st_root(dir: &Path) -> bool {
+    let facts = st_root_facts(dir);
+    facts.package_json && (facts.start_script || facts.server_js)
+}
+
+/// 在目录里按**大小写不敏感**找文件名（`Start.bat` 与 `start.bat` 是同一个文件）。
+fn resolve_child_script(dir: &Path, wanted: &str) -> Option<PathBuf> {
+    let direct = dir.join(wanted);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.eq_ignore_ascii_case(wanted) && entry.path().is_file() {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// 子进程输出落点：`<应用配置目录>/logs/st-launch.log`。
+///
+/// 与 `client-error.log` **同一目录**（需求原话"记 client-error.log 同级诊断日志"），
+/// 但不共用文件：一次启动的输出可能有几千行，混进错误日志会把
+/// "最近那次崩溃"挤到翻不到的位置。
+fn st_launch_log_path(app: &AppHandle) -> Result<PathBuf, ShellError> {
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| ShellError::Io {
+            path: "<app_config_dir>".to_string(),
+            message: error.to_string(),
+        })?;
+    Ok(config_dir.join("logs").join("st-launch.log"))
+}
+
+/// 启动本地 SillyTavern（F15 / T13.4）。
+///
+/// 三条安全约束都在**这里**兜底，不依赖前端：
+///   1. `cwd` 必须是绝对路径、确实存在、且是一个目录；
+///   2. `cwd` **必须自己通过 ST 判据** —— 不是"前端说它是 ST 就算"。这条最关键：
+///      没有它，任何目录放一个 `start.bat` 就能被这条命令拉起；
+///   3. `cmd` 只能取 `SPAWN_TARGETS` 里的三个名字，且对应文件真的在那目录里。
+///
+/// 为什么捕获输出而不是让它开一个控制台窗口：开窗的话失败信息只存在于
+/// 那个窗口里，用户关掉就没了，我们也没法把 ST 自己的报错贴到面板上。
+/// 这里用 `CREATE_NO_WINDOW` + 重定向到 `st-launch.log`，失败时前端读这个文件
+/// 就能把 ST 的原话显示出来（见 `SpawnReceipt.logPath`）。
+///
+/// 进程不等待、不 kill：ST 是长期运行的服务，壳退出后它也该继续活着。
+#[tauri::command]
+pub fn spawn_detached(app: AppHandle, cmd: String, cwd: String) -> ShellResult<SpawnReceipt> {
+    use std::process::{Command, Stdio};
+
+    let target_dir = paths::absolute_path(&cwd)?;
+    let reject = |reason: &str| ShellError::SpawnRejected {
+        target: target_dir.display().to_string(),
+        reason: reason.to_string(),
+    };
+
+    if !target_dir.is_dir() {
+        return Err(reject("该路径不存在或不是目录"));
+    }
+
+    let normalized = cmd.trim().to_ascii_lowercase();
+    if !SPAWN_TARGETS.contains(&normalized.as_str()) {
+        return Err(ShellError::SpawnRejected {
+            target: cmd.clone(),
+            reason: format!("只允许启动 {}", SPAWN_TARGETS.join(" / ")),
+        });
+    }
+
+    if !looks_like_st_root(&target_dir) {
+        return Err(reject(
+            "该目录不像 SillyTavern（缺 package.json 的 scripts.start，或没有 server.js）",
+        ));
+    }
+
+    let log_path = st_launch_log_path(&app)?;
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| ShellError::io(parent, error))?;
+    }
+    // 每次启动重写：留着上一次的输出会让"这次为什么失败"更难判断
+    let stdout = File::create(&log_path).map_err(|error| ShellError::io(&log_path, error))?;
+    let stderr = stdout
+        .try_clone()
+        .map_err(|error| ShellError::io(&log_path, error))?;
+
+    let mut command = match normalized.as_str() {
+        "start.bat" => {
+            let script = resolve_child_script(&target_dir, "start.bat")
+                .ok_or_else(|| reject("该目录里没有 start.bat / Start.bat"))?;
+            let mut command = Command::new("cmd");
+            // 用文件名而不是绝对路径：`Start.bat` 里的相对路径依赖 cwd，
+            // 而 cwd 已经设成 ST 根目录了。
+            command.arg("/C").arg(
+                script
+                    .file_name()
+                    .ok_or_else(|| reject("start.bat 文件名非法"))?,
+            );
+            command
+        }
+        _ => {
+            if !target_dir.join("server.js").is_file() {
+                return Err(reject("该目录里没有 server.js"));
+            }
+            let mut command = Command::new("node.exe");
+            command.arg("server.js");
+            command
+        }
+    };
+
+    command
+        .current_dir(&target_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+
+    // CREATE_NO_WINDOW：不弹黑框；输出已经重定向到日志文件
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            /*
+             * 失败必须留痕（v0.1.5 生产反馈）。
+             *
+             * 线上那次：`st-launch.log` 是 **0 字节**、`client-error.log` 里一个字都没有，
+             * 用户只看到一句"启动失败"—— 谁也说不清是缺 node、缺 bat 还是被拦。
+             * 现在的顺序是：先写诊断（含 cmd、cwd、OS 原始错误），再返回错误。
+             */
+            let entry = format!(
+                "[{}] spawn_detached FAILED cmd={} cwd={} error={}",
+                now_iso8601(),
+                normalized,
+                target_dir.display(),
+                error
+            );
+            let _ = append_error_log_impl(&app, &entry);
+            return Err(ShellError::Io {
+                path: target_dir.display().to_string(),
+                message: format!("启动 {normalized} 失败：{error}"),
+            });
+        }
+    };
+    let pid = child.id();
+    // 不 wait、不 kill：drop 掉 Child 后子进程继续运行（Windows 上不会连带终止）
+    drop(child);
+
+    // 诊断留痕：这一行是"某天 ST 起不来"时唯一能对上号的时间点
+    let entry = format!(
+        "[{}] spawn_detached cmd={} cwd={} pid={}",
+        now_iso8601(),
+        normalized,
+        target_dir.display(),
+        pid
+    );
+    // 日志写不进去不能拦住"已经启动成功"这件事 —— 尽力而为
+    let _ = append_error_log_impl(&app, &entry);
+
+    Ok(SpawnReceipt {
+        pid,
+        log_path: paths::display_path(&log_path),
+    })
+}
+
+/// 解压回执（对应 `ExtractReceipt`）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractReceipt {
+    pub dest_path: Option<String>,
+    /// 解压后目标目录是否已经像 ST（判据同 `looks_like_st_root`）
+    pub has_st_structure: bool,
+}
+
+/// 把 ST 的 release zip 解压到目标目录（F15 / T13.3「一键安装」的 c 步）。
+///
+/// ## 为什么调系统 `tar.exe` 而不是引 `zip` crate
+///
+/// 解压 zip 需要 deflate 实现，Rust 标准库没有；引 `zip` 会连带 `flate2`
+/// （以及它的一串构建依赖）。本项目刻意维持"依赖表不动"（base64 都是手写的），
+/// 而 Windows 10 1803 起 `System32\tar.exe`（bsdtar）本来就能解 zip ——
+/// Tauri 2 又要求 WebView2，等于要求 Win10+，这个前提本来就成立。
+///
+/// **必须用绝对路径** `%SystemRoot%\System32\tar.exe`：打包后的应用 PATH 与开发机
+/// 不同，`Command::new("tar")` 可能解析到 Git 自带的 GNU tar（对 zip 支持不一），
+/// 也可能解析不到 —— 那种失败极难从现象反推。
+///
+/// ## 沙箱边界
+///
+/// `dest_dir` **必须落在用户主目录下**。一键安装的功能是"装到我的 SillyTavern 目录"，
+/// 没有任何正当理由往别处铺文件；这一条把"下载+解压"从"任意位置写文件"
+/// 收窄成"只在用户家里装东西"。
+#[tauri::command]
+pub fn extract_zip_to(app: AppHandle, zip_path: String, dest_dir: String) -> ShellResult<ExtractReceipt> {
+    use std::process::Command;
+
+    let zip = paths::absolute_path(&zip_path)?;
+    let dest = paths::absolute_path(&dest_dir)?;
+
+    if !zip.is_file() {
+        return Err(ShellError::PathNotFound {
+            path: zip.display().to_string(),
+        });
+    }
+    let is_zip = zip
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false);
+    if !is_zip {
+        return Err(ShellError::ExtNotAllowed {
+            name: zip.display().to_string(),
+        });
+    }
+
+    let home = app.path().home_dir().map_err(|error| ShellError::Io {
+        path: "<home_dir>".to_string(),
+        message: error.to_string(),
+    })?;
+    // 用 canonicalize 比较：`C:\Users\x\..\Windows` 这类写法要能被拒掉
+    let canonical_home = home.canonicalize().unwrap_or_else(|_| home.clone());
+    if !dest.exists() {
+        fs::create_dir_all(&dest).map_err(|error| ShellError::io(&dest, error))?;
+    }
+    let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.clone());
+    if !canonical_dest.starts_with(&canonical_home) {
+        return Err(ShellError::PathNotAllowed {
+            path: dest.display().to_string(),
+        });
+    }
+
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let tar = PathBuf::from(system_root).join("System32").join("tar.exe");
+    if !tar.is_file() {
+        return Err(ShellError::Io {
+            path: tar.display().to_string(),
+            message: "系统里找不到 tar.exe（Windows 10 1803+ 自带）。请手动解压下载到的 zip，再点「重新检测」。"
+                .to_string(),
+        });
+    }
+
+    let output = Command::new(&tar)
+        .arg("-x")
+        .arg("-f")
+        .arg(&zip)
+        .arg("-C")
+        .arg(&dest)
+        .output()
+        .map_err(|error| ShellError::io(&tar, error))?;
+
+    if !output.status.success() {
+        // 把 tar 自己的话带出去：解压失败的原因（空间不足/路径过长/zip 损坏）
+        // 只有它知道，我们不能用"解压失败"盖掉
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: String = stderr.chars().rev().take(600).collect::<Vec<_>>().into_iter().rev().collect();
+        return Err(ShellError::Io {
+            path: dest.display().to_string(),
+            message: format!("解压失败（tar 退出码 {:?}）：{}", output.status.code(), tail.trim()),
+        });
+    }
+
+    Ok(ExtractReceipt {
+        dest_path: paths::display_path(&dest),
+        has_st_structure: looks_like_st_root(&dest),
+    })
+}
+
+/// 回环端口探测回执（对应 `PortProbe`）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortProbe {
+    pub alive: bool,
+    pub host: String,
+    pub port: u16,
+    pub elapsed_ms: u64,
+    /// `io::ErrorKind` 的可读名（`ConnectionRefused` / `TimedOut` / `PermissionDenied`…）
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
+}
+
+/// ST 的默认端口（需求写死；TS 侧 `ST_BASE_URL` 与它必须一致）
+pub const ST_DEFAULT_PORT: u16 = 8000;
+
+/// 单次 TCP 探测的超时（毫秒）。与 TS 侧 `ST_PROBE_TIMEOUT_MS` 同值。
+pub const PORT_PROBE_TIMEOUT_MS: u64 = 1500;
+
+/// 探测**回环地址**上某个端口有没有人 accept（v0.1.5 生产反馈追加）。
+///
+/// ## 为什么这条判据必须在壳里，而不是在 webview 里 fetch
+///
+/// 线上实测：ST 已经在 `0.0.0.0:8000` 上跑，webview 里的 `fetch(no-cors)` 仍然
+/// reject，面板报"没有应答"。而 ST 自己的访问日志里**从头到尾没有一条来自 webview
+/// 的连接** —— 请求在浏览器网络层就没出去（系统代理 / 安全软件 / 本地网络权限都
+/// 可能）。这一层跟"ST 有没有发 CORS 头"毫无关系，所以换 fetch 的写法解决不了。
+///
+/// TCP `connect` 不经过任何 HTTP 中间层：能连上 = 端口有人在听 = ST 活着。
+/// 这正是需求要的那一个比特。
+///
+/// ## 边界
+///
+/// 只连 `127.0.0.1`（主机名写死，不接受参数），所以它**不是**端口扫描器 ——
+/// 只能问到本机。端口可通过参数指定是为了测试，默认 8000。
+/// 失败**不返回 Err**：连不上是正常结论，不是命令错误。
+#[tauri::command]
+pub fn probe_st_alive(port: Option<u16>) -> PortProbe {
+    use std::net::{Shutdown, SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let port = port.unwrap_or(ST_DEFAULT_PORT);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let started = Instant::now();
+
+    match TcpStream::connect_timeout(&addr, Duration::from_millis(PORT_PROBE_TIMEOUT_MS)) {
+        Ok(stream) => {
+            // 立刻关掉：我们只要"能连上"这个事实，不在这条连接上收发任何数据
+            let _ = stream.shutdown(Shutdown::Both);
+            PortProbe {
+                alive: true,
+                host: "127.0.0.1".to_string(),
+                port,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                error_kind: None,
+                error_message: None,
+            }
+        }
+        Err(error) => PortProbe {
+            alive: false,
+            host: "127.0.0.1".to_string(),
+            port,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            error_kind: Some(format!("{:?}", error.kind())),
+            error_message: Some(error.to_string()),
+        },
+    }
+}
+
+/// 打开一个**外部 URL**（F15 / T13.4、T13.5：推送完要打开 ST 页面）。
+///
+/// 只放行 `http://` / `https://`：`file://` 能打开本地任意文件（含 `.exe`），
+/// `javascript:` / `data:` 在系统默认程序里也有各自的坑。这里不做"解析后再判断"
+/// 的宽松处理 —— 前缀不匹配直接拒，越简单越不可能被绕过。
+///
+/// 控制字符与空白一律拒：这条命令的入参来自于"我们自己拼的 URL"，
+/// 一旦出现换行/空格，说明上游拼接被污染了，此时拒绝比"帮他清理一下"安全。
+#[tauri::command]
+pub fn open_external(app: AppHandle, url: String) -> ShellResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let trimmed = url.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    let allowed = lowered.starts_with("http://") || lowered.starts_with("https://");
+    let polluted = trimmed.chars().any(|c| c.is_control() || c.is_whitespace());
+
+    if !allowed || polluted {
+        return Err(ShellError::ExtNotAllowed {
+            name: trimmed.to_string(),
+        });
+    }
+
+    app.opener()
+        .open_url(trimmed.to_string(), None::<&str>)
+        .map_err(|error| ShellError::Io {
+            path: trimmed.to_string(),
+            message: format!("打开链接失败：{error}"),
+        })
+}
+
+/// 当前时间的 ISO-8601（秒精度）。
+///
+/// 不引 chrono / time 就是为了一个时间戳：这里把 UNIX 秒手工换算成
+/// 年月日时分秒，只覆盖 1970..=9999，够用到本世纪结束。
+fn now_iso8601() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|delta| delta.as_secs())
+        .unwrap_or(0);
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    // 从 1970-01-01 起按 400 年格里高利周期推进
+    let mut year = 1970_i64;
+    let mut remaining = days as i64;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let length = if leap { 366 } else { 365 };
+        if remaining < length {
+            break;
+        }
+        remaining -= length;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_lengths = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1_usize;
+    for length in month_lengths {
+        if remaining < length {
+            break;
+        }
+        remaining -= length;
+        month += 1;
+    }
+
+    format!(
+        "{year:04}-{month:02}-{:02}T{hour:02}:{minute:02}:{second:02}Z",
+        remaining + 1
+    )
+}
+
+// ─────────────────────────────────────────────────────────────
 // 客户端错误日志（T10.26）
 // ─────────────────────────────────────────────────────────────
 
@@ -929,8 +1652,17 @@ fn normalize_error_log_entry(entry: &str) -> String {
 ///      落盘"交给调度器决定。
 #[tauri::command]
 pub fn append_client_error_log(app: AppHandle, entry: String) -> ShellResult<String> {
-    let target = error_log_path(&app)?;
-    let text = normalize_error_log_entry(&entry);
+    append_error_log_impl(&app, &entry)
+}
+
+/// 追加日志的唯一实现（v0.1.5 / F15 抽出）。
+///
+/// 抽出来是因为 `spawn_detached` 也要留痕（"某天 ST 起不来"时唯一能对上号的
+/// 时间点），而它拿的是 `&AppHandle`。复制一份写入逻辑的话，轮转、截断、
+/// fsync 这三条保证迟早会在一处松掉 —— 而日志恰恰是出问题时才被发现不靠谱的东西。
+fn append_error_log_impl(app: &AppHandle, entry: &str) -> ShellResult<String> {
+    let target = error_log_path(app)?;
+    let text = normalize_error_log_entry(entry);
 
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|error| ShellError::io(parent, error))?;
@@ -1232,5 +1964,273 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── F15 / T13.1：ST 判据、启动白名单、路径探测 ──────────────
+    //
+    // 这三处是"放行"逻辑：放错了就是让任意目录里的批处理被拉起，
+    // 或者让一个不像 ST 的目录通过检查后在启动时炸掉。所以判据必须有矩阵。
+
+    /// 写一个最小 ST 结构，返回目录
+    fn fake_st_root(tag: &str, package_json: Option<&str>, server_js: bool) -> PathBuf {
+        let dir = temp_dir(tag);
+        fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = package_json {
+            fs::write(dir.join("package.json"), text).unwrap();
+        }
+        if server_js {
+            fs::write(dir.join("server.js"), b"// noop\n").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn st_criteria_matrix() {
+        // 判据：package.json 存在 **且**（scripts.start 或 server.js 存在）
+        let with_start = r#"{"scripts":{"start":"node server.js"}}"#;
+        let without_start = r#"{"scripts":{"build":"tsc"}}"#;
+
+        // ① 有 package.json + scripts.start → 是 ST（不要求 server.js）
+        let dir = fake_st_root("st-start", Some(with_start), false);
+        assert!(looks_like_st_root(&dir), "scripts.start 就够了");
+        let _ = fs::remove_dir_all(&dir);
+
+        // ② 有 package.json + server.js（没有 start）→ 是 ST
+        let dir = fake_st_root("st-serverjs", Some(without_start), true);
+        assert!(looks_like_st_root(&dir), "server.js 是第二条兼容判据");
+        let _ = fs::remove_dir_all(&dir);
+
+        // ③ 有 package.json，但既没 start 也没 server.js → 不是
+        let dir = fake_st_root("st-neither", Some(without_start), false);
+        assert!(!looks_like_st_root(&dir), "两个判据都不满足就不能放行");
+        let _ = fs::remove_dir_all(&dir);
+
+        // ④ 没有 package.json，只有 server.js → 不是（缺一半判据）
+        let dir = fake_st_root("st-no-pkg", None, true);
+        assert!(!looks_like_st_root(&dir), "没有 package.json 不算 ST");
+        let _ = fs::remove_dir_all(&dir);
+
+        // ⑤ package.json 是坏 JSON，但有 server.js → **算 ST**
+        //
+        // 这条一开始写成了"不该放行"，那是把判据当成了"package.json 可解析"。
+        // 需求给的判据是"package.json 存在 且（scripts 含 start 或 server.js 存在）"——
+        // 存在不等于可解析，而 `node server.js` 也确实跑得起来。
+        // 修的是测试的期望值，不是实现（与"既有测试把缺陷写成期望值"相反的方向：
+        // 这次是测试比需求更严）。
+        let dir = fake_st_root("st-broken", Some("{not json"), true);
+        assert!(
+            looks_like_st_root(&dir),
+            "server.js 在，就算 package.json 坏了也该放行"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn child_script_resolution_is_case_insensitive() {
+        // ST 官方压缩包里是 `Start.bat`（大写 S），而白名单里写的是 `start.bat`。
+        // Windows 的文件系统本身不区分大小写，所以 `join("start.bat").is_file()`
+        // 已经能命中；真正要证明的是**命中的是磁盘上那个文件**，而不是一个
+        // 看起来同名、实际由我们拼出来的路径。
+        let dir = temp_dir("st-case");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Start.bat"), b"@echo off\n").unwrap();
+
+        let found = resolve_child_script(&dir, "start.bat").expect("大小写不该影响查找");
+        // canonicalize 会把路径换成磁盘上的真实大小写（Windows 上还带 \\?\ 前缀），
+        // 这是"两者是同一个文件"的直接证据 —— 比断言字符串相等可靠，
+        // 因为断言字符串相等会随文件系统是否区分大小写而变（本机就不区分）。
+        let real = fs::canonicalize(&found).expect("应当能解析到真实路径");
+        assert_eq!(
+            real.file_name().unwrap().to_string_lossy(),
+            "Start.bat",
+            "找到的应当是磁盘上那个真实名字"
+        );
+        assert!(resolve_child_script(&dir, "nothere.bat").is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_whitelist_is_exactly_three_targets() {
+        // 白名单是"启动任意程序"与"只启动 ST"之间的那道门，改动必须是有意的
+        assert_eq!(SPAWN_TARGETS, ["start.bat", "node.exe", "server.js"]);
+        for forbidden in [
+            "powershell.exe",
+            "cmd.exe",
+            "..\\evil.bat",
+            "C:\\Windows\\System32\\calc.exe",
+            "start.bat & calc",
+        ] {
+            assert!(
+                !SPAWN_TARGETS.contains(&forbidden),
+                "{forbidden} 不该在白名单里"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_paths_reports_file_dir_and_none() {
+        let dir = temp_dir("probe-paths");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("package.json");
+        fs::write(&file, b"{}").unwrap();
+        let missing = dir.join("nope.json");
+
+        let result = probe_paths(vec![
+            dir.display().to_string(),
+            file.display().to_string(),
+            missing.display().to_string(),
+        ])
+        .expect("探测应成功");
+
+        assert_eq!(result[0].exists, "dir");
+        assert_eq!(result[1].exists, "file");
+        assert_eq!(result[2].exists, "none");
+        // 原样回传：调用方要拿它去对上"我问的是哪一条"
+        assert_eq!(result[2].path, missing.display().to_string());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_paths_rejects_relative_and_oversized_batches() {
+        assert!(probe_paths(vec!["relative/path".to_string()]).is_err(), "相对路径必须拒绝");
+
+        let too_many: Vec<String> = (0..=MAX_PROBE_PATHS)
+            .map(|index| format!("C:\\probe-{index}"))
+            .collect();
+        match probe_paths(too_many) {
+            Err(ShellError::TooManyPaths { count, limit }) => {
+                assert_eq!(count, MAX_PROBE_PATHS + 1);
+                assert_eq!(limit, MAX_PROBE_PATHS);
+            }
+            other => panic!("超过上限应当报 TooManyPaths，实际 {other:?}"),
+        }
+    }
+
+    // ── F15 生产反馈：回环端口探测 ──────────────────────────
+
+    #[test]
+    fn collect_st_dirs_matches_prefix_case_insensitively_and_dirs_only() {
+        // 这条决定"扫不扫得到用户的 ST"：现场那份在 F:\SillyTavern，
+        // 靠的就是盘符根上的前缀匹配。
+        let root = temp_dir("st-collect");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["SillyTavern", "sillytavern-1.13.2", "MySillyTavern", "SillyTavern-notes"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        // 同名但**是文件**的：不该被当成安装目录
+        fs::write(root.join("SillyTavern.txt"), b"x").unwrap();
+
+        let found = collect_st_dirs(&root);
+        let names: Vec<String> = found
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        /*
+         * `SillyTavern-notes` 会被收进来 —— 这是**刻意的**，不是漏洞：
+         *
+         * 收集阶段只按前缀筛，判断阶段（`looks_like_st_root`：package.json +
+         * scripts.start/server.js）才决定它算不算 ST。如果收集阶段就猜"notes 不像 ST"，
+         * 那 `SillyTavern-1.13.2`、`SillyTavern-test`、`SillyTavern 备份` 这些
+         * 都得逐个加白名单，最后必然漏。
+         *
+         * 真正要挡的是两类：**不以该前缀开头的**（MySillyTavern）与**不是目录的**
+         * （SillyTavern.txt）—— 那两类收进来纯属噪声。
+         */
+        assert_eq!(
+            names,
+            vec!["SillyTavern", "SillyTavern-notes", "sillytavern-1.13.2"],
+            "前缀匹配 + 只收目录；MySillyTavern（前缀不符）与 SillyTavern.txt（是文件）都该排除"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains("My")),
+            "MySillyTavern 不该出现在候选里"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_st_dirs_returns_empty_for_missing_dir() {
+        // 不存在的盘（可移动盘没挂）必须静默返回空集，不能报错打断整轮检测
+        let missing = temp_dir("st-collect-missing");
+        assert!(collect_st_dirs(&missing).is_empty());
+    }
+
+    #[test]
+    fn probe_st_alive_detects_listening_socket() {
+        // 真起一个监听（绑 0 端口让 OS 分配，避免撞上用户机器上真在跑的 8000）
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("应当能绑定回环端口");
+        let port = listener.local_addr().unwrap().port();
+
+        let result = probe_st_alive(Some(port));
+        assert!(result.alive, "端口有人 listen 时必须判活着：{result:?}");
+        assert_eq!(result.host, "127.0.0.1");
+        assert_eq!(result.port, port);
+        assert!(result.error_kind.is_none(), "成功时不该带错误类型");
+
+        drop(listener);
+    }
+
+    #[test]
+    fn probe_st_alive_reports_not_listening_after_close() {
+        // 先占一个端口再关掉 —— 这样拿到的是"确定没人听"的端口号
+        // （直接挑一个随机端口可能被别的东西占着，测试会偶发）
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("应当能绑定回环端口");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let result = probe_st_alive(Some(port));
+        assert!(!result.alive, "端口关掉后必须判没活着");
+
+        /*
+         * 期望的错误类型**不止一种**，这不是放宽，是实测结论：
+         *
+         * 本机（Windows，会话内）关掉的回环端口，收到的是 **TimedOut** 而不是
+         * ConnectionRefused —— 即 SYN 被静默丢弃而不是回 RST（防火墙/安全软件
+         * 常这么干）。第一版断言 `== ConnectionRefused` 因此红了。
+         *
+         * 对产品的含义：**不能把 TimedOut 当成"另一种故障"去引导用户**，
+         * 它就是"没人应答"的一种现实形态；同时也说明超时兜底是必需的
+         * （没有 timeout 这一条会挂满 21 秒的默认 TCP 重试）。
+         */
+        let kind = result.error_kind.as_deref();
+        assert!(
+            matches!(kind, Some("ConnectionRefused") | Some("TimedOut") | Some("HostUnreachable")),
+            "关掉的端口应当报「没人听」那一类错误，实际：{result:?}"
+        );
+        assert!(result.error_message.is_some(), "要把 OS 原话带出去");
+        assert!(
+            result.elapsed_ms >= 1,
+            "耗时字段要能反映「立刻被拒」与「卡到超时」的差别：{result:?}"
+        );
+    }
+
+    #[test]
+    fn probe_st_alive_default_port_is_the_documented_one() {
+        assert_eq!(ST_DEFAULT_PORT, 8000);
+        // 只断言"调用不 panic 且回执自洽"，不断言结果 —— 本机可能真装着 ST
+        let result = probe_st_alive(None);
+        assert_eq!(result.port, 8000);
+        assert!(result.alive == result.error_kind.is_none());
+    }
+
+    #[test]
+    fn iso8601_formats_known_epoch() {
+        // 引一个时间库为它增加构建依赖不值。范围断言足以抓住"月日算错"。
+        let stamp = now_iso8601();
+        let bytes = stamp.as_bytes();
+        assert_eq!(bytes.len(), 20, "YYYY-MM-DDTHH:MM:SSZ 应当 20 个字符：{stamp}");
+        assert_eq!(&stamp[4..5], "-");
+        assert_eq!(&stamp[10..11], "T");
+        assert!(stamp.ends_with('Z'));
+        let year: i32 = stamp[0..4].parse().expect("年份可解析");
+        let month: u32 = stamp[5..7].parse().expect("月份可解析");
+        let day: u32 = stamp[8..10].parse().expect("日期可解析");
+        assert!((1970..=9999).contains(&year));
+        assert!((1..=12).contains(&month));
+        assert!((1..=31).contains(&day));
     }
 }

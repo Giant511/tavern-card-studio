@@ -46,6 +46,22 @@ pub enum ShellError {
     #[error("路径越界，不在规则目录内：{path}")]
     PathNotAllowed { path: String },
 
+    /// 一次请求的路径数超过上限（F15 / T13.1）。
+    ///
+    /// 为什么要有上限：`probe_paths` 是唯一接受「一次多个任意绝对路径」的命令，
+    /// 没有上限的话它可以被当成"批量探测整台机器的目录存不存在"的扫描器。
+    /// 上限取 64 —— ST 检测实际只用 2~10 条。
+    #[error("一次最多探测 {limit} 条路径，收到 {count} 条")]
+    TooManyPaths { count: usize, limit: usize },
+
+    /// 启动目标被白名单拒绝（F15 / T13.1）。
+    ///
+    /// 单独一个错误码而不是复用 `PATH_NOT_ALLOWED`：前端要能一眼区分
+    /// "这个目录不是 SillyTavern"（`SPAWN_REJECTED`，属于预期内的用户状态）
+    /// 与"路径越界"（`PATH_NOT_ALLOWED`，属于越权尝试）。
+    #[error("拒绝启动：{reason}（目标 {target}）")]
+    SpawnRejected { target: String, reason: String },
+
     #[error("IO 失败（{path}）：{message}")]
     Io { path: String, message: String },
 }
@@ -65,6 +81,8 @@ impl ShellError {
             Self::RulesDirMissing => "RULES_DIR_MISSING",
             Self::UnknownRuleKind { .. } => "UNKNOWN_RULE_KIND",
             Self::PathNotAllowed { .. } => "PATH_NOT_ALLOWED",
+            Self::TooManyPaths { .. } => "TOO_MANY_PATHS",
+            Self::SpawnRejected { .. } => "SPAWN_REJECTED",
             Self::Io { .. } => "IO_ERROR",
         }
     }
@@ -99,6 +117,14 @@ impl ShellError {
             }
             Self::ExtNotAllowed { name } => {
                 map.insert("name".to_string(), name.clone().into());
+            }
+            Self::TooManyPaths { count, limit } => {
+                map.insert("count".to_string(), (*count).into());
+                map.insert("limit".to_string(), (*limit).into());
+            }
+            Self::SpawnRejected { target, reason } => {
+                map.insert("target".to_string(), target.clone().into());
+                map.insert("reason".to_string(), reason.clone().into());
             }
             Self::UnknownRuleKind { kind } => {
                 map.insert("kind".to_string(), kind.clone().into());

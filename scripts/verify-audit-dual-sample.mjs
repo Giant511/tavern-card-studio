@@ -76,8 +76,22 @@ function legacyPresetFrom(currentPreset) {
  * （原始八板块文本），拿不到"换一套预设渲染"的形态。
  * 字段与 ST 规范一一对应。
  */
-function toServerBytes(card, descriptionText) {
+function toServerBytes(card, descriptionText, options = {}) {
   const block = (id) => card.blocks.find((item) => item.id === id)?.text ?? '';
+  /*
+   * `blankNewFields`（v0.1.5 / G3-1）：把 first_mes / mes_example / alternate_greetings
+   * 全部写成空。
+   *
+   * 为什么需要：真正的"六板块旧格式卡"这两个板块**必然为空** —— 那时模型里
+   * 还没有它们。而"description 只有六块标题、但字段有内容"的卡，其实是
+   * **标准 SillyTavern 卡**（ST 把这两块放在顶层独立字段，从不写进 description）。
+   * 两种形态必须分开造，否则会得出"标准 ST 卡也是旧卡"的错误结论。
+   *
+   * 第一版漏了 `alternate_greetings`：它的内容会渲染进「初始场景」板块，
+   * 于是样本仍然"字段有内容"、仍然不报 legacy —— 一次很典型的
+   * "样本没造干净，却看起来像实现有 bug"。
+   */
+  const blank = options.blankNewFields === true;
   const payload = {
     spec: 'chara_card_v2',
     spec_version: '2.0',
@@ -86,12 +100,12 @@ function toServerBytes(card, descriptionText) {
       description: descriptionText,
       personality: block('personality'),
       scenario: card.residual.scenario,
-      first_mes: card.residual.firstMes,
-      mes_example: card.residual.mesExample,
+      first_mes: blank ? '' : card.residual.firstMes,
+      mes_example: blank ? '' : card.residual.mesExample,
       creator_notes: card.meta.creatorNotes,
       system_prompt: card.residual.systemPrompt,
       post_history_instructions: card.residual.postHistoryInstructions,
-      alternate_greetings: [...card.residual.alternateGreetings],
+      alternate_greetings: blank ? [] : [...card.residual.alternateGreetings],
       tags: [...card.meta.tags],
       creator: card.meta.creator,
       character_version: card.meta.characterVersion,
@@ -143,7 +157,14 @@ export function buildDualSamples() {
     legacyPreset,
     legacyTxt,
     eightTxt,
-    legacyBytes: toServerBytes(card, legacyDescription),
+    /** 真·六板块旧卡：description 六块 + 两个新字段**为空** */
+    legacyBytes: toServerBytes(card, legacyDescription, { blankNewFields: true }),
+    /**
+     * 标准 SillyTavern 卡（v0.1.5 / G3-1）：description 与旧卡**逐字节相同**，
+     * 只有 first_mes / mes_example 有内容。它**不是**旧卡 —— 正是靠"字段有内容"
+     * 与旧卡区分开，这条样本用来钉住"不许误报"。
+     */
+    stCardBytes: toServerBytes(card, legacyDescription),
     newBytes: toServerBytes(card, eightDescription),
   };
 }
@@ -176,9 +197,11 @@ export function runAuditDualSample() {
     '八板块渲染里两个新标题都在（空板块也写标题，这正是旧/新形态的判据基础）',
   );
 
-  // ── 样本 A：六板块形态（内容与 B 相同，只有分块形态不同）──
-  const legacyDescription = dropSection(dropSection(legacyTxt, '【对话示例】'), '【初始场景】');
-  const legacyResult = service.run(toServerBytes(card, legacyDescription), {}, 'legacy-six-block');
+  // ── 样本 A：真正的六板块旧卡（两字段为空 + description 只有六块标题）──
+  //
+  // 直接用 `buildDualSamples()` 产出的字节，不在这里再拼一份 ——
+  // 两份样本必须是同一对，否则"离线绿、HTTP 红"时分不清是谁的错。
+  const legacyResult = service.run(sample.legacyBytes, {}, 'legacy-six-block');
   const legacyIssues = legacyResult.report.issues;
 
   check(
@@ -207,6 +230,31 @@ export function runAuditDualSample() {
   check(
     legacyIssues.filter((issue) => issue.ruleId === 'builtin:block-missing').length === 0,
     '没有逐条报「板块缺失」（旧卡不该刷 warning）',
+  );
+
+  // ── 样本 A2：标准 SillyTavern 卡（六块 description + 两字段有内容）──
+  //
+  // v0.1.5 / G3-1 新增。这张卡与样本 A 的 description **完全相同**，只有
+  // first_mes / mes_example 有内容 —— 而"有内容"恰恰说明它不是旧卡：
+  // 旧卡这两个字段必然为空。两者在 JSON 上唯一的差别就是字段是否为空，
+  // 所以旧判据（只看 description 标题）必然把它们判成同一类，误报就此产生。
+  const stResult = service.run(sample.stCardBytes, {}, 'standard-st-card');
+  const stIssues = stResult.report.issues;
+  check(
+    stIssues.filter((issue) => issue.ruleId === 'builtin:legacy-six-block').length === 0,
+    '★标准 ST 卡（两字段有内容）**不**报「不含对话示例/初始场景」',
+    stIssues
+      .filter((issue) => issue.ruleId === 'builtin:legacy-six-block')
+      .map((issue) => issue.message)
+      .join('; '),
+  );
+  check(
+    stResult.report.summary.error === 0,
+    '★标准 ST 卡审计 error = 0',
+    stIssues
+      .filter((issue) => issue.severity === 'error')
+      .map((issue) => issue.ruleId)
+      .join(','),
   );
 
   // ── 样本 B：八板块形态 ──

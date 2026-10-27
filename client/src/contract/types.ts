@@ -132,6 +132,84 @@ export interface CardsDirScan {
   truncated: boolean;
 }
 
+/**
+ * 路径存在形态（F15 / T13.1）。
+ *
+ * 三态而不是布尔：`file` 与 `dir` 对调用方的含义完全不同 ——
+ * "`package.json` 是个目录"和"它不存在"在 ST 检测里都算"没装"，
+ * 但在排查时一个是"用户目录被搞坏了"，一个是"还没装"。
+ */
+export type PathKind = 'file' | 'dir' | 'none';
+
+/** 单条路径探测结果 */
+export interface PathProbe {
+  /** 原样回传的绝对路径（调用方用它对上"我问的是哪一条"） */
+  path: string;
+  exists: PathKind;
+}
+
+/**
+ * SillyTavern 候选目录（F15 / T13.2）。
+ *
+ * **这是候选，不是结论**：`dirs` 里的目录可能全都不存在。
+ * 判定由 `client/src/session/st-install.ts` 的 `judgeStInstall` 做 ——
+ * 判据要能被矩阵单测，而壳里没有测试宿主。
+ */
+export interface StCandidates {
+  /** 用户主目录（展示用）；拿不到时为 null */
+  home: string | null;
+  /** 候选目录绝对路径，已去重排序；标准位置即使不存在也会在列 */
+  dirs: string[];
+}
+
+/**
+ * 允许启动的目标（白名单，与 Rust 侧 `SPAWN_TARGETS` 逐字一致）。
+ *
+ * 只这三个：ST 官方 Windows 入口 `start.bat`（磁盘上常写作 `Start.bat`，
+ * 大小写由壳侧兼容），以及"直接跑 node server.js"的两种表达。
+ */
+export type SpawnTarget = 'start.bat' | 'node.exe' | 'server.js';
+
+/** 启动回执（F15 / T13.4） */
+export interface SpawnReceipt {
+  /** 子进程 pid（仅用于展示与日志对号） */
+  pid: number;
+  /**
+   * 子进程 stdout/stderr 的落点（`<应用配置目录>/logs/st-launch.log`）。
+   *
+   * 为什么要交给渲染层：启动失败时要把 **ST 自己的报错**贴给用户，
+   * 而不是我们转述。路径本身由壳解析，这里只是转发 —— 渲染层没有
+   * "指定任意路径"的能力，拿到的是一条已存在文件的路径。
+   */
+  logPath: string | null;
+}
+
+/**
+ * 回环端口探测结果（F15 / v0.1.5 生产反馈追加）。
+ *
+ * 为什么需要它：webview 里的 `fetch` 会被系统代理 / 安全软件 / 本地网络权限挡住，
+ * 而"ST 有没有在跑"这个问题与 HTTP 层无关 —— 端口有没有人 accept 就够了。
+ * 壳侧 `TcpStream::connect_timeout` 只连 `127.0.0.1`，不经过任何 HTTP 中间层。
+ */
+export interface PortProbe {
+  alive: boolean;
+  /** 固定 `127.0.0.1`（不接受参数，所以这条能力不是端口扫描器） */
+  host: string;
+  port: number;
+  /** 探测耗时（毫秒），用于区分"立刻被拒"与"卡到超时" */
+  elapsedMs: number;
+  /** `io::ErrorKind` 的可读名：ConnectionRefused / TimedOut / PermissionDenied… */
+  errorKind: string | null;
+  errorMessage: string | null;
+}
+
+/** 解压回执（F15 / T13.3 一键安装的 c 步） */export interface ExtractReceipt {
+  /** 解压到的目录（壳给的展示路径） */
+  destPath: string | null;
+  /** 解压后该目录是否已经像 SillyTavern（判据与检测一致） */
+  hasStStructure: boolean;
+}
+
 /** 客户端持久化配置（T6.8） */
 export interface ClientConfig {
   /** 服务端 API 根地址，如 http://127.0.0.1:8730 */
@@ -183,6 +261,21 @@ export interface ClientConfig {
   /** 当前高亮方案 id */
   highlightSchemeId: string | null;
   /**
+   * 当前世界书格式预设 id（v0.1.5 / G5）。
+   *
+   * 上面三个字段从 v0.1.0 就存在，但**直到 G5 才真正被读写** ——
+   * 之前只声明、不落盘，所以"切换过哪个"重启就丢。四个 id 现在一起生效：
+   * 启动时按它们恢复选择，切换时立即写回。
+   *
+   * 值为 `null` 表示"没选过/用内置默认"。**不存预设本体** ——
+   * 本体在预设库（`preset-library.json`，由壳解析路径），这里只存指针。
+   */
+  worldbookPresetId: string | null;
+  /** 当前初始场景格式预设 id（v0.1.5 / G5） */
+  greetingPresetId: string | null;
+  /** 当前对话示例格式预设 id（v0.1.5 / G5） */
+  chatExamplePresetId: string | null;
+  /**
    * 角色卡目录（T9.8 / F4）。`null` = 未设置，使用壳给出的默认值
    * （`%USERPROFILE%\Documents\TavernCardStudio\cards`）。
    *
@@ -200,6 +293,26 @@ export interface ClientConfig {
    * **"浏览选择"的路径不写入这里**（那是一次性动作）。
    */
   lastFaceChoice: string | null;
+  /**
+   * 用户手动指定过的 SillyTavern 安装目录（F15 / T13.2，需求里的"记忆路径"）。
+   *
+   * 与 `cardsDir` 同一套语义：`null` = 没指定过，走自动扫描
+   * （`find_st_candidates` 列出的候选，逐个验判据）。
+   *
+   * 为什么要记：ST 的目录名千奇百怪（`SillyTavern-1.13.2`、
+   * `我的酒馆`…），自动扫描只认 `SillyTavern*` 前缀，
+   * 用户自己指定过一次之后就不该再让他每次重选。
+   */
+  stPath: string | null;
+  /**
+   * SillyTavern release 包的下载镜像前缀（F15 / T13.3）。
+   *
+   * 需求写的是"官方 GitHub release + 可配置镜像前缀"。前缀直接拼在官方地址前面
+   * （`https://ghfast.top/https://github.com/...`），所以留空就是官方地址。
+   * 校验（必须 http(s):// 开头）在 `st-install.ts` 的 `stDownloadUrl` 里做 ——
+   * 这里只存原文，不做归一化，坏值在下载时给出明确报错。
+   */
+  stMirrorPrefix: string | null;
 }
 
 export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
@@ -217,6 +330,11 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
   platformRuleId: null,
   presetId: null,
   highlightSchemeId: null,
+  worldbookPresetId: null,
+  greetingPresetId: null,
+  chatExamplePresetId: null,
   cardsDir: null,
   lastFaceChoice: null,
+  stPath: null,
+  stMirrorPrefix: null,
 };

@@ -180,6 +180,17 @@ if (serverStamp.ok) {
  *
  * 它要防的真实故障仍然存在，只是判据换成内容：**改了 shared、`pack:server`
  * 没重跑，包里还是旧的 shared**。那种情况下文件内容一定不同。
+ *
+ * ## `.build-stamp.json` 例外（v0.1.5 / 2026-10-26）
+ *
+ * 这个文件里有 `at`（构建时刻），每次 `build:*` 都会变。把它纳入"逐字节相同"
+ * 会让**代码完全一致**的包被判成"内容不同" —— 实测：改了客户端 CSS 后重跑
+ * `build:shared`，`sourceHash` 一模一样（`cdc1d0fc…`），只因 `at` 不同就红了两条。
+ *
+ * 判据应该比的是"这份产物来自哪个源码快照"，那是 `sourceHash` 的语义。
+ * 所以这里对 stamp **只比 `sourceHash`/`sourceFiles`/`package`，不比 `at`**。
+ * 这不是放宽：源码一改 `sourceHash` 就变，"换了 shared 却没重打服务端"
+ * 照样被抓到。
  */
 function compareTree(expectedDir, actualDir, what) {
   if (!existsSync(expectedDir) || !existsSync(actualDir)) {
@@ -200,7 +211,15 @@ function compareTree(expectedDir, actualDir, what) {
   for (const rel of files) {
     const a = join(expectedDir, rel);
     const b = join(actualDir, rel);
-    if (!existsSync(b) || sha256(a) !== sha256(b)) differing.push(rel);
+    if (!existsSync(b)) {
+      differing.push(rel);
+      continue;
+    }
+    if (rel.endsWith('.build-stamp.json')) {
+      if (stampFingerprint(a) !== stampFingerprint(b)) differing.push(rel);
+      continue;
+    }
+    if (sha256(a) !== sha256(b)) differing.push(rel);
   }
   if (differing.length > 0) {
     fail(`${what}：${differing.length}/${files.length} 个文件内容不同（例：${differing.slice(0, 3).join('、')}）`);
@@ -209,7 +228,39 @@ function compareTree(expectedDir, actualDir, what) {
   say(`   OK ${`${what} ${files.length} 个文件逐字节相同`.padEnd(34)}`.padEnd(52));
 }
 
+/** stamp 的"内容指纹"：排除构建时刻，只留能说明"来自哪份源码"的部分 */
+function stampFingerprint(file) {
+  try {
+    const doc = JSON.parse(readFileSync(file, 'utf8'));
+    return JSON.stringify({
+      package: doc.package,
+      sourceHash: doc.sourceHash,
+      sourceFiles: doc.sourceFiles,
+    });
+  } catch {
+    // 读不动就退回整文件哈希 —— 宁可误报，不要漏报
+    return sha256(file);
+  }
+}
+
 compareTree(join(ROOT, 'shared/dist'), join(ROOT, 'release/server/app/node_modules/@tcs/shared/dist'), 'shared/dist = 包内 @tcs/shared');
+/*
+ * 包内**两份** shared 副本也必须互相一致（v0.1.5 / 2026-10-26）。
+ *
+ * `pack-server.mjs` 先放一份到 `app/shared`（第 80 行），再 `copyTree` 成
+ * `app/node_modules/@tcs/shared`（第 220 行）—— 后者才是运行时 ESM 解析到的那份。
+ *
+ * 上面那条断言比对的是 node_modules 那份（正确的目标），但**"复制这一步有没有
+ * 漏文件"没人管**：实测把 `app/shared/dist/format/worldbook.js` 改掉后
+ * report:release 全绿。虽然运行时不读那份，可它一旦与 node_modules 分叉，
+ * 说明 copyTree 出了问题 —— 而 copyTree 出问题的另一面可能就是"漏了某个文件"。
+ * 这条断言成本是一行，抓的是打包链路本身的异常。
+ */
+compareTree(
+  join(ROOT, 'release/server/app/shared/dist'),
+  join(ROOT, 'release/server/app/node_modules/@tcs/shared/dist'),
+  '包内 shared 两份副本互相一致',
+);
 // `server/public` 是**静态资源**，不经过 tsc 编译，所以不能断言它 ≤ server/dist
 // （昨天那条断言本身就是错的：改了 index.html 只会让 public 比 dist 新，而根本不
 //  需要重新编译 —— 它会稳定地报红，逼人去改一条假规则）。

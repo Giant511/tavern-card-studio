@@ -184,12 +184,41 @@ test('TXT 导出：切换预设后分隔符与标题随之改变', () => {
   assert.ok(withDivider.includes('---'), 'divider 预设的 TXT 应含 ---');
 });
 
-test('TXT 导出：世界书不写入（结构化字段）', () => {
+/*
+ * 这条原来断言「世界书不写入 TXT」，理由是"世界书是结构化字段"。
+ *
+ * 那个理由不成立：TXT 是**整卡**的文本形态，世界书同样有文本形态
+ * （`@@ENTRY` 段，TXT 卡导入时本来就要解析它）。当初"不写入"是因为
+ * `buildTxtExport` 只遍历三类板块，而世界书是 `structured` —— 属于**漏了**，
+ * 不是决定不写。
+ *
+ * 线上后果（用户 v0.1.4 实测）：导出 TXT 后世界书整段消失，且没有任何提示。
+ * 现改为断言"必须写入"，并覆盖两种来源：
+ *   · `worldbook.text` 非空 → 原样输出（保真优先，不擅自改写成 @@ENTRY）；
+ *   · `worldbook.text` 为空 → 从 entries 渲染出 `@@ENTRY`。
+ */
+test('TXT 导出：世界书必须写入（文本形态，不是"结构化就不写"）', () => {
   const artifact = buildTxtExport(CARD, PRESET_DEFAULT);
   const entry = CARD.worldbook.entries[0];
   assert.ok(entry, '样本卡应有世界书条目');
   const probe = entry.content.slice(0, 10);
-  assert.ok(!artifact.text.includes(probe), 'TXT 不应包含世界书正文');
+
+  assert.ok(artifact.text.includes('【世界书】'), 'TXT 缺世界书段标题');
+
+  // 样本卡的 worldbook.text 可能为空，此时内容来自 entries 渲染
+  const fromEntries = CARD.worldbook.text === '';
+  if (fromEntries) {
+    assert.ok(artifact.text.includes('@@ENTRY'), 'text 为空时应从 entries 渲染 @@ENTRY');
+    assert.ok(artifact.text.includes(probe), 'TXT 丢了世界书正文');
+  } else {
+    assert.ok(artifact.text.includes(CARD.worldbook.text.slice(0, 20)), 'TXT 应原样带上 worldbook.text');
+  }
+});
+
+test('TXT 导出：空世界书不留空标题', () => {
+  const empty = { ...CARD, worldbook: { ...CARD.worldbook, entries: [], text: '' } };
+  const artifact = buildTxtExport(empty, PRESET_DEFAULT);
+  assert.ok(!artifact.text.includes('【世界书】'), '空世界书不该留一个只有标题的空段');
 });
 
 // ── 统一入口与哈希 ──────────────────────────────────────────

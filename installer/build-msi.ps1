@@ -30,7 +30,7 @@
 
 [CmdletBinding()]
 param(
-  [string]$Version = '0.1.4',
+  [string]$Version = '0.1.5',
   [string]$WixPath = '',
   [string]$WixExt = '',
   # 留空则在正文里解析（param 默认值阶段 $PSScriptRoot 可能为空，见下方说明）

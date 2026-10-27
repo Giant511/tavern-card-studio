@@ -77,3 +77,12 @@ docs/*
 !docs/server-developer.md
 !docs/Cloud Deployment Manual.md
 PLAN.md
+
+# 记忆全文卷（2026-10-26 用户要求）：与 PLAN.md 同类 —— 含本机路径、真实卡数据与排障记录，
+# 只留本地。**索引**在 `~/.workbuddy/memory/MEMORY.md`（每次会话自动注入），正文在这里。
+# 写成 `/memory.md` 只锚仓库根，避免误伤子目录里可能存在的同名文件。
+/memory.md
+
+# G7 取证截图：画面上就是用户真实的世界书正文（成人向角色设定）。
+# 留着本地看即可，**不进版本历史** —— 一旦推上去就再也删不干净。
+assets/g7-*.png

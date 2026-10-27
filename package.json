@@ -1,7 +1,7 @@
 {
   "name": "tavern-card-studio",
   "private": true,
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "酒馆（SillyTavern）角色卡审计与编辑工具链：服务端（版本控制/审计）+ 客户端（分块编辑器）",
   "license": "MIT",
   "type": "module",

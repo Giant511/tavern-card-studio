@@ -73,8 +73,10 @@ export function previewCardText(
   preset: TxtPreset,
   mode: ImportMode,
   greetingFormat?: GreetingFormatParams,
+  /** 世界书格式（v0.1.5 / G4）：TXT 卡里的世界书段按当前预设解析 */
+  worldbookFormat?: WorldbookFormatParams,
 ): CardTextPreview {
-  const result = importCardText(card, text, preset, mode, greetingFormat);
+  const result = importCardText(card, text, preset, mode, greetingFormat, worldbookFormat);
   const issues: ImportIssueView[] = result.issues.map((issue) => ({
     // 只有「缺板块」这一条会随模式改变级别：严格是 error（导入中止），
     // 宽松是 warning（按空块处理）。其它问题（重复标题、未知标题）与模式无关。

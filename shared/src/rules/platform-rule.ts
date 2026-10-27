@@ -88,8 +88,35 @@ export interface RuleCondition {
   equals?: string | number | boolean;
   /** 字段值必须不等于它（用于 constant 缺省 = false 的语义） */
   notEquals?: string | number | boolean;
-  /** true = 字段必须存在；false = 字段必须不存在 */
+  /**
+   * 旧写法：true = 字段必须存在；false = 字段必须不存在。
+   *
+   * v0.1.5 / G7 起推荐写 `exists` / `absent`（更好读，且能表达否定形式），
+   * 但**保留 present** —— 已有规则文件在用，删了等于让它们静默失效。
+   */
   present?: boolean;
+  /**
+   * `true` = 字段必须**存在**（不是 undefined / null）；`false` = 必须不存在。
+   *
+   * ## 为什么需要（v0.1.5 / G7，出路三）
+   *
+   * 用户的世界书分"持续世界书"与"关键词世界书"两节，持续型条目**没有**
+   * `priority`（触发概率），关键词型**没有**它 —— 于是"存在性"本身就是
+   * **区分两类条目的可靠信号**，不必给每条都手写一个 `constant` 标记。
+   *
+   * 判定口径是"字段在条目对象里有没有出现"，不是"值是否为真" ——
+   * `priority: 0` 算存在。这与 `equals`/`notEquals` 是正交的两件事。
+   */
+  exists?: boolean;
+  /**
+   * `true` = 字段必须**不存在**；`false` = 必须存在。
+   *
+   * 与 `exists` 互为取反，两个都能写只是为了规则读起来顺：
+   * 「关键词缺失且 priority 不存在」比「`exists: false`」好读。
+   * 同时写两个且互相矛盾时，**否定优先**（任一不满足即整条条件不成立），
+   * 这是"宁可少报也不误报"的取舍。
+   */
+  absent?: boolean;
 }
 
 interface BaseContentRule {

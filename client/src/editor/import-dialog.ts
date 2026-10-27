@@ -72,6 +72,13 @@ export interface ImportDialogDeps {
    * 分段的（来自别的工具），按冻结默认切会把整段当成一条开场白。
    */
   getGreetingFormat?: () => GreetingFormatParams | undefined;
+  /**
+   * 当前世界书格式（v0.1.5 / G4）。
+   *
+   * TXT 卡里可能带世界书段，片段格式按用户选中的预设解析 —— 不传就会用
+   * 冻结的 `@@ENTRY` 格式，自定义格式（`【条目N：…】`）一条都认不出。
+   */
+  getWorldbookFormat?: () => WorldbookFormatParams | undefined;
 }
 
 export class ImportDialog {
@@ -250,6 +257,7 @@ export class ImportDialog {
       preset,
       this.mode,
       this.deps.getGreetingFormat?.(),
+      this.deps.getWorldbookFormat?.(),
     );
     this.worldbookPreview = null;
 

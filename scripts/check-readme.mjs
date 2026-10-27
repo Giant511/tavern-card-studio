@@ -125,6 +125,43 @@ for (const rel of linkTargets) {
 }
 notes.push(`相对链接 ${linkTargets.size} 个，缺失 ${missing} 个`);
 
+// ── 4b. 页内锚点（#xxx）能跳到某个标题 ────────────────────
+/*
+ * 之前这里把 `#` 开头的链接整个 skip 掉了，于是「改了章节标题、忘了改引用」
+ * 这种断链从来没人报 —— 读者在 GitHub 上点一下才发现跳不动，而作者
+ * 只看到"链接 0 缺失"。
+ *
+ * 锚点规则按 GitHub：小写、去标点、空格转连字符。中文标题保留原字符。
+ * 只做近似还原（不做完整的 GitHub 兼容），但足以抓住"标题改名而引用没跟"
+ * 这类真实断链。
+ */
+const slug = (headingText) =>
+  headingText
+    .trim()
+    .toLowerCase()
+    .replace(/[`*_~]/g, '')
+    .replace(/[^\p{L}\p{N}\s-]/gu, '')
+    .replace(/\s+/g, '-');
+
+const headingAnchors = new Set();
+for (const line of lines) {
+  const m = /^#{1,6}\s+(.*)$/.exec(line);
+  if (m) headingAnchors.add(slug(m[1]));
+}
+
+const inPage = new Set();
+for (const m of text.matchAll(/\]\(#([^)]+)\)/g)) {
+  inPage.add(decodeURIComponent(m[1]));
+}
+let deadAnchors = 0;
+for (const anchor of inPage) {
+  if (!headingAnchors.has(anchor)) {
+    fail(`页内锚点失效：#${anchor}（没有对应标题；标题改名后引用要同步）`);
+    deadAnchors += 1;
+  }
+}
+notes.push(`页内锚点 ${inPage.size} 个，失效 ${deadAnchors} 个`);
+
 // ── 5. 表格列数一致 ──────────────────────────────────────
 const countCols = (line) => {
   // 去掉首尾竖线后按未转义竖线切分
