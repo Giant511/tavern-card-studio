@@ -2971,3 +2971,343 @@ body {
   font-size: 11px;
   color: var(--muted);
 }
+
+/* ─────────────────────────────────────────────────────────────
+   另存为的格式选择（v0.1.5 / G6）
+   ─────────────────────────────────────────────────────────────
+   尺寸基线沿用 F5（`new-card-modal` 那批注释）：
+     · 宽屏 640px、窄屏 92vw，不低于 520px —— 原来 520px 时
+       「原生 SillyTavern 结构，可继续编辑、可导入 ST / Chub；建议作为工作副本」
+       这种描述会折成三行，每一项高度都不一致，整列看起来是歪的；
+     · 内容区内边距 22/24px。**不在 `.modal-body` 基类上加**（那会一起
+       改形设置、导出、规则面板，F5 已明确过这条边界）；
+     · 描述行高 1.6：两行说明贴在一起时，读起来像一整段糊住的话。
+
+   为什么三个选项竖排、整行可点：这是「三选一」，不是「三选一 + 确定」。
+   横排卡片在 1100px 窗口下会挤成一列，看起来像布局坏了。 */
+
+.save-format-modal {
+  width: min(700px, 92vw);
+  min-width: min(560px, 92vw);
+}
+
+.save-format-modal .modal-body {
+  padding: 22px 24px;
+}
+
+/* 标题下那句"三种格式的产物与导出完全一致" —— 是**前提说明**，
+   与下面的选项留出明显间距，否则会读成第一个选项的说明。 */
+.save-format-modal .modal-head {
+  padding: 16px 24px 12px;
+}
+
+.save-format-modal .confirm-text {
+  margin: 0 0 4px;
+  color: var(--muted);
+}
+
+.save-format-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 14px 0 0;
+}
+
+.save-format-option {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 13px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.save-format-option:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.save-format-option.is-active {
+  border-color: var(--accent);
+  background: #f5f8ff;
+  box-shadow: 0 0 0 2px rgba(47, 111, 235, 0.12);
+}
+
+.save-format-option:disabled {
+  cursor: not-allowed;
+  background: var(--app-bg);
+  border-style: dashed;
+}
+
+/* 禁用的选项不能整体降透明度：那会把"为什么不能用"也一起变淡，
+   而这行字恰恰是用户唯一需要读的内容。只把名字调灰。 */
+.save-format-option:disabled .save-format-name {
+  color: var(--muted);
+}
+
+.save-format-option:disabled .save-format-desc {
+  color: var(--muted);
+}
+
+.save-format-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--app-fg);
+}
+
+.save-format-desc {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+/* 不可用原因单独一行、带前缀符号：与描述同色同时会让它读成
+   "这个格式的一个特点"，而它其实是阻止你选它的理由。 */
+.save-format-blocked {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--warn);
+}
+
+/* 勾选行与选项之间加一条淡分隔：它属于"这次操作的偏好"，
+   不属于上面那三个格式之一。 */
+.save-format-remember {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.save-format-remember input[type='checkbox'] {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+}
+
+/* 按钮区：确认按钮文字较长（"保存为 ST 角色卡 JSON…"），
+   给足内边距，否则在 640px 里会显得局促。 */
+.save-format-modal .modal-foot {
+  padding: 14px 24px 18px;
+  justify-content: flex-end;
+}
+
+.save-format-modal .modal-foot .btn {
+  min-width: 92px;
+  min-height: 36px;
+}
+
+/* ── 「在 SillyTavern 中测试」面板（v0.1.5 / F15）──────────────
+   四个状态共用一套骨架，只有 .st-state-body 里的内容随状态换。
+   宽度取 720：安装指引里的步骤文案与"常见原因清单"都是长句，
+   560 的基类宽度会让它们折成五六行。 */
+.modal.st-panel {
+  width: min(720px, 94vw);
+  min-width: min(600px, 94vw);
+}
+
+.st-panel .modal-head {
+  padding: 16px 22px 12px;
+}
+
+.st-panel .modal-body {
+  padding: 18px 22px 20px;
+}
+
+.st-state {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.st-badge {
+  flex: none;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--app-bg);
+  border: 1px solid var(--border);
+}
+
+.st-badge[data-state='installed-idle'] {
+  color: var(--warn);
+  background: var(--warn-bg);
+  border-color: #f3d9a4;
+}
+
+.st-badge[data-state='running'] {
+  color: var(--accent);
+  background: #f5f8ff;
+  border-color: #c9d9fb;
+}
+
+.st-badge[data-state='pushed'] {
+  color: var(--ok);
+  background: #ecfdf3;
+  border-color: #b7e4c7;
+}
+
+.st-state-text {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--app-fg);
+}
+
+.st-location {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 12px;
+}
+
+.st-location-label {
+  flex: none;
+  color: var(--muted);
+}
+
+.st-location-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono, ui-monospace, Consolas, monospace);
+  color: var(--app-fg);
+}
+
+.st-state-body {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.st-h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.st-text {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.st-steps {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.st-links,
+.st-actions,
+.st-mirror {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.st-hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.st-mirror .input {
+  flex: 1 1 320px;
+  min-width: 240px;
+}
+
+.st-caution {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+  background: var(--app-bg);
+  border-left: 3px solid var(--border-strong);
+  padding: 9px 12px;
+  border-radius: 0 6px 6px 0;
+}
+
+/* 「没找到 Node」必须显眼：这一步是唯一需要用户离开客户端去装东西的地方 */
+.st-node-missing {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid #f3d9a4;
+  background: var(--warn-bg);
+  border-radius: 8px;
+}
+
+.st-node-missing .st-caution {
+  background: transparent;
+  border-left: 0;
+  padding: 0;
+  color: var(--warn);
+}
+
+.st-error {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid #f5c2bd;
+  background: var(--danger-bg);
+  border-radius: 8px;
+}
+
+.st-error-title {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--danger);
+  white-space: pre-wrap;
+  font-family: var(--mono, ui-monospace, Consolas, monospace);
+}
+
+.st-error-sub {
+  margin: 10px 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.st-error-hints {
+  margin: 0 0 10px;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--app-fg);
+}
+
+.st-note {
+  margin: 16px 0 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--muted);
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+}

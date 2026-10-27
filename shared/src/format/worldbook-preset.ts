@@ -31,7 +31,16 @@ export interface WorldbookFormatParams {
   entryOpen: string;
   /** 正文开始标记（整行匹配） */
   contentMark: string;
-  /** 条目闭标记模板，必须含 `{id}` */
+  /**
+   * 条目闭标记模板，必须含 `{id}`。
+   *
+   * **可以是空串**（v0.1.5 / G4）：表示"隐式闭合"—— 条目边界由下一个开标记
+   * 或文件结束确定，不要求显式结束行。
+   *
+   * 为什么需要：`@@ENTRY`/`@@END` 是 ST 生态的成对标记，但"标题式"格式
+   * （`【条目1：名字】` + 字段行 + 正文）天然没有结束标记。要求它写结束行
+   * 等于让用户为每个条目多写一行冗余文字，而条目边界本来就由开标记唯一确定。
+   */
   entryClose: string;
   /** 字段行顺序；只影响写出，解析按任意顺序都认 */
   fieldOrder: string[];
@@ -39,8 +48,18 @@ export interface WorldbookFormatParams {
   labelMap: Record<string, string>;
   /** 字段名与值之间的分隔串（默认 `": "`） */
   fieldSeparator: string;
-  /** 列表字段（keys / secondary_keys）的项分隔串（默认 `", "`） */
-  listSeparator: string;
+  /**
+   * 列表字段（keys / secondary_keys）的项分隔串（默认 `", "`）。
+   *
+   * **可以是数组**（v0.1.5 / G3-2 容错）：写成 `["、", ",", "，"]` 就同时认
+   * 顿号、半角逗号、全角逗号。为什么需要：线上实测用户的关键词行是
+   * `成人、性、做爱`（顿号）与 `潮吹,射精`（半角逗号无空格），而预设是
+   * `", "`（逗号+空格）——两种都不匹配，于是整行关键词被当成**一个**关键词。
+   *
+   * 数组时**长分隔符优先**匹配（`", "` 不会被 `","` 抢先切走）；
+   * 写回时只用第一个 —— 输出格式必须唯一，否则同一份数据每次导出都不一样。
+   */
+  listSeparator: string | readonly string[];
   /** 条目之间的分隔串（默认两个换行） */
   entrySeparator: string;
 }
@@ -212,6 +231,13 @@ export function parseWorldbookPreset(input: unknown): WorldbookPresetParseResult
 
   const template = (key: 'entryOpen' | 'entryClose'): string => {
     const value = rawFormat[key];
+    /*
+     * `entryClose` 允许省略或写成空串（v0.1.5 / G4）—— 那是"隐式闭合"模式，
+     * 条目由下一个开标记或文件结束闭合。`entryOpen` 仍必须给。
+     */
+    if (key === 'entryClose' && (value === undefined || (typeof value === 'string' && value.trim() === ''))) {
+      return '';
+    }
     if (typeof value !== 'string' || value.trim() === '') {
       errors.push(`format.${key} 必须是非空字符串`);
       return DEFAULT_WORLDBOOK_FORMAT[key];
@@ -241,11 +267,14 @@ export function parseWorldbookPreset(input: unknown): WorldbookPresetParseResult
   }
 
   // 三个标记必须互不相同，否则解析无法判定"这一行到底是什么"
+  // （`entryClose` 为空 = 隐式闭合模式，没有闭标记文字，不参与比对）
   const marks = [
     ['entryOpen', entryOpen.replace(ID_TOKEN, '')],
     ['contentMark', contentMarkText],
-    ['entryClose', entryClose.replace(ID_TOKEN, '')],
-  ] as const;
+    ...(entryClose.trim() === ''
+      ? []
+      : [['entryClose', entryClose.replace(ID_TOKEN, '')] as const]),
+  ] as ReadonlyArray<readonly [string, string]>;
   for (let i = 0; i < marks.length; i += 1) {
     for (let j = i + 1; j < marks.length; j += 1) {
       if (marks[i]![1].trim() === marks[j]![1].trim()) {
@@ -325,8 +354,22 @@ export function parseWorldbookPreset(input: unknown): WorldbookPresetParseResult
     errors.push('format.fieldSeparator 必须含冒号或其它可见字符（否则字段名与值无法切分）');
   }
   const listSeparator = rawFormat['listSeparator'];
-  if (listSeparator !== undefined && (typeof listSeparator !== 'string' || listSeparator === '')) {
-    errors.push('format.listSeparator 必须是非空字符串');
+  /*
+   * v0.1.5 / G3-2：允许字符串**或**非空字符串数组（多分隔符容错）。
+   * 数组每项都必须非空 —— 空串会让每个字符边界都成为分隔点。
+   */
+  if (listSeparator !== undefined) {
+    if (typeof listSeparator === 'string') {
+      if (listSeparator === '') errors.push('format.listSeparator 必须是非空字符串');
+    } else if (Array.isArray(listSeparator)) {
+      if (listSeparator.length === 0) {
+        errors.push('format.listSeparator 数组不能为空；想用默认值就整个字段省略');
+      } else if (listSeparator.some((item: unknown) => typeof item !== 'string' || item === '')) {
+        errors.push('format.listSeparator 数组的每一项都必须是非空字符串');
+      }
+    } else {
+      errors.push('format.listSeparator 必须是字符串或非空字符串数组');
+    }
   }
   const entrySeparator = rawFormat['entrySeparator'];
   if (entrySeparator !== undefined && (typeof entrySeparator !== 'string' || !entrySeparator.includes('\n'))) {

@@ -49,9 +49,13 @@ import {
   pickCardFile,
   pickSavePath,
   readBinaryFile,
+  readPresetLibrary,
   readTextExact,
   shellInfo,
+  writeBinaryFileAtomic,
   writeFileAtomic,
+  writePresetLibrary,
+  type ClientConfig,
   type ShellError,
 } from '../contract';
 
@@ -59,7 +63,6 @@ import {
   collectBlocks,
   defaultExpandedBlockIds,
   importCardText,
-  serializeCard,
   setBlockText,
   totalLength,
   type EditorBlockSnapshot,
@@ -86,7 +89,7 @@ import {
 } from '../rules/preset-switch';
 import { isSyncReady, probeServer, type ProbeResult } from '../net/server-probe';
 import { ExportDialog } from '../export/export-dialog';
-import { buildExportAsync } from '../export/export-card';
+import { buildExportAsync, checkWorldbookExportSafety } from '../export/export-card';
 import { SyncDialog } from '../sync/sync-dialog';
 import { CardsDialog } from '../sync/cards-dialog';
 import { RepoDialog } from '../sync/repo-dialog';
@@ -117,6 +120,18 @@ import {
   serializePreset,
   type PresetImportOutcome,
 } from '../rules/preset-library';
+import { PresetPersistence } from '../rules/preset-persist';
+import type { PresetKind, PresetLibraryItem } from '../rules/preset-store';
+import { SaveFormatDialog, type SaveFormatDialogResult } from '../session/save-format-dialog';
+import { StDialog } from '../session/st-dialog';
+import { stStatusText } from '../session/st-install';
+import {
+  saveFormatNote,
+  saveFormatOption,
+  withSaveExtension,
+  type SaveFormat,
+} from '../session/save-format';
+import { defaultSaveFaceDeps, resolveSaveFace, type ResolvedSaveFace } from '../session/save-face';
 import { deriveCardNameFromFile } from './open-name';
 import { browserHintStore, dismissNameHint, resetNameHint, shouldShowNameHint } from './name-hint';
 import {
@@ -248,7 +263,7 @@ class EditorApp {
    * 而"探测失败"与"不能登录"不是一回事 —— 用户可能只是令牌还没填。
    */
   private authServerUrl = '';
-  /** 世界书格式预设（T10.31）：内置 default + 用户导入项，只存在运行期 */
+  /** 世界书格式预设（T10.31）：内置 default + 用户导入项 */
   private worldbookPresets: WorldbookPreset[] = [DEFAULT_WORLDBOOK_PRESET];
   private worldbookPreset: WorldbookPreset = DEFAULT_WORLDBOOK_PRESET;
   /**
@@ -261,6 +276,31 @@ class EditorApp {
   private greetingPreset: FieldPreset = DEFAULT_GREETING_PRESET;
   private chatExamplePresets: FieldPreset[] = [DEFAULT_CHAT_EXAMPLES_PRESET];
   private chatExamplePreset: FieldPreset = DEFAULT_CHAT_EXAMPLES_PRESET;
+  /**
+   * 用户预设库（v0.1.5 / G5）：导入即落盘，启动即加载。
+   *
+   * 只存**用户导入的那些**（不含内置）。内置永远来自 `rules/` 目录或打包副本，
+   * 存一份副本进库的话，将来内置更新了会被旧副本盖回去。
+   *
+   * IO 在这里注入而不是在 `preset-persist` 里直接 import contract：
+   * 那个类因此不依赖 Tauri，能在 Node 里直接单测时序。
+   */
+  private readonly presetStore = new PresetPersistence({
+    read: async () => {
+      const file = await readPresetLibrary();
+      return file === null ? null : { text: file.text };
+    },
+    write: async (text) => writePresetLibrary(text),
+  });
+  /** 库加载完之前不写盘：否则「导入一个」会把还没读进来的旧预设一起清掉 */
+  private presetStoreReady = false;
+  /**
+   * 取证/截图演示期间为 true：{@link rememberPreset} 直接跳过落盘。
+   *
+   * 演示夹具是用户真实内容（含他的自定义规则），不该因为跑一次截图
+   * 就写进本机预设库；浏览器里写盘也必然失败，会多一条与本取证无关的警告。
+   */
+  private demoQuiet = false;
   private validateTimer: number | null = null;
   private activeIssueId: string | null = null;
 
@@ -280,6 +320,15 @@ class EditorApp {
   private readonly statusBar = byId('status');
   private settings: SettingsDialog | null = null;
   private newCardDialog: NewCardDialog | null = null;
+  /** 另存为的格式选择对话框（v0.1.5 / G6） */
+  private saveFormatDialog: SaveFormatDialog | null = null;
+  /**
+   * 「在 SillyTavern 中测试」面板（v0.1.5 / F15）。
+   *
+   * 延迟构造（第一次点按钮时）：它一构造就会去扫主目录 + 探进程状态，
+   * 而绝大多数会话根本不碰 ST —— 启动时白跑一趟只会拖慢首屏。
+   */
+  private stDialog: StDialog | null = null;
   private connection: ProbeResult | null = null;
   /** 最近一次审计的等级计数（切规则后要给用户一句话结论） */
   private lastSummary = { error: 0, warning: 0, info: 0 };
@@ -287,7 +336,13 @@ class EditorApp {
   constructor(card: UnifiedCard | null) {
     // 传入 null = 空白启动（F3）：启动时不打开任何卡，工作台是空的。
     if (card !== null) {
-      const session = new CardSession({ card, cardId: readCardIdFromCard(card) ?? undefined });
+      const session = new CardSession({
+        card,
+        cardId: readCardIdFromCard(card) ?? undefined,
+        // 此时预设还没从磁盘加载（`start()` 里才有），先给冻结默认；
+        // `start()` 载入预设后会统一 `setWorldbookFormat` 覆盖一次。
+        worldbookFormat: this.worldbookPreset.format,
+      });
       this.sessions.push(session);
       this.activeId = session.id;
     }
@@ -331,6 +386,12 @@ class EditorApp {
     // autoProbe 拿到配置后会覆盖它。
     this.applyDebugServerUrl();
     this.rules = await buildRuleset();
+    /*
+     * 用户预设库（v0.1.5 / G5）：必须紧跟 buildRuleset ——
+     * 用户导入的预设是"并进候选列表"，内置那份得先到位，同 id 才能正确覆盖。
+     * 这里会顺带恢复上次选中的六类预设（config 里的 id）。
+     */
+    await this.loadPresetLibrary();
     // 配色来自高亮方案本体（规则资产），不写死在样式表里
     applySchemeStyles(this.rules.highlightFile);
     if (this.rules.warnings.length > 0) {
@@ -364,6 +425,29 @@ class EditorApp {
       onActivate: (id) => this.activateSession(id),
       onClose: (id) => void this.closeSession(id),
       onNew: () => void this.newCard(),
+    });
+
+    /*
+     * 「卡片右键」入口（v0.1.5 / F15 · T13.6）：需求要求顶栏按钮与卡片右键是同一个入口。
+     *
+     * 这个仓库此前没有任何右键菜单，为一个入口造一套菜单框架不划算，
+     * 而"卡片"在本应用里最直接的化身就是标签（一张卡一个标签）。
+     * 所以这里把右键解释成"对这张卡做 ST 测试"：先切到那个标签，
+     * 再开面板 —— 面板里所有动作都作用于活动会话，切过去才能保证
+     * 用户看到的卡与推过去的卡是同一张。
+     *
+     * `contextmenu` 挂在容器上而不是每个标签上：标签是 `render()` 重建的，
+     * 逐个绑定会在每次重绘后留下一堆指向已销毁节点的监听。
+     */
+    byId('tabbar-host').addEventListener('contextmenu', (event) => {
+      const target = event.target as HTMLElement | null;
+      const hit = target?.closest<HTMLElement>('[data-session-id]') ?? null;
+      if (hit === null) return;
+      const id = hit.dataset['sessionId'];
+      if (id === undefined) return;
+      event.preventDefault();
+      if (id !== this.activeId) this.activateSession(id);
+      void this.openStDialog();
     });
 
     this.wireToolbar();
@@ -415,6 +499,19 @@ class EditorApp {
      * 判断方法：把入口往上挪一行，行为不变就说明它没依赖那个对象。
      */
     const exportFaceParams = new URLSearchParams(location.search);
+
+    /*
+     * 世界书拦截取证（v0.1.5 / G3-2）：`?wbDemo=foreign&exportFace=1`
+     *
+     * 先真实地把世界书文本喂进编辑器（走 setBlockText），再打开导出面板 ——
+     * 此时闸门会看到"text 非空 + entries 空"并硬阻断。
+     * 位置同样必须在 `start()` 尾部：依赖 `exportDialog` 已构造。
+     */
+    const wbDemo = exportFaceParams.get('wbDemo');
+    if (wbDemo === 'foreign' || wbDemo === 'good') {
+      this.applyDemoWorldbook(wbDemo);
+    }
+
     if (exportFaceParams.get('exportFace') === '1') {
       const demoKind = exportFaceParams.get('faceDemo') ?? '';
       /*
@@ -437,6 +534,47 @@ class EditorApp {
       }
       this.exportDialog?.open('png');
       this.exportDialog?.refreshFaceChoices();
+    }
+
+    /*
+     * 另存为格式对话框截图（v0.1.5 / G6）：`?saveFormatDemo=1`
+     *
+     * 同样必须在 `start()` 尾部：`askSaveFormat` 依赖 `saveFormatDialog`，
+     * 而它是在这之后才按需构造的。写早了 `?.open()` 会静默跳过，
+     * 症状是"截出来是普通编辑器页面"（踩过四次的坑）。
+     *
+     * 注意这里**不调 `saveSessionToDisk`** —— 那会真的弹系统保存对话框。
+     * 只打开格式选择框，让截图能证明三种选项与禁用态渲染正确。
+     */
+    if (exportFaceParams.get('saveFormatDemo') === '1') {
+      void this.previewSaveFormatDialog(exportFaceParams.get('saveFormatPng') === 'off');
+    }
+
+    /*
+     * ST 面板调试入口（v0.1.5 / F15）：`?st=1`
+     *
+     * 位置仍在 `start()` 尾部：`openStDialog()` 要求会话已挂载（`mountActiveSession()`
+     * 在上面），否则面板打开时"当前卡"是空的。
+     * 浏览器里它会显示"请在桌面客户端里使用"（`isShellAvailable()` 为假），
+     * 壳里走真实检测 —— 同一行代码，两种环境各自诚实。
+     */
+    if (exportFaceParams.get('st') === '1') {
+      void this.openStDialog();
+    }
+
+    /*
+     * 世界书"常驻"误报取证（v0.1.5 / G7）：`?auditDemo=before` / `?auditDemo=after`
+     *
+     * 夹具由 `scripts/gen-g7-fixtures.mjs` 只写进 `client/dist/g7/`（用户真实内容，
+     * 按设计**不进仓库、不进安装包**；`build:client` 第 0 步会连带清掉）。
+     * 这里 fetch 回来，再走**真实路径**（导入预设 → 切规则 → 写世界书 → 审计），
+     * 不是伪造界面状态。
+     *
+     * 位置仍在 `start()` 尾部：依赖会话已挂载（`mountActiveSession()` 在上面）。
+     */
+    const auditDemo = exportFaceParams.get('auditDemo');
+    if (auditDemo === 'before' || auditDemo === 'after') {
+      void this.runAuditDemo(auditDemo);
     }
 
     /*
@@ -605,6 +743,9 @@ class EditorApp {
         preset: this.rules?.preset ?? null,
         // 初始场景预设决定"多条开场白用哪个分隔行回写"（v0.1.3 追加项一）
         greetingFormat: this.greetingFormat().format,
+        // 世界书格式（v0.1.5 / G4）：导出闸门要按**同一份**预设重解析，
+        // 否则会把用户那份自定义格式误判成"解析失败"并阻止导出
+        worldbookFormat: this.worldbookPreset.format,
       }),
       // 导出前强制重算：不能用过期报告放行
       revalidate: () => {
@@ -1143,6 +1284,8 @@ class EditorApp {
       // TXT 导入必须按**用户当前选的**初始场景分隔符切分：
       // 他手上的卡可能是别的工具用 === 分段的，按冻结默认切会并成一条。
       getGreetingFormat: () => this.greetingFormat().format,
+      // 世界书格式（v0.1.5 / G4）：TXT 卡里的世界书段按当前预设解析
+      getWorldbookFormat: () => this.worldbookPreset.format,
     });
   }
 
@@ -1344,6 +1487,8 @@ class EditorApp {
       error > 0 ? 'bad' : warning > 0 ? 'warn' : 'ok',
     );
     this.refreshRulesLabel();
+    // 记下选择（v0.1.5 / G5）
+    this.persistSelection({ platformRuleId: id });
   }
 
   /** 切换高亮方案：重新编译 + 重新着色 */
@@ -1389,6 +1534,249 @@ class EditorApp {
 
     this.setStatus(`已切换高亮方案：${file.name}（${id}）`, 'ok');
     this.refreshRulesLabel();
+    // 记下选择（v0.1.5 / G5）
+    this.persistSelection({ highlightSchemeId: id });
+  }
+
+  /**
+   * 加载用户预设库，并恢复上次选中的预设（v0.1.5 / G5）。
+   *
+   * 必须在 `buildRuleset()` **之后**调用 —— 用户预设是"并入候选列表"，
+   * 内置那份要先在，同 id 的用户份才能正确覆盖它。
+   *
+   * 三个设计取舍：
+   *   · **逐条失败不打断**：一条坏数据只丢它自己，其余照常加载（库格式层的
+   *     容错在 `preset-store`，这里负责"坏了要说出是哪一条"）；
+   *   · **不自动切换**：加载只是把候选补齐，用哪个由 config 里的 id 决定 ——
+   *     否则用户上次选的高亮会被最后一个导入的盖掉；
+   *   · **提示合并成一条**：启动时把 8 条警告逐条 setStatus，用户只会看到最后一条，
+   *     等于没提示。
+   */
+  private async loadPresetLibrary(): Promise<void> {
+    /*
+     * 浏览器直开（无壳）没有配置文件也没有预设库 —— 不是错误。
+     * 不加这一层，每次刷新页面都会在状态栏留一条"预设库读取失败"，
+     * 而那是故意不支持的场景（截图/验收才用浏览器）。
+     */
+    if (!isShellAvailable()) {
+      this.presetStoreReady = true;
+      return;
+    }
+
+    const loaded = await this.presetStore.load();
+    this.presetStoreReady = true;
+
+    const problems: string[] = [...loaded.warnings];
+    for (const item of loaded.items) {
+      const problem = this.applyLibraryItem(item);
+      if (problem !== null) {
+        const label = item.name !== '' ? item.name : (item.id ?? '(未命名)');
+        problems.push(`预设库里的 ${item.kind}「${label}」未能加载：${problem}`);
+      }
+    }
+
+    const selectionProblems = await this.restorePresetSelection();
+    problems.push(...selectionProblems);
+
+    if (problems.length > 0) {
+      this.setStatus(problems.join('；'), 'warn');
+      // 同时进控制台：状态栏只显示一行，长内容会被截断
+      console.warn('[presets] 预设库加载问题：', problems);
+    }
+  }
+
+  /**
+   * 把库里的一条并进内存列表。**不切换、不提示**（那由调用方决定）。
+   *
+   * 返回 `null` = 成功；返回字符串 = 失败原因（直接展示给用户）。
+   *
+   * 为什么不复用 `importXxxText` 那几个方法：它们有的会顺手切换
+   * （`importHighlightText` 会 `switchHighlight`），启动时切换就会覆盖
+   * config 里记着的选择 —— 那正是这一版要修的问题。
+   */
+  private applyLibraryItem(item: PresetLibraryItem): string | null {
+    if (!this.rules) return '规则尚未加载';
+    switch (item.kind) {
+      case 'platform': {
+        const outcome = importPlatformRule(this.rules.platformFiles, item.text);
+        if (!outcome.ok) return firstIssue(outcome.issues);
+        const platformSourceText = { ...this.rules.platformSourceText };
+        if (outcome.id) platformSourceText[outcome.id] = item.text;
+        this.rules = { ...this.rules, platformFiles: outcome.value, platformSourceText };
+        return null;
+      }
+      case 'highlight': {
+        const outcome = importHighlightScheme(
+          this.rules.highlightFile,
+          this.rules.highlightFiles,
+          item.text,
+        );
+        if (!outcome.ok || !outcome.value || outcome.id === null) return firstIssue(outcome.issues);
+        this.rules = {
+          ...this.rules,
+          highlightFiles: [
+            ...this.rules.highlightFiles.filter((file) => file.id !== outcome.id),
+            outcome.value,
+          ],
+          highlightSourceText: { ...this.rules.highlightSourceText, [outcome.id]: item.text },
+        };
+        return null;
+      }
+      case 'txt': {
+        const outcome = importTxtPreset(this.rules.presets, item.text);
+        if (!outcome.ok) return firstIssue(outcome.issues);
+        this.rules = { ...this.rules, presets: outcome.value };
+        return null;
+      }
+      case 'worldbook': {
+        const outcome = importWorldbookPreset(this.worldbookPresets, item.text);
+        if (!outcome.ok) return firstIssue(outcome.issues);
+        this.worldbookPresets = outcome.value;
+        return null;
+      }
+      case 'greeting':
+      case 'chat-examples': {
+        const block: FieldPresetBlock = item.kind === 'greeting' ? 'initial-scene' : 'chat-examples';
+        const outcome = importFieldPreset(this.fieldPresetsOf(block), item.text, block);
+        if (!outcome.ok) return firstIssue(outcome.issues);
+        if (block === 'initial-scene') this.greetingPresets = outcome.value;
+        else this.chatExamplePresets = outcome.value;
+        return null;
+      }
+    }
+  }
+
+  /**
+   * 按 config 里记的 id 恢复六类选择。
+   *
+   * 返回需要告诉用户的问题（找不到那个预设时）。**找不到就回退内置默认**，
+   * 不能因为一个 id 失效就停在半初始化状态 —— 那样用户连"为什么我的规则不对"
+   * 都无从查起。
+   */
+  private async restorePresetSelection(): Promise<string[]> {
+    if (!this.rules) return [];
+    let config;
+    try {
+      config = await configGet();
+    } catch {
+      // 浏览器直开：没有配置可读，不算问题
+      return [];
+    }
+
+    const problems: string[] = [];
+
+    // ── 平台规则 ──
+    if (config.platformRuleId !== null && config.platformRuleId !== this.rules.platformId) {
+      try {
+        const resolved = resolvePlatformRule(config.platformRuleId, this.rules.platformFiles);
+        this.rules = { ...this.rules, platform: resolved, platformId: config.platformRuleId };
+      } catch {
+        problems.push(`上次使用的平台规则「${config.platformRuleId}」已不存在，已回到「${this.rules.platformId}」`);
+      }
+    }
+
+    // ── 高亮方案 ──
+    if (config.highlightSchemeId !== null && config.highlightSchemeId !== this.rules.highlightId) {
+      const file = this.rules.highlightFiles.find((item) => item.id === config.highlightSchemeId);
+      if (file === undefined) {
+        problems.push(`上次使用的高亮方案「${config.highlightSchemeId}」已不存在，已回到「${this.rules.highlightId}」`);
+      } else {
+        try {
+          const compiled = compileHighlightRule(resolveHighlightRule(file.id, this.rules.highlightFiles));
+          this.rules = { ...this.rules, highlight: compiled, highlightFile: file, highlightId: file.id };
+          applySchemeStyles(file);
+        } catch (error) {
+          problems.push(`高亮方案「${file.id}」编译失败已回退：${describe(error)}`);
+        }
+      }
+    }
+
+    // ── TXT 预设 ──
+    if (config.presetId !== null) {
+      const preset = this.rules.presets.find((item) => item.id === config.presetId);
+      if (preset === undefined) {
+        problems.push(`上次使用的 TXT 预设「${config.presetId}」已不存在，继续用当前的`);
+      } else {
+        this.rules = { ...this.rules, preset };
+      }
+    }
+
+    // ── 世界书格式预设 ──
+    if (config.worldbookPresetId !== null) {
+      const preset = this.worldbookPresets.find((item) => item.id === config.worldbookPresetId);
+      if (preset === undefined) {
+        problems.push(`上次使用的世界书格式「${config.worldbookPresetId}」已不存在，继续用内置格式`);
+      } else {
+        this.worldbookPreset = preset;
+      }
+    }
+
+    // ── 初始场景 / 对话示例格式预设 ──
+    if (config.greetingPresetId !== null) {
+      const preset = this.greetingPresets.find((item) => item.id === config.greetingPresetId);
+      if (preset === undefined) {
+        problems.push(`上次使用的初始场景格式「${config.greetingPresetId}」已不存在，继续用内置格式`);
+      } else {
+        this.greetingPreset = preset;
+      }
+    }
+    if (config.chatExamplePresetId !== null) {
+      const preset = this.chatExamplePresets.find((item) => item.id === config.chatExamplePresetId);
+      if (preset === undefined) {
+        problems.push(`上次使用的对话示例格式「${config.chatExamplePresetId}」已不存在，继续用内置格式`);
+      } else {
+        this.chatExamplePreset = preset;
+      }
+    }
+
+    // 会话里存着格式（编辑世界书时用它），恢复完要同步到已打开的会话
+    if (this.worldbookPreset !== DEFAULT_WORLDBOOK_PRESET) {
+      for (const session of this.sessions) session.setWorldbookFormat(this.worldbookPreset.format);
+    }
+
+    return problems;
+  }
+
+  /**
+   * 记下刚导入成功的预设（v0.1.5 / G5）。
+   *
+   * 三条约束：
+   *   · 导入已经生效，**保存失败不回滚**（回滚等于把用户刚导入的东西又删了）；
+   *   · 失败必须告知 —— 否则用户以为存好了，重启发现没了；
+   *   · 库还没加载完时不写（`presetStoreReady`）：那会把磁盘上已有的预设
+   *     连同这次导入一起覆盖成"只有这一条"。
+   */
+  private async rememberPreset(
+    kind: PresetKind,
+    name: string,
+    text: string,
+    id: string | null,
+  ): Promise<void> {
+    // 取证/截图演示期间不落盘：那是用户真实内容，不该被写进本机预设库
+    if (this.demoQuiet) return;
+    if (!this.presetStoreReady) {
+      this.setStatus(
+        `已导入「${id ?? name}」（本次生效）—— 预设库尚未加载完成，这次没有保存，重启会丢失`,
+        'warn',
+      );
+      return;
+    }
+    const result = await this.presetStore.remember(kind, name, text, id);
+    if (!result.saved) {
+      this.setStatus(
+        `已导入「${id ?? name}」（本次生效），但**没能保存到预设库**：${result.error ?? '未知原因'}。重启后需要重新导入。`,
+        'warn',
+      );
+    }
+  }
+
+  /** 记录当前选择（切换时调；失败只警告，不影响编辑） */
+  private persistSelection(patch: Partial<ClientConfig>): void {
+    // 浏览器直开无配置可写 —— 那是预期内的，不该每切一次弹一条警告
+    if (!isShellAvailable()) return;
+    void configPatch(patch).catch((error: unknown) => {
+      this.setStatus(`设置未能保存（下次启动会回到默认）：${describe(error)}`, 'warn');
+    });
   }
 
   /** 导入 TXT 预设（T10.30）：原子回退 + 同 id 覆盖 + 不自动切换 */
@@ -1403,6 +1791,12 @@ class EditorApp {
     // 导入后**不切换**当前预设：导入是"加入候选"，切换是"改变导出格式"，
     // 两件事合在一起时，用户正在看的内容会突然按另一种格式重排，很难归因。
     this.refreshRulesLabel();
+    /*
+     * 落盘（v0.1.5 / G5）。**不 await**：导入已经在内存生效，写盘是副作用，
+     * 让它卡住"导入"这个动作的响应没有好处。失败时 `rememberPreset`
+     * 自己会提示，且不回滚。
+     */
+    void this.rememberPreset('txt', outcome.name ?? 'TXT 预设', text, outcome.id);
     return outcome;
   }
 
@@ -1411,6 +1805,9 @@ class EditorApp {
     const outcome = importWorldbookPreset(this.worldbookPresets, text);
     if (!outcome.ok) return outcome;
     this.worldbookPresets = outcome.value;
+    // 落盘（v0.1.5 / G5）：世界书格式是"分节编号 + 隐式闭合"这类外部格式的唯一载体，
+    // 丢了它下次打开软件就会按默认格式解析用户的世界书 → 又变成"解析不出条目"
+    void this.rememberPreset('worldbook', outcome.name ?? '世界书预设', text, outcome.id);
     return outcome;
   }
 
@@ -1418,9 +1815,23 @@ class EditorApp {
     const preset = this.worldbookPresets.find((item) => item.id === id);
     if (!preset) return;
     this.worldbookPreset = preset;
+    /*
+     * 所有打开的会话都要换成新格式，并**重解析现有文本**（v0.1.5 / G4）。
+     *
+     * 只换 `this.worldbookPreset` 是不够的：会话里存着格式，编辑世界书时用它。
+     * 更关键的是"文本没变、解析器变了"——不重解析，entries 会停在旧值，
+     * 而审计已经按新预设说"没问题"，于是又变成"面板正常、导出丢内容"。
+     */
+    for (const session of this.sessions) {
+      session.setWorldbookFormat(preset.format);
+      session.reparseWorldbook();
+    }
     // 世界书预设参与解析与格式检查，切换后必须重检 —— 否则面板停在旧口径上
     this.validate();
     this.refreshRulesLabel();
+    // 记下选择（v0.1.5 / G5）：否则下次启动又回到默认格式，
+    // 而用户的文本是按这套格式写的 —— 表现为"世界书又解析不出来了"
+    this.persistSelection({ worldbookPresetId: preset.id });
   }
 
   private exportTxtPresetById(id: string): string | null {
@@ -1477,6 +1888,16 @@ class EditorApp {
     if (!outcome.ok) return outcome;
     if (block === 'initial-scene') this.greetingPresets = outcome.value;
     else this.chatExamplePresets = outcome.value;
+    /*
+     * 落盘（v0.1.5 / G5）。两个板块在库里用不同 kind 分开存 ——
+     * 混成一个的话，把「对话示例预设」导进「初始场景」那一栏这种错位
+     * 在加载时就再也检不出来了（`importFieldPreset` 的 block 校验会白做）。
+     */
+    if (block === 'initial-scene') {
+      void this.rememberPreset('greeting', outcome.name ?? '初始场景预设', text, outcome.id);
+    } else {
+      void this.rememberPreset('chat-examples', outcome.name ?? '对话示例预设', text, outcome.id);
+    }
     return outcome;
   }
 
@@ -1513,6 +1934,13 @@ class EditorApp {
         : `已切换对话示例预设：${preset.name}（${describeFieldPreset(preset)}）`,
       'ok',
     );
+    // 记下选择（v0.1.5 / G5）：两个板块各记各的，否则重启后分隔行变了、
+    // 多条开场白会被重新切分
+    this.persistSelection(
+      block === 'initial-scene'
+        ? { greetingPresetId: preset.id }
+        : { chatExamplePresetId: preset.id },
+    );
   }
 
   private exportFieldPresetById(block: FieldPresetBlock, id: string): string | null {
@@ -1536,6 +1964,8 @@ class EditorApp {
         ` · 按新口径重检：错误 ${error} 警告 ${warning}`,
       error > 0 ? 'bad' : warning > 0 ? 'warn' : 'ok',
     );
+    // 记下选择（v0.1.5 / G5）
+    this.persistSelection({ presetId: preset.id });
   }
 
   /** 导入平台规则：校验 + 原子回退都在 rule-library 里 */
@@ -1562,6 +1992,8 @@ class EditorApp {
         };
         this.validate();
       }
+      // 落盘（v0.1.5 / G5）
+      void this.rememberPreset('platform', outcome.name ?? '平台规则', text, outcome.id);
     }
     return outcome;
   }
@@ -1588,6 +2020,8 @@ class EditorApp {
       // 导入即应用：切到新方案，用户能立刻看到效果
       this.switchHighlight(outcome.id);
       this.rulesDialog?.refresh();
+      // 落盘（v0.1.5 / G5）
+      void this.rememberPreset('highlight', outcome.name ?? '高亮方案', text, outcome.id);
     }
     return outcome;
   }
@@ -2045,6 +2479,119 @@ class EditorApp {
     if (!wasDirty && this.session.dirty) this.refreshTabs();
     this.refreshStats();
     this.scheduleValidate(260);
+  }
+
+  /**
+   * 验收入口（v0.1.5 / G3-2）：把一段世界书文本**真实地**喂进编辑器。
+   *
+   * 用途：截图证明"外来格式的世界书会被拦"与"正常世界书不拦"。
+   *
+   * 走的是真实的 `session.setBlockText`（解析器、脏标记、校验调度全都真的跑），
+   * 不是伪造界面状态 —— 输入由脚本代劳，行为完全真实。
+   * 文案上标明"验收样本"，避免看截图的人以为这是他的真实卡。
+   *
+   * @param kind `foreign` = 用户报障那种 `【条目N：…】` 格式；`good` = 标准 @@ENTRY
+   */
+  applyDemoWorldbook(kind: 'foreign' | 'good'): void {
+    const foreign = [
+      '持续世界书',
+      '【条目1：西奥核心关系逻辑】',
+      '顺序：275',
+      '触发概率：100',
+      '内容：{{char}}与{{user}}的关系发展缓慢，从保持距离逐渐转为依赖。',
+      '【条目2：西奥成人规则】',
+      '顺序：300',
+      '触发概率：100',
+      '内容：{{char}}是纯0／固定被动方，不会转为1。',
+    ].join('\n');
+
+    const good = [
+      '@@ENTRY 0',
+      'name: 西奥核心关系逻辑',
+      'insertion_order: 275',
+      '@@CONTENT',
+      '{{char}}与{{user}}的关系发展缓慢，从保持距离逐渐转为依赖。',
+      '@@END 0',
+      '',
+      '@@ENTRY 1',
+      'name: 西奥成人规则',
+      'insertion_order: 300',
+      '@@CONTENT',
+      '{{char}}是纯0／固定被动方，不会转为1。',
+      '@@END 1',
+    ].join('\n');
+
+    const runtime = this.blocks.find((item) => item.snapshot.id === 'worldbook');
+    if (runtime === undefined) return;
+    if (!runtime.expanded) this.expand(runtime, true);
+    const text = kind === 'foreign' ? foreign : good;
+    this.onBlockChange(runtime, text);
+    this.validate();
+  }
+
+  /**
+   * 世界书"常驻"误报取证（v0.1.5 / G7）。
+   *
+   * 走**真实路径**：导入用户的世界书预设 → 切到它 → 导入他的平台规则 → 切过去
+   * → 把 19 条世界书文本写进面板（`onBlockChange`，与手动粘贴同一条链路）
+   * → 审计。所以截图上的"错误 0"是算出来的，不是摆出来的。
+   *
+   * 三段与演示相关的取舍：
+   *   · 夹具 fetch 自 `g7/*.json`（用户内容不进仓库、不进包）；
+   *   · `demoQuiet` 期间不写预设库 —— 浏览器里写盘必然失败，会刷一条与
+   *     本取证无关的警告，掩盖真正要看的那几个数字；
+   *   · 世界书面板展开，否则截图只能看到折叠标题。
+   */
+  private async runAuditDemo(kind: 'before' | 'after'): Promise<void> {
+    try {
+      const response = await fetch(`g7/${kind}.json`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`取不到夹具（HTTP ${String(response.status)}）`);
+      const demo = (await response.json()) as {
+        label: string;
+        worldbookText: string;
+        worldbookPreset: { id: string; name: string };
+        platformRule: { id: string; name: string };
+      };
+
+      this.demoQuiet = true;
+      const wbOutcome = this.importWorldbookPresetText(JSON.stringify(demo.worldbookPreset));
+      if (!wbOutcome.ok) throw new Error(`世界书预设导入失败：${wbOutcome.issues[0]?.message ?? ''}`);
+      if (wbOutcome.id) this.selectWorldbookPreset(wbOutcome.id);
+
+      const ruleOutcome = this.importPlatformText(JSON.stringify(demo.platformRule));
+      if (!ruleOutcome.ok) throw new Error(`平台规则导入失败：${ruleOutcome.issues[0]?.message ?? ''}`);
+      if (ruleOutcome.id) this.switchPlatform(ruleOutcome.id);
+      this.demoQuiet = false;
+
+      const runtime = this.blocks.find((item) => item.snapshot.id === 'worldbook');
+      if (runtime === undefined) throw new Error('世界书面板还没建起来');
+      this.onBlockChange(runtime, demo.worldbookText);
+      /*
+       * 必须重建一次板块视图再展开。
+       *
+       * `onBlockChange` 只更新 `runtime.snapshot` 与会话，**不会**把新文本推给
+       * 已经存在的编辑器实例（BlockEditor 没有 setText）。所以先 expand 再改文本时，
+       * 面板上仍是旧内容 —— 而审计用的是会话里的新内容，于是截图会出现
+       * "面板显示 A、数字算的是 B"这种最误导人的组合。
+       */
+      this.reloadBlocksFromCard();
+      const rebuilt = this.blocks.find((item) => item.snapshot.id === 'worldbook');
+      if (rebuilt !== undefined) this.expand(rebuilt, true);
+      this.validate();
+
+      const report = this.report;
+      const wb = this.session.card.worldbook;
+      this.setStatus(
+        `取证演示（${demo.label}）：错误 ${String(report?.summary.error ?? 0)} · ` +
+          `警告 ${String(report?.summary.warning ?? 0)} · 提示 ${String(report?.summary.info ?? 0)}` +
+          ` · 世界书域 ${String(report?.issues.filter((i) => i.location.blockId === 'worldbook').length ?? 0)} 条` +
+          ` · 世界书文本 ${String(wb.text.length)} 字 / 条目 ${String(wb.entries.length)} 条`,
+        'info',
+      );
+    } catch (error) {
+      this.demoQuiet = false;
+      this.setStatus(`取证演示失败：${describe(error)}`, 'bad');
+    }
   }
 
   private scheduleValidate(delay: number): void {
@@ -2526,6 +3073,107 @@ class EditorApp {
     openButton.addEventListener('click', () => void this.openCard());
     saveButton.addEventListener('click', () => void this.saveCard());
     previewButton.addEventListener('click', () => this.togglePreview());
+
+    /*
+     * 「在 SillyTavern 中测试」（v0.1.5 / F15）。
+     *
+     * 浏览器模式禁用：它要扫主目录、拉进程、写 ST 的 characters 目录，
+     * 这里**没有一条能力**在浏览器里存在。不禁用的话，用户点下去会看到
+     * "检测失败：SHELL_BRIDGE_ERROR"，而真正的原因是"你在浏览器里"。
+     */
+    const stButton = byId<HTMLButtonElement>('btn-st');
+    if (!shell) {
+      stButton.disabled = true;
+      stButton.dataset['browserDisabled'] = '1';
+      stButton.title = '浏览器模式：请把本地 SillyTavern 推送到桌面客户端里用';
+    }
+    stButton.addEventListener('click', () => void this.openStDialog());
+  }
+
+  /**
+   * 打开 ST 面板（延迟构造）。
+   *
+   * 三个回调刻意都很薄：角色名决定文件名、JSON 走既有导出管线、
+   * 路径记忆写进配置（C5）。这里不放任何 ST 相关的判断 ——
+   * 那些都在 `session/st-install.ts`（可单测）。
+   */
+  private async openStDialog(): Promise<void> {
+    if (!this.hasSession) return;
+    this.stDialog ??= new StDialog({
+      notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
+      getCardName: () => this.session.card.meta.name,
+      buildStPush: () => this.buildStPushArtifact(),
+      rememberPath: (path) => this.rememberStPath(path),
+    });
+    await this.stDialog.open();
+  }
+
+  /**
+   * 生成要推送给 ST 的**PNG 角色卡**（v0.1.5 / G8，需求 T13.5 的"复用导出管线"）。
+   *
+   * ## 为什么从 JSON 改成 PNG（决策 #212）
+   *
+   * G8 现场：`西奥.json` 落盘正确、ST 的「导入角色卡」也能成功，但**角色目录扫描器
+   * 始终不显示它**（刷新、重启都无效）—— ST 1.18 的文件夹扫描只认 PNG 卡；
+   * UI 导入是另一条代码路径，它认 JSON，于是很容易被误判成"JSON 可用"。
+   * 用户现有的角色全部是 PNG，这也印证了那条规则。
+   *
+   * ## 卡面从哪来（与 v0.1.4 导出的优先级一致，不在推送面板里再弹选择）
+   *
+   * `resolveSaveFace()` 就是「另存为 PNG」用的那条链：
+   * 会话原图（零重编码）→ 上次记住的图库封面 → 内置默认卡面。
+   * 复用它的好处不只是省一段代码：**同一个用户动作（保存 / 推送）产出的封面不会不一样**。
+   *
+   * 唯一的额外判定是「世界书会不会丢内容」（G3-2 的硬阻断）：那种情况下
+   * 推过去的卡在世界书里是空的，而用户会以为"推成功了"。
+   *
+   * 审计 error 不拦：这是"拿去 ST 里看看效果"的入口，草稿阶段本来就有问题 ——
+   * 拦下来等于把 ST 变成又一个导出闸门。
+   */
+  private async buildStPushArtifact(): Promise<{
+    bytes: Uint8Array;
+    sha256: string;
+    fileName: string;
+    face: { from: 'source' | 'library' | 'default'; fileName: string | null; note: string };
+  } | null> {
+    const reasons = checkWorldbookExportSafety(this.card, this.worldbookPreset.format);
+    if (reasons.length > 0) {
+      this.setStatus(`推送已阻止：${reasons[0] ?? ''}`, 'bad');
+      return null;
+    }
+
+    const face = await this.resolveSaveFace();
+    if (face === null) {
+      // 浏览器里读不到任何卡面（readDefaultFace 走 IPC）—— PNG 卡必须有图
+      this.setStatus('推送需要一个卡面，但当前环境读不到（浏览器模式请用桌面客户端）', 'bad');
+      return null;
+    }
+
+    const preset = this.rules?.preset ?? null;
+    const artifact = await buildExportAsync(
+      this.card,
+      preset,
+      'png',
+      this.greetingFormat().format,
+      face.bytes,
+    );
+    if (artifact.format !== 'png') throw new Error('内部错误：PNG 推送拿到了文本产物');
+    return {
+      bytes: artifact.png,
+      sha256: artifact.sha256,
+      fileName: artifact.fileName,
+      face: { from: face.from, fileName: face.fileName, note: face.note },
+    };
+  }
+
+  /** 记住用户选过的 ST 目录（C5） */
+  private async rememberStPath(path: string): Promise<void> {
+    try {
+      await configPatch({ stPath: path });
+    } catch (error) {
+      // 记不住不拦住推送：路径只是"下次不用再选"，不是功能前提
+      this.setStatus(`ST 目录未能记住（下次仍可重新选）：${describe(error)}`, 'warn');
+    }
   }
 
   /**
@@ -2619,7 +3267,8 @@ class EditorApp {
    * 有卡时把控制权交回 applyConnection，无卡时统一禁用。
    */
   private setCardActionEnabled(enabled: boolean): void {
-    for (const id of ['btn-save', 'btn-preview', 'btn-export', 'btn-rules']) {
+    // btn-st 是 v0.1.5 / F15 的 ST 入口：零标签时同样没有"当前卡"可推
+    for (const id of ['btn-save', 'btn-preview', 'btn-export', 'btn-rules', 'btn-st']) {
       const node = document.getElementById(id) as HTMLButtonElement | null;
       if (node && !node.dataset['browserDisabled']) node.disabled = !enabled;
     }
@@ -2761,27 +3410,96 @@ class EditorApp {
   }
 
   /**
+   * 只打开格式选择框（截图/验收用，不写盘）。
+   *
+   * `forcePngDisabled` 用来演示"浏览器里 PNG 不可用"那种态 —— 真实环境下
+   * 它由 `askSaveFormat` 探测卡面能否取得来判定。
+   */
+  async previewSaveFormatDialog(forcePngDisabled = false): Promise<void> {
+    if (!this.saveFormatDialog) this.saveFormatDialog = new SaveFormatDialog();
+    const result = await this.saveFormatDialog.open({
+      defaultFormat: this.hasSession ? this.session.saveFormat : 'json',
+      pngAvailable: !forcePngDisabled,
+      ...(forcePngDisabled
+        ? { pngUnavailableReason: '浏览器模式读不到卡面 —— 请在桌面客户端里另存为 PNG' }
+        : {}),
+    });
+    if (result !== null) {
+      this.setStatus(
+        `演示：已选择 ${saveFormatOption(result.format).label}${result.remember ? '（并记住此格式）' : ''}`,
+        'ok',
+      );
+    }
+  }
+
+  /**
    * 保存指定会话到磁盘（另存为语义）。
    *
-   * **只改会话状态**：路径与脏标记都写在 session 上，app.ts 不再有游离字段。
+   * **只改会话状态**：路径、格式与脏标记都写在 session 上，app.ts 不再有游离字段。
    * 这是 T9.2 一并要求的「另存为只改会话状态」。
+   *
+   * v0.1.5 / G6：支持三种格式（ST JSON / TXT / PNG 卡），产物与「导出」**完全一致**
+   * —— 两条链路共用 `buildExportAsync`，不各拼一份。格式记到会话上，此后 Ctrl+S
+   * 沿用它（否则另存为 PNG 之后保存会往 `.png` 写 JSON）。
    */
   private async saveSessionToDisk(session: CardSession): Promise<boolean> {
     try {
-      // 默认落点 = cardsDir（F4）；文件名取角色名，重名自动追加序号
+      const choice = await this.askSaveFormat(session);
+      if (choice === null) return false;
+      if (choice.remember) session.setSaveFormat(choice.format);
+
+      // PNG 需要卡面：先解析（失败要在弹保存对话框**之前**说，否则用户填完路径才失败）
+      const face = choice.format === 'png' ? await this.resolveSaveFace() : null;
+
+      // 默认落点 = cardsDir（F4）；文件名取角色名并按格式换扩展名，重名自动追加序号
       const dir = await effectiveCardsDir();
-      const suggested = await suggestCardFileName(session.card.meta.name, dir);
-      const target = await pickSavePath(suggested, 'json', dir === '' ? undefined : dir);
+      const suggestedBase = await suggestCardFileName(session.card.meta.name, dir);
+      const target = await pickSavePath(
+        withSaveExtension(suggestedBase, choice.format),
+        choice.format,
+        dir === '' ? undefined : dir,
+      );
       if (!target) return false;
 
-      const text = serializeCard(session.card);
-      const receipt = await writeFileAtomic(target, text);
+      const artifact = await buildExportAsync(
+        session.card,
+        this.rules?.preset ?? null,
+        choice.format,
+        this.greetingFormat().format,
+        face?.bytes,
+      );
+
+      // PNG 是二进制：走二进制写；文本两种格式走文本写。
+      // 两条都带 sha256 断言（壳写后回读重算，不一致就报错）。
+      const receipt =
+        artifact.format === 'png'
+          ? await writeBinaryFileAtomic(target, bytesToBase64(artifact.png), artifact.sha256)
+          : await writeFileAtomic(target, artifact.text, artifact.sha256);
+
       session.markSaved(target);
+      session.setSaveFormat(choice.format);
       this.refreshTabs();
       this.renderCardName();
+
+      const notes: string[] = [];
+      if (face !== null && face.note !== '') notes.push(face.note);
+      if (face !== null) {
+        notes.push(
+          face.from === 'source'
+            ? '卡面用本卡原图（像素未重编码）'
+            : face.from === 'library'
+              ? `卡面用图库：${face.fileName ?? '(未知)'}`
+              : '卡面用内置默认图',
+        );
+      }
+      const followUp = saveFormatNote(choice.format);
+      if (followUp !== '') notes.push(followUp);
+
       this.setStatus(
-        `已保存：${receipt.pathDisplay ?? '(非 UTF-8 路径)'} · ${receipt.bytesWritten} 字节 · ` +
-          `sha256 ${receipt.sha256.slice(0, 12)}… · 回读${receipt.verified ? '一致' : '不一致！'}`,
+        `已保存（${saveFormatOption(choice.format).label}）：${receipt.pathDisplay ?? '(非 UTF-8 路径)'} · ` +
+          `${receipt.bytesWritten} 字节 · sha256 ${receipt.sha256.slice(0, 12)}… · ` +
+          `回读${receipt.verified ? '一致' : '不一致！'}` +
+          (notes.length === 0 ? '' : ` —— ${notes.join('；')}`),
         receipt.verified ? 'ok' : 'bad',
       );
       return true;
@@ -2789,6 +3507,53 @@ class EditorApp {
       this.setStatus(`保存失败：${describe(error)}`, 'bad');
       return false;
     }
+  }
+
+  /**
+   * 问格式（v0.1.5 / G6）。
+   *
+   * 为什么每次都问（而不是"直接按会话格式存"）：另存为本身就是"我要存成另一种"
+   * 的动作。想跳过就勾「以后都用这个格式」，那时不再问。
+   */
+  private async askSaveFormat(session: CardSession): Promise<SaveFormatDialogResult | null> {
+    if (!this.saveFormatDialog) this.saveFormatDialog = new SaveFormatDialog();
+
+    // 能不能出 PNG 取决于能否拿到卡面（浏览器无壳读不到内置默认图）
+    let pngAvailable = true;
+    let pngUnavailableReason = '';
+    try {
+      const probe = await this.resolveSaveFace();
+      if (probe === null) {
+        pngAvailable = false;
+        pngUnavailableReason = '浏览器模式读不到卡面 —— 请在桌面客户端里另存为 PNG';
+      }
+    } catch (error) {
+      pngAvailable = false;
+      pngUnavailableReason = `卡面不可用：${describe(error)}`;
+    }
+
+    return this.saveFormatDialog.open({
+      defaultFormat: session.saveFormat,
+      pngAvailable,
+      pngUnavailableReason,
+    });
+  }
+
+  /** 解析"这张卡自己的封面"（原图 > 图库记住的那张 > 内置默认） */
+  private async resolveSaveFace(): Promise<ResolvedSaveFace | null> {
+    return resolveSaveFace(
+      defaultSaveFaceDeps({
+        sourceBytes: () => this.session?.pngSource?.bytes ?? null,
+        cardsDir: () => effectiveCardsDir(),
+        remembered: () => this.lastFaceChoice,
+        readLibraryFile: async (path) => {
+          const fileName = path.slice(path.lastIndexOf('/') + 1);
+          const binary = await readBinaryFile(path);
+          // 复用 png-source 的版本：它顺带核对摘要（字节数与 sha256 自证）
+          return { bytes: (await decodeBinaryFile(binary)).bytes, fileName };
+        },
+      }),
+    );
   }
 
   /** 把会话的规则选择同步到界面（切换标签后调用） */
@@ -2820,6 +3585,8 @@ class EditorApp {
       highlightId: this.rules?.highlightId,
       presetId: preset?.id ?? null,
       filePath: null,
+      // 世界书格式（v0.1.5 / G4）：编辑世界书时按用户选中的预设解析
+      worldbookFormat: this.worldbookPreset.format,
     });
     this.sessions.push(session);
     this.activeId = session.id;
@@ -3733,6 +4500,32 @@ function describe(error: unknown): string {
     return `[${shellError.code}] ${shellError.message ?? ''}`;
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * 取第一条校验问题的话术。
+ *
+ * 导入失败时 `issues` 里第一条通常就是根因（后续是连锁），全塞进启动警告会变成
+ * 一堵墙。完整清单在「规则」面板里能看到。
+ */
+function firstIssue(issues: readonly { message: string }[]): string {
+  return issues[0]?.message ?? '格式校验未通过';
+}
+
+/**
+ * 字节 → base64（契约的二进制写只收 base64）。
+ *
+ * 分块拼接再 `btoa`：`String.fromCharCode(...bytes)` 一次性展开在几 MB 的 PNG 上
+ * 会超参数个数上限（Chrome 约 12 万）抛 `RangeError: Maximum call stack size exceeded`，
+ * 而报错点与"图片太大"之间的关系没人能一眼看出来。
+ */
+function bytesToBase64(bytes: Uint8Array): string {
+  const chunk = 0x8000;
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
+  }
+  return btoa(binary);
 }
 
 // ── 启动 ────────────────────────────────────────────────────

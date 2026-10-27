@@ -60,6 +60,21 @@ function escapeRegExp(text: string): string {
  * 写死 `[ \t]+` 会让所有中文风格的开标记都必须写成"条目 4："，
  * 而用户的文件从来不是那样写的。
  */
+/**
+ * 条目标记（`@@ENTRY {id}` / `【条目{id}：`）→ 正则。
+ *
+ * ## 为什么允许"标记行内还有内容"（v0.1.5 / G4）
+ *
+ * 用户实测的自定义预设 `entryOpen: "【条目{id}："`，而他的世界书写的是
+ * `【条目1：西奥核心关系逻辑】` —— 编号与名称在**同一行**。旧实现要求标记
+ * **独占整行**（`$` 锚定），于是这种"最自然的写法"一条都匹配不上，
+ * 整份 2300 字解析成 0 条。
+ *
+ * 现在：`{id}` 之后到行尾的剩余内容会被捕获（第 2 组），由调用方当作条目名。
+ * **只在模板带闭合部分时启用**（`suffix` 非空）—— 默认格式 `@@ENTRY {id}`
+ * 的 suffix 是空，保持严格整行，避免把 `@@ENTRY 0 keys: a` 这种写错的
+ * 行悄悄吞掉。
+ */
 function markerPattern(template: string): RegExp {
   const at = template.indexOf('{id}');
   const prefixRaw = at < 0 ? template : template.slice(0, at);
@@ -67,18 +82,141 @@ function markerPattern(template: string): RegExp {
   const requiresSpace = /\s$/.test(prefixRaw);
   const prefix = prefixRaw.trimEnd();
   const gap = requiresSpace ? '[ \\t]+' : '[ \\t]*';
-  return new RegExp(`^${escapeRegExp(prefix)}${gap}(\\S+)${escapeRegExp(suffix)}[ \\t]*$`);
+  const prefixPattern = `^${escapeRegExp(prefix)}${gap}`;
+  const suffixPattern = escapeRegExp(suffix);
+  // 模板有闭合部分（如 `：` `】` `>`）⇒ 允许行内剩余；否则严格整行
+  if (suffix.trim() !== '') {
+    return new RegExp(`${prefixPattern}(\\S+?)${suffixPattern}(.*)$`);
+  }
+  return new RegExp(`${prefixPattern}(\\S+)${suffixPattern}[ \\t]*$`);
+}
+
+/**
+ * 条目名清洗：去掉行内剩余里"包裹性"的首尾符号。
+ *
+ * ## 两类剥离，各自一条规则（v0.1.5 / G7 修正）
+ *
+ * 1. **整体成对**：`「名字」`、`【名字】`、`《名字》` —— 首尾是同一对符号，
+ *    两边一起去；
+ * 2. **孤立单侧**：`名字】`（前面没有 `【`）、`「名字`（后面没有 `」`）——
+ *    只去孤立的那一侧。
+ *
+ * ## 旧实现为什么漏（用户实测的样本）
+ *
+ * 剩余是 `「西奥核心关系逻辑」】` —— 尾部的 `】` 是 entryOpen 模板的收尾符，
+ * 名字本身又用 `「」` 包了一层。旧代码的成对分支带了个
+ * `!text.includes(close)` 前提（本意是"别碰成对的"），于是：
+ * 剥掉孤立 `】` 之后拿到 `「西奥核心关系逻辑」`，但那对引号**首尾成对**，
+ * 被这个前提挡住，永远剥不掉 —— 名字里留着两个引号。
+ *
+ * 现在把两类拆成独立规则，每轮只做一次、循环到稳定（`【【名字】】` 这种
+ * 多层包裹也能去干净）。判据仍然是"**边界**上的符号"，所以
+ * `设定（草稿）` 里那对括号（不在边界）不会被碰。
+ */
+const NAME_PAIRS: ReadonlyArray<readonly [string, string]> = [
+  ['【', '】'],
+  ['[', ']'],
+  ['（', '）'],
+  ['(', ')'],
+  ['《', '》'],
+  ['「', '」'],
+  ['『', '』'],
+];
+
+function cleanInlineName(raw: string): string {
+  let text = raw.trim();
+  const countOf = (haystack: string, needle: string): number => {
+    let total = 0;
+    for (let at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + needle.length)) {
+      total += 1;
+    }
+    return total;
+  };
+
+  /*
+   * 上限 6 轮：每次至少去掉一个字符，而真实名字不会这么长地层层包裹。
+   * 设上限是为了万一规则之间有来回（去完首符又露出尾符）也不死循环。
+   */
+  for (let round = 0; round < 6; round += 1) {
+    let changed = false;
+
+    // 规则 1：整体被同一对符号包住 → 两边一起去
+    for (const [open, close] of NAME_PAIRS) {
+      if (
+        text.length > open.length + close.length &&
+        text.startsWith(open) &&
+        text.endsWith(close)
+      ) {
+        text = text.slice(open.length, text.length - close.length).trim();
+        changed = true;
+        break;
+      }
+    }
+    if (changed) continue;
+
+    /*
+     * 规则 2：尾符比开符多 ⇒ 末尾那个是**孤立**的，去掉一个。
+     *
+     * 判据用**计数不平衡**而不是"全文不含开符"，因为名字内部可能合法地
+     * 含有一对括号：`甲【乙】丙】` 里 `【】` 是名字的一部分，末尾那个 `】`
+     * 是标题自己的收尾符 —— "不含开符"会放它过去，计数不平衡才能认出来。
+     * 反过来 `前（后）` 计数平衡，括号一个都不动。
+     */
+    for (const [open, close] of NAME_PAIRS) {
+      if (text.endsWith(close) && countOf(text, close) > countOf(text, open)) {
+        text = text.slice(0, -close.length).trimEnd();
+        changed = true;
+        break;
+      }
+    }
+    if (changed) continue;
+
+    // 规则 3：首符比闭符多 ⇒ 开头那个是孤立的，去掉一个
+    for (const [open, close] of NAME_PAIRS) {
+      if (text.startsWith(open) && countOf(text, open) > countOf(text, close)) {
+        text = text.slice(open.length).trimStart();
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) break;
+  }
+  return text.trim();
 }
 
 /** 无 `{id}` 的标记（正文标记）→ 整行正则 */
-function exactLinePattern(mark: string): RegExp {
-  return new RegExp(`^${escapeRegExp(mark.trimEnd())}[ \\t]*$`);
+/**
+ * 正文标记（`@@CONTENT` / `内容：`）→ 正则。
+ *
+ * ## 为什么捕获行内剩余（v0.1.5 / G4）
+ *
+ * 用户那份世界书写的是 `内容：{{char}}与{{user}}…` —— 正文**紧跟标记在同一行**。
+ * 旧实现要求标记独占整行（`^内容：[ \t]*$`），于是这类行落到"未知字段"
+ * 分支（`内容` 不是已知字段）被丢弃，正文一个字都进不来。
+ *
+ * 现在捕获剩余部分作为正文第一行（第 1 组）。剩下的是常见写法差异，
+ * 不是错误。
+ */
+function contentMarkPattern(mark: string): RegExp {
+  return new RegExp(`^${escapeRegExp(mark.trimEnd())}(.*)$`);
 }
 
 interface CompiledFormat {
   entryStart: RegExp;
   contentMark: RegExp;
-  entryEnd: RegExp;
+  /**
+   * 闭标记正则。**`null` = 隐式闭合模式**（v0.1.5 / G4）。
+   *
+   * 预设里把 `entryClose` 省略（或写成空串）时进入这个模式：
+   * 条目边界由**下一个开标记或文件结束**确定，不要求显式结束行。
+   *
+   * 为什么需要：`@@ENTRY` / `@@END` 是 ST 生态的成对标记，但"标题式"格式
+   * （`【条目1：名字】` + 字段行 + 正文）天然没有结束标记 —— 用户那份预设
+   * 声明了 `entryClose: "条目{id}结束"`，而他的 2000 多字里一处都没写这个。
+   * 旧实现会因此对**每个条目**报 `missing-end` error ⇒ `ok=false` ⇒ 拒绝写回
+   * entries ⇒ 导出丢失。而条目边界其实由开标记唯一确定，闭标记是冗余的。
+   */
+  entryEnd: RegExp | null;
   labels: Map<string, string>;
   fieldCore: string;
 }
@@ -86,10 +224,13 @@ interface CompiledFormat {
 /** 预编译一次，避免在逐行循环里反复构造正则与反查表 */
 function compileFormat(params: WorldbookFormatParams): CompiledFormat {
   const core = params.fieldSeparator.trim() === '' ? ':' : params.fieldSeparator.trim();
+  const closeTemplate = typeof params.entryClose === 'string' ? params.entryClose.trim() : '';
   return {
     entryStart: markerPattern(params.entryOpen),
-    contentMark: exactLinePattern(params.contentMark),
-    entryEnd: markerPattern(params.entryClose),
+    contentMark: contentMarkPattern(params.contentMark),
+    // 空串 ⇒ 隐式闭合（不生成正则）。`markerPattern('')` 会退化成"任意单词行"，
+    // 那会把每一行正文都当闭标记，所以必须显式挡掉。
+    entryEnd: closeTemplate === '' ? null : markerPattern(closeTemplate),
     labels: reverseLabelMap(params),
     fieldCore: core,
   };
@@ -107,6 +248,23 @@ export type WorldbookIssueCode =
   | 'bad-value'
   | 'unexpected-line'
   | 'leading-text'
+  /**
+   * 文本非空、但全文**一个条目标记都没有**（v0.1.5 / G3-2，红线级）。
+   *
+   * 这是"整段格式不对"的信号，必须报 error 而不是 warning —— 因为 `ok=false`
+   * 才会让 `setBlockText` 拒绝写回 `entries`。否则会出现最糟的静默丢数据：
+   * 用户把别处格式的世界书（如 `【条目1：…】` + `内容：…`）粘进面板 →
+   * 解析出 0 条、但只有 leading-text 一条 warning → `ok=true` →
+   * **原有 entries 被写回成空数组** → 导出 JSON 的 character_book 变空。
+   */
+  | 'no-entry-marker'
+  /**
+   * 预设声明了闭标记，但整份文本一次都没用到 → 已按隐式闭合解析（v0.1.5 / G4）。
+   *
+   * 是 **warning 不是 error**：条目边界由开标记唯一确定，闭标记冗余；
+   * 但用户应该知道"我预设里写的结束行其实没生效"，否则下次还以为它在起作用。
+   */
+  | 'implicit-close'
   // 注意：没有 'no-keys' —— 见 closeDraft 里的注释（语义判据归规则集）
   ;
 
@@ -168,26 +326,72 @@ export function unescapeContentLine(line: string): string {
   return ESCAPE_TARGET.test(line) && line.startsWith('\\') ? line.slice(1) : line;
 }
 
-function formatCsvList(items: readonly string[], separator: string): string {
-  const needle = separator.trim() === '' ? separator : separator.trim();
+/**
+ * 列表字段写出。`separator` 允许数组（v0.1.5 / G3-2），但**只用第一个**：
+ * 输出格式必须唯一，否则同一份数据每次导出都不一样，diff 里全是噪声。
+ *
+ * `join` 用的是**原始**分隔符（不 trim）：默认值 `", "` 要写出 `成人, 性`，
+ * 而不是 `成人,性`。第一版我在这里用了 normalize 后的（trim 过的）串，
+ * 输出悄悄少了一个空格 —— 这属于"看起来无所谓、但会让所有既有卡片的
+ * 导出字节变化"，靠 round-trip 测试才抓回来。
+ * `needle`（判"值里含分隔符就要加引号"）仍用 trim 后的形式，因为
+ * `"a, b"` 里含 `","` 才是需要转义的事实。
+ */
+function formatCsvList(items: readonly string[], separator: string | readonly string[]): string {
+  const first = Array.isArray(separator) ? separator[0] : (separator as string);
+  const joinWith = typeof first === 'string' && first !== '' ? first : ', ';
+  const needle = joinWith.trim() === '' ? joinWith : joinWith.trim();
   return items
     .map((item) => (item.includes(needle) || item.includes('"') ? `"${item.split('"').join('\\"')}"` : item))
-    .join(separator);
+    .join(joinWith);
+}
+
+/**
+ * 把 `listSeparator` 规范化成"按长度降序"的分隔符数组（v0.1.5 / G3-2）。
+ *
+ * 为什么要降序：`[", ", ","]` 里如果先试 `","`，`"a, b"` 会被切成 `"a"` 和
+ * `" b"`（多一个前导空格）；先试 `", "` 才是对的。长的优先 = 最具体的优先。
+ *
+ * 空串 **不** 当作分隔符（否则每个字符边界都成了分隔点，见 `parseCsvList` 的
+ * `sepLength = Math.max(1, sep.length)` 兜底）：空串会被过滤掉，全空时回退到 `[',']`。
+ */
+function normalizeListSeparators(separator: string | readonly string[]): string[] {
+  const raw = Array.isArray(separator) ? separator : [separator as string];
+  const cleaned = raw
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter((item) => item !== '');
+  if (cleaned.length === 0) return [','];
+  // 去重后按长度降序（同长度保持原序，保证确定性）
+  return [...new Set(cleaned)].sort((left, right) => right.length - left.length);
 }
 
 /**
  * 列表字段解析。
  *
- * 分隔符可配置（`listSeparator`），但**引号与转义规则固定** —— 那是 CSV 的语法，
- * 不是格式偏好：允许用户把分隔符改成 `、` 却又要自己发明转义规则，只会让文件不可移植。
+ * 分隔符可配置（`listSeparator`，支持多分隔符），但**引号与转义规则固定** ——
+ * 那是 CSV 的语法，不是格式偏好：允许用户把分隔符改成 `、` 却又要自己发明转义规则，
+ * 只会让文件不可移植。
+ *
+ * ## 两层容错（v0.1.5 / G4）
+ *
+ * 用户那份预设声明 `listSeparator: "，"`（全角逗号），但他的关键词行混用了
+ * `成人、性、做爱`（顿号）与 `潮吹,射精`（半角逗号）—— 只按 `，` 切，
+ * 整行会变成**一个**关键词（`keys` 长度 1 而非 5）。
+ *
+ * 处理方式是**两阶段**，而不是直接把所有逗号类标点都当分隔符：
+ *   1. 先按预设声明切；
+ *   2. **只有当结果只有一项**、且这一项里含其它常见分隔符时，才放宽重切。
+ *
+ * 为什么不直接并集：`"a、b"` 作为**一个**关键词（顿号在词内）时，并集会把它
+ * 误切成两个。两阶段只在"按原规则完全切不开"时才放宽，误伤面小得多。
  */
-function parseCsvList(value: string, separator: string): string[] {
-  if (value.trim() === '') return [];
-  const sep = separator.trim() === '' ? separator : separator.trim();
+const FALLBACK_LIST_SEPARATORS: readonly string[] = [',', '、', '，'];
+
+/** 按给定分隔符集合切分（引号与转义规则固定） */
+function splitCsvList(value: string, separators: readonly string[]): string[] {
   const items: string[] = [];
   let current = '';
   let quoted = false;
-  const sepLength = Math.max(1, sep.length);
   for (let index = 0; index < value.length; index += 1) {
     const char = value[index]!;
     if (quoted) {
@@ -207,16 +411,47 @@ function parseCsvList(value: string, separator: string): string[] {
       quoted = true;
       continue;
     }
-    if (value.startsWith(sep, index)) {
+    // 长分隔符优先：逐个试，命中即切
+    const matched = separators.find((candidate) => value.startsWith(candidate, index));
+    if (matched !== undefined) {
       items.push(current.trim());
       current = '';
-      index += sepLength - 1;
+      index += matched.length - 1;
       continue;
     }
     current += char;
   }
   items.push(current.trim());
   return items;
+}
+
+function parseCsvList(
+  value: string,
+  separator: string | readonly string[],
+  lenient: boolean,
+): string[] {
+  if (value.trim() === '') return [];
+  const separators = normalizeListSeparators(separator);
+  const items = splitCsvList(value, separators);
+  if (items.length > 1) return items;
+
+  /*
+   * 阶段 2 只在**自定义预设**下开（v0.1.5 / G4 修正）。
+   *
+   * 内置格式的 `keys: 成人、性` 是**一个**含顿号的关键词（顿号在词内是合法的，
+   * 比如书名、人名并列）。无条件放宽会把它切成两个 —— 于是"导出再导入"
+   * 会悄悄改变关键词集合。这正是既有测试 `before.entries[0].keys.length === 1`
+   * 守着的行为，不能为了兼容外部格式去动它。
+   */
+  if (!lenient) return items;
+
+  const extra = FALLBACK_LIST_SEPARATORS.filter((candidate) => !separators.includes(candidate));
+  if (extra.length === 0) return items;
+  const widened = [...new Set([...separators, ...extra])].sort(
+    (left, right) => right.length - left.length,
+  );
+  const retried = splitCsvList(value, widened);
+  return retried.length > items.length ? retried : items;
 }
 
 
@@ -239,12 +474,34 @@ function parsePosition(value: string): number | string | null {
   return Number.isFinite(numeric) ? numeric : text;
 }
 
+/**
+ * 布尔字段的取值识别。
+ *
+ * ## 为什么加中文（v0.1.5 / G7）
+ *
+ * 用户的中文格式预设把字段标签改成了中文（`常驻：是`），解析器却只认
+ * `true/1/yes/on` —— 于是"常驻"这条**永远读不进来**，条目一律按 `constant: false`
+ * 处理，接着"非常驻却无关键词"这类规则对持续型条目全线误报（实测 29 条）。
+ *
+ * 新增 `是` / `否`（大小写不敏感对中文无意义，但对混写无害）。
+ *
+ * ## 刻意**不**认的写法
+ *
+ * `真/假`、`对/错`、`√/×`、`有/无` 都不认 —— 需求明确了"不得猜"。
+ * 猜错的代价比报错大得多：`常驻：假` 若被当成 true，条目会变成常驻，
+ * 而用户以为它是关键词条目。认不出就走 `bad-value` warning 并保持字段缺省。
+ *
+ * `yes/no/on/off` 是早期就支持的英文同义词，保留（删掉会让已写好的文件坏掉）。
+ */
 function parseBool(value: string): boolean | null {
   const text = value.trim().toLowerCase();
-  if (['true', '1', 'yes', 'on'].includes(text)) return true;
-  if (['false', '0', 'no', 'off'].includes(text)) return false;
+  if (['true', '1', 'yes', 'on', '是'].includes(text)) return true;
+  if (['false', '0', 'no', 'off', '否'].includes(text)) return false;
   return null;
 }
+
+/** 布尔字段的可写值提示（只在报错时用到，不参与解析） */
+export const BOOL_VALUE_HINT = '是/否、true/false、1/0';
 
 /** 补 id：缺失或非数字时按「当前已用编号 +1」补齐，返回新数组（不改动入参） */
 export function ensureEntryIds(entries: readonly StWorldbookEntry[]): {
@@ -372,16 +629,58 @@ function parseFieldLine(
 }
 
 /**
+ * 是否是**内置默认格式**（本工具自己的规范写法）。
+ *
+ * ## 为什么需要这个判定（v0.1.5 / G4）
+ *
+ * 宽容策略分两档，不能一刀切：
+ *
+ * · **内置默认格式 = 规范**：`@@ENTRY 0` / `@@CONTENT` / `@@END 0` 是本工具
+ *   自己写出去的格式。文本不合规就是**用户写漏了**，必须报 error —— 静默容错
+ *   会让"漏写 @@END"这种真错误永远发现不了（而且写回时行为会变）。
+ * · **自定义预设 = 外部格式兼容**：用户从别处导入的预设（如 `【条目{id}：` +
+ *   `内容：`、无结束标记、顿号分隔关键词）本来就不是本工具发明的语法。它的
+ *   "不规范"往往只是对方的书写习惯，报 error 只会让整份内容无法写回、进而丢失。
+ *
+ * 所以宽容只对**自定义预设**开启。判据用标记字面量比较：任一标记与默认不同，
+ * 就认为用户有意定义了另一套语法。
+ */
+function isBuiltinFormat(params: WorldbookFormatParams): boolean {
+  const base = DEFAULT_WORLDBOOK_FORMAT;
+  return (
+    params.entryOpen === base.entryOpen &&
+    params.contentMark === base.contentMark &&
+    params.entryClose === base.entryClose
+  );
+}
+
+/**
  * 世界书 TXT → entries（按格式预设）。
  * 所有结构问题都带行号返回；error 级问题意味着「不要拿结果去做合并」。
  */
 export function parseWorldbookTextWith(text: string, params: WorldbookFormatParams): ParseWorldbookResult {
   const fmt = compileFormat(params);
+  /**
+   * 宽容档位（v0.1.5 / G4）：自定义预设才放宽。
+   * 影响三处 —— 隐式闭合自适应、重复 id 续号、列表分隔符回退。
+   * 三处都读这一个变量，避免"某一处严某一处松"的错位。
+   */
+  const lenient = !isBuiltinFormat(params);
   const issues: WorldbookParseIssue[] = [];
   const entries: StWorldbookEntry[] = [];
   const seenIds = new Set<number>();
+  /** 已出现过的最大 id；重复 id 续号时从它 +1 起（v0.1.5 / G4） */
+  let maxSeenId = -1;
   let draft: DraftEntry | null = null;
   let leadingText = false;
+  /**
+   * 是否见过任何条目标记（v0.1.5 / G3-2）。
+   *
+   * 与 `entries.length === 0` 不是一回事：可以有标记但每一条都因缺正文被剔除
+   * （那时已有 `missing-content` error），也可以是**一个标记都没有**。
+   * 后者才是"整段格式不对"，需要单独报 error。
+   */
+  let sawEntryMarker = false;
   /** 缺正文标记被整块剔除的条目（id + 起始行） */
   const droppedMissingContent: { id: number; line: number }[] = [];
   const contentMarkText = params.contentMark;
@@ -408,23 +707,68 @@ export function parseWorldbookTextWith(text: string, params: WorldbookFormatPara
   };
 
   const lines = splitKeepEol(text);
+
+  /*
+   * 闭标记自适应（v0.1.5 / G4）。
+   *
+   * 用户那份预设声明了 `entryClose: "条目{id}结束"`，但他的 2000 多字里
+   * **一处都没写**这个结束行 —— "标题式"世界书天然靠下一个标题分界。
+   * 于是旧逻辑对每个条目报 `missing-end` error ⇒ `ok=false` ⇒ 拒绝写回
+   * entries ⇒ 导出丢内容。
+   *
+   * 判据是**全文一次都没出现**闭标记：那说明这份文本的书写习惯就是隐式闭合，
+   * 按隐式模式解析并给一条提示。若"有的条目写了、有的没写"，仍按显式模式报
+   * `missing-end` —— 那是真的写漏了，不能替用户掩盖。
+   */
+  let entryEnd = fmt.entryEnd;
+  if (entryEnd !== null && lenient) {
+    const usedAnyClose = lines.some((rawLine) => entryEnd!.test(splitLineEol(rawLine).content));
+    if (!usedAnyClose) {
+      const presentOpen = lines.some((rawLine) => fmt.entryStart.test(splitLineEol(rawLine).content));
+      if (presentOpen) {
+        entryEnd = null;
+        issues.push({
+          severity: 'warning',
+          code: 'implicit-close',
+          line: 1,
+          message:
+            `当前世界书预设声明了闭标记（\`${params.entryClose.replace('{id}', '0')}\`），` +
+            '但整份文本一次都没用到 —— 已按「隐式闭合」解析（条目由下一个开标记或文件结束分界）。' +
+            '如果你的写法本来就是隐式闭合，把预设里的 entryClose 留空即可不再提示',
+        });
+      }
+    }
+  }
+
   for (let index = 0; index < lines.length; index += 1) {
     const rawLine = lines[index]!;
     const lineNumber = index + 1;
     const { content: line } = splitLineEol(rawLine);
 
     if (fmt.entryStart.test(line)) {
+      sawEntryMarker = true;
       if (draft) {
-        issues.push({
-          severity: 'error',
-          code: 'missing-end',
-          entryId: draft.id,
-          line: lineNumber,
-          message: `条目 ${draft.id} 缺少闭标记（在第 ${lineNumber} 行遇到下一个开标记）`,
-        });
+        /*
+         * 遇到下一个开标记 ⇒ 上一个条目闭合。
+         *
+         * 隐式闭合模式（预设没写 `entryClose`）下这是**正常路径**，不是错误；
+         * 显式闭合模式（如默认 `@@END`）下才报 `missing-end`。
+         */
+        if (entryEnd !== null) {
+          issues.push({
+            severity: 'error',
+            code: 'missing-end',
+            entryId: draft.id,
+            line: lineNumber,
+            message: `条目 ${draft.id}（第 ${draft.line} 行开始）缺少闭标记（在第 ${lineNumber} 行遇到下一个开标记）`,
+          });
+        }
         closeDraft(lineNumber - 1);
       }
-      const raw = fmt.entryStart.exec(line)?.[1] ?? '';
+      const startMatch = fmt.entryStart.exec(line);
+      const raw = startMatch?.[1] ?? '';
+      /** 标记行内剩余内容（v0.1.5 / G4）：`【条目1：名字】` 的 `名字】` */
+      const inlineTail = (startMatch?.[2] ?? '').trim();
       const id = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
       if (!Number.isFinite(id)) {
         issues.push({
@@ -435,30 +779,99 @@ export function parseWorldbookTextWith(text: string, params: WorldbookFormatPara
         });
         continue;
       }
+      /*
+       * id 重复（v0.1.5 / G4 改为自动续号）。
+       *
+       * 用户那份世界书把"持续世界书"（条目 1–7）与"关键词世界书"（条目 1–12）
+       * 拼在一起，两段**各自从 1 编号** —— 这是极常见的写法（分章节写、再合并）。
+       * 旧实现报 error ⇒ `ok=false` ⇒ 整份拒绝写回 ⇒ 2300 多字仍然进不去，
+       * 与"不许无声丢数据"冲突。
+       *
+       * 现在：保留两条、按出现顺序给后面那条重新编号，并报 warning。
+       * **不静默**：明确告诉用户"你的 1–12 各出现了两次，已重新编号为 13–24"，
+       * 且导出后的 id 唯一（符合 ST 的 entries 约定）。
+       */
+      let finalId = id;
       if (seenIds.has(id)) {
-        issues.push({
-          severity: 'error',
-          code: 'duplicate-id',
-          entryId: id,
-          line: lineNumber,
-          message: `条目 id ${id} 重复（首次出现于上文，第 ${lineNumber} 行再次声明）；禁止静默合并，请改为唯一 id`,
-        });
+        if (!lenient) {
+          /*
+           * 内置格式下重复 id 是**真错误**：用户手写了两个 `@@ENTRY 3`，
+           * 语义上他可能想改前一个、或想覆盖 —— 两种解释都合理，替他选一种
+           * 就是替他改了数据。保持 v0.1.2 起的语义：报 error、拒绝合并
+           * （条目仍全部保留在结果里，只是 `ok=false` 不写回）。
+           */
+          issues.push({
+            severity: 'error',
+            code: 'duplicate-id',
+            entryId: id,
+            line: lineNumber,
+            message: `条目 id ${id} 重复（首次出现于上文，第 ${lineNumber} 行再次声明）；禁止静默合并，请改为唯一 id`,
+          });
+        } else {
+          /*
+           * 自定义预设下重复 id 往往是**外部格式的自然结果**：用户那份世界书
+           * 分「持续世界书」「关键词世界书」两节，各自从条目 1 编号 ——
+           * 单看每节都合法，合起来就撞了。报 error 会让整份 2000 多字无法写回
+           * （→ 又变成"静默丢内容"），所以续号并明确告知。
+           *
+           * 新编号取"当前最大 id + 1"，而不是"最小空位"：最小空位会让第二段
+           * 的重复条目拿到 0（排在最后），编号看起来是乱的；递增则符合
+           * "后面的条目排在后面"的直觉。
+           */
+          maxSeenId += 1;
+          finalId = maxSeenId;
+          issues.push({
+            severity: 'warning',
+            code: 'duplicate-id',
+            entryId: id,
+            line: lineNumber,
+            message:
+              `条目 id ${id} 重复（第 ${lineNumber} 行再次声明，首次见上文）；` +
+              `已按出现顺序重新编号为 ${finalId}，两条内容都保留`,
+          });
+        }
       }
-      seenIds.add(id);
-      draft = { id, line: lineNumber, fields: {}, sawContent: false, bodyRaw: [] };
+      seenIds.add(finalId);
+      if (finalId > maxSeenId) maxSeenId = finalId;
+      draft = { id: finalId, line: lineNumber, fields: {}, sawContent: false, bodyRaw: [] };
+      /*
+       * 行内剩余当条目名（v0.1.5 / G4）。
+       *
+       * `【条目1：西奥核心关系逻辑】` 这种"编号与名称同一行"的写法很自然，
+       * 旧实现因为要求标记独占整行，整份文本一条都解析不出来。
+       *
+       * 只作为**兜底**：若后面还有 `名称：` 字段行，那一行会覆盖它
+       * （显式字段比行内猜测更可信）。空剩余则不设 name。
+       */
+      if (inlineTail !== '') {
+        const name = cleanInlineName(inlineTail);
+        if (name !== '') draft.fields['name'] = name;
+      }
       continue;
     }
 
-    if (fmt.contentMark.test(line)) {
+    /*
+     * 正文标记。`sawContent` 之后不再认 —— 它表示"正文从这里开始"，只该出现一次。
+     *
+     * 加这个条件是为了让**正文里以 `内容：` 开头的行**（用户可能真的这么写）
+     * 不会被第二个正文标记吃掉。行内剩余（`内容：正文第一句`）作为正文首行。
+     */
+    if (!(draft?.sawContent ?? false) && fmt.contentMark.test(line)) {
       if (!draft) {
         issues.push({ severity: 'error', code: 'orphan-marker', line: lineNumber, message: `第 ${lineNumber} 行的正文标记出现在任何条目之前` });
         continue;
       }
       draft.sawContent = true;
+      const tail = fmt.contentMark.exec(line)?.[1] ?? '';
+      if (tail.trim() !== '') {
+        // 保留行尾，正文按行拼接（`closeDraft` 会去掉最后一个换行）
+        const { eol } = splitLineEol(rawLine);
+        draft.bodyRaw.push(`${unescapeContentLine(tail.trimStart())}${eol}`);
+      }
       continue;
     }
 
-    const endMatch = fmt.entryEnd.exec(line);
+    const endMatch = entryEnd === null ? null : entryEnd.exec(line);
     if (endMatch) {
       const rawId = endMatch[1] ?? '';
       const id = /^\d+$/.test(rawId) ? Number(rawId) : Number.NaN;
@@ -521,13 +934,24 @@ export function parseWorldbookTextWith(text: string, params: WorldbookFormatPara
         continue;
       }
       if (LIST_FIELDS.has(key)) {
-        draft.fields[key] = parseCsvList(value, params.listSeparator);
+        draft.fields[key] = parseCsvList(value, params.listSeparator, lenient);
         continue;
       }
       if (BOOL_FIELDS.has(key)) {
         const bool = parseBool(value);
         if (bool === null) {
-          issues.push({ severity: 'warning', code: 'bad-value', entryId: draft.id, line: lineNumber, message: `条目 ${draft.id} 的 ${key} 不是布尔值（${value}），已忽略` });
+          /*
+           * 认不出就**不猜**：字段保持缺省（constant 即 false），只报一条 warning。
+           * 文案里给出可写值 —— 只说"不是布尔值"用户不知道能写什么，
+           * 尤其在中文字段标签下 `是/否` 根本不是他的第一直觉。
+           */
+          issues.push({
+            severity: 'warning',
+            code: 'bad-value',
+            entryId: draft.id,
+            line: lineNumber,
+            message: `条目 ${draft.id} 的 ${label}（${key}）不是布尔值（${value}）—— 已忽略，${key} 保持缺省。可写：${BOOL_VALUE_HINT}`,
+          });
           continue;
         }
         draft.fields[key] = bool;
@@ -560,13 +984,30 @@ export function parseWorldbookTextWith(text: string, params: WorldbookFormatPara
   }
 
   if (draft) {
-    issues.push({
-      severity: 'error',
-      code: 'missing-end',
-      entryId: draft.id,
-      line: lines.length,
-      message: `条目 ${draft.id} 缺少闭标记（文件结束仍未闭合）`,
-    });
+    /*
+     * 读到文件结束仍有未闭合的条目。
+     *
+     * 隐式闭合模式（预设没写 `entryClose`）下这是**正常收尾** —— 最后一个条目
+     * 天然由 EOF 闭合，不报问题。显式闭合模式才报 `missing-end`。
+     */
+    if (entryEnd !== null) {
+      issues.push({
+        severity: 'error',
+        code: 'missing-end',
+        entryId: draft.id,
+        line: lines.length,
+        /*
+         * 同时给出**条目起始行**（v0.1.5 / G3-2）。
+         *
+         * `line` 是"读到文件尾才发现没闭合"的位置，对定位没帮助 ——
+         * 用户看到"第 800 行"只知道末尾有问题，不知道是哪个条目。
+         * `draft.line` 是条目开头，那才是他要改的地方。
+         */
+        message:
+          `条目 ${draft.id}（第 ${draft.line} 行开始）缺少闭标记（读到文件结束仍未闭合：` +
+          `应为 \`${params.entryClose.replace('{id}', String(draft.id))}\`）`,
+      });
+    }
     closeDraft(lines.length);
   }
 
@@ -581,7 +1022,69 @@ export function parseWorldbookTextWith(text: string, params: WorldbookFormatPara
     });
   }
 
+  /*
+   * 全文没有条目标记（v0.1.5 / G3-2，红线）。
+   *
+   * 判据：文本里有非空白内容，但 `entryStart` 一次都没匹配上。
+   * 这不是"空世界书"（空世界书是 text.trim() === ''，走到这里就直接返回 0 条，
+   * 属于合法状态），而是**格式完全不匹配**。
+   *
+   * 为什么必须报 error：`ok` 的定义是"没有 error"。只报 warning 时 `ok=true`，
+   * `setBlockText` 会把 `entries: []` 写回卡片，把用户原有的条目清空 ——
+   * 而界面上 `text` 还在（显示层走文本回退），看起来一切正常，
+   * 直到导出才发现 character_book 是空的。这是"无声丢数据"，必须挡住。
+   *
+   * 报错文案要给出**怎么改**，而不是只说"格式不对"：用户手里那份
+   * `【条目1：…】/顺序：…/内容：…` 与我们要求的 `@@ENTRY`/`@@CONTENT`/`@@END`
+   * 是两套完全不同的标记，光说"解析失败"等于没说。
+   */
+  if (entries.length === 0 && !sawEntryMarker && text.trim() !== '') {
+    const firstContentLine = lines.findIndex((line) => splitLineEol(line).content.trim() !== '');
+    /*
+     * 识别几种常见的"外来格式"，把话说到点子上。
+     *
+     * 只说"没有条目标记"用户仍然不知道该改什么 —— 他手里那段文字看起来
+     * 结构很清晰（`【条目1：…】` / `顺序：` / `内容：`），凭什么说格式不对？
+     * 所以要明说：**你这套标记不是本工具的**，并给出对照。
+     */
+    const looksLike = detectForeignWorldbookFormat(text);
+    const hint =
+      looksLike === null
+        ? ''
+        : `（检测到 ${looksLike.name} 写法：${looksLike.sample} —— 本工具要求的是 ` +
+          '`@@ENTRY n` / `@@CONTENT` / `@@END n` 三个标记）';
+    issues.push({
+      severity: 'error',
+      code: 'no-entry-marker',
+      line: firstContentLine >= 0 ? firstContentLine + 1 : 1,
+      message:
+        `世界书文本里没有任何条目标记（应为 \`${params.entryOpen.replace('{id}', '0')}\` … ` +
+        `\`${params.contentMark}\` … \`${params.entryClose.replace('{id}', '0')}\`）；` +
+        `这段文字未被解析成条目，写回会清空原有条目${hint}`,
+    });
+  }
+
   return { entries, issues, ok: issues.every((issue) => issue.severity !== 'error') };
+}
+
+/**
+ * 猜这段文本是哪套世界书写法（仅用于错误提示，不参与解析）。
+ *
+ * 线上那份样本是 `【条目1：标题】` + `顺序：275` + `内容：…`，
+ * 标题里还夹着"顺序/触发概率/内容"这些字段行 —— 看起来非常规整，
+ * 所以用户不会怀疑格式，必须由我们指出差异。
+ */
+function detectForeignWorldbookFormat(text: string): { name: string; sample: string } | null {
+  if (/^【条目\s*\d+/m.test(text)) {
+    return { name: '「【条目N：…】+ 顺序/内容：」', sample: '【条目1：标题】↑ 顺序：275 ↑ 内容：…' };
+  }
+  if (/^###\s*条目/m.test(text) || /^##\s*条目/m.test(text)) {
+    return { name: 'Markdown 标题式', sample: '## 条目 1' };
+  }
+  if (/^\s*\{\s*"keys"/m.test(text) || /^\s*\[\s*\{/m.test(text)) {
+    return { name: 'JSON 片段', sample: '[{ "keys": [...] }]' };
+  }
+  return null;
 }
 
 /** 世界书 TXT → entries（v1.0 冻结格式）。自定义格式用 `parseWorldbookTextWith`。 */

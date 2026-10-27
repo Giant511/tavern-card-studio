@@ -28,8 +28,12 @@ import {
   type TxtPreset,
 } from './preset.js';
 import {
+  DEFAULT_WORLDBOOK_FORMAT,
+  type WorldbookFormatParams,
+} from './worldbook-preset.js';
+import {
   mergeWorldbookEntries,
-  parseWorldbookText,
+  parseWorldbookTextWith,
   renderWorldbookText,
   type MergeWorldbookResult,
   type WorldbookParseIssue,
@@ -84,6 +88,14 @@ export interface ParseCardTextOptions {
    * 那不是保全，那是自作主张。
    */
   preserveUnrecognized?: boolean;
+  /**
+   * 世界书 TXT 的格式（v0.1.5 / G4）。
+   *
+   * 不传就用冻结的 `@@ENTRY` 格式 —— 那会让自定义格式的 TXT 卡在导入时
+   * 世界书段解析失败（`【条目N：…】` 这类写法一条都认不出）。
+   * 客户端导入 TXT 卡时应传当前选中的世界书预设。
+   */
+  worldbookFormat?: WorldbookFormatParams;
 }
 
 export type CardTextIssueCode =
@@ -142,7 +154,7 @@ export interface ParseCardTextResult {
   /** 文件中缺失的板块（按预设顺序） */
   missing: BlockId[];
   unknownHeadings: UnknownHeading[];
-  worldbook: { entries: ReturnType<typeof parseWorldbookText>['entries']; issues: WorldbookParseIssue[] } | null;
+  worldbook: { entries: ReturnType<typeof parseWorldbookTextWith>['entries']; issues: WorldbookParseIssue[] } | null;
   /** 保全结论；未开启保全时为 null */
   preserved: PreservedInfo | null;
 }
@@ -210,6 +222,15 @@ export function renderCardText(card: UnifiedCard, preset: TxtPreset, options: Re
     const heading = headingTextFor(preset, id, block?.anchor?.headingText ?? null);
     let body: string;
     if (id === 'worldbook') {
+      /*
+       * 世界书段的内容来源优先级（v0.1.5 / G3-3 复查后确认，保持原语义）：
+       *   ① 显式传入的 `worldbookText`
+       *   ② `card.worldbook.text`（编辑器里正在编辑的原文）
+       *   ③ 从 `entries` 渲染出的 `@@ENTRY` 段
+       *
+       * ②在③之前是刻意的：用户在面板里改了文本但还没成功解析时，
+       * TXT 至少要把他写的东西写出来 —— 而不是悄悄换成"上一次解析成功的条目"。
+       */
       body =
         options.worldbookText ??
         (card.worldbook.text !== '' ? card.worldbook.text : renderWorldbookText(card.worldbook.entries));
@@ -217,6 +238,23 @@ export function renderCardText(card: UnifiedCard, preset: TxtPreset, options: Re
       body = block?.text ?? '';
     }
     if (!includeEmpty && body.trim() === '') continue;
+
+    /*
+     * `worldbook.includeHeading`（v0.1.5 / G3-3）。
+     *
+     * 这个参数原来**只被 schema 校验、从未被渲染读取** —— README §4.3 把它写成
+     * 一个生效的开关，实际设成 false 也照样输出 `【世界书】`。属于"文档承诺了
+     * 但没实现"，现已接上。
+     *
+     * 只对世界书段生效（README 的字段名就是 `worldbook.includeHeading`）：
+     * 其它板块的标题是**解析锚点**，去掉就再也读不回来了，所以那里的开关
+     * 语义不同，不做成通用能力。
+     */
+    const skipHeading = id === 'worldbook' && preset.worldbook?.includeHeading === false;
+    if (skipHeading) {
+      if (body.trim() !== '') parts.push(body);
+      continue;
+    }
     parts.push(body.trim() === '' ? heading : `${heading}\n${body}`);
   }
 
@@ -651,7 +689,11 @@ export function parseCardText(text: string, preset: TxtPreset, options: ParseCar
 
   // ---- 世界书 ----
   const worldbookSection = byBlock.get('worldbook');
-  const worldbookParsed = parseWorldbookText(worldbookSection?.body ?? '');
+  // 按当前世界书预设解析（v0.1.5 / G4）：不传就退回冻结格式
+  const worldbookParsed = parseWorldbookTextWith(
+    worldbookSection?.body ?? '',
+    options.worldbookFormat ?? DEFAULT_WORLDBOOK_FORMAT,
+  );
   for (const issue of worldbookParsed.issues) {
     issues.push({
       severity: issue.severity,

@@ -18,13 +18,17 @@ import {
   assembleDescription,
   buildPngCard,
   parsePngCard,
+  DEFAULT_WORLDBOOK_FORMAT,
+  parseWorldbookTextWith,
   presetAssembleOptions,
+  renderWorldbookText,
   serializeStCard,
   summarizePng,
   type AuditReport,
   type BlockId,
   type GreetingFormatParams,
   type PngCardSpec,
+  type WorldbookFormatParams,
   type TxtPreset,
   type UnifiedCard,
 } from '@tcs/shared';
@@ -36,6 +40,16 @@ export interface ExportBlocked {
   /** 错误级问题（必须逐条展示，不能只说"有问题"） */
   errors: AuditReport['issues'];
   message: string;
+  /**
+   * 硬阻断原因（v0.1.5 / G3-2，红线）。
+   *
+   * 与审计 error 的区别：审计 error 可以"仍要导出"绕过（用户自己判断），
+   * 而这里的问题是**导出会无声丢数据**，绕过等于同意丢内容 —— 所以
+   * `hardBlock === true` 时界面**不提供**"仍要导出"。
+   */
+  hardBlock?: boolean;
+  /** 硬阻断的具体说明（逐条，含修复指引） */
+  hardReasons?: string[];
 }
 
 export interface ExportAllowed {
@@ -45,12 +59,106 @@ export interface ExportAllowed {
 export type ExportGate = ExportBlocked | ExportAllowed;
 
 /**
- * 导出闸门：审计报告 → 是否拦截。
+ * 世界书"导出会丢内容"的检查（v0.1.5 / G3-2，红线）。
  *
- * 只在 `exportable === false` 时拦截。报告里可能没有 `summary`（构造异常），
- * 此时按"有问题就拦"处理——宁可多拦一次，也不要静默导出坏卡。
+ * ## 为什么必须有这一层
+ *
+ * 线上实测链路：用户把别处格式的世界书粘进面板 → 解析器一条都没认出来 →
+ * `entries` 变成空数组，而 `text` 仍是那 2300 多字（显示层走文本回退，
+ * 编辑器里看着正常）→ 导出 JSON 时 `character_book.entries = []` →
+ * **内容消失，且没有任何提示**。
+ *
+ * 用户的原话是"不得静默导出空世界书 —— 这是无声丢数据红线"。所以这里
+ * 不看审计报告（那是"卡好不好"），只看**这条数据会不会被写丢**。
+ *
+ * ## 两条判据（都是"数据必丢"，不是"格式不规范"）
+ *
+ * 1. `text` 非空但 `entries` 为空 —— 一个条目都没解析出来，导出必丢；
+ * 2. `text` 非空且**重新解析它仍然有 error** —— 说明文本里有解析不了的片段
+ *    （缺 `@@END`、缺正文标记、或整段格式不对），此时 `entries` 要么是旧的、
+ *    要么是残缺的，导出的都不是用户眼前看到的内容。
+ *
+ * ## 为什么判据 2 不是"text ≠ renderWorldbookText(entries)"
+ *
+ * 第一版就是这么写的，截图当场抓出**误拦**：标准格式的卡也被拦了。
+ * 原因是规范渲染与用户原文必然字形不同（字段是否写出、顺序、缺省值表达），
+ * 于是"不相等"恒成立 —— 把"格式差异"错当成"数据丢失"。
+ * 改成"重新解析有没有 error"才是同一个语义：**能不能完整读回来**。
+ *
+ * 判据刻意不"自动修复"（比如自动把 text 塞进一个条目）：那样会造出一条
+ * 用户没写过的条目，比报错更糟。
  */
-export function evaluateExportGate(report: AuditReport | null): ExportGate {
+export function checkWorldbookExportSafety(
+  card: UnifiedCard,
+  /** 当前世界书格式（v0.1.5 / G4）：必须与编辑器、审计用同一份，否则会误判 */
+  worldbookFormat?: WorldbookFormatParams,
+): string[] {
+  const reasons: string[] = [];
+  const text = card.worldbook.text;
+  if (text.trim() === '') return reasons;
+
+  const format = worldbookFormat ?? DEFAULT_WORLDBOOK_FORMAT;
+  const markHint = format.entryClose.trim() === ''
+    ? '条目需以 `【条目0：…】（按当前预设）` 开头、正文标记之后写正文'
+    : `条目需以 \`${format.entryOpen.replace('{id}', '0')}\` 开头、\`${format.contentMark}\` 之后写正文、\`${format.entryClose.replace('{id}', '0')}\` 结束`;
+
+  if (card.worldbook.entries.length === 0) {
+    reasons.push(
+      `世界书有 ${String(text.length)} 字文本，但一个条目都没解析出来（0 条）—— ` +
+        '导出会把 character_book.entries 写成空数组，这 ' +
+        `${String(text.length)} 字内容会丢失。请先修复世界书格式：` +
+        `${markHint}；也可以在「规则与预设 → 世界书预设」里换一个匹配你写法的格式。`,
+    );
+    return reasons;
+  }
+
+  // 判据 2：重新解析当前文本，仍有 error 就说明有内容读不回来
+  const reparsed = parseWorldbookTextWith(text, format);
+  if (!reparsed.ok) {
+    const errors = reparsed.issues.filter((issue) => issue.severity === 'error');
+    const first = errors[0];
+    const where = first?.line === undefined ? '' : `（第 ${String(first.line)} 行起）`;
+    reasons.push(
+      `世界书文本里有 ${String(errors.length)} 处无法解析的内容${where}：` +
+        `${first?.message ?? '格式不完整'}。` +
+        `当前只解析出 ${String(reparsed.entries.length)} 个条目，导出的将不是你在编辑器里看到的内容。`,
+    );
+  }
+  return reasons;
+}
+
+/**
+ * 导出闸门：审计报告 + 数据完整性 → 是否拦截。
+ *
+ * 只在 `exportable === false` 时因审计拦截。报告里可能没有 `summary`（构造异常），
+ * 此时按"有问题就拦"处理——宁可多拦一次，也不要静默导出坏卡。
+ *
+ * `card` 是可选的（v0.1.5 / G3-2）：传了才做"世界书会不会丢内容"的硬阻断检查。
+ * 保持可选是为了不破坏"只有报告、没有卡"的既有调用（如离线校验脚本）。
+ */
+export function evaluateExportGate(
+  report: AuditReport | null,
+  card?: UnifiedCard,
+  worldbookFormat?: WorldbookFormatParams,
+): ExportGate {
+  /*
+   * 硬阻断优先于审计：它描述的是"数据必丢"，比"卡可能被平台拒"严重得多。
+   * 而且这条**不允许绕过** —— 用户点"仍要导出"等于同意丢内容，
+   * 但用户此刻并不知道自己会丢什么（编辑器里看着 2000 多字还在）。
+   */
+  if (card !== undefined) {
+    const hardReasons = checkWorldbookExportSafety(card, worldbookFormat);
+    if (hardReasons.length > 0) {
+      return {
+        blocked: true,
+        errors: [],
+        hardBlock: true,
+        hardReasons,
+        message: '世界书条目未能解析，导出将丢失内容，请先修复格式',
+      };
+    }
+  }
+
   if (!report) {
     return {
       blocked: true,
@@ -202,6 +310,34 @@ export function buildTxtExport(card: UnifiedCard, preset: TxtPreset): ExportArti
     // 空板块不输出：TXT 里冒一个只有标题的空段没意义，解析端也会按空块处理
     if (body.trim() === '') continue;
     units.push({ at: orderIndex(id), text: `${options.heading(id)}\n${body}` });
+  }
+
+  /*
+   * 世界书段（v0.1.5 / G6）。
+   *
+   * 这里曾经**整段漏掉**：上面那两轮循环只处理 `description-segment` /
+   * `personality` / `field-backed` 三类，而世界书是 `structured` ——
+   * 于是「导出 TXT」和「另存为 TXT」都不含世界书，用户的世界书在文本里凭空消失。
+   * （`shared/format/card-txt.ts` 的 `renderCardText` 一直是对的，但它服务于
+   * TXT 卡**导入**，导出面板走的是本函数 —— 两条路径分叉，缺陷只在这一条上。）
+   *
+   * 内容来源与 renderCardText 一致，优先级也一样：
+   *   ① `card.worldbook.text`（编辑器里正在编辑的原文）
+   *   ② 从 `entries` 渲染出的 `@@ENTRY` 段
+   * ①在前是刻意的：用户改了文本但还没成功解析时，TXT 至少要把他写的东西写出来，
+   * 而不是悄悄换成"上一次解析成功的条目"。
+   */
+  const worldbookBody =
+    card.worldbook.text !== ''
+      ? card.worldbook.text
+      : renderWorldbookText(card.worldbook.entries);
+  if (worldbookBody.trim() !== '') {
+    // `worldbook.includeHeading === false` 时不带标题（README §4.3 承诺的开关）
+    const skipHeading = preset.worldbook?.includeHeading === false;
+    units.push({
+      at: orderIndex('worldbook'),
+      text: skipHeading ? worldbookBody : `${options.heading('worldbook')}\n${worldbookBody}`,
+    });
   }
 
   units.sort((a, b) => a.at - b.at);

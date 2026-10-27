@@ -29,6 +29,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::shell_info,
             commands::read_text_exact,
+            commands::read_preset_library,
+            commands::write_preset_library,
             commands::read_binary_file,
             commands::read_default_face,
             commands::open_folder,
@@ -40,6 +42,13 @@ pub fn run() {
             commands::probe_cards_dir,
             commands::scan_cards_dir,
             commands::append_client_error_log,
+            // v0.1.5 / F15：本地 SillyTavern 联动（探测 / 启动 / 打开链接）
+            commands::probe_paths,
+            commands::find_st_candidates,
+            commands::probe_st_alive,
+            commands::extract_zip_to,
+            commands::spawn_detached,
+            commands::open_external,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败：请检查 tauri.conf.json 与 icons");

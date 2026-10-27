@@ -5,7 +5,13 @@
  * 「仍要导出 / 取消」，默认焦点在「取消」上——避免误按回车就导出坏卡。
  */
 
-import type { AuditReport, GreetingFormatParams, TxtPreset, UnifiedCard } from '@tcs/shared';
+import type {
+  AuditReport,
+  GreetingFormatParams,
+  TxtPreset,
+  UnifiedCard,
+  WorldbookFormatParams,
+} from '@tcs/shared';
 
 import {
   askConfirm,
@@ -42,6 +48,8 @@ export interface ExportDialogCallbacks {
     preset: TxtPreset | null;
     /** 初始场景预设的分隔格式（v0.1.3 追加项一）；缺省 = 冻结默认 */
     greetingFormat?: GreetingFormatParams;
+    /** 世界书格式（v0.1.5 / G4）：闸门重解析必须与编辑器同一份口径，否则会误判 */
+    worldbookFormat?: WorldbookFormatParams;
   };
   /** 重新审计（导出前强制刷新，避免用旧报告放行） */
   revalidate: () => AuditReport | null;
@@ -250,9 +258,43 @@ export class ExportDialog {
   private renderGatePreview(): void {
     // 强制重新审计：导出决策不能基于过期报告
     const report = this.callbacks.revalidate();
-    const gate = evaluateExportGate(report);
+    const state = this.callbacks.getState();
+    const gate = evaluateExportGate(report, state.card, state.worldbookFormat);
 
     this.gateBox.replaceChildren();
+
+    /*
+     * 硬阻断（世界书会丢内容）：**禁用导出按钮**，不给"仍要导出"这条路。
+     *
+     * 与审计拦截的区别很关键：审计说"卡可能在平台上表现异常"，用户可以自担风险；
+     * 这里说"这 2000 多字一定写不进去"，点导出等于同意丢数据 —— 而用户此刻
+     * 不知道自己会丢什么（编辑器里文本还在）。所以只能修，不能绕。
+     */
+    if (gate.blocked && gate.hardBlock === true) {
+      this.gateBox.hidden = false;
+      this.confirmButton.disabled = true;
+
+      const head = el('div', 'gate-head');
+      head.append(el('span', 'gate-icon', '⛔'), el('span', 'gate-title', '导出已阻止 · 会丢失内容'));
+      this.gateBox.append(head, el('p', 'gate-message', gate.message));
+
+      const list = el('ul', 'gate-errors');
+      for (const reason of gate.hardReasons ?? []) {
+        const item = el('li', 'gate-error-item');
+        item.append(el('span', 'gate-text', reason));
+        list.append(item);
+      }
+      this.gateBox.append(list);
+      this.gateBox.append(
+        el(
+          'p',
+          'gate-note',
+          '这条不是"建议修正"：修好之前导出按钮不可用。内容留在卡片里，不会因为这次拦截而丢失。',
+        ),
+      );
+      return;
+    }
+
     if (!gate.blocked) {
       this.gateBox.hidden = true;
       this.confirmButton.disabled = false;
@@ -294,7 +336,22 @@ export class ExportDialog {
   private async run(): Promise<void> {
     // 再算一次：renderGatePreview 之后用户可能改了内容（虽然弹窗挡着，但保险）
     const report = this.callbacks.revalidate();
-    const gate = evaluateExportGate(report);
+    const state = this.callbacks.getState();
+    const gate = evaluateExportGate(report, state.card, state.worldbookFormat);
+
+    /*
+     * 硬阻断在这里**再挡一次**，不依赖按钮 disabled。
+     *
+     * 按钮状态是"界面事实"，可能被别处（重渲染、快捷键、未来的改动）复位；
+     * 而"会丢 2000 多字"是数据事实，必须在真正动手写盘的那一步再校验。
+     * 而且这条**不走 askConfirm**：弹二次确认等于给了"同意丢数据"的入口。
+     */
+    if (gate.blocked && gate.hardBlock === true) {
+      const detail = (gate.hardReasons ?? []).join('\n');
+      this.callbacks.notify(`已阻止导出：${gate.message}${detail === '' ? '' : `（${detail}）`}`, 'bad');
+      this.renderGatePreview();
+      return;
+    }
 
     if (gate.blocked && !this.bypassGate) {
       // 二次确认：默认「取消」。必须 await —— askConfirm 在壳里是异步的，
@@ -310,7 +367,7 @@ export class ExportDialog {
       this.bypassGate = true;
     }
 
-    const state = this.callbacks.getState();
+    // `state` 已经在上面的闸门检查处取过（含 worldbookFormat），这里复用
     this.confirmButton.disabled = true;
     this.confirmButton.textContent = '导出中…';
 

@@ -29,6 +29,16 @@ export type ShellErrorCode =
   | 'UNKNOWN_RULE_KIND'
   /** 路径越界（试图穿越出规则目录） */
   | 'PATH_NOT_ALLOWED'
+  /** 一次请求的路径数超过上限（details.count / details.limit） */
+  | 'TOO_MANY_PATHS'
+  /**
+   * 启动目标被白名单拒绝（details.target / details.reason）。
+   *
+   * 与 `PATH_NOT_ALLOWED` 分开：这个码在正常使用中**会出现**
+   * （"这个目录不是 SillyTavern"就是它），属于用户状态而不是越权；
+   * 混在一起会让 UI 把"还没装 ST"报成安全错误。
+   */
+  | 'SPAWN_REJECTED'
   /** 其它 IO 失败 */
   | 'IO_ERROR'
   /** 非壳错误（前端参数错误、插件异常等） */

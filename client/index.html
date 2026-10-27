@@ -44,6 +44,13 @@
         <button id="btn-open" type="button" class="btn">打开…</button>
         <button id="btn-save" type="button" class="btn">另存为…</button>
         <button id="btn-export" type="button" class="btn primary">导出…</button>
+        <!--
+          v0.1.5 / F15：一键推送本地 SillyTavern。
+          放在「导出」右边：它本质上是"导出到某个具体去处"，与导出同一族。
+          四个状态（未安装 / 已装未运行 / 运行中 / 推送完成）都在同一个面板里演进，
+          顶栏这个按钮只是入口，不承担状态展示（状态在面板与底部状态栏）。
+        -->
+        <button id="btn-st" type="button" class="btn ghost" title="把当前卡推送到本地 SillyTavern">在 SillyTavern 中测试</button>
         <button id="btn-preview" type="button" class="btn ghost">渲染预览</button>
         <button id="btn-rules" type="button" class="btn ghost">规则与预设…</button>
         <span id="conn-chip" class="conn-chip off" title="服务端连接状态">
