@@ -42,6 +42,20 @@ pub struct WriteReceipt {
     pub verified: bool,
 }
 
+/// 二进制读取结果（对应 BinaryFile，v0.1.4 / T12.3）
+///
+/// 为什么是 base64 而不是 `Vec<u8>`：Tauri 的命令返回值要序列化成 JSON，
+/// 5 MB 的 PNG 变成 `Vec<u8>` 就是 500 万个数（约 20 MB 文本），
+/// IPC 与 `JSON.parse` 都要几秒；base64 只膨胀 33%。两侧都有现成实现。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinaryFile {
+    pub path_display: Option<String>,
+    pub base64: String,
+    pub bytes_len: u64,
+    pub sha256: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleFileEntry {
@@ -87,6 +101,124 @@ fn sha256_hex(bytes: &[u8]) -> String {
     for byte in digest {
         // 小写 hex，固定两位
         let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{byte:02x}"));
+    }
+    out
+}
+
+/// 标准 base64 解码（RFC 4648）。**严格**：非字母表字符、长度非 4 倍数、
+/// 填充位出现在中间，一律报错。
+///
+/// 为什么严格：这是**写盘**路径。宽松解码（跳过非法字符）会把一段被截断的
+/// base64 静默解成"短一点的 PNG"，然后落盘、回读自证还通过（因为回读的是
+/// 我们刚写的错字节）—— 用户得到一张打不开的图，且所有校验都是绿的。
+/// 宁可在这里报错。
+fn base64_decode(input: &str) -> ShellResult<Vec<u8>> {
+    fn value_of(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bad = |message: &str| ShellError::Io {
+        path: "<base64>".to_string(),
+        message: message.to_string(),
+    };
+
+    // 允许空白（有些工具折行写入），其余一律不许
+    let filtered: Vec<u8> = input
+        .bytes()
+        .filter(|byte| !matches!(byte, b'\r' | b'\n' | b' ' | b'\t'))
+        .collect();
+
+    if filtered.len() % 4 != 0 {
+        return Err(bad("base64 长度不是 4 的倍数（数据可能被截断）"));
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(filtered.len() / 4 * 3);
+    let chunks = filtered.len() / 4;
+    for index in 0..chunks {
+        let block = &filtered[index * 4..index * 4 + 4];
+        let is_last = index + 1 == chunks;
+
+        // 统计本块尾部的填充（只允许在**最后一块**出现）
+        let padding = block.iter().filter(|byte| **byte == b'=').count();
+        if padding > 0 && !is_last {
+            return Err(bad("base64 填充符 '=' 出现在中间块"));
+        }
+        if padding > 2 {
+            return Err(bad("base64 一个块里最多两个填充符"));
+        }
+        if padding > 0 && !block[4 - padding..].iter().all(|byte| *byte == b'=') {
+            return Err(bad("base64 填充符位置不合法"));
+        }
+        if padding > 0 && block[..4 - padding].iter().any(|byte| *byte == b'=') {
+            return Err(bad("base64 填充符位置不合法"));
+        }
+
+        let mut packed: u32 = 0;
+        for slot in 0..4 {
+            let raw = block[slot];
+            let six = if raw == b'=' {
+                0
+            } else {
+                value_of(raw).ok_or_else(|| bad("base64 含非法字符"))? as u32
+            };
+            packed = (packed << 6) | six;
+        }
+
+        out.push(((packed >> 16) & 0xff) as u8);
+        if padding < 2 {
+            out.push(((packed >> 8) & 0xff) as u8);
+        }
+        if padding < 1 {
+            out.push((packed & 0xff) as u8);
+        }
+    }
+
+    Ok(out)
+}
+
+/// 标准 base64 编码（RFC 4648，带 `=` 补位、不折行）。
+///
+/// 手写而不是引 `base64` crate：这里**只需要编码**（解码在渲染层用 `atob`），
+/// 20 行无分支的实现，换来 Cargo 依赖表不动 —— MSI 离线构建时少一个要拉取的包，
+/// 也少一个版本漂移点。正确性由 `test/contract-binary.test.mjs` 用 Node 的
+/// `Buffer.toString('base64')` 逐例对拍（含 0/1/2 字节的补位边界）。
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    // 每 3 字节 → 4 字符，向上取整后预留容量（避免反复 realloc 大图）
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut iter = input.chunks_exact(3);
+    for chunk in &mut iter {
+        let packed = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+        out.push(ALPHABET[((packed >> 18) & 0b11_1111) as usize] as char);
+        out.push(ALPHABET[((packed >> 12) & 0b11_1111) as usize] as char);
+        out.push(ALPHABET[((packed >> 6) & 0b11_1111) as usize] as char);
+        out.push(ALPHABET[(packed & 0b11_1111) as usize] as char);
+    }
+
+    match iter.remainder() {
+        [one] => {
+            let packed = u32::from(*one) << 16;
+            out.push(ALPHABET[((packed >> 18) & 0b11_1111) as usize] as char);
+            out.push(ALPHABET[((packed >> 12) & 0b11_1111) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        [one, two] => {
+            let packed = (u32::from(*one) << 16) | (u32::from(*two) << 8);
+            out.push(ALPHABET[((packed >> 18) & 0b11_1111) as usize] as char);
+            out.push(ALPHABET[((packed >> 12) & 0b11_1111) as usize] as char);
+            out.push(ALPHABET[((packed >> 6) & 0b11_1111) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
     }
     out
 }
@@ -168,6 +300,105 @@ pub fn read_text_exact(path: String, max_bytes: Option<u64>) -> ShellResult<Text
     })
 }
 
+/// 读内置默认卡面（v0.1.4 / T12.5）。
+///
+/// 为什么要有这条命令，而不是让渲染层自己拼资源路径：
+///   · 资源目录在不同安装形态下不一样（MSI / 绿色包 / `tauri dev`），
+///     这个差异只该由 Rust 侧的一份解析逻辑承担（`paths::default_face_path`）；
+///   · 契约规则是"渲染层只拿语义化能力"：前端说"给我默认卡面"，
+///     而不是"去读 $RESOURCE/card-face-default.png"。
+///     后者一旦路径算错，表现是"默认卡面显示不出来"，而没人会去查资源目录。
+///
+/// 返回完整 PNG 字节（base64），与 `read_binary_file` 同形。
+#[tauri::command]
+pub fn read_default_face(app: AppHandle) -> ShellResult<BinaryFile> {
+    read_binary_impl(&paths::default_face_path(&app)?)
+}
+
+/// 在系统文件管理器里打开一个**目录**（v0.1.4 / T12.5）。
+///
+/// 为什么不直接给渲染层 opener 插件权限（`opener:allow-open-path`）：
+/// 那等于开放"用默认程序打开任意路径"—— 包括 `.exe` 和 `file://` URL。
+/// 这里收窄成"只能开目录"，并且走自定义命令：
+///   · 渲染层没有 IPC 级的 opener 权限（capabilities 至今未授予）；
+///   · Rust 侧先校验"是绝对路径 + 确实是目录"，再调插件**的 Rust API**
+///     （ACL 只拦 IPC 调用，Rust 内部调用不经过它）。
+///
+/// 需求 F5 要的"打开图库目录"因此是"打开一个文件夹"，
+/// 不是"执行一个路径"。
+#[tauri::command]
+pub fn open_folder(app: AppHandle, path: String) -> ShellResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let target = paths::absolute_path(&path)?;
+    if !target.is_dir() {
+        return Err(ShellError::Io {
+            path: target.display().to_string(),
+            message: "不是目录".to_string(),
+        });
+    }
+    app.opener()
+        .open_path(target.display().to_string(), None::<&str>)
+        .map_err(|error| ShellError::Io {
+            path: target.display().to_string(),
+            message: format!("打开目录失败：{error}"),
+        })
+}
+
+/// 读二进制文件的唯一实现（任意路径 / 内置资源共用）
+fn read_binary_impl(target: &Path) -> ShellResult<BinaryFile> {
+    let limit = paths::MAX_TEXT_BYTES;
+    paths::ensure_readable_file(target, limit)?;
+
+    let bytes = fs::read(target).map_err(|error| ShellError::io(target, error))?;
+    if bytes.len() as u64 > limit {
+        return Err(ShellError::TooLarge {
+            size: bytes.len() as u64,
+            limit,
+        });
+    }
+
+    Ok(BinaryFile {
+        path_display: paths::display_path(target),
+        base64: base64_encode(&bytes),
+        bytes_len: bytes.len() as u64,
+        sha256: sha256_hex(&bytes),
+    })
+}
+
+/// 读二进制文件（v0.1.4 / T12.3）：base64 + 字节数 + sha256。
+///
+/// 与 `read_text_exact` **同形**：同一条 `absolute_path` 校验、同一个默认上限
+/// （64 MiB）、同一套错误枚举。差别只有两点：
+///   · 返回 base64 而不是解码后的文本；
+///   · **没有 `NOT_UTF8`** —— 二进制没有"非法字符"这回事，PNG 里出现任何字节
+///     都合法。多加一个错误码会让调用方以为要处理它。
+///
+/// 这里刻意**不做内容嗅探**（不检查像不像 PNG）：契约层的职责是"原样搬运字节"，
+/// 判断"这是不是一张 PNG 卡"属于 `shared/png-card`。混在一起会让
+/// "读一张 5 MB 的 jpg 当卡面"这种合法用法被拒。
+#[tauri::command]
+pub fn read_binary_file(path: String, max_bytes: Option<u64>) -> ShellResult<BinaryFile> {
+    let target = paths::absolute_path(&path)?;
+    let limit = max_bytes.unwrap_or(paths::MAX_TEXT_BYTES);
+    paths::ensure_readable_file(&target, limit)?;
+
+    let bytes = fs::read(&target).map_err(|error| ShellError::io(&target, error))?;
+    if bytes.len() as u64 > limit {
+        return Err(ShellError::TooLarge {
+            size: bytes.len() as u64,
+            limit,
+        });
+    }
+
+    Ok(BinaryFile {
+        path_display: paths::display_path(&target),
+        base64: base64_encode(&bytes),
+        bytes_len: bytes.len() as u64,
+        sha256: sha256_hex(&bytes),
+    })
+}
+
 /// 原子写 + 摘要断言 + 回读校验。
 ///
 /// `expected_sha256` 与传入文本的实际摘要不符时，一个字节都不写。
@@ -177,8 +408,35 @@ pub fn write_file_atomic(
     text: String,
     expected_sha256: Option<String>,
 ) -> ShellResult<WriteReceipt> {
-    let target = paths::absolute_path(&path)?;
-    let bytes = text.into_bytes();
+    write_atomic_impl(&path, text.into_bytes(), expected_sha256)
+}
+
+/// 原子写二进制（v0.1.4 / T12.5）：入参是 base64，落盘的是**解码后的原始字节**。
+///
+/// 与 `write_file_atomic` 共用同一个实现（`write_atomic_impl`），所以
+/// 原子性、写前摘要断言、写后回读自证这三条**不可能**在其中一条路径上退化。
+/// 复制一份实现是这里最该避免的事 —— 那份副本不会有人给它补测试。
+///
+/// 为什么入参是 base64 而不是 `Vec<u8>`：Tauri 会把 `Vec<u8>` 当作数字数组
+/// 过 JSON，一张 5 MB 的 PNG 就是 500 万个数字（约 20 MB 文本），
+/// 解析就要几秒；base64 只膨胀 33%。见 `read_binary_file` 的同一条理由。
+#[tauri::command]
+pub fn write_binary_file_atomic(
+    path: String,
+    base64: String,
+    expected_sha256: Option<String>,
+) -> ShellResult<WriteReceipt> {
+    let bytes = base64_decode(&base64)?;
+    write_atomic_impl(&path, bytes, expected_sha256)
+}
+
+/// 原子写的唯一实现（文本与二进制共用）
+fn write_atomic_impl(
+    path: &str,
+    bytes: Vec<u8>,
+    expected_sha256: Option<String>,
+) -> ShellResult<WriteReceipt> {
+    let target = paths::absolute_path(path)?;
     let sha256 = sha256_hex(&bytes);
 
     if let Some(expected) = expected_sha256.as_deref() {
@@ -519,9 +777,44 @@ pub fn probe_cards_dir(path: String, create: Option<bool>) -> ShellResult<DirPro
 /// 因此它返回的是名字而不是路径，也不下潜子目录 —— 能力范围与用途对齐，
 /// 免得变成一个"任意目录列举器"。
 #[tauri::command]
-pub fn scan_cards_dir(path: String, limit: Option<usize>) -> ShellResult<CardsDirScan> {
+pub fn scan_cards_dir(
+    path: String,
+    limit: Option<usize>,
+    extensions: Option<Vec<String>>,
+) -> ShellResult<CardsDirScan> {
     let target = paths::absolute_path(&path)?;
     let cap = limit.unwrap_or(5000);
+
+    /*
+     * 扩展名白名单（v0.1.4 / T12.5）。
+     *
+     * 卡片目录用 `.json`；卡面图库用 `.png/.jpg/.jpeg/.webp`。**同一段扫描逻辑**
+     * 而不是复制一份 `scan_face_dir`：那份副本迟早会在"不递归""遇到非 UTF-8
+     * 文件名怎么办""截断标记"这些细节上与这里分叉，而分叉后没有任何测试会红。
+     *
+     * 规范化：统一小写、补前导点、去重。空数组按"什么都不匹配"处理 ——
+     * 传空数组的人多半是算错了，回一个空列表比回全部文件安全。
+     */
+    let allowed: Vec<String> = match extensions {
+        None => vec![".json".to_string()],
+        Some(list) => {
+            let mut normalized: Vec<String> = list
+                .into_iter()
+                .map(|item| {
+                    let lowered = item.trim().to_ascii_lowercase();
+                    if lowered.starts_with('.') {
+                        lowered
+                    } else {
+                        format!(".{lowered}")
+                    }
+                })
+                .filter(|item| item.len() > 1)
+                .collect();
+            normalized.sort();
+            normalized.dedup();
+            normalized
+        }
+    };
 
     if !target.is_dir() {
         // 目录还不存在不算错误：调用方紧接着会去创建它
@@ -552,7 +845,8 @@ pub fn scan_cards_dir(path: String, limit: Option<usize>) -> ShellResult<CardsDi
         let Some(name) = name.to_str() else {
             continue; // 非 UTF-8 文件名不参与重名判断（无法与用户输入比较）
         };
-        if !name.to_ascii_lowercase().ends_with(".json") {
+        let lowered = name.to_ascii_lowercase();
+        if !allowed.iter().any(|suffix| lowered.ends_with(suffix.as_str())) {
             continue;
         }
         if names.len() >= cap {
@@ -752,7 +1046,7 @@ mod tests {
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("sub").join("deep.json"), b"{}").unwrap();
 
-        let scan = scan_cards_dir(dir.display().to_string(), None).expect("扫描应成功");
+        let scan = scan_cards_dir(dir.display().to_string(), None, None).expect("扫描应成功");
 
         assert_eq!(scan.names, vec!["A.json", "b.json"], "只列 .json、排序、不递归");
         assert!(!scan.truncated);
@@ -764,7 +1058,7 @@ mod tests {
     fn scan_missing_dir_is_empty_not_error() {
         let dir = temp_dir("scan-missing");
 
-        let scan = scan_cards_dir(dir.display().to_string(), None).expect("目录不存在不该报错");
+        let scan = scan_cards_dir(dir.display().to_string(), None, None).expect("目录不存在不该报错");
 
         assert!(scan.names.is_empty());
         assert!(!scan.truncated);
@@ -804,10 +1098,138 @@ mod tests {
             fs::write(dir.join(format!("{index}.json")), b"{}").unwrap();
         }
 
-        let scan = scan_cards_dir(dir.display().to_string(), Some(3)).expect("扫描应成功");
+        let scan = scan_cards_dir(dir.display().to_string(), Some(3), None).expect("扫描应成功");
 
         assert_eq!(scan.names.len(), 3);
         assert!(scan.truncated, "超过上限要明确标记截断");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── base64 编码器（v0.1.4 / T12.3）───────────────────────
+    //
+    // 用手写实现换掉一个 Cargo 依赖，代价是必须自己证明它是对的。
+    // 这里直接用 RFC 4648 §10 的**官方测试向量**：它们恰好覆盖了
+    // 三种补位情况（0 / 1 / 2 个剩余字节），是最容易写错的地方。
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        // (明文, 期望 base64) —— RFC 4648 §10 "Test Vectors"
+        let cases: [(&[u8], &str); 7] = [
+            (b"", ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                base64_encode(input),
+                expected,
+                "base64 编码与 RFC 4648 向量不符（输入 {:?}）",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    #[test]
+    fn base64_never_wraps_lines() {
+        // 长输入必须单行：折行的 base64 前端 atob 也能吃，但会让
+        // "长度 = ⌈n/3⌉*4" 这条断言与 sha 对拍失效，多一个变量。
+        let input = vec![0xab_u8; 4096];
+        let encoded = base64_encode(&input);
+        assert!(!encoded.contains('\n'), "base64 不许折行");
+        // 4096 = 3*1365 + 1 → 尾部剩 1 字节：0xAB → 取 6 位得 42('q')，
+        // 余下 2 位补零得 48('w')，再补 "=="，即 "qw=="
+        assert_eq!(encoded.len(), 4096_usize.div_ceil(3) * 4);
+        assert!(encoded.ends_with("qw=="), "尾部补位不对：…{}", &encoded[encoded.len() - 4..]);
+    }
+
+    #[test]
+    fn base64_handles_all_byte_values() {
+        // 全 256 个字节值走一遍：确保高位没有被符号扩展弄错
+        // （Rust 的 u8→u32 是无符号提升，但手写位运算时很容易写成 i8）
+        let input: Vec<u8> = (0..=255_u8).collect();
+        let encoded = base64_encode(&input);
+        // 256 = 3*85 + 1 → 最后 1 字节剩，补两个 =
+        assert!(encoded.ends_with("=="), "256 字节应当补两个等号");
+        assert_eq!(encoded.len(), 256_usize.div_ceil(3) * 4);
+    }
+
+    #[test]
+    fn base64_roundtrip_is_lossless() {
+        // 编解码必须互为逆运算：写 PNG 走的是 decode，读回来走 encode，
+        // 只测其中一个方向等于只测了一半
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            b"f".to_vec(),
+            b"fo".to_vec(),
+            b"foobar".to_vec(),
+            (0..=255_u8).collect(),
+            (0..5000_u32).map(|index| (index % 251) as u8).collect(),
+        ];
+        for input in cases {
+            let encoded = base64_encode(&input);
+            let decoded = base64_decode(&encoded).expect("合法 base64 应当解码成功");
+            assert_eq!(decoded, input, "编解码往返丢字节（长度 {}）", input.len());
+        }
+    }
+
+    #[test]
+    fn base64_decode_rejects_malformed() {
+        // 写盘路径必须严格：宽松解码会把截断的数据写成"短一点的 PNG"，
+        // 而回读自证仍然通过（回读的是刚写的错字节）
+        for bad in ["Zm9vY", "Zm9v Ym9vY", "Zm=v", "Z!9v", "====", "Zm9vYg==="] {
+            assert!(
+                base64_decode(bad).is_err(),
+                "非法 base64 应当被拒绝：{bad}"
+            );
+        }
+        // 折行与空白是允许的（有些工具这么写）
+        assert_eq!(base64_decode("Zm9v\nYmFy").unwrap(), b"foobar");
+    }
+
+    #[test]
+    fn scan_cards_dir_defaults_to_json_only() {
+        // 默认行为不能变：既有调用（查重名、列卡片）都依赖"只回 .json"
+        let dir = temp_dir("scan-ext-default");
+        fs::create_dir_all(&dir).unwrap();
+        for name in ["a.json", "b.png", "c.txt", "d.JSON"] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        let scan = scan_cards_dir(dir.display().to_string(), None, None).expect("扫描应成功");
+        let mut names = scan.names.clone();
+        names.sort();
+        assert_eq!(names, vec!["a.json", "d.JSON"], "默认只认 .json（大小写不敏感）");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_cards_dir_accepts_image_extensions() {
+        // 卡面图库复用同一段扫描：扩展名可传，且大小写不敏感
+        let dir = temp_dir("scan-ext-images");
+        fs::create_dir_all(&dir).unwrap();
+        for name in ["a.png", "b.PNG", "c.jpg", "d.webp", "e.json", "f.txt"] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        let scan = scan_cards_dir(
+            dir.display().to_string(),
+            None,
+            Some(vec!["PNG".to_string(), ".jpg".to_string(), "webp".to_string()]),
+        )
+        .expect("扫描应成功");
+        let mut names = scan.names.clone();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["a.png", "b.PNG", "c.jpg", "d.webp"],
+            "扩展名应当大小写不敏感、前导点可有可无"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

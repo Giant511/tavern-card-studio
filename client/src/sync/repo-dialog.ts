@@ -678,8 +678,25 @@ export class RepoDialog {
       }
     }
     const message = error instanceof RepoClientError ? error.displayMessage : String(error);
-    this.noteEl.textContent = `${prefix}：${message}`;
-    this.deps.notify(`${prefix}：${message}`, 'bad');
+
+    /*
+     * 按错误类别分层（v0.1.4 / G1）。
+     *
+     * 事故背景：改名走 PATCH，而服务端的 CORS 预检漏了 PATCH，于是浏览器在
+     * **发出请求之前**就拒绝，`fetch` 抛 `TypeError` —— 客户端只能把它归成
+     * `NETWORK`，显示「无法连接服务端」，而同刻顶栏明明是"已连接"。
+     * 根因已在服务端修掉（允许方法改为从路由表派生），但**文案分层是另一半**：
+     * 权限问题必须说"权限不足"，不能说"连不上"，否则用户会去查网络和防火墙。
+     *
+     * 403 加前缀而不是替换：服务端原话里带着"该怎么办"，那部分信息不能丢。
+     * 401 不加前缀 —— 认证失败必须保持服务端原话（防用户名枚举，docs/29）。
+     */
+    const shown =
+      error instanceof RepoClientError && error.code === 'FORBIDDEN'
+        ? `权限不足 —— ${message}`
+        : message;
+    this.noteEl.textContent = `${prefix}：${shown}`;
+    this.deps.notify(`${prefix}：${shown}`, 'bad');
   }
 
   /** 供端到端断言：当前签发区里的原文（不应在关闭后还能读到） */

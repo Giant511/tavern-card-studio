@@ -13,10 +13,13 @@ import {
   configPatch,
   defaultCardsDir,
   isShellAvailable,
+  openFolder,
   pickDirectory,
   probeCardsDir,
 } from '../contract';
 import { decideCardsDir, resolveCardsDir } from '../session/cards-path';
+import { effectiveCardsDir } from '../session/cards-dir';
+import { faceLibraryDir } from '../export/face-library';
 import { isSyncReady, normalizeServerUrl, probeServer, type ProbeResult } from '../net/server-probe';
 import { connectLocalService, describeLocalSuccess, LOCAL_API_ORIGIN } from '../net/local-connect';
 import type { AuthPhase } from '../auth/session';
@@ -96,6 +99,9 @@ export class SettingsDialog {
   private readonly cardsDirInput: HTMLInputElement;
   private readonly cardsDirStatus: HTMLParagraphElement;
   private readonly chooseDirButton: HTMLButtonElement;
+  /** 卡面图库路径（只读展示）与"打开目录"按钮（v0.1.4 / T12.5） */
+  private readonly faceDirValue: HTMLInputElement;
+  private readonly openFaceDirButton: HTMLButtonElement;
   /** 壳给出的默认目录；浏览器模式下为空串（拿不到） */
   private defaultDir = '';
   private lastResult: ProbeResult | null = null;
@@ -307,6 +313,8 @@ export class SettingsDialog {
     this.cardsDirInput.addEventListener('input', () => {
       // 手改之后不再显示上一次探测的结论 —— 那是对旧路径说的
       this.setDirStatus('', 'info');
+      // 图库路径是派生的（<cardsDir>/card-faces），跟着一起变
+      void this.refreshFaceDir();
     });
     this.chooseDirButton = el('button', 'btn', '选择…');
     this.chooseDirButton.type = 'button';
@@ -324,6 +332,38 @@ export class SettingsDialog {
     this.cardsDirStatus.hidden = true;
 
     dirSection.append(dirField, this.cardsDirStatus);
+
+    /*
+     * 卡面图库（v0.1.4 / T12.5，需求 F5）。
+     *
+     * 只显示路径 + 一个"打开目录"按钮，**不做管理 UI**（需求明确写在范围控制里）：
+     * 删图/改名用户自己进目录操作，多一套增删界面就是多一套出错的地方。
+     * 路径是派生的（`<cardsDir>/card-faces`），不给用户改 —— 改它等于让
+     * "图库"这个概念有两个定义。
+     */
+    const faceField = el('label', 'field');
+    faceField.append(el('span', 'field-label', '卡面图库（导出 PNG 卡时可选）'));
+    const faceRow = el('div', 'field-row');
+    this.faceDirValue = el('input', 'input mono');
+    this.faceDirValue.type = 'text';
+    this.faceDirValue.readOnly = true;
+    this.faceDirValue.dataset['role'] = 'face-dir-value';
+    this.openFaceDirButton = el('button', 'btn', '打开图库目录');
+    this.openFaceDirButton.type = 'button';
+    this.openFaceDirButton.dataset['role'] = 'open-face-dir';
+    this.openFaceDirButton.addEventListener('click', () => void this.openFaceDir());
+    faceRow.append(this.faceDirValue, this.openFaceDirButton);
+    faceField.append(faceRow);
+    faceField.append(
+      el(
+        'span',
+        'field-hint',
+        '把 png / jpg / webp 放进这个目录，导出 PNG 卡时就能在缩略图里选。' +
+          '目录跟着上面的卡片存放位置走，首次使用会自动创建。',
+      ),
+    );
+    dirSection.append(faceField);
+    void this.refreshFaceDir();
 
     // ── 诊断（T10.26）────────────────────────────────────
     //
@@ -733,6 +773,53 @@ export class SettingsDialog {
     this.diagnosticsStatus.textContent = text;
     this.diagnosticsStatus.className = `probe-status ${kind}`;
     this.diagnosticsStatus.hidden = text === '';
+  }
+
+  /**
+   * 刷新图库路径的显示（v0.1.4 / T12.5）。
+   *
+   * 路径是**派生**的（`<cardsDir>/card-faces`），所以跟着上面那一行输入框变；
+   * 用户手改目录时这里要立刻跟上，否则会显示一个即将失效的路径。
+   */
+  private async refreshFaceDir(): Promise<void> {
+    const typed = this.cardsDirInput.value.trim();
+    if (typed !== '') {
+      this.faceDirValue.value = faceLibraryDir(typed);
+      this.openFaceDirButton.disabled = false;
+      return;
+    }
+    try {
+      const fallback = await effectiveCardsDir();
+      this.faceDirValue.value = fallback === '' ? '（尚未确定卡片目录）' : faceLibraryDir(fallback);
+      this.openFaceDirButton.disabled = fallback === '';
+    } catch {
+      this.faceDirValue.value = '（尚未确定卡片目录）';
+      this.openFaceDirButton.disabled = true;
+    }
+  }
+
+  /**
+   * 打开图库目录（需求 F5）。
+   *
+   * 先 `probeCardsDir(create: true)` 再打开：需求要求"首次使用时自动创建"，
+   * 而"打开一个不存在的目录"在资源管理器里会退到父目录，用户会以为图库坏了。
+   */
+  private async openFaceDir(): Promise<void> {
+    const target = this.faceDirValue.value.trim();
+    if (target === '' || target.startsWith('（')) {
+      this.setDirStatus('还没有可用的卡片目录：先在上面设置一个', 'warn');
+      return;
+    }
+    try {
+      const probe = await probeCardsDir(target, { create: true });
+      if (!probe.writable) {
+        this.setDirStatus(`图库目录不可用：${probe.reason ?? '不可写'}`, 'bad');
+        return;
+      }
+      await openFolder(probe.pathDisplay ?? target);
+    } catch (error) {
+      this.setDirStatus(`打开图库目录失败：${errorText(error)}`, 'bad');
+    }
   }
 
   private async chooseCardsDir(): Promise<void> {

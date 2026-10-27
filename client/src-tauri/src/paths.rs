@@ -54,6 +54,45 @@ pub fn rules_root(app: &AppHandle) -> Result<PathBuf, ShellError> {
     Err(ShellError::RulesDirMissing)
 }
 
+/// 解析内置默认卡面（v0.1.4 / T12.5）。
+///
+/// 与 `rules_root` 同一条思路的三级回退，但**多一层"只读约定"**：
+/// 这个文件由安装包提供，用户不该改它；所以这里只返回路径，
+/// 由 `read_default_face` 读成字节交给渲染层 —— 渲染层永远拿不到这个路径，
+/// 也就没有"照着这个路径去写"的机会。
+///
+/// 顺序：
+///   1. 环境变量 `TCS_DEFAULT_FACE`（测试/运维覆盖用）
+///   2. 安装包资源目录 `resource_dir()/card-face-default.png`
+///   3. 仓库内 `src-tauri/resources/card-face-default.png`（仅开发期）
+pub fn default_face_path(app: &AppHandle) -> Result<PathBuf, ShellError> {
+    if let Ok(raw) = std::env::var("TCS_DEFAULT_FACE") {
+        let candidate = PathBuf::from(raw);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let candidate = resource_dir.join("card-face-default.png");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    // 开发期：`tauri dev` 不拷 resources，回退到仓库里的源文件
+    let dev = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("card-face-default.png");
+    if dev.is_file() {
+        return Ok(dev);
+    }
+
+    Err(ShellError::PathNotFound {
+        path: "card-face-default.png（安装包资源缺失）".to_string(),
+    })
+}
+
 /// 校验并返回绝对路径。不做 canonicalize（保存目标可能还不存在）。
 pub fn absolute_path(raw: &str) -> Result<PathBuf, ShellError> {
     if raw.trim().is_empty() {

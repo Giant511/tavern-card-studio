@@ -14,17 +14,22 @@
 import {
   BLOCK_DEFINITION_MAP,
   BLOCK_IDS,
+  PNG_KEYWORD_FOR_SPEC,
   assembleDescription,
+  buildPngCard,
+  parsePngCard,
   presetAssembleOptions,
   serializeStCard,
+  summarizePng,
   type AuditReport,
   type BlockId,
   type GreetingFormatParams,
+  type PngCardSpec,
   type TxtPreset,
   type UnifiedCard,
 } from '@tcs/shared';
 
-export type ExportFormat = 'json' | 'txt';
+export type ExportFormat = 'json' | 'txt' | 'png';
 
 export interface ExportBlocked {
   blocked: true;
@@ -71,8 +76,8 @@ export function evaluateExportGate(report: AuditReport | null): ExportGate {
   };
 }
 
-export interface ExportArtifact {
-  format: ExportFormat;
+export interface ExportArtifactText {
+  format: 'json' | 'txt';
   /** 建议文件名（含扩展名） */
   fileName: string;
   /** 将要写入的完整文本 */
@@ -86,6 +91,25 @@ export interface ExportArtifact {
 }
 
 /**
+ * PNG 产物（v0.1.4 / T12.5）。
+ *
+ * 刻意做成**判别联合**而不是给文本产物加一个可选 `binary?`：
+ * 后者会让"text 是空串"和"这是二进制产物"两种状态同时存在，
+ * 调用方迟早会有人读 `artifact.text` 拿到空串并把它写进文件。
+ */
+export interface ExportArtifactPng {
+  format: 'png';
+  fileName: string;
+  /** 完整 PNG 字节（图像 + 新建的卡数据块） */
+  png: Uint8Array;
+  bytes: number;
+  sha256: string | null;
+  notes: string[];
+}
+
+export type ExportArtifact = ExportArtifactText | ExportArtifactPng;
+
+/**
  * JSON 导出：SillyTavern 原生结构。
  *
  * 用 2 空格缩进 + 结尾换行，与服务端/既有导出链路一致 ——
@@ -95,7 +119,7 @@ export function buildJsonExport(
   card: UnifiedCard,
   preset: TxtPreset | null,
   greetingFormat?: GreetingFormatParams,
-): ExportArtifact {
+): ExportArtifactText {
   const options = preset ? presetAssembleOptions(preset) : {};
   // v0.1.3 追加项一：初始场景预设决定"多条开场白用哪个分隔行"。
   // 只影响 dirty 板块的回写切分（未编辑的板块用原字段值，不重算）。
@@ -137,7 +161,7 @@ export function buildJsonExport(
  *   · 性格、每个字段板块各算一个单元；
  *   · 世界书仍不写入（它是结构化字段，见 docs/04）。
  */
-export function buildTxtExport(card: UnifiedCard, preset: TxtPreset): ExportArtifact {
+export function buildTxtExport(card: UnifiedCard, preset: TxtPreset): ExportArtifactText {
   const options = presetAssembleOptions(preset);
   const description = assembleDescription(card.blocks, card.description, options);
   const personalityBlock = card.blocks.find((block) => block.id === 'personality');
@@ -203,12 +227,76 @@ export function buildExport(
   preset: TxtPreset | null,
   format: ExportFormat,
   greetingFormat?: GreetingFormatParams,
-): ExportArtifact {
+): ExportArtifactText {
   if (format === 'json') return buildJsonExport(card, preset, greetingFormat);
+  if (format === 'png') {
+    throw new Error('PNG 产物需要卡面字节：请走 buildPngExport');
+  }
   if (!preset) {
     throw new Error('TXT 导出需要预设：无法确定标题与分隔符');
   }
   return buildTxtExport(card, preset);
+}
+
+/**
+ * PNG 卡导出（v0.1.4 / T12.5，决策 #162/#164）。
+ *
+ * 三步，顺序不能换：
+ *   1. 用**与 JSON 导出完全相同**的序列化（`serializeStCard`）得到卡 JSON ——
+ *      否则同一次导出，"导出 JSON"和"导出 PNG"里的卡内容会不一样；
+ *   2. 记下这份 JSON 文本（不是对象），交给 `buildPngCard` 逐字节写入；
+ *   3. `buildPngCard` 负责剥掉图里**既有的** ccv3/chara 块再插新块（D3）。
+ *
+ * 第 3 步是"换成默认卡面导出"时最关键的一环：那张默认卡面本身是干净的，
+ * 但用户可能拿**另一张 PNG 卡**当封面 —— 此时图里带着那张卡的正文，
+ * 不剥掉就等于把别人的卡内容塞进了这张卡的 PNG 里。
+ *
+ * spec 与 keyword 的对应（D2）：V3 → `ccv3`，V2/V1 → `chara`。
+ * V1 卡没有 spec 字段，但 ST 读取时认的仍是 `chara`，所以按 V2 写。
+ */
+export function buildPngExport(
+  card: UnifiedCard,
+  preset: TxtPreset | null,
+  faceBytes: Uint8Array,
+  greetingFormat?: GreetingFormatParams,
+): ExportArtifactPng {
+  const options = preset ? presetAssembleOptions(preset) : {};
+  const payload = serializeStCard(card, greetingFormat ? { ...options, greetingFormat } : options);
+  const jsonText = `${JSON.stringify(payload, null, 2)}\n`;
+
+  const spec: PngCardSpec = card.meta.spec === 'v3' ? 'v3' : 'v2';
+  const keyword = PNG_KEYWORD_FOR_SPEC[spec];
+  const png = buildPngCard(faceBytes, jsonText, spec);
+
+  // 自证：写进去的必须能被我们自己读回来（结构对了才有意义）
+  const reread = parsePngCard(png);
+  if (reread.kind !== 'card') {
+    throw new Error('PNG 产物自检失败：写进去的数据块读不回来');
+  }
+  if (reread.keyword !== keyword) {
+    throw new Error(`PNG 产物自检失败：keyword 应为 ${keyword}，实际 ${reread.keyword}`);
+  }
+  if (reread.jsonText !== jsonText) {
+    throw new Error('PNG 产物自检失败：读回的卡 JSON 与写入的不一致');
+  }
+
+  const summary = summarizePng(png);
+  const faceSize =
+    summary === null ? '' : `封面 ${String(summary.width)}×${String(summary.height)}`;
+
+  return {
+    format: 'png',
+    fileName: `${safeName(card)}.png`,
+    png,
+    bytes: png.length,
+    sha256: null,
+    notes: [
+      `${spec === 'v3' ? 'V3' : 'V2'} 卡写入 ${keyword} 数据块`,
+      `${faceSize}（图像字节未重新编码）`,
+      '旧 ccv3/chara 数据块已剥离，导出不会累积重复块',
+      '缩进 2 空格 + 结尾换行，与 JSON 导出同一份序列化',
+    ],
+  };
 }
 
 /** 文件名剥离非法字符（Windows/macOS 取交集，保守处理） */
@@ -244,10 +332,16 @@ async function sha256Hex(text: string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-export interface ExportArtifactReady extends ExportArtifact {
-  /** 真实内容哈希（非空） */
-  sha256: string;
+/** 二进制摘要。PNG 产物的 sha256 必须按**落盘字节**算，不能按文本 */
+async function sha256Bytes(bytes: Uint8Array): Promise<string> {
+  const view = new Uint8Array(bytes); // 复制一份独立的 ArrayBuffer 视图，喂给 subtle
+  const digest = await crypto.subtle.digest('SHA-256', view);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
+
+export type ExportArtifactReady =
+  | (ExportArtifactText & { sha256: string })
+  | (ExportArtifactPng & { sha256: string });
 
 /**
  * 导出入口（唯一）：文本 + 真实 sha256。
@@ -261,8 +355,15 @@ export async function buildExportAsync(
   preset: TxtPreset | null,
   format: ExportFormat,
   greetingFormat?: GreetingFormatParams,
+  faceBytes?: Uint8Array,
 ): Promise<ExportArtifactReady> {
+  if (format === 'png') {
+    if (faceBytes === undefined) {
+      throw new Error('PNG 导出缺少卡面：请先在"卡面"步骤里选一张图');
+    }
+    const artifact = buildPngExport(card, preset, faceBytes, greetingFormat);
+    return { ...artifact, sha256: await sha256Bytes(artifact.png) };
+  }
   const artifact = buildExport(card, preset, format, greetingFormat);
-  const sha256 = await sha256Hex(artifact.text);
-  return { ...artifact, sha256 };
+  return { ...artifact, sha256: await sha256Hex(artifact.text) };
 }

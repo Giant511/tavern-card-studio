@@ -29,7 +29,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::shell_info,
             commands::read_text_exact,
+            commands::read_binary_file,
+            commands::read_default_face,
+            commands::open_folder,
             commands::write_file_atomic,
+            commands::write_binary_file_atomic,
             commands::scan_rule_dir,
             commands::read_rule_text,
             commands::default_cards_dir,

@@ -105,6 +105,14 @@ export const VERIFY_INVENTORY = [
     evidence:
       '2026-10-25 跑通 46 项（off 起步 / off→selfsigned 热更并真连 https / 重新生成进 certs-backup / custom 不匹配 400 / custom 匹配热更 / 端口占用 409 回滚且原监听仍可连 / worker 停止时保存不谎报已热更）',
   },
+  {
+    file: 'scripts/verify-g1-rename.mjs',
+    status: 'live-server',
+    run: 'npm run build:server && node scripts/verify-g1-rename.mjs',
+    why: '要真起 worker 才能看到 CORS 预检（Allow-Methods 是按路由表派生的，纯函数测不到）与真实的 403/网络错误分层：三态文案必须在真响应码上验，mock 出来的 403 无法证明服务端真的拒了',
+    evidence:
+      '2026-10-26 跑通 28 项（8 个方法×路径组合的预检均允许 / 改名路径预检含 PATCH / 中英文改名各一次且列表读回新名 / 只读仓库令牌改名为 403 FORBIDDEN 且文案不含「无法连接」/ 端口无人监听时才是 NETWORK「无法连接服务端」/ 三态文案两两不等）',
+  },
   // ── browser-dump：断言读快照，抓取需要 headless Chrome ──
   {
     file: 'scripts/verify-v13-extras.mjs',
@@ -143,6 +151,20 @@ export const VERIFY_INVENTORY = [
   { file: 'scripts/capture-f3-account-purge.sh', status: 'browser-dump', run: 'bash scripts/capture-f3-account-purge.sh', why: '交付截图生成器（assets/f3-*.png）；要真服务端（serve，含面板）+ 真注销一次 + headless Chrome', evidence: '2026-10-25 生成 2 张截图（客户端确认弹窗含输入框、治理页注销审计），逐张人工核验' },
   { file: 'scripts/capture-e2e-dumps.sh', status: 'browser-dump', run: 'bash scripts/capture-e2e-dumps.sh', why: '抓取器本身不是断言脚本，是 verify-e2e 的输入生成器', evidence: '2026-10-25 生成 14 份快照 + 14 张截图' },
   { file: 'scripts/capture-t10x.sh', status: 'browser-dump', run: 'bash scripts/capture-t10x.sh', why: '同上：verify-t10x 的输入生成器', evidence: '2026-10-25 生成 3 份保全样本快照' },
+  {
+    file: 'scripts/capture-v14-faces.sh',
+    status: 'browser-dump',
+    run: 'npm run build:ui && bash scripts/capture-v14-faces.sh',
+    why:
+      '交付截图生成器（assets/face-0{1,2,3}-*.png 卡面选择三态）；只要静态 dist + headless Chrome。' +
+      '**注意它证明的是布局，不是读盘**：浏览器里没有壳，图库与原图必然是空的，' +
+      '脚本用 ?faceDemo= 注入候选并在 UI 上打「演示」角标；真实读盘由 test/contract-binary、' +
+      'test/png-roundtrip 与 cargo test 证明',
+    evidence:
+      '2026-10-26 生成 3 张（默认 690558 / 图库 722627 / 原图 718066 字节，三张字节互不相同），' +
+      '逐张核验；期间抓到两个真缺陷：角标与占位符重复渲染成「默认卡面默认」、' +
+      'refresh 拿初始 choice 当记忆值导致「原图态预选成默认卡面」',
+  },
 
   // ── live-browser：需要 CDP 调试端口 + 运行中的应用 ──────
   {
