@@ -23,6 +23,7 @@ import {
 
 import { serializeCard, setBlockText } from '../editor/block-doc.ts';
 import { generateCardId, readCardIdFromCard, validateCardId } from './card-id.ts';
+import type { PngSource } from './png-source.ts';
 
 /** 未命名卡在标签栏与标题上的占位文本 */
 export const UNNAMED_CARD_LABEL = '未命名';
@@ -128,6 +129,17 @@ export class CardSession {
    * 拿 A 卡的原文去写回 B 卡，是那种"导出后才发现内容不对"的错误。
    */
   #worldbookSource: WorldbookImportResult | null = null;
+  /**
+   * PNG 卡的原图来源（v0.1.4 / T12.4，决策 #165/#168）。
+   *
+   * 与 `#worldbookSource` 同一条理由：那张图是"这张卡的来源"，
+   * 挂在 App 上会在切标签时串卡 —— 用户导出 B 卡却拿到 A 卡的封面，
+   * 而且看起来完全正常。
+   *
+   * 存**完整 PNG 字节**（不是 ImageData）：导出时直接
+   * `buildPngCard(原图, 新 JSON)`，像素逐字节不变（D1）。
+   */
+  #pngSource: PngSource | null = null;
   readonly #cardId: string;
 
   constructor(options: CardSessionOptions) {
@@ -167,6 +179,20 @@ export class CardSession {
 
   setWorldbookSource(source: WorldbookImportResult | null): void {
     this.#worldbookSource = source;
+  }
+
+  /**
+   * 这张卡的原图（PNG 导入才有；导出 PNG 时作为"原图"候选，D4）。
+   *
+   * 换卡内容（`replaceCard`）**不清空它** —— 内容与封面是两件事，
+   * 用户改完正文仍然该用自己的封面导出。只有明确换了图才覆盖。
+   */
+  get pngSource(): PngSource | null {
+    return this.#pngSource;
+  }
+
+  setPngSource(source: PngSource | null): void {
+    this.#pngSource = source;
   }
 
   get dirty(): boolean {

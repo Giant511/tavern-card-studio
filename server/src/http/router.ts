@@ -106,4 +106,15 @@ export class Router {
     }
     return [...methods];
   }
+
+  /**
+   * 全部已注册的方法（CORS 预检的兜底集合）。
+   *
+   * 存在的理由见 `app.ts` 的 OPTIONS 分支：允许方法**必须从路由表派生**。
+   * 手写字符串那一版漏了 PATCH，于是壳里（`tauri://localhost` → 跨域）
+   * 改名必然失败，而浏览器同源测试全绿 —— 见决策 #159。
+   */
+  allMethods(): string[] {
+    return [...new Set(this.routes.map((route) => route.method))];
+  }
 }

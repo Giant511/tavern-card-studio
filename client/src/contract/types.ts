@@ -36,6 +36,28 @@ export interface WriteReceipt {
   verified: boolean;
 }
 
+/**
+ * 二进制读取结果（v0.1.4 / T12.3）。
+ *
+ * 为什么走 base64 而不是字节数组：Tauri 的命令参数/返回值要过 JSON，
+ * 一个 5 MB 的 PNG 变成 `number[]` 就是 5M 个 JSON 数字（约 20 MB 文本，
+ * 序列化要几秒）；base64 只膨胀 33%，且两端都有现成实现。
+ *
+ * 渲染层拿到后 `atob` → `Uint8Array` 再交给 `shared/png-card`。
+ * `sha256` 与 `bytesLen` 是**回读自证**的判据：解码回来长度/摘要对不上，
+ * 说明传输链路有问题，此时不该继续写盘。
+ */
+export interface BinaryFile {
+  /** 供 UI 展示的路径；非 UTF-8 时为 null（与 TextFile 同口径） */
+  pathDisplay: string | null;
+  /** 原始字节的 base64（标准字母表，**不带**换行） */
+  base64: string;
+  /** 原始字节数（不是 base64 字符串长度） */
+  bytesLen: number;
+  /** 原始字节的 sha256（小写 hex） */
+  sha256: string;
+}
+
 /** 规则目录中的单个文件 */
 export interface RuleFileEntry {
   /** 文件名（UTF-8）。非 UTF-8 文件名不会出现在这里，而是进 skipped */
@@ -168,6 +190,16 @@ export interface ClientConfig {
    * 重启即失效。这一点见 docs/11 §8。
    */
   cardsDir: string | null;
+  /**
+   * 上次导出 PNG 时用的卡面（v0.1.4 / T12.5，需求 F4.4「记忆」）。
+   *
+   * 编码成一个字符串而不是对象，避免在两侧维护 shape 与迁移旧配置：
+   *   `null` 未设置 / `'default'` 内置默认 / `'source'` 当前卡原图 /
+   *   `'lib:<文件名>'` 图库里某一张。
+   * 前缀 `lib:` 是必需的 —— 图库文件名可能恰好叫 `default`。
+   * **"浏览选择"的路径不写入这里**（那是一次性动作）。
+   */
+  lastFaceChoice: string | null;
 }
 
 export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
@@ -186,4 +218,5 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
   presetId: null,
   highlightSchemeId: null,
   cardsDir: null,
+  lastFaceChoice: null,
 };

@@ -48,6 +48,7 @@ import {
   isShellAvailable,
   pickCardFile,
   pickSavePath,
+  readBinaryFile,
   readTextExact,
   shellInfo,
   writeFileAtomic,
@@ -128,6 +129,7 @@ import {
 // 版本号从 package.json 内联（Vite 构建期处理），不硬编码 —— 见 appVersion()
 import clientPackage from '../../package.json';
 import { CardSession } from '../session/card-session';
+import { decodeBinaryFile, inspectPng, toPngSource } from '../session/png-source';
 import { effectiveCardsDir, suggestCardFileName } from '../session/cards-dir';
 import { TabBar, type TabItem } from '../session/tab-bar';
 import { generateCardId, readCardIdFromCard, withCardId } from '../session/card-id';
@@ -198,6 +200,26 @@ class EditorApp {
   // 多标签下"当前是哪张卡"由 activeId 决定，app.ts 再留一份必然串卡。
   /** 设置里保存的 token（同步请求要用；probeServer 的 url 不含 token） */
   private settingsToken = '';
+  /**
+   * 上次导出 PNG 用的卡面（v0.1.4 / T12.5）。
+   *
+   * 在 App 上缓存一份而不是每次 `configGet`：导出面板换格式时会连续读两次，
+   * 每次都打一次 IPC 会让"选 PNG → 换 TXT → 再选 PNG"出现明显的卡顿。
+   * 真值仍是配置（启动时加载，见 `loadConfig`）。
+   */
+  private lastFaceChoice: string | null = null;
+  /**
+   * 截图用的演示卡面（v0.1.4 / T12.5）。
+   *
+   * 只有 `?faceDemo=` 调试参数会赋值，正常流程恒为 `null`。
+   * 存在的理由：浏览器里（无壳）读不了本地文件，图库与"原图"必然为空，
+   * 那样截图只能证明空态，证明不了网格与预览。UI 上给这些候选打「演示」角标，
+   * 所以不会与真实数据混淆。真正的读盘能力由 live 脚本与契约测试证明。
+   */
+  private demoFaces: Array<{ name: string; bytes: Uint8Array }> | null = null;
+  private demoSourceBytes: Uint8Array | null = null;
+  /** 截图用：浏览器里读不到内置默认卡面（无壳），拿它当替身 */
+  private demoDefaultBytes: Uint8Array | null = null;
   /**
    * 账户登录态（T10.7）。
    *
@@ -380,6 +402,44 @@ class EditorApp {
     if (previewMode !== null) await this.runPreviewScenario(previewMode);
 
     /*
+     * 截图/验收入口（v0.1.4 / T12.5）：`?exportFace=1&faceDemo=library|source`
+     *
+     * **位置就是判据**（这是第四次踩同一个坑）：依赖两样东西 ——
+     *   ① `exportDialog` 已构造（在 `wireExportAndSync()` 里，而它排在
+     *      `wireSettings()` **之后**）；
+     *   ② 会话已挂载（`mountActiveSession()` 在上面）。
+     *
+     * 第一版写在 `wireSettings()` 里，那时 `exportDialog` 还是 null，
+     * `this.exportDialog?.open()` 的可选链**静默跳过** —— 症状是截出来一张
+     * 普通编辑器页面，看起来像"入口没实现"，而不是"位置错了"。
+     * 判断方法：把入口往上挪一行，行为不变就说明它没依赖那个对象。
+     */
+    const exportFaceParams = new URLSearchParams(location.search);
+    if (exportFaceParams.get('exportFace') === '1') {
+      const demoKind = exportFaceParams.get('faceDemo') ?? '';
+      /*
+       * **无条件**准备默认卡面的替身：浏览器里 `readDefaultFace()` 走 IPC，
+       * 没有壳必然失败。只给"带 faceDemo 的场景"准备的话，`?exportFace=1`
+       * 这一张（恰恰是最该证明"默认卡面能显示"的那张）会满屏"预览失败"。
+       */
+      const demoBytes = await this.loadDemoFaceBytes();
+      if (demoBytes !== null) {
+        this.demoDefaultBytes = demoBytes;
+        if (demoKind === 'library') {
+          this.demoFaces = [
+            { name: '示例封面-a.png', bytes: demoBytes },
+            { name: '示例封面-b.png', bytes: demoBytes },
+            { name: '示例封面-c.png', bytes: demoBytes },
+          ];
+        } else if (demoKind === 'source') {
+          this.demoSourceBytes = demoBytes;
+        }
+      }
+      this.exportDialog?.open('png');
+      this.exportDialog?.refreshFaceChoices();
+    }
+
+    /*
      * 登录 / 仓库令牌入口的截图调试入口（v0.1.3 / F5 后半）。
      *
      *   ?login=1                    打开登录框（三个入口并列的状态）
@@ -552,6 +612,34 @@ class EditorApp {
         return this.report;
       },
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
+      /*
+       * PNG 导出的卡面上下文（v0.1.4 / T12.5）。
+       *
+       * 全部走闭包现读：卡面依赖"当前会话的原图"与"当前配置的卡片目录"，
+       * 两者都会在对话框存在期间变化（切标签、改设置）。
+       */
+      face: {
+        getCardsDir: () => effectiveCardsDir(),
+        getSourceBytes: () => this.demoSourceBytes ?? this.session?.pngSource?.bytes ?? null,
+        getRemembered: () => this.lastFaceChoice,
+        setRemembered: (value) => {
+          /*
+           * 记忆只影响"下次预选"，写失败不该打断导出 —— 所以不 await、不抛。
+           * 但要更新本地字段：否则同一个面板里换两次格式，第二次会读到旧值。
+           */
+          this.lastFaceChoice = value;
+          void configPatch({ lastFaceChoice: value }).catch(() => {
+            /* 配置写不进去只影响下次预选，不影响这次导出 */
+          });
+        },
+        /*
+         * 演示候选走 **getter**：它们要到 `start()` 尾部才准备好，
+         * 而这个回调对象在面板构造时就固定了。传值会永远拿到 null
+         * —— 症状就是"图库那张截图和默认那张字节完全相同"。
+         */
+        getDemoFaces: () => this.demoFaces,
+        getDemoDefaultBytes: () => this.demoDefaultBytes,
+      },
       onExported: () => {
         // 导出成功后不自动上传（避免误操作）；用户可在同步面板手动上传
       },
@@ -564,7 +652,11 @@ class EditorApp {
       getPayload: () => {
         const preset = this.rules?.preset ?? null;
         return buildExportAsync(this.card, preset, 'json', this.greetingFormat().format).then(
-          (artifact) => artifact.text,
+          (artifact) => {
+            // 'json' 一定是文本产物；判别联合在这里收窄，避免 `artifact.text` 在 PNG 上读到 undefined
+            if (artifact.format === 'png') throw new Error('内部错误：JSON 上传拿到了 PNG 产物');
+            return artifact.text;
+          },
         );
       },
       // 上传目标 = 活动会话（F11）：cardId 创建时定死，baseSeq 是上次对齐的版本
@@ -843,7 +935,25 @@ class EditorApp {
    */
   private repoClientConfig(): { serverUrl: string; accessToken: string } | null {
     const connection = this.connection;
-    const token = this.authSession?.accessToken ?? '';
+    const session = this.authSession;
+
+    /*
+     * 仓库令牌模式下**一律返回 null**（v0.1.4 / G1）。
+     *
+     * `AuthSession.accessToken` 那个 getter 在令牌模式下返回令牌**原文** ——
+     * 那是让既有同步链路零改动的关键设计。但仓库管理（`/api/repos` 系列）
+     * 只认账户令牌，把它交给这里等于拿 `tcr_` 去调，服务端必回 403。
+     *
+     * 原来只在两处 `getRepos` 各自挡了一下，**仓库对话框本身没挡**：
+     * 于是令牌模式下打开「仓库与令牌」，看到的是"加载仓库列表失败：仓库令牌
+     * 不能管理仓库…"这种把用户引向错误方向的提示。
+     *
+     * 挡在这里是唯一能覆盖全部调用点的位置（本函数只有三个调用点，
+     * 都在"管理仓库"这条链上，上传走的是 server-sync 的另一套配置）。
+     */
+    if (session?.isRepoTokenMode === true) return null;
+
+    const token = session?.accessToken ?? '';
     const serverUrl = connection?.url ?? this.authServerUrl;
     if (token === '' || serverUrl === '' || serverUrl === undefined) return null;
     return { serverUrl, accessToken: token };
@@ -1757,6 +1867,8 @@ class EditorApp {
     try {
       const config = await configGet();
       this.settingsToken = config.token;
+      // 上次导出用的卡面（v0.1.4 / T12.5）：一次性读进来，导出面板换格式时不再打 IPC
+      this.lastFaceChoice = config.lastFaceChoice ?? null;
       // 认证请求用的地址与探测用的地址同源：都没配置时一并留空，
       // 这样"点登录"会明确提示去设置里填地址，而不是打向一个默认端口
       this.authServerUrl = config.serverUrl;
@@ -2731,12 +2843,41 @@ class EditorApp {
     return readCardIdFromCard(this.card) ?? generateCardId(this.card.meta.name);
   }
 
+  /**
+   * 截图用的演示卡面字节：取内置默认卡面（它就在仓库里，浏览器里走 fetch）。
+   *
+   * 不用 `readDefaultFace()`：那是 IPC，浏览器里没有壳。
+   * 取不到就返回 null —— 调用方按"没有演示数据"处理，不会因此崩。
+   */
+  private async loadDemoFaceBytes(): Promise<Uint8Array | null> {
+    try {
+      const response = await fetch('resources/card-face-default.png');
+      if (!response.ok) return null;
+      return new Uint8Array(await response.arrayBuffer());
+    } catch {
+      return null;
+    }
+  }
+
   private async openCard(): Promise<void> {
     try {
       const dir = await effectiveCardsDir();
       // T10.9：过滤器放开 .txt —— TXT 角色卡**没有 JSON 信封**，整篇按当前预设切板块
+      // v0.1.4 / T12.4：再放开 .png —— SillyTavern 的 PNG 卡
       const path = await pickCardFile(dir === '' ? undefined : dir, { allowText: true });
       if (!path) return;
+
+      /*
+       * PNG 必须在**读文本之前**分流。
+       *
+       * `readTextExact` 对 PNG 会报 `NOT_UTF8`（那是它的正确行为）——
+       * 若把它当"打开失败"报给用户，一张正常的 PNG 卡就变成了"文件有问题"。
+       */
+      if (/\.png$/i.test(path)) {
+        await this.openPngCard(path, dir);
+        return;
+      }
+
       const file = await readTextExact(path);
 
       // 按扩展名分流，而不是「先试 JSON、失败再退回 TXT」：后者会把一个语法错误的
@@ -2756,6 +2897,13 @@ class EditorApp {
 
       const parsed = parseStCard(file.text, { greetingFormat: this.greetingFormat().format });
       this.replaceCard(parsed.card);
+      /*
+       * 打开了 JSON 卡 ⇒ 这张卡的原图来源失效。
+       *
+       * 不清的话，用户在 A 卡（PNG 导入）的会话里又打开了一个 JSON 卡，
+       * 导出 PNG 时"原图"候选还是 A 那张 —— 等于把别人的封面安到这张卡上。
+       */
+      this.session.setPngSource(null);
       // 打开的文件不在 cardsDir 里时说一句：用户会以为"打开过的卡都在那个目录"
       const outside = dir !== '' && !path.toLowerCase().startsWith(dir.toLowerCase());
       const opened = `已打开：${file.pathDisplay ?? '(非 UTF-8 路径)'}（${file.bytesLen} 字节）`;
@@ -2770,6 +2918,70 @@ class EditorApp {
     } catch (error) {
       this.setStatus(`打开失败：${describe(error)}`, 'bad');
     }
+  }
+
+  /**
+   * 打开 PNG 卡（v0.1.4 / T12.4，决策 #165）。
+   *
+   * 三条分支，都**不是错误**：
+   *   1. 有 `ccv3` → 按 V3 读；
+   *   2. 只有 `chara` → 按 V2 读；
+   *   3. 两个都没有 → "这是一张图片，不是卡"。此时**不报错**，而是把它作为
+   *      这张卡的封面候选（F3 的原话），零标签则以文件名建一张空卡承载它 ——
+   *      否则"按图片导入为卡面"没有落点。
+   *
+   * 第 3 条很关键：ST 生态里"拿一张立绘当头像"是常见动作，
+   * 如果它被当成"导入失败"，用户会以为自己选错了文件。
+   */
+  private async openPngCard(path: string, cardsDir: string): Promise<void> {
+    const binary = await readBinaryFile(path);
+    const { bytes, digestVerified } = await decodeBinaryFile(binary);
+    const display = binary.pathDisplay ?? '(非 UTF-8 路径)';
+
+    if (!digestVerified) {
+      // 不阻断：可能是环境没有 subtle，也可能真的坏了。后面 CRC 会再判一次。
+      this.setStatus(`警告：${display} 的字节摘要与读取结果不一致，可能已损坏`, 'warn');
+    }
+
+    const inspected = inspectPng(bytes);
+
+    if (inspected.kind === 'bare') {
+      // 没有卡数据：当作封面图，不当作失败的导入
+      const created = this.hasSession
+        ? null
+        : this.createSessionFromFile(path.replace(/\.png$/i, '.json'));
+      this.session.setPngSource(toPngSource(bytes, binary.pathDisplay, 'chara'));
+      const size = `${String(inspected.note)}`;
+      this.setStatus(
+        created === null
+          ? `已把 ${display} 设为当前卡的封面（${size}）`
+          : `已新建「${created}」并把 ${display} 设为封面（${size}）`,
+        'info',
+      );
+      // 封面只能在导出时体现，界面需要重画一次候选列表
+      this.exportDialog?.refreshFaceChoices();
+      return;
+    }
+
+    const parsed = parseStCard(inspected.jsonText, { greetingFormat: this.greetingFormat().format });
+    const created = this.hasSession ? null : this.createSessionFromFile(path);
+    this.replaceCard(parsed.card);
+    /*
+     * 记住原图（D4）。注意存的是**完整字节**（含数据块）：导出时
+     * `buildPngCard` 会剥掉旧块再写新卡，所以"复用原图"不会把旧内容留在图里。
+     */
+    this.session.setPngSource(toPngSource(bytes, binary.pathDisplay, inspected.keyword));
+    this.exportDialog?.refreshFaceChoices();
+
+    const spec = inspected.keyword === 'ccv3' ? 'V3' : 'V2';
+    const outside = cardsDir !== '' && !path.toLowerCase().startsWith(cardsDir.toLowerCase());
+    const tail = outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${cardsDir}` : '';
+    this.setStatus(
+      created === null
+        ? `已打开 PNG 卡：${display}（${spec} 数据块 · ${String(binary.bytesLen)} 字节）${tail}`
+        : `已新建「${created}」并打开 PNG 卡：${display}（${spec} · ${String(binary.bytesLen)} 字节）${tail}`,
+      outside ? 'warn' : 'ok',
+    );
   }
 
   /**

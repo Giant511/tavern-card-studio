@@ -1,7 +1,7 @@
 {
   "name": "tavern-card-studio",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "酒馆（SillyTavern）角色卡审计与编辑工具链：服务端（版本控制/审计）+ 客户端（分块编辑器）",
   "license": "MIT",
   "type": "module",
@@ -64,7 +64,8 @@
     "report:release": "node scripts/report-release.mjs",
     "capture:t10x": "bash scripts/capture-t10x.sh",
     "verify:t10x": "node scripts/verify-t10x.mjs",
-    "verify:t1034": "node scripts/verify-t1034-custom.mjs"
+    "verify:t1034": "node scripts/verify-t1034-custom.mjs",
+    "verify:g1": "node scripts/verify-g1-rename.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

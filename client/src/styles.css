@@ -2836,3 +2836,138 @@ body {
   gap: 14px;
   align-items: center;
 }
+
+/* ─────────────────────────────────────────────────────────────
+   卡面选择（v0.1.4 / T12.5）
+   ─────────────────────────────────────────────────────────────
+   网格用 auto-fill + minmax：图库可能有 1 张也可能 30 张，
+   固定列数在两种极端下都难看（1 张时一张小图孤零零，30 张时要滚很长）。
+   缩略图固定 72×96（3:4，接近多数角色立绘），object-fit: cover 裁切而不是拉伸。 */
+
+.face-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 10px;
+  margin: 10px 0 4px;
+}
+
+.face-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.face-card:hover {
+  border-color: var(--accent);
+}
+
+.face-card.is-active {
+  border-color: var(--accent);
+  background: #f5f8ff;
+  box-shadow: 0 0 0 2px rgba(47, 111, 235, 0.12);
+}
+
+.face-thumb {
+  position: relative;
+  aspect-ratio: 3 / 4;
+  border-radius: 6px;
+  background: var(--app-bg);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.face-thumb-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.face-thumb-empty {
+  font-size: 16px;
+  color: var(--border-strong);
+}
+
+/* 「默认 / 原图 / 演示」角标压在缩略图左上角。
+   放在名字**下面**会让一行读成「默认卡面默认」—— 同义重复，
+   看起来像文案拼错了（第一版就是这样）。 */
+.face-badge {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(43, 43, 43, 0.72);
+  color: #fff;
+  font-size: 10px;
+  line-height: 1.5;
+  pointer-events: none;
+}
+
+.face-card {
+  position: relative;
+}
+
+.face-name {
+  font-size: 11px;
+  color: var(--app-fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.face-preview {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  background: #fcfcfd;
+}
+
+.face-preview-name {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.face-preview-img {
+  max-width: 180px;
+  max-height: 240px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  display: block;
+  margin-bottom: 6px;
+}
+
+.face-preview-error {
+  margin: 0;
+  font-size: 11px;
+  color: var(--danger);
+}
+
+.face-note {
+  margin: 6px 0 0;
+  color: var(--warn);
+}
+
+.face-library-path {
+  margin: 4px 0 0;
+  word-break: break-all;
+}
+
+.face-empty {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}

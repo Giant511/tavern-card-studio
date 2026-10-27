@@ -863,10 +863,30 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       pathname = url.pathname;
 
       if (method === 'OPTIONS') {
+        /*
+         * 允许方法**从路由表派生**，不手写字符串。
+         *
+         * v0.1.4 / G1 事故：这里原本写死 `'GET, POST, PUT, DELETE, OPTIONS'`，
+         * 独独漏了 PATCH。而 PATCH 正是「仓库改名」「令牌改权限」用的方法 ——
+         * 浏览器/WebView 对非简单方法**先发预检**，预检里没有 PATCH ⇒
+         * 实际请求根本发不出去，`fetch` 抛 `TypeError: Failed to fetch`，
+         * 被客户端的 catch 映射成「无法连接服务端」。
+         *
+         * 为什么浏览器测试抓不到：E2E 跑在同源页面里，不触发预检；只有壳
+         * （`tauri://localhost` → `http://127.0.0.1`）才必然跨域。又是
+         * 「只在壳里错」的一类。实测证据：同一页面里 GET/DELETE 都拿到
+         * HTTP 401（请求真的发出去了），只有 PATCH 是 TypeError。
+         *
+         * 改成派生之后，新增方法不会再漏 —— 手写清单迟早会和路由表分叉。
+         * 路径没有注册路由时（404）回退到全部方法：否则预检先挂，
+         * 用户看到的是"网络错误"而不是真实的 404。
+         */
+        const pathMethods = router.allowedMethods(pathname);
+        const allowed = [...(pathMethods.length > 0 ? pathMethods : router.allMethods()), 'OPTIONS'];
         res.writeHead(204, {
           ...COMMON_HEADERS,
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+          'Access-Control-Allow-Methods': [...new Set(allowed)].join(', '),
           'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-API-Token',
           'Access-Control-Expose-Headers': 'ETag, X-TCS-Sha256, X-TCS-Audit-Source, X-TCS-Audit-Sha256, X-TCS-Card-Id',
           'Access-Control-Max-Age': '600',

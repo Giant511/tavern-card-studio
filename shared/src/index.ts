@@ -22,6 +22,9 @@ export * from './format/worldbook-preset.js';
 export * from './format/worldbook-io.js';
 export * from './format/card-txt.js';
 
+// v0.1.4 / T12.2：PNG 卡的块级读写（纯 TS，零图像编解码）
+export * from './png-card.js';
+
 export * from './rules/platform-rule.js';
 export * from './rules/highlight-rule.js';
 export * from './rules/unknown-keys.js';

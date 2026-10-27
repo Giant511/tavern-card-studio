@@ -7,13 +7,21 @@
 
 import type { AuditReport, GreetingFormatParams, TxtPreset, UnifiedCard } from '@tcs/shared';
 
-import { askConfirm, isShellAvailable, pickSavePath, writeFileAtomic } from '../contract';
+import {
+  askConfirm,
+  isShellAvailable,
+  pickSavePath,
+  writeBinaryFileAtomic,
+  writeFileAtomic,
+} from '../contract';
 import {
   buildExportAsync,
   evaluateExportGate,
   type ExportArtifactReady,
   type ExportFormat,
 } from './export-card';
+import { FacePicker } from './face-picker';
+import { encodeFaceChoice, type FaceChoice } from './face-library';
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -38,6 +46,26 @@ export interface ExportDialogCallbacks {
   /** 重新审计（导出前强制刷新，避免用旧报告放行） */
   revalidate: () => AuditReport | null;
   notify: (message: string, kind?: 'ok' | 'warn' | 'bad' | 'info') => void;
+  /**
+   * PNG 导出用的卡面上下文（v0.1.4 / T12.5）。
+   *
+   * 全部用回调而不是直接读 App 的字段：导出对话框保持"只认回调"的形状，
+   * 这样它仍然可以在没有任何会话的情况下被构造（截图入口、浏览器预览）。
+   */
+  face?: {
+    /** 图库根目录（`<cardsDir>`）；空串 = 未配置 */
+    getCardsDir: () => Promise<string>;
+    /** 当前卡的原图（PNG 导入才有） */
+    getSourceBytes: () => Uint8Array | null;
+    /** 记住上次选择（F4.4） */
+    getRemembered: () => string | null;
+    /** 写入上次选择 */
+    setRemembered: (value: string) => void;
+    /** 截图用演示候选（仅 `?faceDemo=`；必须用 getter，见 face-picker 的说明） */
+    getDemoFaces?: () => ReadonlyArray<{ name: string; bytes: Uint8Array }> | null;
+    /** 截图用：浏览器里读不到内置默认卡面时的替身 */
+    getDemoDefaultBytes?: () => Uint8Array | null;
+  };
   /** 导出成功后回调（T6.7 可据此同步上传） */
   onExported?: (artifact: ExportArtifactReady, receipt: { pathDisplay: string | null; bytesWritten: number; sha256: string; verified: boolean }) => void;
 }
@@ -55,6 +83,7 @@ export class ExportDialog {
   private readonly receiptBox: HTMLElement;
   private readonly confirmButton: HTMLButtonElement;
   private readonly cancelButton: HTMLButtonElement;
+  private readonly facePicker: FacePicker | null = null;
   private pendingFormat: ExportFormat = 'json';
   private bypassGate = false;
 
@@ -81,6 +110,7 @@ export class ExportDialog {
     const formatRow = el('div', 'format-row');
     for (const [value, label, desc] of [
       ['json', 'SillyTavern JSON', '原生角色卡结构，可导入 ST / Chub 等平台；服务端存档用这个'],
+      ['png', 'PNG 角色卡', '图片 + 卡数据块，SillyTavern 可直接拖入；先选一张卡面'],
       ['txt', 'TXT 文本', '按当前预设拼装标题与分隔符，便于人工核对与粘贴'],
     ] as Array<[ExportFormat, string, string]>) {
       const button = el('button', 'format-option');
@@ -90,11 +120,42 @@ export class ExportDialog {
       button.addEventListener('click', () => {
         this.pendingFormat = value;
         this.syncFormatSelection();
+        this.syncFormatDependent();
         this.renderGatePreview();
       });
       formatRow.append(button);
     }
     section.append(formatRow);
+
+    /*
+     * 卡面选择（v0.1.4 / T12.5）：选「PNG 卡」时出现，换回 JSON/TXT 时收起。
+     *
+     * 放在格式选择**之后、闸门之前**：用户的动作顺序是"选格式 → 选卡面 → 看到
+     * 闸门提示 → 点导出"。把卡面放到闸门后面，会让有错误级问题的卡先弹一堆红字，
+     * 而用户此时还没走完"我要导出什么"的流程。
+     */
+    if (this.callbacks.face !== undefined) {
+      this.facePicker = new FacePicker({
+        getCardsDir: this.callbacks.face.getCardsDir,
+        getSourceBytes: this.callbacks.face.getSourceBytes,
+        /*
+         * 演示数据必须用 getter 传：它在 `start()` 尾部才准备好，
+         * 而这里在面板构造时执行。传值会永远拿到构造那一刻的 `null`。
+         */
+        ...(this.callbacks.face.getDemoFaces === undefined
+          ? {}
+          : { getDemoFaces: this.callbacks.face.getDemoFaces }),
+        ...(this.callbacks.face.getDemoDefaultBytes === undefined
+          ? {}
+          : { getDemoDefaultBytes: this.callbacks.face.getDemoDefaultBytes }),
+        onChoiceChange: (choice: FaceChoice) => {
+          const encoded = encodeFaceChoice(choice);
+          if (encoded !== null) this.callbacks.face?.setRemembered(encoded);
+        },
+        notify: (message, kind) => this.callbacks.notify(message, kind),
+      });
+      section.append(this.facePicker.root);
+    }
 
     // 闸门区（有 error 时出现在这里）
     this.gateBox = el('div', 'gate-box');
@@ -141,6 +202,7 @@ export class ExportDialog {
     this.receiptBox.hidden = true;
     this.receiptBox.replaceChildren();
     this.syncFormatSelection();
+    this.syncFormatDependent();
     this.renderGatePreview();
     this.overlay.hidden = false;
     // 焦点给「取消」：有错误时防止误按回车导出
@@ -151,12 +213,37 @@ export class ExportDialog {
     this.overlay.hidden = true;
   }
 
+  /**
+   * 供外部刷新卡面候选（v0.1.4 / T12.5）。
+   *
+   * 场景：导入了一张 PNG 卡 / 换了一张图之后，导出面板里的"原图"候选
+   * 必须跟着变。不刷新的话用户会看到上一张卡的封面 —— 而它"看起来正常"。
+   */
+  refreshFaceChoices(): void {
+    this.facePicker?.refresh();
+  }
+
+  /** 格式变化时同步"依赖格式的界面"：目前只有卡面区段 */
+  private syncFormatDependent(): void {
+    if (this.facePicker === null) return;
+    if (this.pendingFormat === 'png') {
+      const remembered = this.callbacks.face?.getRemembered() ?? null;
+      void this.facePicker.prepare(remembered);
+    } else {
+      this.facePicker.hide();
+    }
+  }
+
   private syncFormatSelection(): void {
     for (const button of this.overlay.querySelectorAll<HTMLButtonElement>('.format-option')) {
       button.classList.toggle('active', button.dataset['format'] === this.pendingFormat);
     }
     this.confirmButton.textContent =
-      this.pendingFormat === 'json' ? '导出 JSON…' : '导出 TXT…';
+      this.pendingFormat === 'json'
+        ? '导出 JSON…'
+        : this.pendingFormat === 'png'
+          ? '导出 PNG…'
+          : '导出 TXT…';
   }
 
   /** 打开时先按最新报告算一遍闸门，让用户在点导出之前就知道会被拦 */
@@ -228,7 +315,26 @@ export class ExportDialog {
     this.confirmButton.textContent = '导出中…';
 
     try {
-      const artifact = await buildExportAsync(state.card, state.preset, this.pendingFormat, state.greetingFormat);
+      /*
+       * PNG 的卡面字节必须**在构建产物之前**拿到：
+       * `buildPngExport` 要把卡 JSON 写进图里，没有图就没有产物。
+       * 这也是"非 PNG 卡面在此刻转码"的地方 —— 转码失败要说清是哪张图。
+       */
+      let faceBytes: Uint8Array | undefined;
+      if (this.pendingFormat === 'png') {
+        if (this.facePicker === null) {
+          throw new Error('PNG 导出需要卡面选择器（当前界面未初始化）');
+        }
+        faceBytes = await this.facePicker.resolveForExport();
+      }
+
+      const artifact = await buildExportAsync(
+        state.card,
+        state.preset,
+        this.pendingFormat,
+        state.greetingFormat,
+        faceBytes,
+      );
 
       if (!isShellAvailable()) {
         // 浏览器模式：给出可手动保存的提示（不假装成功）
@@ -243,8 +349,16 @@ export class ExportDialog {
         return;
       }
 
-      // 把内存里的 sha256 传给壳：壳写后回读重算，不一致就报错（写后自证）
-      const receipt = await writeFileAtomic(target, artifact.text, artifact.sha256);
+      /*
+       * 分两条写盘路径，但**共用同一个 Rust 实现**（`write_atomic_impl`），
+       * 所以原子性 / 写前摘要断言 / 写后回读自证在 PNG 上一样成立。
+       * 把 `artifact.sha256` 传下去：壳会先算一遍落盘字节的摘要，
+       * 不符就一个字节都不写 —— 这证明"落盘的图就是内存里那张图"。
+       */
+      const receipt =
+        artifact.format === 'png'
+          ? await writeBinaryFileAtomic(target, bytesToBase64(artifact.png), artifact.sha256)
+          : await writeFileAtomic(target, artifact.text, artifact.sha256);
 
       this.renderReceipt(receipt, artifact);
       this.callbacks.onExported?.(artifact, receipt);
@@ -309,6 +423,16 @@ const BLOCK_LABELS: Record<string, string> = {
   user: '用户相关设定',
   worldbook: '世界书',
 };
+
+/** 二进制 → base64（写盘契约的入参形态） */
+function bytesToBase64(bytes: Uint8Array): string {
+  const CHUNK = 0x8000;
+  let binary = '';
+  for (let index = 0; index < bytes.length; index += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + CHUNK));
+  }
+  return btoa(binary);
+}
 
 function blockLabel(id: string): string {
   return BLOCK_LABELS[id] ?? id;
