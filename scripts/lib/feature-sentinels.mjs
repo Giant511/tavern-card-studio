@@ -86,6 +86,28 @@ export const FEATURE_SENTINELS = [
       { text: '初始场景', where: '板块标题（initial-scene → first_mes / alternate_greetings）' },
     ],
   },
+  {
+    feature: 'T12.5',
+    title: 'PNG 卡：导出格式多一项「PNG 角色卡」，并带卡面选择步骤',
+    since: '0.1.4',
+    expect: [
+      { text: 'PNG 角色卡', where: '导出对话框 › 格式选择第三项（json / png / txt）' },
+      { text: '默认卡面', where: '卡面区段里"内置模板"那一项的名字' },
+      { text: '打开图库目录', where: '卡面区段与设置面板里的按钮' },
+    ],
+  },
+  {
+    feature: 'T12.4',
+    title: 'PNG 卡：导入时按扩展名分流（无数据块不当作失败）',
+    since: '0.1.4',
+    expect: [
+      {
+        text: '不含角色卡数据',
+        where: '打开一张没有 ccv3/chara 的 PNG 时状态栏给出的解释',
+      },
+      { text: '已打开 PNG 卡', where: '成功导入 PNG 卡后的状态栏文案' },
+    ],
+  },
 ];
 
 /** 递归列出目录下所有文件（相对路径，正斜杠） */

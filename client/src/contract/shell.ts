@@ -18,6 +18,7 @@ import { load, type Store } from '@tauri-apps/plugin-store';
 import { ShellError, toShellError } from './errors.js';
 import {
   DEFAULT_CLIENT_CONFIG,
+  type BinaryFile,
   type CardsDirScan,
   type ClientConfig,
   type DirProbe,
@@ -54,6 +55,53 @@ export function readTextExact(path: string, maxBytes?: number): Promise<TextFile
 }
 
 /**
+ * 读二进制文件（v0.1.4 / T12.3）：返回 base64 + 字节数 + sha256。
+ *
+ * 与 `readTextExact` **同形约束**（这是刻意对齐的，不是复制粘贴）：
+ *   · 只接受绝对路径（相对路径在 Rust 侧直接拒绝）；
+ *   · `maxBytes` 默认 64 MiB，超限报 `TOO_LARGE`；
+ *   · 错误码与文本读取完全一致（`PATH_NOT_FOUND` / `NOT_A_FILE` / `TOO_LARGE` /
+ *     `PATH_NOT_ALLOWED` / `IO`），调用方可以复用同一套错误处理；
+ *   · 不做任何解码/转码 —— 二进制没有"非法 UTF-8"这回事，所以**没有** `NOT_UTF8`。
+ *
+ * 唯一的区别是返回 `base64` 而不是 `text`。为什么不返回 `number[]`：
+ * 5 MB 的 PNG 会变成约 20 MB 的 JSON 文本，序列化本身就要几秒；
+ * base64 只膨胀 33%，两端都有现成实现。
+ *
+ * 为什么不用 plugin-fs 的 `readFile`：那条路走的是"字节数组过 IPC"，
+ * 且权限模型是路径白名单（本项目刻意不注册任意 fs 权限，见 capabilities）。
+ */
+export function readBinaryFile(path: string, maxBytes?: number): Promise<BinaryFile> {
+  return call<BinaryFile>('read_binary_file', { path, maxBytes: maxBytes ?? null });
+}
+
+/**
+ * 读**内置默认卡面**（v0.1.4 / T12.5）。
+ *
+ * 刻意不接收路径：资源目录在 MSI / 绿色包 / `tauri dev` 三种形态下都不一样，
+ * 这个差异只该由 Rust 侧一份解析逻辑承担（`paths::default_face_path`）。
+ * 渲染层说"给我默认卡面"，而不是"去读某个路径"—— 后者一旦算错，
+ * 表现是"默认卡面显示不出来"，而没人会想到去查资源目录。
+ *
+ * 返回结构与 `readBinaryFile` 完全相同，所以解码/校验逻辑可以复用。
+ */
+export function readDefaultFace(): Promise<BinaryFile> {
+  return call<BinaryFile>('read_default_face', {});
+}
+
+/**
+ * 在系统文件管理器里打开一个目录（v0.1.4 / T12.5）。
+ *
+ * **只接受目录**：这个能力刻意比 opener 插件窄得多 —— 插件能给"用默认程序
+ * 打开任意路径"（含 `.exe`、`file://` URL），而这里 Rust 侧先校验
+ * "绝对路径 + 确实是目录"。capabilities 至今没有授予 opener 的任何 IPC 权限，
+ * 所以这条自定义命令是打开文件夹的**唯一**通路。
+ */
+export function openFolder(path: string): Promise<void> {
+  return call<void>('open_folder', { path });
+}
+
+/**
  * 原子写：同目录临时文件 → fsync → rename 覆盖 → 回读校验 sha256。
  *
  * `expectedSha256` 是「我以为我要写什么」的断言：与传入文本的实际摘要不符时，
@@ -67,6 +115,28 @@ export function writeFileAtomic(
   return call<WriteReceipt>('write_file_atomic', {
     path,
     text,
+    expectedSha256: expectedSha256 ?? null,
+  });
+}
+
+/**
+ * 原子写二进制（v0.1.4 / T12.5）：入参 base64，落盘的是解码后的原始字节。
+ *
+ * 与 `writeFileAtomic` 共用 Rust 侧同一个实现（`write_atomic_impl`），
+ * 所以原子性、写前摘要断言、写后回读自证这三条**不会**在其中一条路径上退化。
+ *
+ * `expectedSha256` 的语义与文本版完全一致：不符则一个字节都不写。
+ * 对 PNG 而言这一步尤其值钱 —— 它证明"落盘的图就是内存里那张图"，
+ * 而不是某次重新编码的结果。
+ */
+export function writeBinaryFileAtomic(
+  path: string,
+  base64: string,
+  expectedSha256?: string,
+): Promise<WriteReceipt> {
+  return call<WriteReceipt>('write_binary_file_atomic', {
+    path,
+    base64,
     expectedSha256: expectedSha256 ?? null,
   });
 }
@@ -121,12 +191,28 @@ export function readRuleText(kind: RuleKind, name: string, maxBytes?: number): P
 // 详见 docs/11 §8。
 
 const CARD_FILTERS = [{ name: '角色卡 JSON', extensions: ['json'] }];
+/** 卡面图库 / 浏览选择用的图片过滤器（v0.1.4 / T12.5） */
+const IMAGE_FILTERS = [
+  { name: '图片（PNG / JPG / WebP）', extensions: ['png', 'jpg', 'jpeg', 'webp'] },
+  { name: 'PNG', extensions: ['png'] },
+];
+/**
+ * 打开角色卡时的过滤器（v0.1.4 / T12.4 加 `.png`）。
+ *
+ * 把 png 放在**第一个**"全部支持"项里：Windows 的对话框默认选中第一项，
+ * 用户打开 SillyTavern 的 PNG 卡是最常见的动作。单独一项用于"只看 PNG"。
+ *
+ * 放开的是**过滤器**而不是新增原生能力 —— 仍然 `open()`、`multiple:false`、
+ * `directory:false`，C6 的安全约束（只选单文件、不传递归）没有放宽。
+ */
 const CARD_OR_TEXT_FILTERS = [
-  { name: '角色卡 / 文本', extensions: ['json', 'txt'] },
+  { name: '角色卡 / 文本 / PNG', extensions: ['json', 'txt', 'png'] },
   { name: '角色卡 JSON', extensions: ['json'] },
   { name: '纯文本 TXT', extensions: ['txt'] },
+  { name: 'PNG 角色卡', extensions: ['png'] },
 ];
 const TEXT_FILTERS = [{ name: '文本文件', extensions: ['txt', 'md'] }];
+const PNG_FILTERS = { name: 'PNG 角色卡', extensions: ['png'] };
 
 /**
  * 选一张角色卡文件；取消返回 null。
@@ -142,12 +228,18 @@ const TEXT_FILTERS = [{ name: '文本文件', extensions: ['txt', 'md'] }];
  */
 export async function pickCardFile(
   defaultDir?: string | null,
-  options: { allowText?: boolean } = {},
+  options: { allowText?: boolean; allowImages?: boolean } = {},
 ): Promise<string | null> {
+  const filters =
+    options.allowImages === true
+      ? IMAGE_FILTERS
+      : options.allowText === true
+        ? CARD_OR_TEXT_FILTERS
+        : CARD_FILTERS;
   const selected = await open({
     multiple: false,
     directory: false,
-    filters: options.allowText === true ? CARD_OR_TEXT_FILTERS : CARD_FILTERS,
+    filters,
     ...(defaultDir ? { defaultPath: defaultDir } : {}),
   });
   return typeof selected === 'string' ? selected : null;
@@ -162,12 +254,12 @@ export async function pickCardFile(
  */
 export async function pickSavePath(
   suggestedName: string,
-  format: 'json' | 'txt',
+  format: 'json' | 'txt' | 'png',
   defaultDir?: string | null,
 ): Promise<string | null> {
   const selected = await save({
     defaultPath: defaultDir ? joinPath(defaultDir, suggestedName) : suggestedName,
-    filters: format === 'json' ? CARD_FILTERS : TEXT_FILTERS,
+    filters: format === 'json' ? CARD_FILTERS : format === 'png' ? [PNG_FILTERS] : TEXT_FILTERS,
   });
   return selected ?? null;
 }
@@ -289,12 +381,25 @@ export function probeCardsDir(path: string, options: { create?: boolean } = {}):
 }
 
 /**
- * 列出目录下的 `.json` 文件名（不递归、不读内容）。
+ * 列出目录下的文件名（不递归、不读内容）。
  *
- * 用途只有一个：保存前看看有没有同名文件，好自动追加序号而不是静默覆盖。
+ * 两个用途，共用同一段扫描逻辑：
+ *   · 保存前看看有没有同名 `.json`，好自动追加序号而不是静默覆盖；
+ *   · 卡面图库（v0.1.4 / T12.5）列出 `png/jpg/jpeg/webp`。
+ *
+ * `extensions` 缺省为 `['json']`，**默认行为与之前逐字相同** ——
+ * 既有调用方（查重名）不需要改。传扩展名时大小写不敏感、前导点可有可无。
  */
-export function scanCardsDir(path: string, limit?: number): Promise<CardsDirScan> {
-  return call<CardsDirScan>('scan_cards_dir', { path, limit: limit ?? null });
+export function scanCardsDir(
+  path: string,
+  limit?: number,
+  extensions?: string[],
+): Promise<CardsDirScan> {
+  return call<CardsDirScan>('scan_cards_dir', {
+    path,
+    limit: limit ?? null,
+    extensions: extensions ?? null,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
