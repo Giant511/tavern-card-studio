@@ -15,15 +15,18 @@
 
 import {
   createEmptyCard,
+  DEFAULT_WORLDBOOK_FORMAT,
   type AuditReport,
   type BlockId,
   type UnifiedCard,
+  type WorldbookFormatParams,
   type WorldbookImportResult,
 } from '@tcs/shared';
 
-import { serializeCard, setBlockText } from '../editor/block-doc.ts';
+import { reparseWorldbook as reparseWorldbookCard, serializeCard, setBlockText } from '../editor/block-doc.ts';
 import { generateCardId, readCardIdFromCard, validateCardId } from './card-id.ts';
 import type { PngSource } from './png-source.ts';
+import type { SaveFormat } from './save-format.ts';
 
 /** 未命名卡在标签栏与标题上的占位文本 */
 export const UNNAMED_CARD_LABEL = '未命名';
@@ -65,6 +68,13 @@ export interface CardSessionOptions {
    * 届时这个字段应当删除，不要留两份真相。
    */
   syncCardId?: string | null;
+  /**
+   * 世界书格式（v0.1.5 / G4）。不传则用冻结默认格式 `@@ENTRY`。
+   *
+   * 传它才能让"编辑器里改世界书"走用户选中的预设 —— 不传就会把
+   * `【条目1：…】` 这类自定义格式全部解析失败（线上缺陷）。
+   */
+  worldbookFormat?: WorldbookFormatParams;
 }
 
 /**
@@ -140,6 +150,24 @@ export class CardSession {
    * `buildPngCard(原图, 新 JSON)`，像素逐字节不变（D1）。
    */
   #pngSource: PngSource | null = null;
+  /**
+   * 这张卡磁盘文件的格式（v0.1.5 / G6）。
+   *
+   * 另存为支持三种格式后，"当前文件是什么"就不再恒为 JSON 了。
+   * 不记它的话，另存为 PNG 之后按 Ctrl+S 会往 `.png` 路径写一段 JSON ——
+   * 扩展名与内容不符，平台读不出来，而且看起来像"文件坏了"。
+   *
+   * 默认 `json`：老会话（以及所有从没另存过非 JSON 的卡）保持原行为。
+   */
+  #saveFormat: SaveFormat = 'json';
+  /**
+   * 当前世界书格式（v0.1.5 / G4）。
+   *
+   * 编辑世界书文本时要按**用户选中的预设**解析 —— 与审计、导入、导出同一份口径。
+   * 不放进 `CardSessionOptions`：它是"运行期设置"而不是"卡的身份"，
+   * 切换预设时由 `setWorldbookFormat()` 更新，不需要重建会话（重建会丢编辑位置）。
+   */
+  #worldbookFormat: WorldbookFormatParams;
   readonly #cardId: string;
 
   constructor(options: CardSessionOptions) {
@@ -154,6 +182,37 @@ export class CardSession {
     this.#presetId = options.presetId ?? null;
     this.#cardId = resolveCardId(options);
     this.#syncCardId = options.syncCardId ?? null;
+    // 缺省用冻结格式；App 构造会话后会立刻用当前预设覆盖一次
+    this.#worldbookFormat = options.worldbookFormat ?? DEFAULT_WORLDBOOK_FORMAT;
+  }
+
+  /**
+   * 更新当前世界书格式（切换预设时调）。
+   *
+   * **不重建会话**：重建会丢掉编辑位置与未保存状态，而切换预设只该影响
+   * "下次解析用什么格式"。调用方随后应重解析一次现有文本
+   * （见 `EditorApp.selectWorldbookPreset`）。
+   */
+  setWorldbookFormat(format: WorldbookFormatParams): void {
+    this.#worldbookFormat = format;
+  }
+
+  /**
+   * 按当前格式重解析世界书文本，返回解析问题（v0.1.5 / G4）。
+   *
+   * 切换预设后必须调：文本没变但解析器变了，不重解析会出现
+   * "审计按新预设说没问题、entries 还是旧值"的错位。
+   */
+  reparseWorldbook(): Array<{ severity: 'error' | 'warning'; message: string; line?: number }> {
+    const result = reparseWorldbookCard(this.#card, this.#worldbookFormat);
+    if (!result.changed) return [];
+    this.#card = result.card;
+    this.#onContentChanged();
+    return result.worldbookIssues;
+  }
+
+  get worldbookFormat(): WorldbookFormatParams {
+    return this.#worldbookFormat;
   }
 
   // ── 读：基本身份 ────────────────────────────────────────
@@ -197,6 +256,15 @@ export class CardSession {
 
   get dirty(): boolean {
     return this.#dirty;
+  }
+
+  /** 磁盘文件的格式（另存为时决定，Ctrl+S 沿用它） */
+  get saveFormat(): SaveFormat {
+    return this.#saveFormat;
+  }
+
+  setSaveFormat(format: SaveFormat): void {
+    this.#saveFormat = format;
   }
 
   /** 标签栏 / 标题栏显示名：meta.name 为空则「未命名」 */
@@ -267,7 +335,7 @@ export class CardSession {
     changed: boolean;
     worldbookIssues: Array<{ severity: 'error' | 'warning'; message: string; line?: number }>;
   } {
-    const result = setBlockText(this.#card, blockId, text);
+    const result = setBlockText(this.#card, blockId, text, this.#worldbookFormat);
     if (!result.changed) {
       return { changed: false, worldbookIssues: [] };
     }

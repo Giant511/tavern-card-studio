@@ -106,14 +106,21 @@ export const VERIFY_INVENTORY = [
       '2026-10-25 跑通 46 项（off 起步 / off→selfsigned 热更并真连 https / 重新生成进 certs-backup / custom 不匹配 400 / custom 匹配热更 / 端口占用 409 回滚且原监听仍可连 / worker 停止时保存不谎报已热更）',
   },
   {
-    file: 'scripts/verify-g1-rename.mjs',
-    status: 'live-server',
+    file: 'scripts/verify-g1-rename.mjs',    status: 'live-server',
     run: 'npm run build:server && node scripts/verify-g1-rename.mjs',
     why: '要真起 worker 才能看到 CORS 预检（Allow-Methods 是按路由表派生的，纯函数测不到）与真实的 403/网络错误分层：三态文案必须在真响应码上验，mock 出来的 403 无法证明服务端真的拒了',
     evidence:
       '2026-10-26 跑通 28 项（8 个方法×路径组合的预检均允许 / 改名路径预检含 PATCH / 中英文改名各一次且列表读回新名 / 只读仓库令牌改名为 403 FORBIDDEN 且文案不含「无法连接」/ 端口无人监听时才是 NETWORK「无法连接服务端」/ 三态文案两两不等）',
   },
   // ── browser-dump：断言读快照，抓取需要 headless Chrome ──
+  {
+    file: 'scripts/verify-f15-probe.mjs',
+    status: 'browser-dump',
+    run: 'node scripts/verify-f15-probe.mjs',
+    why: '要真实浏览器的跨源行为：四种 fetch 写法对"不发 CORS 头"的目标各是什么结果，Node 里没有 CORS 强制，模拟不出来。自己起目标服务与页面（页面源用 tauri.localhost，靠 --host-resolver-rules 解析）',
+    evidence:
+      '2026-10-26 跑通 4 项（no-cors 与 no-cors+no-store 均拿到 opaque 响应 / 默认 cors 与默认写法均 TypeError: Failed to fetch）—— 结论：CORS 头缺失不构成 no-cors 失败，线上"ST 在跑却判未运行"不是 CORS 造成的，见决策 #207/#208',
+  },
   {
     file: 'scripts/verify-v13-extras.mjs',
     status: 'browser-dump',
@@ -152,8 +159,7 @@ export const VERIFY_INVENTORY = [
   { file: 'scripts/capture-e2e-dumps.sh', status: 'browser-dump', run: 'bash scripts/capture-e2e-dumps.sh', why: '抓取器本身不是断言脚本，是 verify-e2e 的输入生成器', evidence: '2026-10-25 生成 14 份快照 + 14 张截图' },
   { file: 'scripts/capture-t10x.sh', status: 'browser-dump', run: 'bash scripts/capture-t10x.sh', why: '同上：verify-t10x 的输入生成器', evidence: '2026-10-25 生成 3 份保全样本快照' },
   {
-    file: 'scripts/capture-v14-faces.sh',
-    status: 'browser-dump',
+    file: 'scripts/capture-v14-faces.sh',    status: 'browser-dump',
     run: 'npm run build:ui && bash scripts/capture-v14-faces.sh',
     why:
       '交付截图生成器（assets/face-0{1,2,3}-*.png 卡面选择三态）；只要静态 dist + headless Chrome。' +
@@ -164,6 +170,55 @@ export const VERIFY_INVENTORY = [
       '2026-10-26 生成 3 张（默认 690558 / 图库 722627 / 原图 718066 字节，三张字节互不相同），' +
       '逐张核验；期间抓到两个真缺陷：角标与占位符重复渲染成「默认卡面默认」、' +
       'refresh 拿初始 choice 当记忆值导致「原图态预选成默认卡面」',
+  },
+  {
+    file: 'scripts/capture-v15-g3.sh',
+    status: 'browser-dump',
+    run: 'npm run build:ui && bash scripts/capture-v15-g3.sh',
+    why:
+      'G3 三项缺陷的取证截图（assets/g3-0{1,2,3}-*.png）；只要静态 dist + headless Chrome。' +
+      '**它证明的是界面行为，不是数据正确性**：世界书那两张通过 ?wbDemo= 走真实的 ' +
+      'session.setBlockText（解析器/脏标记/闸门都真跑），数据级结论由 ' +
+      'test/g3-regressions.test.mjs 与 .verify/g3-export-regression.mjs 负责',
+    evidence:
+      '2026-10-26 生成 3 张（legacy 412627 / 阻断 685111 / 对照 605308），逐张核验；' +
+      '**抓到一次误拦**：第一版闸门用 text !== renderWorldbookText(entries) 判断，' +
+      '对照组（格式完全正确）也被拦 —— 正常编辑必然让两者字形不同。改成"重新解析有没有 error"后才正确',
+  },
+  {
+    file: 'scripts/capture-v15-save-format.sh',
+    status: 'browser-dump',
+    run: 'npm run build:ui && bash scripts/capture-v15-save-format.sh',
+    why:
+      'G6 另存为格式对话框的两张取证截图（assets/g6-0{1,2}-*.png）：默认态 + PNG 禁用态。' +
+      '**必须走 http:// 不能用 file://** —— file 协议下模块脚本受 CORS 限制，start() 跑不完，' +
+      '截出来是"加载中…"的初始页，看起来像功能没实现（第一版就是这么错的）',
+    evidence:
+      '2026-10-26 生成 2 张（默认 395550 / 禁用 405183 字节，哈希不同）；' +
+      '默认态三选项齐全且 JSON 预选、按钮文字随选择联动；禁用态 PNG 变灰并写明原因',
+  },
+  {
+    file: 'scripts/capture-v15-g7.sh',
+    status: 'browser-dump',
+    run: 'npm run build:ui && bash scripts/capture-v15-g7.sh',
+    why:
+      'G7 世界书常驻误报的取证截图（assets/g7-0{1,2}-*.png）：同一份 19 条用户数据，' +
+      '只差规则条件。**依赖本地用户文件**（D:/Desktop/桌面文件/temp 下的世界书预设与平台规则、' +
+      '.verify/xiao-worldbook.txt）—— 那是成人向用户内容，按设计不入库、不进包，' +
+      '脚本找不到输入时会以退出码 2 明确报缺',
+    evidence:
+      '2026-10-26 生成 2 张（修复前 432988 / 修复后 446874 字节，哈希不同）：' +
+      '世界书域 29 条 → 15 条，正好少 14（7 条用户规则 + 7 条内置 builtin:worldbook-no-trigger）',
+  },
+  {
+    file: 'scripts/gen-g7-fixtures.mjs',
+    status: 'browser-dump',
+    run: 'node scripts/gen-g7-fixtures.mjs',
+    why:
+      'capture-v15-g7.sh 的输入生成器：把用户真实世界书与两份预设写成 ' +
+      'client/dist/g7/{before,after}.json 供 ?auditDemo= 读取。' +
+      '**只写进 dist**（build:client 第 0 步会清掉），确保用户内容不进仓库、不进 MSI',
+    evidence: '2026-10-26 生成 before 16427 / after 16829 字节；缺输入时退出码 2',
   },
 
   // ── live-browser：需要 CDP 调试端口 + 运行中的应用 ──────

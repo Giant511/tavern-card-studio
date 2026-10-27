@@ -89,16 +89,30 @@ function variantList(rule: ResolvedPlatformRule, token: string): string[] {
  *
  * 条件读的是**同一条目**的原始字段：不必为「关键词为空且非常驻」造一个专用规则类型，
  * 用户也能用 `list-count` + `when` 写出同样的判据。
+ *
+ * ## 两个维度（v0.1.5 / G7 补上"存在性"）
+ *
+ * · **值**（`equals` / `notEquals`）—— 字段存在且等于/不等于某值才算；
+ * · **存在性**（`exists` / `absent`，旧写法 `present`）—— 只看字段有没有出现。
+ *
+ * 两者是正交的：`priority: 0` 在存在性维度上是"存在"，在值维度上是 0。
+ * 把它们混成一个判断，就会出现"值为 0 被当成没有这个字段"这类错误。
  */
 function conditionHolds(item: ScopedText, condition: ContentRule['when']): boolean {
   if (!condition) return true;
   const entry = item.entry;
   if (!entry) return true; // 非条目 scope 不参与条目条件
   const actual = entry[condition.field];
+  /** 存在性口径：undefined 与 null 都算"没有这个字段"，0 与 '' 都算"有" */
+  const present = actual !== undefined && actual !== null;
+
   if (condition.equals !== undefined && actual !== condition.equals) return false;
   if (condition.notEquals !== undefined && actual === condition.notEquals) return false;
-  if (condition.present === true && (actual === undefined || actual === null)) return false;
-  if (condition.present === false && actual !== undefined && actual !== null) return false;
+
+  // 存在性：三个写法同时生效，任何一个不满足就整条不成立（宁可少报不误报）
+  if (condition.exists !== undefined && condition.exists !== present) return false;
+  if (condition.absent !== undefined && condition.absent === present) return false;
+  if (condition.present !== undefined && condition.present !== present) return false;
   return true;
 }
 
@@ -108,14 +122,37 @@ function conditionHolds(item: ScopedText, condition: ContentRule['when']): boole
  *
  * `{count}` / `{value}` 优先用调用方给的实参：同一条规则在不同类型下，
  * "数量"与"数值"的来源不同（列表项数 vs 字段文本），全靠 item 会取到错的那个。
+ *
+ * ## 模板已经写了引号就不再套一层（v0.1.5 / G7-1）
+ *
+ * `entryLabel` 自带 `「」`（`scopes.ts` 拼的），而规则作者常写成
+ * `条目「{entry}」的名称超过…` —— 两者一叠加就成了 `条目「「名字」」`。
+ * 用户那份规则里十条全是这么写的，审计面板整列都是双层引号。
+ *
+ * 修法是**看模板**：它已经把 `{entry}` 包在引号里时，用去掉引号的名字填进去；
+ * 其余情况保持原样（内置规则写的是 `世界书{entry}没有关键词`，依赖那层引号）。
  */
 function fillMessage(template: string, item: ScopedText, value?: string | number): string {
   if (!template.includes('{')) return template;
   const text = value === undefined ? item.text : String(value);
   const count = value === undefined ? (item.listCount ?? 0) : value;
-  return template
+
+  const label = item.entryLabel ?? '该条目';
+  /** 去掉包裹引号的同一个标签（`「名字」` → `名字`；`第 3 条` 原样） */
+  const bareLabel = label.startsWith('「') && label.endsWith('」') ? label.slice(1, -1) : label;
+
+  let out = template;
+  /*
+   * 顺序要紧：先消化"模板自带引号"的形态，再处理剩下的裸 {entry}。
+   * 结果保留**一层**引号 —— 去掉全部引号会让名字与上下文黏在一起
+   * （`条目家族企业、挂名董事…的名称超过`），读起来比双层引号更糟。
+   */
+  out = out.split('「{entry}」').join(`「${bareLabel}」`);
+  out = out.split('“{entry}”').join(`“${bareLabel}”`);
+
+  return out
     .split('{entry}')
-    .join(item.entryLabel ?? '该条目')
+    .join(label)
     .split('{count}')
     .join(String(count))
     .split('{value}')

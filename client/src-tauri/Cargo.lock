@@ -3797,7 +3797,7 @@ dependencies = [
 
 [[package]]
 name = "tcs-shell"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "indexmap 1.9.3",
  "serde",

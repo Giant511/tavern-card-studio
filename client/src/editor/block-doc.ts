@@ -14,9 +14,10 @@ import {
   BLOCK_DEFINITIONS,
   BLOCK_DEFINITION_MAP,
   BLOCK_IDS,
+  DEFAULT_WORLDBOOK_FORMAT,
   FIELD_BLOCK_IDS,
   isBlockId,
-  parseWorldbookText,
+  parseWorldbookTextWith,
   renderWorldbookText,
   serializeStCard,
   setFieldBlockText,
@@ -27,6 +28,7 @@ import {
   type PreservedInfo,
   type TxtPreset,
   type UnifiedCard,
+  type WorldbookFormatParams,
 } from '@tcs/shared';
 
 /**
@@ -150,43 +152,94 @@ export interface SetBlockResult {
 }
 
 /**
+ * 世界书文本 → 条目（唯一入口，v0.1.5 / G4）。
+ *
+ * `setBlockText`（用户编辑）与 `reparseWorldbook`（切换预设后重解析）都走这里，
+ * 保证两条路对"解析失败要不要写回"的判断完全一致。
+ *
+ * @param markDirty 用户编辑为 true（置脏）；切换预设重解析为 false
+ *   —— 文本没变，只是解析器换了，不该让标签出现"未保存修改"
+ */
+function applyWorldbookText(
+  card: UnifiedCard,
+  text: string,
+  format: WorldbookFormatParams,
+  markDirty: boolean,
+): SetBlockResult {
+  const parsed = parseWorldbookTextWith(text, format);
+  const issues = parsed.issues.map((issue) => ({
+    severity: issue.severity,
+    message: issue.message,
+    ...(issue.line === undefined ? {} : { line: issue.line }),
+  }));
+
+  const dirty = markDirty ? true : card.worldbook.dirty;
+
+  if (!parsed.ok) {
+    // 拒绝写回：entries 保持原样，仅记录文本（供 UI 显示用户正在编辑什么）
+    return {
+      card: { ...card, worldbook: { ...card.worldbook, text, dirty } },
+      changed: true,
+      worldbookIssues: issues,
+    };
+  }
+
+  return {
+    card: {
+      ...card,
+      worldbook: { ...card.worldbook, text, entries: parsed.entries, dirty },
+    },
+    changed: true,
+    worldbookIssues: issues,
+  };
+}
+
+/**
+ * 切换世界书预设后重解析现有文本（v0.1.5 / G4）。
+ *
+ * 为什么必须做：文本没变但**解析器变了**。不重解析的话，用户在「世界书预设」
+ * 里选中自己那份格式后，审计（按新预设）会说"没问题"，而 entries 还是旧的
+ * 空数组 —— 正是"面板正常、导出丢内容"的错位来源。
+ *
+ * 文本为空时什么都不做（空世界书合法）。
+ */
+export function reparseWorldbook(card: UnifiedCard, format: WorldbookFormatParams): SetBlockResult {
+  const text = card.worldbook.text;
+  if (text.trim() === '') return { card, changed: false, worldbookIssues: [] };
+  return applyWorldbookText(card, text, format, false);
+}
+
+/**
  * 把某个板块的文本写回卡片，返回**新卡片**（不就地改，便于撤销/对比）。
  *
  * 文本板块：设置 text + dirty，由 serializeStCard 在拼装时写回 description / personality。
  * 世界书块：解析 TXT → entries。**解析出 error 时拒绝写回**（保留上一次的 entries），
  *           避免「半截世界书」被当成删除全部条目。
  */
-export function setBlockText(card: UnifiedCard, id: BlockId, text: string): SetBlockResult {
+export function setBlockText(
+  card: UnifiedCard,
+  id: BlockId,
+  text: string,
+  /**
+   * 世界书格式（v0.1.5 / G4，**必须传**）。
+   *
+   * 不传就退回默认 `@@ENTRY` 格式 —— 那正是线上缺陷：用户导入了
+   * 「幻梦AI世界书格式」预设，审计也按它跑（面板不报错），但**这里的解析
+   * 一直走默认格式**，于是 `【条目1：…】` 一条都认不出、entries 变空、
+   * 导出丢内容。两处口径不一致，症状还互相掩盖。
+   *
+   * 参数可选只为兼容单测里的纯文本板块调用；世界书分支缺省时会用默认格式。
+   */
+  worldbookFormat?: WorldbookFormatParams,
+): SetBlockResult {
   if (id === 'worldbook') {
     const previous = card.worldbook.text;
     if (previous === text) {
       return { card, changed: false, worldbookIssues: [] };
     }
-
-    const parsed = parseWorldbookText(text);
-    const issues = parsed.issues.map((issue) => ({
-      severity: issue.severity,
-      message: issue.message,
-      ...(issue.line === undefined ? {} : { line: issue.line }),
-    }));
-
-    if (!parsed.ok) {
-      // 拒绝写回：entries 保持原样，仅记录文本（供 UI 显示用户正在编辑什么）
-      return {
-        card: { ...card, worldbook: { ...card.worldbook, text, dirty: true } },
-        changed: true,
-        worldbookIssues: issues,
-      };
-    }
-
-    return {
-      card: {
-        ...card,
-        worldbook: { ...card.worldbook, text, entries: parsed.entries, dirty: true },
-      },
-      changed: true,
-      worldbookIssues: issues,
-    };
+    // 用**当前选中的世界书预设**解析，与审计、导入、导出同一份口径。
+    // 缺省（未传）时退回冻结默认格式。
+    return applyWorldbookText(card, text, worldbookFormat ?? DEFAULT_WORLDBOOK_FORMAT, true);
   }
 
   const blockId = id as TextBlockId;
@@ -247,6 +300,8 @@ export function importCardText(
   preset: TxtPreset,
   mode: 'strict' | 'lenient' = 'lenient',
   greetingFormat?: GreetingFormatParams,
+  /** 世界书格式（v0.1.5 / G4）：TXT 卡里的世界书段要按当前预设解析 */
+  worldbookFormat?: WorldbookFormatParams,
 ): {
   card: UnifiedCard | null;
   issues: Array<{ code: string; message: string; line?: number }>;
@@ -256,6 +311,7 @@ export function importCardText(
     mode,
     preserveUnrecognized: true,
     ...(greetingFormat === undefined ? {} : { greetingFormat }),
+    ...(worldbookFormat === undefined ? {} : { worldbookFormat }),
   });
   const issues = result.issues.map((issue) => ({
     code: issue.code,

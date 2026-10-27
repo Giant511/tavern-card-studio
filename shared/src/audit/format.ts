@@ -174,15 +174,38 @@ export function checkPresetConformance(card: UnifiedCard, preset: TxtPreset): Au
   //
   // 一条边界：用户手删了这两个标题行、但字段里仍有内容。此时会报"六板块格式"——
   // 就文本形态而言这个说法是准确的（文本里确实只有六块），而且只是 info。
+  //
+  // ## 线上误报修正（v0.1.5 / G3-1）
+  //
+  // 上一版判据只有 `sixBlockShape`（description 已分块 + description 里没有新板块标题）。
+  // 它把**标准 SillyTavern 卡**全都判成了六板块卡：ST 的 `mes_example` / `first_mes`
+  // 是**顶层独立字段**，本来就不在 `description` 里，所以 description 里永远
+  // 不会有「对话示例」「初始场景」这两个标题 —— 于是用户那张
+  // first_mes 367 字、mes_example 870 字都齐全的卡，照样报
+  // 「旧格式卡片：不含「对话示例」「初始场景」」。
+  //
+  // 判据必须回到**字段本身**：这两个字段有内容，就说明它不是六板块卡
+  // （六板块时代的卡这两个字段必然为空）。标题行只是"文本形态"的证据，
+  // 在字段有内容时它无关紧要 —— 内容才是事实。
   const fieldBlocks = card.blocks.filter(
     (block) => BLOCK_DEFINITION_MAP[block.id].kind === 'field-backed',
   );
   const allMissing = fieldBlocks.length > 0 && fieldBlocks.every((block) => block.missing === true);
+  /**
+   * 字段里真的有内容（判"是不是旧卡"的唯一硬判据）。
+   *
+   * 不看 `missing`：JSON 路径下它恒为 false（只有 TXT 导入会打标），
+   * 只看文本是否为空白。空白 = 这块确实没有内容。
+   */
+  const hasFieldContent = fieldBlocks.some((block) => block.text.trim() !== '');
   const hasNewHeading =
     card.description.raw !== '' &&
     fieldBlocks.some((block) => descriptionHasHeadingFor(card, preset, block.id));
-  const sixBlockShape = card.description.structured && card.description.raw !== '' && !hasNewHeading;
-  if (allMissing || sixBlockShape) {
+  const sixBlockShape =
+    !hasFieldContent && card.description.structured && card.description.raw !== '' && !hasNewHeading;
+  // 两个分支都要求"字段真的没有内容"：`missing` 与 `text` 理论上不会打架，
+  // 但一旦打架（如外部写入的卡），**应以内容为准** —— 有内容就不是旧卡。
+  if (!hasFieldContent && (allMissing || sixBlockShape)) {
     issues = [
       makeAuditIssue({
         ruleId: 'builtin:legacy-six-block',

@@ -348,6 +348,14 @@
             },
             "present": {
               "type": "boolean"
+            },
+            "exists": {
+              "type": "boolean",
+              "description": "true = 该字段必须存在（0 与空串算存在；undefined/null 算不存在）。用于按\"某字段只出现在某一类条目\"区分条目类型。v0.1.5 新增。"
+            },
+            "absent": {
+              "type": "boolean",
+              "description": "true = 该字段必须不存在。与 exists 互为取反，两种写法等价。v0.1.5 新增。"
             }
           }
         },

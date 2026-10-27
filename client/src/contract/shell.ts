@@ -22,9 +22,15 @@ import {
   type CardsDirScan,
   type ClientConfig,
   type DirProbe,
+  type ExtractReceipt,
+  type PathProbe,
+  type PortProbe,
   type RuleDirScan,
   type RuleKind,
   type ShellInfo,
+  type SpawnReceipt,
+  type SpawnTarget,
+  type StCandidates,
   type TextFile,
   type WriteReceipt,
 } from './types.js';
@@ -102,6 +108,94 @@ export function openFolder(path: string): Promise<void> {
 }
 
 /**
+ * 用系统默认浏览器打开一个 http/https 链接（F15 / T13.4、T13.5）。
+ *
+ * v0.1.3 回滚时这条能力一起消失了，v0.1.5 的 F15 需要它（推送完要打开 ST 页面），
+ * 于是按原来的口径恢复：**只放行 http/https**，`file://` / `javascript:` /
+ * `data:` 一律拒绝 —— 前者的实际效果是"用默认程序打开本地任意文件"，
+ * 与 `openFolder` 那条口子加起来就等于恢复了 opener 插件的全部能力。
+ *
+ * 渲染层因此仍然拿不到"打开任意路径"，只有"打开一个网址"。
+ */
+export function openExternal(url: string): Promise<void> {
+  return call<void>('open_external', { url });
+}
+
+// ─────────────────────────────────────────────────────────────
+// SillyTavern 联动（v0.1.5 / F15 · T13.1）
+// ─────────────────────────────────────────────────────────────
+//
+// 这一段的三条能力都**碰本地其它程序**，所以每条都窄：
+//   探测只回答存在形态（不读内容）、候选目录只来自用户主目录、
+//   启动只允许 ST 目录里的三个固定目标。约束在 Rust 侧兜底，
+//   这里只负责把它们翻译成语义化的调用。
+
+/**
+ * 批量探测路径的存在形态（`file` / `dir` / `none`）。
+ *
+ * 为什么不读内容：ST 检测只需要知道"有没有 package.json、有没有 server.js"，
+ * 读内容那是下一步（`readTextExact`）的事。把两件事分开，
+ * "探测"就可以被当成一个纯存在性查询来审计。
+ *
+ * 上限 64 条（Rust 侧 `MAX_PROBE_PATHS`）：没有上限它就是一台目录扫描器。
+ */
+export function probePaths(paths: string[]): Promise<PathProbe[]> {
+  return call<PathProbe[]>('probe_paths', { paths });
+}
+
+/**
+ * 列出 `SillyTavern*` 候选目录（只看用户主目录，不接受路径参数）。
+ *
+ * 返回的是**候选**：标准位置 `%USERPROFILE%\SillyTavern` 无论存不存在都会在列，
+ * 因为"用户装在默认位置"是最常见的情况，不该靠猜。判定交给调用方
+ * （`session/st-install.ts` 的 `judgeStInstall`）。
+ */
+export function findStCandidates(): Promise<StCandidates> {
+  return call<StCandidates>('find_st_candidates', {});
+}
+
+/**
+ * 探测本机回环端口有没有人在听（F15 / v0.1.5 生产反馈追加）。
+ *
+ * 判定"ST 在不在跑"只该问这一条：webview 的 fetch 受系统代理、安全软件、
+ * 本地网络权限影响，它说"不通"不等于端口没开（线上就这么误报过）。
+ * 壳侧走 `TcpStream::connect_timeout(127.0.0.1:port)`，不经过任何 HTTP 中间层。
+ *
+ * 失败**不抛错**：连不上是正常结论（`alive: false` + `errorKind`），不是命令错误。
+ */
+export function probeStAlive(port?: number): Promise<PortProbe> {
+  return call<PortProbe>('probe_st_alive', { port: port ?? null });
+}
+
+/**
+ * 启动本地 SillyTavern（分离进程，不等它退出）。
+ *
+ * **约束在壳里，不在这里**：`cwd` 必须自己通过 ST 判据（package.json +
+ * scripts.start 或 server.js），`cmd` 只能是三个白名单目标之一。
+ * 前端传错不会"启动失败但没人知道"，而是收到 `SPAWN_REJECTED`。
+ *
+ * 返回的 `logPath` 是子进程输出的落点 —— 启动失败时用它把 ST 自己的报错
+ * 读出来贴给用户（`readTextExact(logPath)`），而不是我们转述"启动失败"。
+ */
+export function spawnDetached(cmd: SpawnTarget, cwd: string): Promise<SpawnReceipt> {
+  return call<SpawnReceipt>('spawn_detached', { cmd, cwd });
+}
+
+/**
+ * 把下载好的 ST release zip 解压到目标目录（F15 / T13.3「一键安装」）。
+ *
+ * 为什么解压要原生做：zip 里的文件动辄上万，走 IPC 逐个 `writeFileAtomic`
+ * 慢到不可用，而"一次传整棵树"又会把写文件能力放大成"往任意位置铺文件"。
+ * 壳侧调系统 `tar.exe` 解一次，边界反而更窄。
+ *
+ * **沙箱**：`destDir` 必须落在用户主目录下（壳侧用 canonicalize 比较），
+ * 一键安装只能"装到自己家里"。
+ */
+export function extractZipTo(zipPath: string, destDir: string): Promise<ExtractReceipt> {
+  return call<ExtractReceipt>('extract_zip_to', { zipPath, destDir });
+}
+
+/**
  * 原子写：同目录临时文件 → fsync → rename 覆盖 → 回读校验 sha256。
  *
  * `expectedSha256` 是「我以为我要写什么」的断言：与传入文本的实际摘要不符时，
@@ -137,6 +231,38 @@ export function writeBinaryFileAtomic(
   return call<WriteReceipt>('write_binary_file_atomic', {
     path,
     base64,
+    expectedSha256: expectedSha256 ?? null,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// 用户预设库（v0.1.5 / G5）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 读用户预设库。**文件不存在返回 `null`，不抛错。**
+ *
+ * 首次运行本来就没有这个文件 —— 把它做成错误，调用方就得在
+ * "没有预设"和"读失败"之间猜，而两者对用户的含义完全不同：
+ * 前者是正常状态，后者要提示"你的预设读不出来"。
+ *
+ * 路径由壳解析（`<应用配置目录>/preset-library.json`），渲染层既不拼也不传 ——
+ * 契约里没有"路径"这个参数，所以不存在"照着约定拼路径"的机会。
+ */
+export function readPresetLibrary(): Promise<TextFile | null> {
+  return call<TextFile | null>('read_preset_library', {});
+}
+
+/**
+ * 写用户预设库。原子写 + 写后回读自证，与保存卡片文件同一套保证。
+ *
+ * 与 `writeFileAtomic` 的差别只有一处：**按需创建父目录**。
+ * 保存卡片时父目录必须已存在（不替用户建目录），而应用私有配置目录
+ * 在首次运行时可能还没建，创建它是本职。
+ */
+export function writePresetLibrary(text: string, expectedSha256?: string): Promise<WriteReceipt> {
+  return call<WriteReceipt>('write_preset_library', {
+    text,
     expectedSha256: expectedSha256 ?? null,
   });
 }

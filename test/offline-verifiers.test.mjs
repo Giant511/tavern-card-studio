@@ -68,6 +68,14 @@ test('verify-t1034-custom：四条自定义路径（预设 / 规则 / 世界书�
 test('verify-audit-dual-sample：六板块旧卡可审计，八板块新卡正常校验', () => {
   const result = runAuditDualSample();
   assertAllPassed('verify-audit-dual-sample', result);
-  // 26 项含铁律三条（error=0 / exportable / 只一条 info）+ 两条反证 + PNG 拒绝三条
-  assert.equal(result.checks.length, 26, `断言数从 26 变成 ${String(result.checks.length)}，确认是有意改动`);
+  /*
+   * 26 → 28（v0.1.5 / G3-1）：新增"标准 ST 卡"样本的两条断言。
+   *
+   * 原来的样本 A 名为「六板块旧卡」，但它 first_mes / mes_example / alternate_greetings
+   * 都**有内容** —— 那种形态在 JSON 上与标准 SillyTavern 卡完全一样（ST 把这两块
+   * 放在顶层字段，从不写进 description）。用一个"字段有内容的卡"去断言
+   * 「报旧格式卡片且说"不含这两块"」，等于把线上那条误报写成了期望值。
+   * 现在拆成两张样本：真旧卡（字段全空，仍必须报 info）+ 标准 ST 卡（有内容，不许报）。
+   */
+  assert.equal(result.checks.length, 28, `断言数从 28 变成 ${String(result.checks.length)}，确认是有意改动`);
 });
