@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tavern Card Studio 服务端 0.1.7 · 如何连接</title>
+<title>Tavern Card Studio 服务端 0.1.8 · 如何连接</title>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
@@ -78,7 +78,7 @@
 <main>
   <h1>服务端已安装 · 如何连接</h1>
   <p class="sub">
-    Tavern Card Studio Server <b>0.1.7</b>（多账户版）。按 1 → 4 的顺序做完即可连通；
+    Tavern Card Studio Server <b>0.1.8</b>（多账户版）。按 1 → 4 的顺序做完即可连通；
     放在公网上再加做第 5 节。
   </p>
 
@@ -196,7 +196,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
     <ol>
       <li>打开 Tavern Card Studio 客户端，进入「设置」。</li>
       <li>「服务端地址」填 <span class="addr">http://127.0.0.1:8730</span>（是 8730，不是面板的 8731）。</li>
-      <li>点「测试连接」，看到「已连接（服务端 0.1.7），token 有效」说明网络与令牌都通了。</li>
+      <li>点「测试连接」，看到「已连接（服务端 0.1.8），token 有效」说明网络与令牌都通了。</li>
       <li>再点「登录」，用第 1 节建的账户登录 —— 登录后才会以账户身份看自己的卡片与仓库。</li>
     </ol>
     <h3>「连接本机服务端」按钮</h3>
@@ -290,7 +290,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
           ① <strong>不用管它</strong>：第 1 节的 <code>$tcs</code> 写法只依赖
           <code>node.exe</code> 与 <code>app\</code>，旧包一样能用；<br>
           ② 想拿到本页与 <code>tcs-server.cmd</code>，用强制重装（管理员 PowerShell）：
-          <code>msiexec /i "TavernCardStudioServer-0.1.7.msi" REINSTALL=ALL REINSTALLMODE=amus</code>
+          <code>msiexec /i "TavernCardStudioServer-0.1.8.msi" REINSTALL=ALL REINSTALLMODE=amus</code>
         </td>
       </tr>
       <tr>
