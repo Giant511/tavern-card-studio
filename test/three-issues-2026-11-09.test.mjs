@@ -230,3 +230,79 @@ test('★★ 采样参数仍会被带进请求体（放开上限不能把这条�
   const src = stripComments(read('shared/src/chat/generate.ts'));
   assert.match(src, /request\.max_tokens = s\.maxTokens/, 'max_tokens 仍要下发');
 });
+
+/* ═══════════════════════════════════════════════════════════
+   ④ 启动探活：两侧超时必须同值，且要够长
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★★ 探活超时两侧必须同值', () => {
+  /*
+   * 用户真机报「世界没能打开，等了 90 秒还没就绪」。
+   *
+   * ## 真因不是引擎起不来
+   *
+   * 报错那会儿 8000 还没有 LISTEN，而几分钟后从 adb 直连拿到：
+   *
+   * ```text
+   *   HTTP 200  耗时 0.08s
+   *   {"agent":"SillyTavern:1.19.0:Cohee#1207",...}
+   * ```
+   *
+   * 引擎**起来了**，只是比 30 秒慢。
+   *
+   * ## 原来的模型漏了一种情况
+   *
+   * ```text
+   *   热启动（已有数据）  30 秒
+   *   首次安装            120 秒
+   *   升级安装            ← 没考虑，走 30 秒，不够
+   * ```
+   *
+   * 而启动耗时**随用户数据量增长**（卡 / 聊天 / 世界书都要扫），
+   * 拿固定值卡它会越来越容易不够。
+   *
+   * ## 判据
+   *
+   * 三处必须同值：Java 的 PROBE_TIMEOUT_MS / shared 的 PROBE_TIMEOUT_MS /
+   * 前端的开屏 timeoutMs。不同值的后果是"后端已放弃、前端还在等"，
+   * 用户会看到两次失败，而引擎其实起来了。
+   */
+  const java = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StLauncher.kt',
+  );
+  const shared = read('shared/src/android/st-lifecycle.ts');
+  const mainTs = read('client/src/mobile/main.ts');
+
+  const javaMs = Number(/const val PROBE_TIMEOUT_MS = ([0-9_]+)L/.exec(java)?.[1]?.replace(/_/g, '') ?? '0');
+  const sharedMs = Number(/export const PROBE_TIMEOUT_MS = ([0-9_]+)/.exec(shared)?.[1]?.replace(/_/g, '') ?? '0');
+  const splashMs = Number(/timeoutMs: ([0-9_]+)/.exec(mainTs)?.[1]?.replace(/_/g, '') ?? '0');
+
+  assert.ok(javaMs > 0, '没读到 Java 的 PROBE_TIMEOUT_MS');
+  assert.ok(sharedMs > 0, '没读到 shared 的 PROBE_TIMEOUT_MS');
+  assert.ok(splashMs > 0, '没读到开屏的 timeoutMs');
+
+  assert.equal(javaMs, sharedMs, `Java(${String(javaMs)}) 与 shared(${String(sharedMs)}) 必须同值`);
+  assert.equal(sharedMs, splashMs, `shared(${String(sharedMs)}) 与开屏(${String(splashMs)}) 必须同值`);
+
+  /* 30 秒被真机证伪过：升级安装不够。至少 120 秒 */
+  assert.ok(javaMs >= 120_000, `探活上限不能低于 120 秒，实际 ${String(javaMs)}`);
+});
+
+test('★★★★ 超时提示不许叫用户"重启应用"', () => {
+  /*
+   * 超时时 node 进程通常还活着、还在继续初始化。
+   * "重启应用"会杀掉它，把它拖回起点 —— 那是最坏的建议。
+   *
+   * 正确指引是"进主界面等一会儿"：主界面里任何操作都会再问一次
+   * `ensureRunning`，那时进程往往已经就绪（走复用分支）。
+   */
+  const java = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StLauncher.kt',
+  );
+  const at = java.indexOf('引擎还在启动');
+  assert.ok(at > 0, '找不到超时提示');
+  const body = java.slice(at, at + 300);
+
+  assert.match(body, /不要重启/, '要明确劝阻重启');
+  assert.match(body, /主界面/, '要给出"进主界面等"这条路');
+});

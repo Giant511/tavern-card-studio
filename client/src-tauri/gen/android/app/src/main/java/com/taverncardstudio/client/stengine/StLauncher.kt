@@ -44,7 +44,20 @@ object StLauncher {
 
     /** 探活间隔/上限。与 `st-lifecycle.ts` 的 PROBE_INTERVAL_MS / PROBE_TIMEOUT_MS 一致 */
     const val PROBE_INTERVAL_MS = 500L
-    const val PROBE_TIMEOUT_MS = 30_000L
+    /*
+     * ★★★ 2026-11-09 从 30 秒改成 120 秒（用户真机报"世界没能打开"）。
+     *
+     * 原注释写"低端机冷启动更慢"，但真实情况是：**升级安装后也慢**。
+     * 用户覆盖装 0.1.8 补丁版后 30 秒被判超时，而几分钟后 8000 端口
+     * LISTEN、`/version` 返回 200（0.08s）。
+     *
+     * 启动耗时随用户数据量增长（卡 / 聊天 / 世界书都要扫），不是常数。
+     * 拿固定 30 秒卡它会越来越容易不够。
+     *
+     * 与 `shared/src/android/st-lifecycle.ts` 的 `PROBE_TIMEOUT_MS` 一致 ——
+     * 两侧必须同值，否则会出现"后端已放弃、前端还在等"的错位。
+     */
+    const val PROBE_TIMEOUT_MS = 120_000L
 
     /**
      * **首次启动**的探活上限。与 `st-lifecycle.ts` 的 `FIRST_RUN_PROBE_TIMEOUT_MS` 一致。
@@ -246,9 +259,25 @@ object StLauncher {
                 Thread.sleep(PROBE_INTERVAL_MS)
             }
 
+            /*
+             * ★★★ 超时**不等于失败**（2026-11-09）。
+             *
+             * 走到这里时 node 进程通常还活着、还在继续初始化 ——
+             * 真机上实测：报超时那会儿端口还没 LISTEN，几分钟后
+             * `/version` 就返回 200 了。
+             *
+             * 所以提示里**不能**叫用户"重启应用"：重启会杀掉这个正在
+             * 启动的进程，把它拖回起点。而"点重试"是对的
+             * （`ensureRunning` 会走 `isOurProcessAlive()` 复用分支），
+             * 但用户未必会点。
+             *
+             * 现在明说"进主界面等一会儿"，因为主界面里任何一次操作
+             * 都会再问一次 `ensureRunning`，那时进程往往已经就绪。
+             */
             StartResult(
                 false,
-                "引擎启动超时（${limit / 1000} 秒内没有应答）。点重试，或重启应用。",
+                "引擎还在启动（等了 ${limit / 1000} 秒）。先进主界面等一会儿，" +
+                    "或者点重试 —— 不要重启应用，那会把正在启动的引擎杀掉。",
             )
         } catch (error: Exception) {
             Log.e(TAG, "启动引擎失败", error)
