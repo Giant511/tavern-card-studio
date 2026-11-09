@@ -555,3 +555,58 @@ test('★★★★★ 写完必须回读确认，不许只信 200', () => {
   assert.match(body, /present\.includes\(secretKey\)/, '要按名字核对，不是"有返回值就算成功"');
   assert.match(body, /problems\.push/, '不一致要进 problems（会被显示出来）');
 });
+
+/* ═══════════════════════════════════════════════════════════
+   ⑦ 超时之后：引擎后来就绪，界面要能跟上
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★★ 超时后要有"后来补上"的看守（否则 ready 永远 false）', () => {
+  /*
+   * 真机实测的矛盾：
+   *
+   * ```text
+   *   App：等了 120 秒，报"引擎还在启动"
+   *   adb：几分钟后 8000 LISTEN，/version 200
+   * ```
+   *
+   * 而 `StLauncher.ready` **只在 `publishReady()` 里被置 true**，
+   * 超时路径只调 `markStopped()`（把它清成 false）。
+   *
+   * ⇒ 引擎后来起来了，界面也永远显示没连上，只能靠用户点重试。
+   *
+   * 判据：超时分支必须起一个后台看守，进程还活着就继续等，
+   * 一旦 ST 应答就把 ready 补回去。
+   */
+  const svc = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StService.kt',
+  );
+
+  /* ① 有这个方法 */
+  assert.match(svc, /private fun watchUntilReady\(\)/, '要有后台看守');
+
+  /* ② 超时分支要调它，且只在进程还活着时调 */
+  const at = svc.indexOf('if (!result.ok)');
+  assert.ok(at > 0, '找不到启动失败分支');
+  const body = svc.slice(at, at + 1200);
+  assert.match(body, /watchUntilReady\(\)/, '超时后要看守，不能一走了之');
+  assert.match(body, /isOurProcessAlive\(\)/, '只在进程还活着时看守（死了就是真失败）');
+
+  /* ③ 看守里要真的 probe，并在命中时清错误 + 置 ready */
+  const wAt = svc.indexOf('private fun watchUntilReady');
+  const wBody = svc.slice(wAt, wAt + 2200);
+  assert.match(wBody, /probe\(/, '要看守就必须真的探');
+  assert.match(wBody, /lastError = null/, '就绪后要清掉上次的错误');
+  assert.match(wBody, /publishReady\(/, '就绪后要刷新 ready 与通知');
+  /* ④ 必须有上限，不许无限占线程 */
+  assert.match(wBody, /WATCH_TOTAL_MS/, '要有总时限');
+});
+
+test('★★ 看守要知道进程死了就收工（别陪着僵尸线程）', () => {
+  const svc = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StService.kt',
+  );
+  const at = svc.indexOf('private fun watchUntilReady');
+  const body = svc.slice(at, at + 2200);
+  assert.match(body, /!StLauncher\.isOurProcessAlive\(\)/, '进程没了要退出');
+  assert.match(body, /isDaemon = true/, '必须是 daemon 线程');
+});
