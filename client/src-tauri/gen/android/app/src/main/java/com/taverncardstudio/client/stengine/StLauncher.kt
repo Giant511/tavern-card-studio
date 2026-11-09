@@ -573,7 +573,25 @@ object StLauncher {
              * 这里简化成 FREE —— 因为后续 `startNode` 会真的去 bind，
              * 撞上 EADDRINUSE 会走"启动后立即退出"那条分支并报出来。
              * 在探测阶段区分这两者需要 raw socket，收益不抵复杂度。
+             *
+             * ★★★ 日志必须用 **E 级 + 固定可 grep 的前缀**（2026-11-09）。
+             *
+             * ## 为什么
+             *
+             * 红米真机上出现过"引擎明明在监听，App 却 110 秒探不到"，
+             * 而 `Log.i(TAG, ...)`（TAG=StLauncher）在 MIUI 上**被过滤掉了** ——
+             * 排查时 `grep StLauncher` 一条日志都没有，等于黑盒。
+             *
+             * 用 `Log.e` 并把异常类名 + 消息都写进去，下次一眼就能看出是
+             * `ConnectException`（没人听）还是 `SocketTimeoutException`
+             * （在听但不回），还是别的（被 SELinux/网络策略拦）。
+             * 只在这一条上加 E 级：它只在**探测失败**时打印，
+             * 正常启动时一次都不会刷屏。
              */
+            Log.e(
+                "StProbe",
+                "probe 失败 port=$port：${error.javaClass.simpleName} ${error.message ?: ""}",
+            )
             ProbeResult(ProbeState.FREE, error.javaClass.simpleName)
         } finally {
             connection?.disconnect()
