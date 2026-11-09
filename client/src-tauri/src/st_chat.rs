@@ -313,10 +313,48 @@ pub async fn st_chat_worldinfo_edit(
     .await
 }
 
-/// 导入一本世界书（内容是**整份 JSON 文本**）。
+/// 导入一本世界书（内容是**整份 entries 对象的 JSON 文本**）。
 ///
-/// ST 的 `POST /api/worldinfo/import` 接受 `{ "name": ..., "data": <entries 对象> }`，
-/// 落盘成 `worlds/<name>.json`。同名会覆盖 —— 所以前端必须先查重。
+/// # ★★★ 必须走 `/api/worldinfo/edit`，不能走 `/api/worldinfo/import`
+///
+/// ## 用户报的
+///
+/// > 这个卡里面的世界书导入不了……但是在原生 ST 上可以正常使用
+///
+/// ## 真因（2026-11-09 读 ST 1.19.0 源码确认）
+///
+/// `/api/worldinfo/import` 是**给浏览器上传文件用的**，它第一行就是：
+///
+/// ```js
+///   router.post('/import', (request, response) => {
+///       if (!request.file) return response.sendStatus(400);   // ← 直接 400
+/// ```
+///
+/// `request.file` 由 multer 在 multipart 上传时填充。我们用 JSON body 调它，
+/// `request.file` 永远是 undefined ⇒ **每次都 400**，一次也没成功过。
+///
+/// 而 400 在调用链里被 `persistEmbeddedWorldbook` 的 catch 吞掉（当时是空
+/// catch，只 return null），所以用户看到的是"卡导进来了，书没有"，
+/// 界面上一个字都没有 —— 这就是它潜伏这么久的原因。
+///
+/// ## `/edit` 才是 JSON 通道
+///
+/// ```js
+///   router.post('/edit', (request, response) => {
+///       if (!request.body.name) return 400;
+///       if (!('entries' in request.body.data)) return 400;
+///       writeFileAtomicSync(pathToFile, JSON.stringify(request.body.data, null, 4));
+/// ```
+///
+/// 它接受 `{ name, data }`，且要求 `data` 里有 `entries` 键。
+///
+/// ## 所以 data 要**包一层 `entries`**
+///
+/// 前端传进来的是 entries 字典本身（`{ "0": {...}, "1": {...} }`），
+/// 而 ST 的世界书文件顶层是 `{ "entries": { ... } }` —— 真机备份里的
+/// `worlds/Eldoria.json` 就是这样。这里补上那层。
+///
+/// 同名会覆盖 —— 所以前端必须先查重（`listWorldbookNames`）。
 #[tauri::command]
 pub async fn st_chat_worldinfo_import(
     name: String,
@@ -328,9 +366,18 @@ pub async fn st_chat_worldinfo_import(
         .map_err(|error| ShellError::Invalid {
             message: format!("世界书内容不是合法 JSON：{error}"),
         })?;
+    /*
+     * 前端传 entries 字典；ST 的文件要 `{ entries: ... }`。
+     * 两种都容忍：万一将来有人直接传整份文件，也不至于再包一层。
+     */
+    let file_body = if parsed.get("entries").is_some() {
+        parsed
+    } else {
+        serde_json::json!({ "entries": parsed })
+    };
     api.post_text(
-        "/api/worldinfo/import",
-        serde_json::json!({ "name": name, "data": parsed }),
+        "/api/worldinfo/edit",
+        serde_json::json!({ "name": name, "data": file_body }),
     )
     .await
 }
