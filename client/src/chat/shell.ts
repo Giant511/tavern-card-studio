@@ -81,6 +81,7 @@ import {
   type MobileRepoAuth,
 } from './repo-store.ts';
 import { readLocalCardFile, localCardId } from './card-import-local.ts';
+import { faceFromImage, faceFromName, type CanvasDoc } from './card-face.ts';
 import { runBusy } from './busy-button.ts';
 import {
   CLOUD_REPO_HOST,
@@ -2760,18 +2761,17 @@ export class AppShell {
     );
 
     /*
-     * 底图用**内置兜底卡面**（桌面端那张，用户指定）。
+     * 仓库有卡面资产，但那是 **webp**，而 `buildPngCard` 只认 PNG 容器。
+     * 转码要 canvas，而这条路径的目标是"内容能进来"。
      *
-     * 为什么不去取仓库里的卡面资产：那张图是 webp，而 `buildPngCard`
-     * 只认 PNG 容器；转码要 canvas（`face-encode` 的整条管线），
-     * 而这条路径的目标是"内容能进来"。封面可以在编辑器里再换。
+     * v0.1.8 起不再塞那张统一的默认卡面 —— 传 `null` 让
+     * `writeCardToLibrary` 按卡名生成首字封面。理由：所有下载的卡
+     * 长得一模一样的话，选角色列表里根本认不出哪张是哪张。
      */
-    const base = await readDefaultFaceBytes();
-
     /* 仓库是权威版本，覆盖本地同名卡是预期行为，不弹确认 */
     const plan = await this.resolveCardPlacement({ jsonText, cardId, confirmOverwrite: false });
     if (plan === null) return;
-    await this.writeCardToLibrary({ plan, jsonText, base });
+    await this.writeCardToLibrary({ plan, jsonText, base: null });
   }
 
   /**
@@ -2837,9 +2837,15 @@ export class AppShell {
   private async writeCardToLibrary(input: {
     plan: ImportPlan;
     jsonText: string;
-    base: Uint8Array;
+    /**
+     * 当底图的 PNG 字节。
+     *
+     * `null` = 没有图 ⇒ 按卡名生成一张首字封面。
+     * 用 `null` 而不是空数组：空数组是合法值，混用分不清「没图」和「图是空的」。
+     */
+    base: Uint8Array | null;
   }): Promise<void> {
-    const { plan, jsonText, base } = input;
+    const { plan, jsonText } = input;
 
     /*
      * 内嵌世界书**先**落地。
@@ -2850,6 +2856,24 @@ export class AppShell {
     const cardText = worldName === null ? jsonText : JSON.stringify(
       attachWorldToCard(JSON.parse(jsonText) as unknown, worldName),
     );
+
+    /*
+     * 没有底图就按卡名画一张（v0.1.8，用户口径）。
+     *
+     * 为什么不塞一张统一的默认卡面：选角色列表**显示头像**，
+     * 所有没有封面的卡长得一模一样，用户只能靠名字分辨 ——
+     * 那等于把"有没有封面"变成了"能不能认出自己的卡"。
+     *
+     * 失败不阻断：画不出来就退回内置卡面；内置也没有才抛（那是打包问题）。
+     */
+    let base = input.base;
+    if (base === null) {
+      try {
+        base = await faceFromName(this.doc as unknown as CanvasDoc, plan.displayName);
+      } catch {
+        base = await readDefaultFaceBytes();
+      }
+    }
 
     const png = buildPngCard(base, cardText, plan.spec);
 
@@ -2883,7 +2907,7 @@ export class AppShell {
    * （用户在答对话框，不是在等按钮）；只有真正写盘那段才进忙碌态。
    */
   private async importLocalCard(button: ElLike): Promise<void> {
-    const picked = await this.pickLocalCardFile();
+    const picked = await this.pickFileBytes('image/png,application/json,.png,.json');
     if (picked === null) return;
 
     const parsed = readLocalCardFile(picked.name, picked.bytes);
@@ -2895,17 +2919,27 @@ export class AppShell {
 
     /*
      * PNG 卡用**它自己那张图**当底图 —— 本地导入的卡应该保留它自己的封面。
-     * JSON 卡没有图，用内置兜底卡面（与仓库下载一致）。
+     *
+     * JSON 卡本身没有图，所以这里**问一句**（v0.1.8 用户口径）：
+     * 从相册选一张，或者让它按卡名生成。
+     *
+     * 为什么不直接塞默认图：选角色列表是显示头像的，所有没有封面的卡
+     * 长得一模一样，用户只能靠名字分辨。而 JSON 卡的封面一旦定下，
+     * 手机端**没有任何地方能改**（卡面编辑只在桌面端有），
+     * 所以选择必须发生在导入这一刻。
      */
     let base = parsed.base;
     if (base === null) {
-      try {
-        base = await readDefaultFaceBytes();
-      } catch (error) {
-        const text = error instanceof Error ? error.message : String(error);
-        this.options.onNotify?.(`读不到内置卡面：${text}`, 'danger');
-        return;
+      const choice = await this.askCardFace();
+      if (choice === 'cancel') return;
+
+      if (choice === 'pick') {
+        const pickedFace = await this.pickFaceImage();
+        /* 选图框取消了就当作用户放弃这次导入，不偷偷退回默认图 */
+        if (pickedFace === null) return;
+        base = pickedFace;
       }
+      /* choice === 'default' ⇒ base 保持 null，写入时按卡名生成 */
     }
 
     const cardId = localCardId(parsed.jsonText, picked.name);
@@ -2952,20 +2986,29 @@ export class AppShell {
   /**
    * 弹一个选文件框，读成字节（v0.1.8）。
    *
-   * 用 `<input type="file">` 而不是新加一条 Rust 命令：
+   * ## 为什么用 `<input type="file">` 而不是新加 Rust 命令
+   *
    * WebView 的 `onShowFileChooser` 在本项目已经在用（世界书导入、头像上传），
    * 而 `<input>` 拿到的 `File` 直接能 `arrayBuffer()`，不需要 `content://` 解码。
    *
    * ★ `input.click()` 必须发生在**用户手势的同步链路里**，否则 WebView 会拒绝弹框。
    * 所以本函数从调用到 `click()` 之间不能有 `await`。
    *
+   * ## 为什么 accept 是参数
+   *
+   * 导入卡片要 png/json，换封面要 image/*。两处只差这一个字符串，
+   * 其余（隐藏 input、change/cancel 双保险、60 秒超时、remove）完全一样。
+   * 复制一份的话，将来修超时或修 remove 就会漏一处。
+   *
    * @returns `null` = 用户取消（含 60 秒无操作）
    */
-  private async pickLocalCardFile(): Promise<{ name: string; bytes: Uint8Array } | null> {
+  private async pickFileBytes(
+    accept: string,
+  ): Promise<{ name: string; bytes: Uint8Array } | null> {
     const input = this.doc.createElement('input');
     input.setAttribute('type', 'file');
     /* 扩展名与 MIME 都写：不同 ROM 的选文件器认其中一种 */
-    input.setAttribute('accept', 'image/png,application/json,.png,.json');
+    input.setAttribute('accept', accept);
     input.setAttribute('style', 'position:fixed;left:-9999px;top:0;opacity:0;');
     const body = (this.doc as unknown as { body?: ElLike }).body;
     if (body === undefined) return null;
@@ -2980,8 +3023,8 @@ export class AppShell {
           resolve(value);
         };
         input.addEventListener('change', () => {
-          const pickedBytes = (input as unknown as HTMLInputElement).files?.[0];
-          if (pickedBytes === undefined) {
+          const file = (input as unknown as HTMLInputElement).files?.[0];
+          if (file === undefined) {
             finish(null);
             return;
           }
@@ -2993,13 +3036,13 @@ export class AppShell {
              * 那份字节再写进角色目录就是一个坏文件 —— 而且看起来像"导入成功"。
              */
             if (result instanceof ArrayBuffer) {
-              finish({ name: pickedBytes.name, bytes: new Uint8Array(result) });
+              finish({ name: file.name, bytes: new Uint8Array(result) });
               return;
             }
             finish(null);
           };
           reader.onerror = () => finish(null);
-          reader.readAsArrayBuffer(pickedBytes);
+          reader.readAsArrayBuffer(file);
         });
         input.addEventListener('cancel', () => finish(null));
         globalThis.setTimeout(() => finish(null), 60_000);
@@ -3007,6 +3050,103 @@ export class AppShell {
       });
     } finally {
       input.remove();
+    }
+  }
+
+  /**
+   * 问一句「要不要给这张卡配封面」（v0.1.8）。
+   *
+   * 只在**导入 JSON 卡**时问 —— PNG 卡自带图，没什么可问的。
+   *
+   * 三个出口，语义分清楚：
+   *
+   * ```text
+   *   pick     从相册选一张
+   *   default  按卡名生成（不打扰用户，但也不是"没有封面"）
+   *   cancel   这次不导了
+   * ```
+   *
+   * 「取消」必须显式给一个按钮，不能只靠点遮罩：
+   * 用户在思考"要不要配图"时误触遮罩，会以为导入已经开始了。
+   */
+  private async askCardFace(): Promise<'pick' | 'default' | 'cancel'> {
+    const host = this.root;
+    if (host === null) return 'default';
+
+    return await new Promise<'pick' | 'default' | 'cancel'>((resolve) => {
+      const overlay = el(this.doc, 'div', 'nb-exit-overlay');
+      overlay.setAttribute('data-role', 'card-face-ask');
+
+      const card = el(this.doc, 'div', 'nb-exit-card');
+      card.setAttribute('role', 'dialog');
+      card.setAttribute('aria-modal', 'true');
+
+      const title = el(this.doc, 'p', 'nb-exit-title');
+      title.textContent = '给这张卡配一张封面？';
+      const sub = el(this.doc, 'p', 'nb-exit-subtitle');
+      sub.textContent = '这张卡文件里没有图。可以选一张，或者用卡名生成一张。';
+
+      const actions = el(this.doc, 'div', 'nb-exit-actions');
+
+      const pick = el(this.doc, 'button', 'nb-exit-leave');
+      pick.setAttribute('type', 'button');
+      pick.setAttribute('data-role', 'card-face-pick');
+      pick.textContent = '选一张图';
+      pick.addEventListener('click', () => {
+        overlay.remove();
+        resolve('pick');
+      });
+
+      const fallback = el(this.doc, 'button', 'nb-exit-stay');
+      fallback.setAttribute('type', 'button');
+      fallback.setAttribute('data-role', 'card-face-default');
+      fallback.textContent = '用卡名生成';
+      fallback.addEventListener('click', () => {
+        overlay.remove();
+        resolve('default');
+      });
+
+      const cancel = el(this.doc, 'button', 'nb-exit-stay');
+      cancel.setAttribute('type', 'button');
+      cancel.setAttribute('data-role', 'card-face-cancel');
+      cancel.textContent = '不导了';
+      cancel.addEventListener('click', () => {
+        overlay.remove();
+        resolve('cancel');
+      });
+
+      actions.append(pick, fallback, cancel);
+      card.append(title, sub, actions);
+      overlay.append(card);
+      /* 点遮罩 = 按卡名生成：既不臆断用户要走，也不让他卡在一个必答问题上 */
+      overlay.addEventListener('click', (event) => {
+        if ((event as { target?: unknown }).target !== overlay) return;
+        overlay.remove();
+        resolve('default');
+      });
+
+      host.append(overlay);
+    });
+  }
+
+  /**
+   * 选一张图当封面，缩到 512×512（v0.1.8）。
+   *
+   * 缩图的理由与桌面端 `renderSquare` 同源：卡片封面比例五花八门
+   * （768×1024 最常见），直接塞进 PNG 容器会在圆形头像里被切成椭圆。
+   *
+   * @returns `null` = 用户取消选图，或这张图读不出来（已提示）
+   */
+  private async pickFaceImage(): Promise<Uint8Array | null> {
+    const picked = await this.pickFileBytes('image/*');
+    if (picked === null) return null;
+
+    try {
+      return await faceFromImage(this.doc as unknown as CanvasDoc, picked.bytes);
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      this.options.onNotify?.(text, 'warn');
+      return null;
     }
   }
 
