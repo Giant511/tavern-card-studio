@@ -126,8 +126,30 @@ object StLauncher {
      */
     fun ensureRunning(context: Context, firstRun: Boolean = false): StartResult {
         if (isOurProcessAlive()) {
-            Log.i(TAG, "已有自己起的进程在跑（pid=${pidOf(process)}），不再新起")
-            return StartResult(true, "引擎正在运行", reused = true)
+            /*
+             * ★★★ 进程活着 ≠ 端口在听（2026-11-09 修）。
+             *
+             * 原来是直接 `return StartResult(true, "引擎正在运行")`，
+             * **一次 probe 都不做**。后果是一条完整的死循环：
+             *
+             * ```text
+             *   ① 启动超时（进程还活着、还在初始化）
+             *   ② 用户点重试 → 走这个分支 → 立刻说"引擎正在运行"
+             *   ③ 调用方以为好了，马上发请求
+             *   ④ 端口还没 listen → 请求失败
+             *   ⑤ 用户再点重试 → 回到 ②
+             * ```
+             *
+             * 也就是说"重试"永远不可能成功 —— 它只回答"进程在不在"，
+             * 而用户要的是"能不能用"。
+             *
+             * 现在这里也等端口：与 spawn 那条路径共用 `awaitListening`。
+             * 于是"点重试"变成真的重试：等到 listen 就成功，
+             * 等不到才报超时。
+             */
+            Log.i(TAG, "已有自己起的进程在跑（pid=${pidOf(process)}），等它就绪")
+            val port = activePort.takeIf { it > 0 } ?: PRIMARY_PORT
+            return awaitListening(port, PROBE_TIMEOUT_MS, null)
         }
 
         // ① 先看首选端口有没有人听
@@ -161,6 +183,67 @@ object StLauncher {
         }
 
         return startNode(context, port, firstRun)
+    }
+
+    /**
+     * 等端口真的在听 ST（2026-11-09 抽出）。
+     *
+     * ## 为什么抽出来
+     *
+     * 两条路径要等同一件事，但原来只有一条在等：
+     *
+     * ```text
+     *   spawn 新进程      等端口就绪  ← 原来有
+     *   复用已有进程      直接返回"正在运行"  ← 原来没有，是个洞
+     * ```
+     *
+     * 那个洞的后果是"点重试永远不成功"（详见 `ensureRunning` 的注释）。
+     * 两处逻辑一模一样，复制一份会分叉 —— 所以抽成一个方法。
+     *
+     * @param proc 我们自己 spawn 的进程；复用别处进程时传 `null`
+     *   （那时没法看 `isAlive`，只能靠 probe 与超时）
+     */
+    private fun awaitListening(port: Int, limit: Long, proc: Process?): StartResult {
+        val startedAt = System.currentTimeMillis()
+        while (System.currentTimeMillis() - startedAt < limit) {
+            /*
+             * 只有自己 spawn 的进程才能查存活。复用别处的进程时 `proc` 为 null，
+             * 跳过这一段 —— 那种情况下唯一的事实来源就是 probe。
+             */
+            if (proc != null && !proc.isAlive) {
+                val code = runCatching { proc.exitValue() }.getOrNull()
+                return StartResult(
+                    false,
+                    "引擎启动后立即退出（退出码 ${code ?: "未知"}）。可能是安装包不完整。",
+                )
+            }
+            if (probe(port).state == ProbeState.ST) {
+                val seconds = (System.currentTimeMillis() - startedAt) / 1000
+                Log.i(TAG, "引擎已就绪，用了 ${seconds}s，端口 $port")
+                return StartResult(true, "引擎已就绪（用了 $seconds 秒）")
+            }
+            Thread.sleep(PROBE_INTERVAL_MS)
+        }
+
+        /*
+         * ★★★ 超时**不等于失败**（2026-11-09）。
+         *
+         * 走到这里时 node 进程通常还活着、还在继续初始化 ——
+         * 真机上实测：报超时那会儿端口还没 LISTEN，几分钟后
+         * `/version` 就返回 200 了。
+         *
+         * 所以提示里**不能**叫用户"重启应用"：重启会杀掉这个正在
+         * 启动的进程，把它拖回起点。而"点重试"是对的
+         * （现在重试真的会等端口），但用户未必会点。
+         *
+         * 现在明说"进主界面等一会儿"，因为主界面里任何一次操作
+         * 都会再问一次 `ensureRunning`，那时进程往往已经就绪。
+         */
+        return StartResult(
+            false,
+            "引擎还在启动（等了 ${limit / 1000} 秒）。先进主界面等一会儿，" +
+                "或者点重试 —— 不要重启应用，那会把正在启动的引擎杀掉。",
+        )
     }
 
     /** 真正 spawn。失败时返回可读原因，不抛 */
@@ -240,24 +323,9 @@ object StLauncher {
              */
             Thread({ drain(proc) }, "st-node-output").apply { isDaemon = true }.start()
 
-            // 等端口就绪
-            val startedAt = System.currentTimeMillis()
+            // 等端口就绪（与"复用已有进程"那条路径共用同一段等待逻辑）
             val limit = if (firstRun) FIRST_RUN_PROBE_TIMEOUT_MS else PROBE_TIMEOUT_MS
-            while (System.currentTimeMillis() - startedAt < limit) {
-                if (!proc.isAlive) {
-                    val code = runCatching { proc.exitValue() }.getOrNull()
-                    return StartResult(
-                        false,
-                        "引擎启动后立即退出（退出码 ${code ?: "未知"}）。可能是安装包不完整。",
-                    )
-                }
-                if (probe(port).state == ProbeState.ST) {
-                    val seconds = (System.currentTimeMillis() - startedAt) / 1000
-                    Log.i(TAG, "引擎已就绪，用了 ${seconds}s，端口 $port")
-                    return StartResult(true, "引擎已就绪（用了 ${seconds} 秒）")
-                }
-                Thread.sleep(PROBE_INTERVAL_MS)
-            }
+            return awaitListening(port, limit, proc)
 
             /*
              * ★★★ 超时**不等于失败**（2026-11-09）。
