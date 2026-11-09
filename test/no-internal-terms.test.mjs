@@ -47,6 +47,8 @@ const UI_FILES = [
   /* v0.1.8：本地卡导入的文案（"PNG 卡或 JSON 卡"这类提示都面向用户） */
   'client/src/chat/card-import-local.ts',
   'client/src/chat/busy-button.ts',
+  /* v0.1.8：卡面（"这张图读不出来，换一张 PNG 或 JPG"这类都是用户文案） */
+  'client/src/chat/card-face.ts',
   'client/src/chat/persona-page.ts',
   'client/src/chat/chat-panel.ts',
   'client/src/chat/select-popover.ts',
