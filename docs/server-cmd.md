@@ -48,7 +48,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 | B     | `.\tcs-server.cmd user list`   | 较新的安装包才有；自带 `--config` |
 | C     | `.\start-server.cmd user list` | 较新的安装包才有；无参数时启动服务      |
 
-**别敲裸 `tcs-server`** —— 安装目录里没有这个 exe，只会得到
+**别敲裸 `tcs-server`**。安装目录里没有这个 exe，只会得到
   
 「无法将"tcs-server"项识别为 cmdlet」。要么带 `.cmd`，要么用形态 A。
 
@@ -56,7 +56,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 
 它指向**服务正在用的那份配置**。省掉的话，CLI 会按当前目录另算一个数据目录
   
-（`<当前目录>\data\`），**等于在旁边新建一个空库** —— 症状是
+（`<当前目录>\data\`），**等于在旁边新建一个空库**。症状是
   
 「账户明明建好了，服务却说不存在」，而两处都不会报错。
 
@@ -105,7 +105,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 
 > `--version` 与 `version` 等价。**拼错的选项会被拒绝**（退出码 2）并提示
 >   
-> `tcs-server help` —— 不会被当成"没有子命令，启动服务"。
+> 敲 `tcs-server help`。它不会被当成"没有子命令，启动服务"。
 >   
 > 这条不是洁癖：以前 `--verison` 会静默起一个真服务，还在当前目录写出
 >   
@@ -127,7 +127,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 
 提示 `首账户密码` 时输入（至少 8 个字符，不回显）。**密码只从标准输入读，
   
-不接受命令行参数** —— 参数会进 shell 历史，也会出现在进程列表里。
+不接受命令行参数**。参数会进 shell 历史，也会出现在进程列表里。
 
 它做的事：
 
@@ -178,7 +178,7 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 
 - 一个账户都没有时，它会直接提示「还没有任何账户。用 `tcs-server user add <用户名>`
     
-  创建第一个（管理员）」——看到这句就说明库是空的（或路径选错了，见 §1.2）。
+  创建第一个（管理员）」。看到这句就说明库是空的（或路径选错了，见 §1.2）。
 - 库里有无归属的历史卡片时，末尾会多一行 `注意：有 N 张卡片没有归属账户`。
 
 ### 3.4 `user passwd` —— 重设密码
@@ -302,7 +302,7 @@ curl -s -X DELETE http://127.0.0.1:8731/control/invites/<id> \
 | **仓库令牌**（`tcr_…`） | 客户端「仓库与令牌」里申请     | 单个仓库，读/写/回滚可分别授权 | 给别人或别的工具用           |
 | **全局令牌**（legacy）  | 服务端首次启动自动生成       | **只有未归属账户的卡片**   | 仅运维、或 ≤v0.1.1 的旧服务端 |
 
-**迁移到账户之后，全局令牌看不到任何卡片** —— 卡都已归属账户。这是 0.1.2 的
+**迁移到账户之后，全局令牌看不到任何卡片**。卡都已归属账户。这是 0.1.2 的
   
 有意降权，不是故障。
 
@@ -378,7 +378,7 @@ Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCard
 
 `dataDir` 故意放在安装目录里（不推荐）时，把那个相对路径加进 `installDirWriteAllow`
   
-就不再按文件刷屏 —— 但配置检查那一条仍会告警一次：
+就不再按文件刷屏。但配置检查那一条仍会告警一次：
 
 ```json
 { "installDirWriteCheck": true, "installDirWriteAllow": ["data"] }
@@ -386,7 +386,7 @@ Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCard
 
 测试环境想彻底关掉：`"installDirWriteCheck": false`。注意它**默认开**，
   
-所以"没有告警"有两种可能 —— 真的没问题，或者被关了。`config show` 会直接显示这个值。
+所以"没有告警"有两种可能。真的没问题，或者被关了。`config show` 会直接显示这个值。
 
 ---
 
@@ -410,7 +410,7 @@ Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCard
   
 为什么不直接挂 `node.exe`：node 从不调用 `StartServiceCtrlDispatcher`，
   
-服务会永久卡在 `Start Pending`，而进程其实活着、端口也在听 —— 看起来完全正常，
+服务会永久卡在 `Start Pending`，而进程其实活着、端口也在听，看起来完全正常，
   
 但安装程序会一直等它。
 
@@ -453,7 +453,7 @@ Remove-Item -LiteralPath 'C:\ProgramData\TavernCardStudio' -Recurse -Force
 
 > 卸载动作本身返回 `ignore`：删不掉（例如某个日志文件仍被占用）**不会**让卸载失败
 >   
-> 回滚 —— 回滚会留下一个"卸不掉"的安装，比"留下一个目录"糟糕得多。
+> 但也不会回滚。回滚会留下一个"卸不掉"的安装，比"留下一个目录"糟糕得多。
 >   
 > 真删不掉时手工执行上面两条命令即可。
 
@@ -491,7 +491,7 @@ Windows Installer 只删它自己装的文件，运行期生成的东西（`data
 日志写到 `C:\ProgramData\TavernCardStudio\logs\uninstall-cleanup.log`，记下每个条目的
 字节数、删没删掉、以及**删不掉的原因**（通常是 `EBUSY`：文件还被某个进程占着）。
 如果数据目录已经被删（勾了"同时删除数据"），日志改写到
-`%TEMP%\TavernCardStudio-uninstall-cleanup.log` —— 清理动作**不会**重建数据目录，
+`%TEMP%\TavernCardStudio-uninstall-cleanup.log`。清理动作**不会**重建数据目录，
 否则"卸载后全清"就不成立了。
 
 ---
@@ -571,7 +571,7 @@ Tavern Card Studio Server 0.1.2 自检（node v22.22.2，win32/x64）
 少了它，绿色包放在仓库目录下时，缺的包会从上层 `node_modules` 被找到，
 自检给出**假通过**；装到 `C:\Program Files` 之后立刻崩。
 
-失败时每项会写明「从包外解析到了 … —— 产物缺这个包」，据此就知道缺哪个依赖。
+失败时每项会写明「从包外解析到了 …，产物缺这个包」，据此就知道缺哪个依赖。
 
 ---
 
@@ -591,10 +591,10 @@ Tavern Card Studio Server 0.1.2 自检（node v22.22.2，win32/x64）
 | `--log-level <级别>` | `debug` / `info` / `warn` / `error` |
 | `--no-worker` | 只起控制面（配合 `serve`） |
 | `--dry-run` | 只打印将要执行的 `sc` 命令（配合 `service *`） |
-| `--service-mode <模式>` | 内部用：`process` / `windows-service`。由服务宿主与安装脚本传入，手动运行不要改 —— 内置帮助里没有列出它 |
+| `--service-mode <模式>` | 内部用：`process` / `windows-service`。由服务宿主与安装脚本传入，手动运行不要改。内置帮助里没有列出它 |
 
 选项写在子命令**前后都可以**（解析器扫全部参数，不看位置）。**命令行参数在后
-则后生效** —— 这也是 `start-server.cmd` 把自己的默认值放在 `%*` 之前的原因。
+则后生效**。这也是 `start-server.cmd` 把自己的默认值放在 `%*` 之前的原因。
 
 **拼错的选项会被拒绝，而不是被忽略。** 形如 `--verison` 的未知选项一律打印
 `未知选项：--verison` 并**退出码 2**，提示 `tcs-server help`。
@@ -605,8 +605,8 @@ Tavern Card Studio Server 0.1.2 自检（node v22.22.2，win32/x64）
 运行 `tcs-server help` 查看可用选项。
 ```
 
-这条是安全相关的：早期版本不认识 `--verison`、位置参数又为空，于是**落到 `serve`**
-—— 静默起了一个真服务，还在当前目录写出 `data\config.json`（含明文令牌）。
+这条是安全相关的：早期版本不认识 `--verison`、位置参数又为空，于是**落到 `serve`**，
+静默起了一个真服务，还在当前目录写出 `data\config.json`（含明文令牌）。
 现在不会了。另外 `--version` / `--help` 这两个惯例写法被正式支持
 （等价于 `version` / `help`），脚本里可以放心用。
 
@@ -617,14 +617,14 @@ Tavern Card Studio Server 0.1.2 自检（node v22.22.2，win32/x64）
 | `TCS_CONFIG` | 配置文件路径，优先级最高 |
 | `TCS_DATA_DIR` | 数据目录（等价 `--data-dir`） |
 | `TCS_RULES_DIR` | 规则目录（等价 `--rules-dir`） |
-| `TCS_PASSWORD` | 非交互场景提供密码。**只给脚本用** —— 环境变量虽然不进 shell 历史，仍可能被同用户进程读到 |
+| `TCS_PASSWORD` | 非交互场景提供密码。**只给脚本用**。环境变量虽然不进 shell 历史，仍可能被同用户进程读到 |
 
 ---
 
 ## 8b. 数据目录里有什么（备份与迁移必读）
 
 默认位置是 **`C://ProgramData//TavernCardStudio//store`**（注意是 `store` 子目录，
-不是 `TavernCardStudio` 本身 —— 后者还放着 `config.json` 与安装期日志）。
+不是 `TavernCardStudio` 本身，后者还放着 `config.json` 与安装期日志）。
 
 ```text
 C://ProgramData//TavernCardStudio//
@@ -666,7 +666,7 @@ C://ProgramData//TavernCardStudio//
 
 **③ v0.1.7 之前的备份里没有 `faces/`。**
 
-从旧版本恢复备份时 `faces` 会是空的 —— 这是**正常现象**（那时还没有卡面功能），
+从旧版本恢复备份时 `faces` 会是空的。这是**正常现象**（那时还没有卡面功能），
 不是恢复失败。恢复后卡片内容完好，只是封面需要重新上传。
 
 ### 邀请码存在哪、怎么清
@@ -724,7 +724,7 @@ msiexec /i "C:\path\to\TavernCardStudioServer-0.1.2.msi" REINSTALL=ALL REINSTALL
 
 ## 11. 安全须知
 
-- **密码只从标准输入读**，任何命令都不接受 `--password` 参数 —— 命令行参数会进
+- **密码只从标准输入读**，任何命令都不接受 `--password` 参数，命令行参数会进
   shell 历史，也会出现在进程列表里。
 - **令牌是凭证**，不要贴进聊天、工单、截图。`token show` 的输出用完就清屏。
 - `token rotate` 之后**旧令牌立即失效**，记得重启服务并更新客户端。
@@ -739,6 +739,6 @@ msiexec /i "C:\path\to\TavernCardStudioServer-0.1.2.msi" REINSTALL=ALL REINSTALL
 - **本文件随版本更新。** 任何新增/改名/删除运维命令的改动，必须在同一个提交里
   更新本文件；否则 `npm test` 里的 `test/ops-doc.test.mjs` 会失败。
 - 该守卫比对两处：`server/src/cli.ts` 的内置帮助（命令面的唯一来源）与本文件的
-  命令表；同时校验 `.gitignore` 只放行本文件 —— `docs/` 其余内容不上传。
+  命令表；同时校验 `.gitignore` 只放行本文件，`docs/` 其余内容不上传。
 - 新增文档若需一并上传 GitHub，需显式在 `.gitignore` 里加 `!docs/<文件名>`
   并同步更新该守卫的允许清单。
