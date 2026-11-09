@@ -795,10 +795,55 @@ pub async fn st_chat_secret_present(state: State<'_, StChatState>) -> Result<Vec
         }
     })?;
 
+    /*
+     * ★★★ 判据必须是「ST 真的读得出来」，不是「这个键存在」（2026-11-09 修）。
+     *
+     * ## 用户报的
+     *
+     * > 我明明填了秘钥……报 Key 错误：Key 填错、过期或未设置 Bearer
+     *
+     * 而 App 界面上显示的是「已经配过了」。
+     *
+     * ## 真因：两处判断不同源
+     *
+     * ST 从 1.13 起把 secrets 存成**数组**，每条带 `active` 标记，
+     * 而 `readSecret()` 只认 `active: true` 的那一条：
+     *
+     * ```js
+     *   const activeSecret = secretArray.find(s => id ? s.id === id : s.active);
+     *   return activeSecret?.value || '';        // ← 全都不 active 就返回空串
+     * ```
+     *
+     * 而这里原来只判 `!value.is_null()` —— 数组非空就算"有 key"。
+     * 于是 **数组里一条 active 都没有** 时：
+     *
+     * ```text
+     *   App 说：已配置 ✓
+     *   ST  读到：''（空字符串）
+     *   请求带：Authorization: Bearer （空）
+     *   上游说：未设置 Bearer
+     * ```
+     *
+     * 这就是那条错误信息的完整来路。而且 ST 对 `custom` 源**不拦空 key**
+     * （它的空 key 检查写的是 `source !== CUSTOM`），所以请求照样发出去，
+     * 错误来自上游而不是 ST —— 更难归因。
+     *
+     * ## 修复后的判据
+     *
+     * 与 ST 的 `readSecret()` 完全一致：**数组里必须有一条 `active: true`**。
+     * 顺带也处理旧格式（值是字符串）—— ST 那边同样读不出来，我们也算没有。
+     */
     let mut present = Vec::new();
     if let Some(map) = root.as_object() {
         for (key, value) in map {
-            if !value.is_null() {
+            let Some(items) = value.as_array() else {
+                /* 旧格式（字符串）或 null：ST 的 readSecret 走不到它，算没有 */
+                continue;
+            };
+            let usable = items
+                .iter()
+                .any(|item| item.get("active").and_then(|v| v.as_bool()).unwrap_or(false));
+            if usable {
                 present.push(key.clone());
             }
         }

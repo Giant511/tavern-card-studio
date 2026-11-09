@@ -113,16 +113,25 @@ test('★★★★★ 带 message 的上游错误不许被误伤（原因要原�
    * 上游真正的错误原因（模型不存在、参数非法、余额不足）会被
    * 统一吞成"没填 key" —— 那比不翻译更糟（把用户引到错误方向）。
    */
+  /*
+   * ★ 2026-11-09 修正取样：原来把 `invalid_api_key` 与 `Authentication Fails`
+   * 也放在"不该被译成 key 问题"这一组里 —— 那是取样错了。
+   *
+   * 这两条**确实**是 key 问题（上游在说"这个 key 不行"），把它们归到
+   * key 分支是对的。判据真正要防的是：**非 key 的原因**（模型不存在、
+   * 余额不足）被吞成"key 有问题"，把用户引到错误方向。
+   *
+   * key 类的那两条移到下面单独断言（见"key 类错误应给出三种可能"）。
+   */
   const realErrors = [
     '{"error":{"message":"Model Not Exist","type":"invalid_request_error"}}',
     '{"error":true,"message":"insufficient balance"}',
-    '{"error":true,"code":"invalid_api_key"}',
-    '{"detail":"Authentication Fails"}',
+    '{"error":{"message":"上下文超长，请减少历史","type":"invalid_request_error"}}',
   ];
   for (const body of realErrors) {
     const msg = explainGenerateError(400, body);
     assert.ok(
-      !/API 连接/.test(msg),
+      !/没(有)?填|没存进去/.test(msg),
       `这条带了具体原因，不该被译成"没填 key"：${JSON.stringify(body)} → ${msg}`,
     );
     /* 具体原因必须能被用户看到（截断也要保留开头） */
@@ -133,6 +142,30 @@ test('★★★★★ 带 message 的上游错误不许被误伤（原因要原�
         `原因被吞掉了：${JSON.stringify(body)} → ${msg}`,
       );
     }
+  }
+});
+
+test('★★★★ key 类错误要归到 key 分支，并给出三种可能', () => {
+  /*
+   * 与上一条互补：上一条防"什么都说是 key 问题"，
+   * 这一条防"该说是 key 问题时不敢说"。
+   *
+   * 用户真机那条原文（中转站返回）：
+   *
+   * ```text
+   *   Key 错误：Key 填错、过期或未设置 Bearer。请检查 Key。
+   * ```
+   */
+  const keyErrors = [
+    '{"error":{"code":"","message":"Key 错误：Key 填错、过期或未设置 Bearer。请检查 Key。"}}',
+    '{"error":true,"code":"invalid_api_key"}',
+    '{"detail":"Authentication Fails"}',
+  ];
+  for (const body of keyErrors) {
+    const msg = explainGenerateError(400, body);
+    assert.match(msg, /key/i, `应认成 key 问题：${JSON.stringify(body)} → ${msg}`);
+    /* 三种可能都要说到，尤其额度 —— 那是用户最容易漏判的一种 */
+    assert.match(msg, /额度/, `必须提额度：${msg}`);
   }
 });
 
