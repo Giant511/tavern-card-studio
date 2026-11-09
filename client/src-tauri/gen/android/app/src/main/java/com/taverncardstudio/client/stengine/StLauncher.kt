@@ -483,25 +483,88 @@ object StLauncher {
         var connection: HttpURLConnection? = null
         return try {
             connection = (URL("http://127.0.0.1:$port/version").openConnection() as HttpURLConnection).apply {
-                connectTimeout = 800
-                readTimeout = 800
+                /*
+                 * ★★★ 800ms 在低端机上不够（2026-11-09 真机取证）。
+                 *
+                 * ## 证据：红米 Note 8 Pro 的首启日志
+                 *
+                 * ```text
+                 *   00:04:10  Compiling frontend libraries...
+                 *   00:04:44  webpack compiled successfully in 33260 ms
+                 *   00:04:49  SillyTavern is listening on 127.0.0.1:8000
+                 *   00:06:06  App: 引擎还在启动（等了 120 秒）   ← 仍在报失败
+                 * ```
+                 *
+                 * 引擎在 00:04:49 就 LISTEN 了，而 App 到 00:06:06 还在报
+                 * "没应答"——**中间 77 秒一次都没探成功**。
+                 *
+                 * ## 为什么探不到
+                 *
+                 * 两个原因叠在一起：
+                 *
+                 * ```text
+                 *   ① webpack 刚编译完，node 仍在 GC/预热，响应排队
+                 *   ② 红米是低端机，主频低；800ms 里连 TCP + 等首字节不够
+                 * ```
+                 *
+                 * 探测是**本机回环**，放宽超时几乎不花代价（真连不上时
+                 * 连接会被立即拒绝，不会真等 3 秒）。而探不到 ST 的代价
+                 * 是"引擎明明好了却报失败"—— 那正是用户反复遇到的。
+                 *
+                 * `PROBE_INTERVAL_MS` 是 500ms，一次探测最长 3s 会让循环变慢。
+                 * 这是**刻意的**：探测失败时本来就没必要那么密。
+                 */
+                connectTimeout = 3_000
+                readTimeout = 3_000
                 requestMethod = "GET"
             }
             val code = connection.responseCode
             if (code != 200) {
                 return ProbeResult(ProbeState.OTHER, "HTTP $code")
             }
-            val body = connection.inputStream.bufferedReader().use { it.readText() }
             /*
-             * 判据是"agent 里含 SillyTavern"。
+             * ★★★ 判据放宽：`200 + 端口在听 + 能读响应` 就算 ST 就绪
+             * （2026-11-09 真机取证）。
              *
-             * 为什么不用 pkgVersion：那个字段是 ST 的版本号，别的服务也可能有。
-             * 而 `agent` 是 ST 自己拼的 `SillyTavern/<version>`，辨识度最高。
+             * ## 原来为什么过严
+             *
+             * 原来要求 body 里含 "SillyTavern"。而红米真机上出现过
+             * **200 + `Content-Type: application/json` + body 为空**：
+             * 端口在听、HTTP 通了、就是读不到那串字。
+             *
+             * 那一刻 App 判定"应答但不是 ST"，于是继续等，直到 120 秒超时
+             * —— 而引擎其实早就好了（`SillyTavern is listening` 日志在前）。
+             *
+             * ## 为什么可以不看 body
+             *
+             * 这个 probe 的用途只有一个：**判断我们自己 spawn 的那个进程
+             * 是否已经把端口服务起来了**。我们 bind 的是 8000、是回环、
+             * 而且就在刚才 spawn 的进程里 —— 有人在这个端口上回 200，
+             * 除了它几乎不可能是别人。
+             *
+             * "怕是别的服务占着 8000"那种担心，`ensureRunning()` 里
+             * 另有一段专门处理（`ProbeState.OTHER` → 换备用端口），
+             * 而那段只在**启动前**跑一次，与这里"等自己的进程就绪"是两件事。
+             *
+             * ## body 仍要读，但只用来做"更确定的证据"
+             *
+             * 读得到 SillyTavern 就带上它（日志里能看出是 ST 而不是野服务）；
+             * 读不到也照样判定就绪 —— 不让一次空 body 把启动判死。
              */
+            val body = runCatching {
+                connection.inputStream.bufferedReader().use { it.readText() }
+            }.getOrDefault("")
             if (body.contains("SillyTavern", ignoreCase = true)) {
                 ProbeResult(ProbeState.ST, body.take(120))
             } else {
-                ProbeResult(ProbeState.OTHER, "应答但不是 ST：${body.take(80)}")
+                /*
+                 * 200 但没读到那串字：端口确实在服务，判就绪。
+                 * 日志里标记 `body 空/不含 ST`，便于事后区分是哪种情况。
+                 */
+                ProbeResult(
+                    ProbeState.ST,
+                    if (body.isEmpty()) "200 但 body 为空（端口已在服务）" else "200：${body.take(80)}",
+                )
             }
         } catch (error: Exception) {
             /*

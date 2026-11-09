@@ -610,3 +610,73 @@ test('★★ 看守要知道进程死了就收工（别陪着僵尸线程）', (
   assert.match(body, /!StLauncher\.isOurProcessAlive\(\)/, '进程没了要退出');
   assert.match(body, /isDaemon = true/, '必须是 daemon 线程');
 });
+
+/* ═══════════════════════════════════════════════════════════
+   ⑧ 就绪判据：端口在服务就算好，不许被空 body 判死
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★★ probe 不许因为 body 为空就判定"不是 ST"', () => {
+  /*
+   * 红米真机取证（2026-11-09）：
+   *
+   * ```text
+   *   00:04:44  webpack compiled successfully in 33260 ms
+   *   00:04:49  SillyTavern is listening on 127.0.0.1:8000
+   *   00:06:06  App: 引擎还在启动（等了 120 秒）   ← 仍报失败
+   * ```
+   *
+   * 引擎 00:04:49 就 LISTEN 了，而 App 到 00:06:06 一次都没探成功。
+   *
+   * 原因之一：probe 要求 body 里含 "SillyTavern"，而真机上出现过
+   * **200 + application/json + body 为空** —— 端口在听、HTTP 通了、
+   * 就是读不到那串字。于是被判"应答但不是 ST"，一直等到超时。
+   *
+   * ## 为什么可以放宽
+   *
+   * 这个 probe 只回答一个问题：**我们自己 spawn 的进程把端口服务起来了吗**。
+   * 8000、回环、刚 spawn —— 有人在这个端口回 200，几乎不可能是别人。
+   * "怕是别的服务"那种担心在 `ensureRunning()` 启动前那段处理，
+   * 与"等自己的进程就绪"是两件事。
+   */
+  const java = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StLauncher.kt',
+  );
+  const at = java.indexOf('fun probe(port: Int)');
+  assert.ok(at > 0, '找不到 probe');
+  const body = java.slice(at, at + 3200);
+
+  /* ① 读 body 要容错（空/异常都不许把整个 probe 打死） */
+  assert.match(body, /runCatching\s*\{/, '读 body 要容错');
+
+  /* ② 不含 SillyTavern 时也要判 ST，而不是 OTHER */
+  const tail = body.slice(body.indexOf('contains("SillyTavern"'));
+  assert.match(
+    tail,
+    /ProbeState\.ST/,
+    '200 但 body 不含 SillyTavern 时仍要判就绪（端口已在服务）',
+  );
+  /* 反判据：不许再出现"读不到 ST 就判 OTHER" */
+  assert.doesNotMatch(
+    body,
+    /ProbeResult\(ProbeState\.OTHER, "应答但不是 ST/,
+    '不许因为 body 内容把已经能服务的端口判成"不是 ST"',
+  );
+});
+
+test('★★★★ probe 的 IO 超时不能低于 3 秒（低端机 webpack 编译期间）', () => {
+  /*
+   * 红米上 ST 首启要 **webpack 编译前端库，33 秒**。编译刚结束时 node
+   * 还在 GC/预热，响应排队；而低端机主频低，800ms 里连 TCP + 等首字节不够。
+   *
+   * 探测是**本机回环**，放宽几乎不花代价（真连不上会被立刻拒绝，
+   * 不会真等满）。而探不到的代价是"引擎明明好了却报失败"。
+   */
+  const java = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StLauncher.kt',
+  );
+  const connect = Number(/connectTimeout = ([0-9_]+)/.exec(java)?.[1]?.replace(/_/g, '') ?? '0');
+  const readMs = Number(/readTimeout = ([0-9_]+)/.exec(java)?.[1]?.replace(/_/g, '') ?? '0');
+
+  assert.ok(connect >= 3_000, `connectTimeout 不能低于 3 秒，实际 ${String(connect)}`);
+  assert.ok(readMs >= 3_000, `readTimeout 不能低于 3 秒，实际 ${String(readMs)}`);
+});
