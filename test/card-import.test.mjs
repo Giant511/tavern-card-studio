@@ -189,8 +189,16 @@ test('★★★ 导入必须走「允许新建」，否则新卡写不进去', a
    *   判据要守的性质没变（导入必须 allowCreate），只是要找对位置。
    *   原来的锚点 `onImportVersion:` 现在只剩一行委托，自然找不到。
    */
-  const at = shell.indexOf('private async importRepoVersion(');
-  assert.ok(at > 0, '找不到 importRepoVersion 方法');
+  /*
+   * ★ 2026-11-09（v0.1.8）：落盘那段又从 `importRepoVersion` 抽成了
+   *   `writeCardToLibrary` —— 本地卡导入是第二条走同一条管线的路。
+   *
+   *   判据守的性质没变（导入必须允许新建 / 覆盖不许写死），
+   *   只是**又跟了一次位置**。这已经是这条判据第二次搬家，
+   *   所以这次断言改成不认变量名（见下），下次再抽就不用再改。
+   */
+  const at = shell.indexOf('private async writeCardToLibrary(');
+  assert.ok(at > 0, '找不到 writeCardToLibrary 方法');
   const block = shell.slice(at, at + 3600);
 
   /*
@@ -212,15 +220,18 @@ test('★★★ 导入必须走「允许新建」，否则新卡写不进去', a
    *
    * 这条守的性质没变（新卡必须允许新建），只是现在还要同时守住覆盖。
    */
+  /*
+   * 不认变量名：`!overwrite` / `!plan.overwrite` / `!planned.plan.overwrite` 都算对。
+   * 守的是"第 4 参必须是对某个 overwrite 标志取反"，而不是它叫什么。
+   */
+  const call = /writeCharacterPng\(([^)]*)\)/.exec(block);
+  assert.ok(call !== null, '找不到 writeCharacterPng 调用');
+  const args = call[1].split(',');
+  const flag = (args[args.length - 1] ?? '').trim();
   assert.match(
-    block,
-    /writeCharacterPng\(avatar, charactersDir, png, !overwrite\)/,
-    'allowCreate 要取 !overwrite（新卡 true / 覆盖 false）',
-  );
-  assert.doesNotMatch(
-    block,
-    /writeCharacterPng\(avatar, charactersDir, png, (true|false)\)/,
-    '不许写死 allowCreate —— 覆盖与新建两个方向都需要',
+    flag,
+    /^!\s*[\w.]*overwrite$/,
+    `allowCreate 要取 !<overwrite>（新卡 true / 覆盖 false），实际是：${flag}`,
   );
 });
 

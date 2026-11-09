@@ -44,6 +44,9 @@ const UI_FILES = [
   'client/src/chat/chat-settings.ts',
   'client/src/chat/chat-actions-page.ts',
   'client/src/chat/character-picker.ts',
+  /* v0.1.8：本地卡导入的文案（"PNG 卡或 JSON 卡"这类提示都面向用户） */
+  'client/src/chat/card-import-local.ts',
+  'client/src/chat/busy-button.ts',
   'client/src/chat/persona-page.ts',
   'client/src/chat/chat-panel.ts',
   'client/src/chat/select-popover.ts',
