@@ -125,11 +125,23 @@ test('★★★★★ writeCharacterPng 的 allowCreate 必须跟着 overwrite �
    *   覆盖（overwrite=true）  ⇒ allowCreate=false  要求文件已存在
    * ```
    */
-  assert.match(
-    shellSrc,
-    /writeCharacterPng\(avatar, charactersDir, png, !overwrite\)/,
-    'allowCreate 要取 !overwrite',
-  );
+  /*
+   * ★ 2026-11-09（v0.1.8）：断言改成**不认变量名**。
+   *
+   * 这条原来写死 `!overwrite`，v0.1.8 把落盘抽成 `writeCardToLibrary` 之后
+   * 变量变成 `plan.overwrite`，判据就红了 —— 而它守的性质一个字都没变。
+   * 这是"判据钉写法"的典型：搬家一次就要改一次，改多了就会有人图省事把它删掉。
+   *
+   * 现在只看两件事：**导入那条调用存在**，且第 4 参是对某个 overwrite 取反。
+   * 开场白保存那条传 `false` 是合法的（只改现有卡），所以先定位到导入那条。
+   */
+  const at = shellSrc.indexOf('private async writeCardToLibrary(');
+  assert.ok(at > 0, '找不到 writeCardToLibrary');
+  const block = shellSrc.slice(at, at + 3600);
+  const call = /writeCharacterPng\(([^)]*)\)/.exec(block);
+  assert.ok(call !== null, '找不到 writeCharacterPng 调用');
+  const flag = call[1].split(',').pop().trim();
+  assert.match(flag, /^!\s*[\w.]*overwrite$/, `allowCreate 要取 !<overwrite>，实际是：${flag}`);
 
   /* 名字必须真的传进去 */
   assert.match(

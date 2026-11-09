@@ -80,6 +80,8 @@ import {
   writeRepoConfig,
   type MobileRepoAuth,
 } from './repo-store.ts';
+import { readLocalCardFile, localCardId } from './card-import-local.ts';
+import { runBusy } from './busy-button.ts';
 import {
   CLOUD_REPO_HOST,
   buildOpeningMessages,
@@ -91,6 +93,7 @@ import {
   attachWorldToCard,
   resolveRepoOrigin,
   stringifyStCard,
+  type ImportPlan,
   type RepoConfigState,
 } from '@tcs/shared';
 import {
@@ -1426,6 +1429,7 @@ export class AppShell {
     this.pageHost.append(scroller);
 
     scroller.append(
+      this.renderImportAction(),
       /*
        * 开场与示例（2026-11-05，用户决定 1）。
        *
@@ -1485,6 +1489,49 @@ export class AppShell {
         buildBody: () => el(this.doc, 'p', 'nb-note'),
       }),
     );
+  }
+
+  /**
+   * 「从手机导入卡片」这一行（v0.1.8）。
+   *
+   * ## 为什么放在卡片 Tab、且排在最前
+   *
+   * 三个理由：
+   *
+   * ```text
+   *   ① 卡片 Tab 是"卡资产"的归属地，导入属于这一类
+   *   ② 空角色库时它会是最需要的动作 —— 没有卡，下面三条都无从下手
+   *   ③ 它不依赖登录（仓库页的上传要登录，语义还相反）
+   * ```
+   *
+   * ## 为什么不做成 accordion
+   *
+   * 它是个**动作**，不是可展开的分组。accordion 还得配一个空面板，
+   * 点开之后什么都不显示，反而让人以为坏了。
+   *
+   * ## 为什么文字由 `runBusy` 直接接管
+   *
+   * 按钮里没有子元素：`runBusy` 用 `textContent` 换文案，
+   * 有子元素的话会被整块覆盖掉。所以标题与说明分成两行 ——
+   * 按钮自己一行（三态文案），说明另起一行 `nb-note`。
+   */
+  private renderImportAction(): ElLike {
+    const wrap = el(this.doc, 'div', 'nb-section');
+
+    const button = el(this.doc, 'button', 'nb-listitem');
+    button.setAttribute('type', 'button');
+    button.setAttribute('data-role', 'card-import-entry');
+    button.setAttribute('data-state', 'idle');
+    button.textContent = '从手机导入卡片';
+    button.addEventListener('click', () => {
+      void this.importLocalCard(button);
+    });
+
+    const note = el(this.doc, 'p', 'nb-note');
+    note.textContent = 'PNG 卡或 JSON 卡。TXT 请在桌面端导入。';
+
+    wrap.append(button, note);
+    return wrap;
   }
 
   /**
@@ -2703,12 +2750,47 @@ export class AppShell {
    * 提出来只为一件事：**三级页面（卡片历史）也要调它**。
    * 它原来写在 `renderRepoPage` 的回调闭包里，三级页面是另一个渲染函数，
    * 拿不到那个闭包。把逻辑复制一份更糟 —— 两处会分叉。
+   *
+   * v0.1.8 起落盘那段抽成 `resolveCardPlacement` + `writeCardToLibrary`，
+   * 给本地卡导入共用；这里只剩"取原文 + 给底图"。
    */
   private async importRepoVersion(cardId: string, seq: number): Promise<void> {
     const jsonText = await this.runRepoRequest((config) =>
       repoFetchVersionText(config, cardId, seq, { fetchImpl: pickFetch() }),
     );
 
+    /*
+     * 底图用**内置兜底卡面**（桌面端那张，用户指定）。
+     *
+     * 为什么不去取仓库里的卡面资产：那张图是 webp，而 `buildPngCard`
+     * 只认 PNG 容器；转码要 canvas（`face-encode` 的整条管线），
+     * 而这条路径的目标是"内容能进来"。封面可以在编辑器里再换。
+     */
+    const base = await readDefaultFaceBytes();
+
+    /* 仓库是权威版本，覆盖本地同名卡是预期行为，不弹确认 */
+    const plan = await this.resolveCardPlacement({ jsonText, cardId, confirmOverwrite: false });
+    if (plan === null) return;
+    await this.writeCardToLibrary({ plan, jsonText, base });
+  }
+
+  /**
+   * 决定这张卡落到哪个文件名、要不要覆盖（v0.1.8 从 `importRepoVersion` 抽出）。
+   *
+   * 两条路共用：仓库下载与本地导入。差别只有一个 ——
+   * 本地导入要在"会覆盖"时**先问一句**（`confirmOverwrite`）。
+   *
+   * 为什么不把整个导入做成一个函数：本地导入的按钮要显示三态，
+   * 而"用户在对话框上点取消"不该被当成"导入成功"（按钮会撒谎说已导入）。
+   * 所以把「落名 + 确认」放在按钮进入忙碌之前，写入才包进 `runBusy`。
+   *
+   * @returns `null` = 用户在覆盖确认里取消
+   */
+  private async resolveCardPlacement(input: {
+    jsonText: string;
+    cardId: string;
+    confirmOverwrite: boolean;
+  }): Promise<ImportPlan | null> {
     /*
      * 现有文件名要**现取**，不能用页面进页面时那份：
      * 用户可能刚导入过一张，再导同名的那张就该变 ` (2)`。
@@ -2718,8 +2800,8 @@ export class AppShell {
     if (!listed.ok) throw new Error(listed.reason);
 
     const planned = planCardImport({
-      jsonText,
-      cardId,
+      jsonText: input.jsonText,
+      cardId: input.cardId,
       existingAvatars: listed.items.map((one) => one.avatar),
       /*
        * ★ 名字也要传（2026-11-06，用户报「同一个角色出现多个」）。
@@ -2731,32 +2813,45 @@ export class AppShell {
     });
     if (!planned.ok) throw new Error(planned.reason);
 
-    const { avatar, spec, displayName, overwrite } = planned.plan;
+    /*
+     * 覆盖不可逆，而本地导入没有服务端那份兜底：从别人那里收到一张同名卡，
+     * 就会顶掉用户自己那张。所以这条路必须先问。
+     *
+     * 仓库下载不弹（`confirmOverwrite: false`）—— 那份是权威版本，
+     * 用户点"下载"就是要把本地刷成它。
+     */
+    if (planned.plan.overwrite && input.confirmOverwrite) {
+      const go = await this.confirmOverwriteCard(planned.plan.displayName);
+      if (!go) return null;
+    }
+
+    return planned.plan;
+  }
+
+  /**
+   * 把规划好的卡真正写进角色库（世界书 → 建 PNG → 原子落盘）。
+   *
+   * 顺序不能换：卡里要写 `extensions.world = <书名>`，书名得先定下来。
+   * 反过来（先写卡再写世界书）中途失败会留下"卡指向不存在的书"的坏状态。
+   */
+  private async writeCardToLibrary(input: {
+    plan: ImportPlan;
+    jsonText: string;
+    base: Uint8Array;
+  }): Promise<void> {
+    const { plan, jsonText, base } = input;
 
     /*
-     * ★★★ 内嵌世界书要**先**落地，再写卡（2026-11-06）。
-     *
-     * 顺序理由：卡里要写 `extensions.world = <书名>`，书名得先定下来。
-     * 反过来（先写卡再写世界书）的话，卡里那个字段指向一本还不存在的书，
-     * 中途失败就留下"卡指向空世界书"的坏状态。
-     *
-     * 失败**不阻断导入**：卡本身能用，世界书是加分项。
-     * 阻断会让用户连卡都拿不到 —— 那比"世界书没进来"更糟。
+     * 内嵌世界书**先**落地。
+     * 失败**不阻断导入** —— 卡本身能用；阻断会让用户连卡都拿不到，
+     * 那比"世界书没进来"更糟。
      */
-    const worldName = await this.persistEmbeddedWorldbook(jsonText, displayName);
+    const worldName = await this.persistEmbeddedWorldbook(jsonText, plan.displayName);
     const cardText = worldName === null ? jsonText : JSON.stringify(
       attachWorldToCard(JSON.parse(jsonText) as unknown, worldName),
     );
 
-    /*
-     * 底图用**内置兜底卡面**（桌面端那张，用户指定）。
-     *
-     * 为什么不去取仓库里的卡面资产：那张图是 webp，而 `buildPngCard`
-     * 只认 PNG 容器；转码要 canvas（`face-encode` 的整条管线），
-     * 而这条路径的目标是"内容能进来"。封面可以在编辑器里再换。
-     */
-    const base = await readDefaultFaceBytes();
-    const png = buildPngCard(base, cardText, spec);
+    const png = buildPngCard(base, cardText, plan.spec);
 
     const status = this.readEngineStatus();
     const charactersDir = status?.charactersDir ?? '';
@@ -2774,19 +2869,203 @@ export class AppShell {
      * "该新建却去覆盖" / "该覆盖却去新建" 立刻暴露，而不是静默走错。
      */
     await this.withConnection(() =>
-      this.bridge.writeCharacterPng(avatar, charactersDir, png, !overwrite),
+      this.bridge.writeCharacterPng(plan.avatar, charactersDir, png, !plan.overwrite),
     );
+  }
+
+  /**
+   * 从手机里选一个文件导入成卡片（v0.1.8）。
+   *
+   * 支持 PNG 卡与 JSON 卡。TXT 明确不做：桌面端的 TXT 是**带板块标记的自有格式**，
+   * 手机上没有那套解析，任意 TXT 导进来只会得到空卡 —— 比不给入口更糟。
+   *
+   * 按钮状态刻意分两段：选文件与覆盖确认期间按钮**保持空闲**
+   * （用户在答对话框，不是在等按钮）；只有真正写盘那段才进忙碌态。
+   */
+  private async importLocalCard(button: ElLike): Promise<void> {
+    const picked = await this.pickLocalCardFile();
+    if (picked === null) return;
+
+    const parsed = readLocalCardFile(picked.name, picked.bytes);
+    if (parsed.kind === 'reject') {
+      /* 不是卡就是不是卡，不能进忙碌态装作在处理 */
+      this.options.onNotify?.(parsed.reason, 'warn');
+      return;
+    }
 
     /*
-     * 文案只能说**现在真能做的事**。
-     *
-     * 不能写"可以在「卡片」里打开"—— 卡片页目前只有「编辑角色卡」
-     * 与「用户设定管理」两个入口，没有卡片列表（编辑器按用户要求先不做）。
-     * 承诺一个点了会落空的入口，比不说更糟：用户会以为导入失败。
-     *
-     * 现在真能看到的两个地方：聊天页右上角选角色时的列表、以及仓库页
-     * 选本地卡上传时的列表。
+     * PNG 卡用**它自己那张图**当底图 —— 本地导入的卡应该保留它自己的封面。
+     * JSON 卡没有图，用内置兜底卡面（与仓库下载一致）。
      */
+    let base = parsed.base;
+    if (base === null) {
+      try {
+        base = await readDefaultFaceBytes();
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error);
+        this.options.onNotify?.(`读不到内置卡面：${text}`, 'danger');
+        return;
+      }
+    }
+
+    const cardId = localCardId(parsed.jsonText, picked.name);
+
+    let plan: ImportPlan | null = null;
+    try {
+      plan = await this.resolveCardPlacement({
+        jsonText: parsed.jsonText,
+        cardId,
+        confirmOverwrite: true,
+      });
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error);
+      this.options.onNotify?.(text, 'danger');
+      return;
+    }
+    if (plan === null) return; /* 用户取消覆盖 */
+
+    const target = plan;
+    await runBusy(
+      button,
+      { idle: '从手机导入卡片', busy: '导入中…', done: '已导入 ✓', retry: '重试' },
+      async () => {
+        await this.writeCardToLibrary({ plan: target, jsonText: parsed.jsonText, base });
+      },
+      { doneKind: 'ok' },
+    ).then(() => {
+      /*
+       * 成功后才通知，且**这时候不会重绘**（卡片页不列卡片），
+       * 所以挂 topbar 的通知不会被删掉。
+       */
+      this.options.onNotify?.(
+        target.overwrite
+          ? `已覆盖「${target.displayName}」`
+          : `已导入「${target.displayName}」`,
+        'ok',
+      );
+    }).catch((error: unknown) => {
+      const text = error instanceof Error ? error.message : String(error);
+      this.options.onNotify?.(`导入失败：${text}`, 'danger');
+    });
+  }
+
+  /**
+   * 弹一个选文件框，读成字节（v0.1.8）。
+   *
+   * 用 `<input type="file">` 而不是新加一条 Rust 命令：
+   * WebView 的 `onShowFileChooser` 在本项目已经在用（世界书导入、头像上传），
+   * 而 `<input>` 拿到的 `File` 直接能 `arrayBuffer()`，不需要 `content://` 解码。
+   *
+   * ★ `input.click()` 必须发生在**用户手势的同步链路里**，否则 WebView 会拒绝弹框。
+   * 所以本函数从调用到 `click()` 之间不能有 `await`。
+   *
+   * @returns `null` = 用户取消（含 60 秒无操作）
+   */
+  private async pickLocalCardFile(): Promise<{ name: string; bytes: Uint8Array } | null> {
+    const input = this.doc.createElement('input');
+    input.setAttribute('type', 'file');
+    /* 扩展名与 MIME 都写：不同 ROM 的选文件器认其中一种 */
+    input.setAttribute('accept', 'image/png,application/json,.png,.json');
+    input.setAttribute('style', 'position:fixed;left:-9999px;top:0;opacity:0;');
+    const body = (this.doc as unknown as { body?: ElLike }).body;
+    if (body === undefined) return null;
+    body.append(input);
+
+    try {
+      return await new Promise<{ name: string; bytes: Uint8Array } | null>((resolve) => {
+        let settled = false;
+        const finish = (value: { name: string; bytes: Uint8Array } | null): void => {
+          if (settled) return;
+          settled = true;
+          resolve(value);
+        };
+        input.addEventListener('change', () => {
+          const pickedBytes = (input as unknown as HTMLInputElement).files?.[0];
+          if (pickedBytes === undefined) {
+            finish(null);
+            return;
+          }
+          const reader = new FileReader();
+          reader.onload = () => {
+            const result = reader.result;
+            /*
+             * 必须是 ArrayBuffer。用 `readAsText` 读 PNG 会把二进制掰成文本，
+             * 那份字节再写进角色目录就是一个坏文件 —— 而且看起来像"导入成功"。
+             */
+            if (result instanceof ArrayBuffer) {
+              finish({ name: pickedBytes.name, bytes: new Uint8Array(result) });
+              return;
+            }
+            finish(null);
+          };
+          reader.onerror = () => finish(null);
+          reader.readAsArrayBuffer(pickedBytes);
+        });
+        input.addEventListener('cancel', () => finish(null));
+        globalThis.setTimeout(() => finish(null), 60_000);
+        (input as unknown as HTMLInputElement).click();
+      });
+    } finally {
+      input.remove();
+    }
+  }
+
+  /**
+   * 覆盖前确认（v0.1.8）。
+   *
+   * 挂到 `this.root` 而不是 `pageHost`：`.nb-exit-overlay` 是 `position: fixed`，
+   * 挂在页面层里会被层的 `transform` 变成"相对层定位"（§121 同一个坑），
+   * 而且换页时会被连带删掉 —— 那样这个 Promise 永远不 resolve，导入就卡死。
+   */
+  private async confirmOverwriteCard(name: string): Promise<boolean> {
+    const host = this.root;
+    if (host === null) return false;
+
+    return await new Promise<boolean>((resolve) => {
+      const overlay = el(this.doc, 'div', 'nb-exit-overlay');
+      overlay.setAttribute('data-role', 'card-import-confirm');
+
+      const card = el(this.doc, 'div', 'nb-exit-card');
+      card.setAttribute('role', 'dialog');
+      card.setAttribute('aria-modal', 'true');
+
+      const title = el(this.doc, 'p', 'nb-exit-title');
+      title.textContent = `本地已有「${name}」`;
+      const sub = el(this.doc, 'p', 'nb-exit-subtitle');
+      sub.textContent = '覆盖会替换这张卡的内容，不能恢复。';
+
+      const actions = el(this.doc, 'div', 'nb-exit-actions');
+
+      const confirm = el(this.doc, 'button', 'nb-exit-leave');
+      confirm.setAttribute('type', 'button');
+      confirm.setAttribute('data-role', 'card-import-confirm-ok');
+      confirm.textContent = '覆盖';
+      confirm.addEventListener('click', () => {
+        overlay.remove();
+        resolve(true);
+      });
+
+      const cancel = el(this.doc, 'button', 'nb-exit-stay');
+      cancel.setAttribute('type', 'button');
+      cancel.setAttribute('data-role', 'card-import-confirm-cancel');
+      cancel.textContent = '取消';
+      cancel.addEventListener('click', () => {
+        overlay.remove();
+        resolve(false);
+      });
+
+      actions.append(confirm, cancel);
+      card.append(title, sub, actions);
+      overlay.append(card);
+      /* 点遮罩等同取消：覆盖是危险动作，误触不该前进 */
+      overlay.addEventListener('click', (event) => {
+        if ((event as { target?: unknown }).target !== overlay) return;
+        overlay.remove();
+        resolve(false);
+      });
+
+      host.append(overlay);
+    });
   }
 
   private renderPersonaPage(): void {
