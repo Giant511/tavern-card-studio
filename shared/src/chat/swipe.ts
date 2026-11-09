@@ -163,15 +163,60 @@ export function popLastAssistant(history: readonly StChatMessage[]): {
   target: StChatMessage | null;
   index: number;
 } {
-  for (let i = history.length - 1; i >= 0; i -= 1) {
-    const message = history[i];
-    if (message !== undefined && message.is_user !== true) {
-      return {
-        history: [...history.slice(0, i), ...history.slice(i + 1)],
-        target: message,
-        index: i,
-      };
-    }
+  /*
+   * ★★★ 只认**最后一条**，不许往前找（2026-11-09 修）。
+   *
+   * ## 用户报的
+   *
+   * > 如果删除了角色底端的回复，点击重新生成就会出现回复异常，
+   * > 并且有报连不上 ST
+   *
+   * ## 原实现为什么错
+   *
+   * 原来是从末尾**往前扫**，找到第一条非 user 的就弹：
+   *
+   * ```ts
+   *   for (let i = history.length - 1; i >= 0; i -= 1) {
+   *     if (message.is_user !== true) return { ...我弹它... }
+   *   }
+   * ```
+   *
+   * 用户删掉底部那条 assistant 之后，历史是：
+   *
+   * ```text
+   *   [0] user:      你好
+   *   [1] assistant: 回复1
+   *   [2] user:      再来        ← 最后一条
+   * ```
+   *
+   * 于是它把 **[1] 回复1** 弹走了，剩下：
+   *
+   * ```text
+   *   [0] user: 你好
+   *   [2] user: 再来
+   * ```
+   *
+   * 两条连续的 user 消息发给上游 ⇒ 模型行为异常（多数接口不接受
+   * 连续 user，或把它当成一段超长输入）。这就是"回复异常"的来源；
+   * 而紧接着的保存/计数请求失败，用户看到的就是"连不上"那句。
+   *
+   * ## 正确语义
+   *
+   * 「重新生成」= **重做最后一轮**。它只在"最后一条确实是 assistant"
+   * 时成立。最后一条是 user 时，用户想要的是"为这条生成回复"——
+   * 那是发送，不是重新生成。让调用方去提示，比擅自改坏历史好。
+   *
+   * ★ 这条与"扫描式删除"是**不同需求**：删除任意一条消息走的是
+   *   另一个函数（按 index 删）。把两件事合到一个函数上，
+   *   就是这里出错的根源。
+   */
+  const last = history[history.length - 1];
+  if (last === undefined || last.is_user === true) {
+    return { history: [...history], target: null, index: -1 };
   }
-  return { history: [...history], target: null, index: -1 };
+  return {
+    history: history.slice(0, -1),
+    target: last,
+    index: history.length - 1,
+  };
 }

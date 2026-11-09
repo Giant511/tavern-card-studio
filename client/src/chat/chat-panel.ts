@@ -1605,7 +1605,25 @@ export class ChatPanel {
     }
     const popped = popLastAssistant(this.messages);
     if (popped.target === null) {
-      this.callbacks.onNotify?.('还没有可以重新生成的内容', 'warn');
+      /*
+       * ★ 两种"没得弹"要说不同的话（2026-11-09）。
+       *
+       * ```text
+       *   历史是空的             → "还没有对话"
+       *   最后一条是 user        → "最后一条还没回复，直接发送就行"
+       * ```
+       *
+       * 原来两种情况都是「还没有可以重新生成的内容」。而用户在
+       * "删掉底部回复"之后看到的正是这一句 —— 他刚删完，会以为坏了。
+       * 实际上下一步很清楚：**直接点发送**就是为这条 user 生成回复。
+       */
+      const last = this.messages[this.messages.length - 1];
+      this.callbacks.onNotify?.(
+        last === undefined
+          ? '还没有对话，先发一句话吧'
+          : '最后一条是你的发言，它还没有回复 —— 直接点发送就行',
+        'warn',
+      );
       return;
     }
     this.messages = popped.history;
