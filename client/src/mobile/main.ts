@@ -764,7 +764,18 @@ async function boot(): Promise<void> {
 
   const waited = await waitForEngine({
     intervalMs: 1000,
-    timeoutMs: 90_000,
+    /*
+     * ★★★ 与引擎侧的探活上限同值（2026-11-09）。
+     *
+     * 原来是 90 秒，而引擎侧是 30 秒 —— **两侧不一致**，后果是：
+     * 引擎先放弃并写下"启动失败"状态，开屏还在傻等 60 秒，
+     * 然后显示"等了 90 秒还没就绪"。用户看到两个失败，
+     * 而实际上引擎 60 秒后就起来了。
+     *
+     * 现在两侧都是 120 秒（与 `st-lifecycle.ts` 的 `PROBE_TIMEOUT_MS` 一致）。
+     * 慢一点可接受，**"起来了却报失败"不可接受**。
+     */
+    timeoutMs: 120_000,
     probe: () => readEngineProbe(),
     onPhase: (phase) => {
       splash.setPhase(phase);
