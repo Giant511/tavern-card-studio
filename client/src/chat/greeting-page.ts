@@ -211,7 +211,12 @@ export function renderGreetingPage(
   if (state.characters.length === 0) {
     const empty = el(doc, 'p', 'nb-note');
     empty.setAttribute('data-role', 'greeting-empty');
-    empty.textContent = '还角色库里还没有角色。先导入一张卡，再回来改它的开场。';
+    /*
+     * 原文是「还角色库里还没有角色。先导入一张卡…」—— 开头多了一个"还"。
+     * 同时把"先导入一张卡"落到具体入口：v0.1.8 之前手机上根本没有导入入口，
+     * 这句话是在指一条不存在的路；现在有了，就说清它在哪。
+     */
+    empty.textContent = '角色库里还没有角色。去「卡片」页点「从手机导入卡片」，再回来改它的开场。';
     list.append(empty);
     return root;
   }

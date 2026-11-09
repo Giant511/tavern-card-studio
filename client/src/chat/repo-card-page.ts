@@ -38,6 +38,7 @@
  */
 
 import { el, type DocLike, type ElLike } from './chat-view.ts';
+import { runBusy } from './busy-button.ts';
 
 export interface RepoVersionRow {
   seq: number;
@@ -60,59 +61,13 @@ export interface RepoCardPageCallbacks {
   onNotify: (message: string, kind?: 'info' | 'ok' | 'warn' | 'danger') => void;
 }
 
-/**
- * 让一个按钮进入"忙碌 → 成功/失败"的三态循环。
+/*
+ * 三态按钮的实现搬到 `busy-button.ts`（v0.1.8）。
  *
- * 抽出来是因为下载和"设为最新"要做**完全一样**的事，
- * 写两遍必然有一处漏掉复位（那是本项目踩过三次的坑）。
- *
- * @returns 完成时的 Promise。**调用方必须 `.catch()`** ——
- *   失败时会 reject（好让调用方弹通知），不接就是 unhandled rejection。
+ * 搬的理由不是"文件太长"，是本地卡导入成了第三个用它的地方：
+ * 复制一份就会有一处漏掉复位（本项目踩过三次），
+ * 所以宁可多一个文件也不写第二份实现。
  */
-function runBusy(
-  button: ElLike,
-  labels: { idle: string; busy: string; done: string; retry: string },
-  work: () => Promise<void>,
-  options: { doneKind?: 'ok' | 'warn' } = {},
-): Promise<void> {
-  const idle = labels.idle;
-  button.textContent = labels.busy;
-  button.setAttribute('disabled', 'true');
-  /* 让忙碌态可被判定（探针与判据都读这个，不去猜文字） */
-  button.setAttribute('data-state', 'busy');
-
-  return (async () => {
-    try {
-      await work();
-      button.textContent = labels.done;
-      button.setAttribute('data-state', 'done');
-      if (options.doneKind !== undefined) button.setAttribute('data-tone', options.doneKind);
-      /*
-       * 成功后**复位**：用户可能想再下一次，或再对另一版操作。
-       * 800ms 够看清，又不至于让按钮一直停在"已下载"让人以为不能再点。
-       */
-      globalThis.setTimeout(() => {
-        button.textContent = idle;
-        button.removeAttribute('disabled');
-        button.setAttribute('data-state', 'idle');
-        button.removeAttribute('data-tone');
-      }, 800);
-    } catch (error) {
-      /*
-       * 失败留在原地：文字变「重试」、可点。
-       *
-       * ★ 这里**不调 onNotify** —— 按钮本身就表达了结果。
-       *   只靠通知的问题是它会被遮挡/自动消失（见文件头）。
-       *   调用方接到 reject 后再额外弹一条说明细节，两条一起用。
-       */
-      button.textContent = labels.retry;
-      button.setAttribute('data-state', 'failed');
-      button.setAttribute('data-tone', 'danger');
-      button.removeAttribute('disabled');
-      throw error;
-    }
-  })();
-}
 
 export function renderRepoCardPage(
   doc: DocLike,

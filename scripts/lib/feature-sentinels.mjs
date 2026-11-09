@@ -396,6 +396,21 @@ export const FEATURE_SENTINELS = [
       },
     ],
   },
+  {
+    feature: 'T18',
+    title: '本地卡导入：卡片页可以直接从手机里选 PNG / JSON 导入卡片',
+    since: '0.1.8',
+    expect: [
+      {
+        text: '从手机导入卡片',
+        where: '卡片 Tab 顶部动作行（原「开场与示例」之上）',
+      },
+      {
+        text: 'PNG 卡或 JSON 卡。TXT 请在桌面端导入。',
+        where: '同上，动作行下方的说明',
+      },
+    ],
+  },
 ];
 
 /** 递归列出目录下所有文件（相对路径，正斜杠） */

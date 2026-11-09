@@ -237,20 +237,44 @@ test('★★★★★ 下载要有三态反馈（用户报的第一个问题）'
    *   failed  重试       红色，留在原地可点
    * ```
    */
-  assert.match(level3, /function runBusy/, '要有统一的忙碌三态助手');
-  assert.match(level3, /data-state', 'busy'/, '要标忙碌态');
-  assert.match(level3, /data-state', 'done'/, '要标成功态');
-  assert.match(level3, /data-state', 'failed'/, '要标失败态');
+  /*
+   * ★ 2026-11-09（v0.1.8）：助手从 `repo-card-page.ts` 搬到 `busy-button.ts`。
+   *
+   * 搬的理由是本地卡导入成了**第三个**用它的地方 —— 复制一份必然有一处
+   * 漏掉复位（本项目踩过三次）。所以不再要求它"必须写在三级页面这个文件里"，
+   * 而是要求：
+   *
+   * ```text
+   *   ① 存在一个可复用的三态助手（不管在哪个文件）
+   *   ② 三级页面真的用它，不是自己另写一套
+   *   ③ 四种状态齐全
+   * ```
+   *
+   * 这三条合起来才是"统一的忙碌三态"，比"某个文件里有 function runBusy"更接近意图。
+   */
+  const busy = read('client/src/chat/busy-button.ts');
+  assert.match(busy, /export function runBusy/, '要有可复用的忙碌三态助手');
+  for (const state of ['busy', 'done', 'failed']) {
+    assert.ok(
+      busy.includes(`data-state', '${state}'`),
+      `三态助手里要标 ${state} 态`,
+    );
+  }
+  assert.match(busy, /removeAttribute\('disabled'\)/, '失败后按钮要能再点');
+  assert.match(level3, /from '\.\/busy-button\.ts'/, '三级页面要复用这个助手，不另写');
 
   /* 忙碌文案必须是"下载中…"这类，不能只是变灰 */
   assert.match(level3, /busy: '下载中…'/, '下载要有进行中文案');
   assert.match(level3, /done: '已下载 ✓'/, '成功要有明确文案');
   assert.match(level3, /retry: '重试'/, '失败要能重试');
 
-  /* 失败后必须恢复可点，否则用户被卡住 */
-  const failAt = level3.indexOf("button.setAttribute('data-state', 'failed')");
+  /*
+   * 失败后必须恢复可点，否则用户被卡住。
+   * v0.1.8 起这段在 `busy-button.ts` 里（随助手一起搬走），判据跟着走。
+   */
+  const failAt = busy.indexOf("data-state', 'failed'");
   assert.ok(failAt > 0, '找不到失败分支');
-  const failBody = level3.slice(failAt, failAt + 260);
+  const failBody = busy.slice(failAt, failAt + 260);
   assert.match(failBody, /removeAttribute\('disabled'\)/, '失败后按钮要能再点');
 });
 
