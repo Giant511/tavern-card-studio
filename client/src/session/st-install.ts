@@ -255,7 +255,20 @@ export function staleJsonSiblings(cardName: string, existing: readonly string[])
  */
 export function stStatusText(
   state: StState,
-  context: { root?: string; fileName?: string; address?: string } = {},
+  context: {
+    root?: string;
+    fileName?: string;
+    address?: string;
+    /**
+     * 这次推送是"更新已有角色"而不是"首次推送"（v0.1.7 修订一）。
+     *
+     * 刻意做成 context 里的一个布尔，而不是给 `StState` 加第五个状态：
+     * 四个状态描述的是**ST 装没装、跑没跑**，而"更新还是新建"是同一状态下
+     * 两种结果 —— 混进状态机会让 `verdict` 的判定逻辑凭空多一个分支，
+     * 而那个分支没有任何对应的探测动作。
+     */
+    updated?: boolean;
+  } = {},
 ): string {
   switch (state) {
     case 'missing':
@@ -270,7 +283,17 @@ export function stStatusText(
        * 刷新角色列表即可看到」，当时推的是 JSON —— 而那句话**不成立**：ST 的文件夹
        * 扫描不读 .json，用户刷新多少次都看不到。现在推开的是 PNG，并且把
        * "要按 F5" 与 "推的是 PNG" 都写进来，避免用户以为还需要点「导入」。
+       *
+       * v0.1.7 修订一：同名再推现在是**覆盖**而不是新建，所以"已推送"这个说法
+       * 会让用户以为又多了一个角色。更新的情形单独说，并且点明"聊天记录不受影响"
+       * —— 那正是他改完设定最担心的事。
        */
+      if (context.updated === true) {
+        return (
+          `已更新 ST 里的这个角色${context.fileName ? `（${context.fileName}）` : ''}` +
+          '· F5 刷新可见，聊天记录不受影响'
+        );
+      }
       return `已推送为 PNG · 在 ST 中 F5 刷新可见${context.fileName ? `（${context.fileName}）` : ''}`;
   }
 }

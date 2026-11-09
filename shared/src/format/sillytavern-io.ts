@@ -201,7 +201,7 @@ export function parseStCard(input: unknown, options: ParseStCardOptions = {}): P
 
   const entries = pickEntries(characterBookRaw);
   if (characterBookRaw && !Array.isArray(characterBookRaw['entries'])) {
-    issues.push({ path: 'character_book.entries', message: 'character_book 缺少 entries 数组，已按空世界书处理', severity: 'warning' });
+    issues.push({ path: 'character_book.entries', message: '世界书缺少条目列表，已按空世界书处理', severity: 'warning' });
   }
 
   const creatorNotes = pickStr('creator_notes') || pickStr('creatorcomment') || pickStr('creator_notes');

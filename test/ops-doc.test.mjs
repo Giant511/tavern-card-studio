@@ -29,6 +29,32 @@ const PUBLISHED_DOCS = [
   'docs/server-cmd.md',
   'docs/server-developer.md',
   'docs/Cloud Deployment Manual.md',
+  /*
+   * v0.1.7 安卓端的三份。它们是**开发文档**，但和上面三份一样不含本机路径 /
+   * 内网地址 / 密钥，且必须版本化：
+   *   · adapter-contract 是 T15.4/T15.5 的施工图与契约测试的断言来源
+   *   · design-language 是移动端所有 token 的唯一来源，代码要引用
+   *   · wireframe 是设计确认的依据
+   * 不入库的话，下一个接手的人只能靠聊天记录里翻结论。
+   */
+  'docs/adapter-contract-st-v1.19.md',
+  /*
+   * v0.1.7 后续三份（2026-10-29 追加）。判据同上面：是开发文档、但不含
+   * 本机路径 / 内网地址 / 密钥，且必须版本化 ——
+   *   · t15.3-apk-design 是 T15.3 的动工依据（前台服务 / Doze / 孤儿清理 / W^X）
+   *   · t15.6-asr-byo 承载 §F4 的**隐私红线**与判据级要求，留在聊天记录里必然丢
+   *   · node-upgrade-cost 是"升 Node 要重趟构建"这条既定代价的实测值，下次升版要照它看
+   *
+   * ⚠ 顺序必须与 `.gitignore` 里的 `!docs/...` 出现顺序**完全一致**：
+   * 这个测试是 `deepEqual`，不是集合比较。改一处就要改两处的**同一个位置**，
+   * 否则报"清单不一致"，而实际只是次序不同 —— 那种红很容易被误读成"漏放了文件"。
+   */
+  'docs/t15.3-apk-design.md',
+  'docs/t15.6-asr-byo.md',
+  'docs/node-upgrade-cost.md',
+  'docs/spike-01-node-android.md',
+  'docs/design-language-nebula.md',
+  'docs/wireframe-nebula-tabs.html',
 ];
 
 const doc = existsSync(DOC) ? readFileSync(DOC, 'utf8') : '';

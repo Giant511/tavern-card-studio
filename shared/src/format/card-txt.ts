@@ -18,7 +18,8 @@ import { BLOCK_DEFINITION_MAP, BLOCK_IDS, type BlockId } from '../model/blocks.j
 import { createEmptyCard, type CardBlock, type UnifiedCard } from '../model/unified-card.js';
 import { iterateLines, matchHeadingLine, normalizeHeading, parseDescription } from './description.js';
 import { isFieldBlock } from './field-blocks.js';
-import { parseGreetings, type GreetingFormatParams } from './greeting-preset.js';
+import { type GreetingFormatParams } from './greeting-preset.js';
+import { parseCompositeScene, SCENE_SECTION_LABELS } from './composite-scene.js';
 import {
   headingTextFor,
   presetAliasTable,
@@ -751,8 +752,16 @@ export function parseCardText(text: string, preset: TxtPreset, options: ParseCar
   };
   const greetingFormat = options.greetingFormat ?? presetGreetingFormat(preset);
   const greetingText = fieldSectionText('initial-scene');
-  const greetings = parseGreetings(greetingText ?? '', greetingFormat);
   const examplesText = fieldSectionText('chat-examples');
+  /*
+   * ★ 初始场景是**复合段**（2026-11-09）：一个 `【初始场景】` 标题下含
+   * `@@开场白` 与 `@@情景` 两段。所以这里不再单独取 `scenario` ——
+   * 它由 `parseCompositeScene` 从同一段文本里切出来。
+   *
+   * 老格式（无 @@ 标记）整段按开场白处理，情景为空；这条兼容在
+   * `composite-scene.ts` 里，本文件不用再判。
+   */
+  const sceneParsed = parseCompositeScene(greetingText ?? '', greetingFormat);
 
   const buildCard = (): UnifiedCard => {
     const card = createEmptyCard();
@@ -762,16 +771,37 @@ export function parseCardText(text: string, preset: TxtPreset, options: ParseCar
     card.blocks = BLOCK_IDS.filter((id) => id !== 'worldbook').map((id) => {
       // 字段板块：正文直接落 residual（见下方），板块里显示同一段文本
       if (isFieldBlock(id)) {
-        const text = (id === 'initial-scene' ? greetingText : examplesText) ?? '';
+        /*
+         * ★★★ 按 id 查表，**不要用三元表达式按 id 判断**（2026-11-08 修）。
+         *
+         * 原写法是 `id === 'initial-scene' ? greetingText : examplesText`，
+         * 只有两个字段板块时成立。加进 scenario 之后，它会掉进 else 拿到
+         * `examplesText`（null）—— 表现为**导出的场景正文再导入就没了**，
+         * 而且 `ok: true` / `missing: []` / `unknown: []` 全绿，
+         * 没有任何一处会报错。这类"静默丢内容"最难查。
+         *
+         * 查表的好处：加板块时**漏了就是 undefined**，能立刻看出来。
+         */
+        const fieldTextOf: Partial<Record<BlockId, string | null>> = {
+          /*
+           * initial-scene 用**原始段落正文**（含 @@ 标记），不是渲染出来的
+           * 纯开场白 —— 编辑框里要能看到并编辑两段。渲染只在"从 residual
+           * 重建视图"时用（`fieldBlockTextFrom`）。
+           */
+          'initial-scene': greetingText,
+          'chat-examples': examplesText,
+        };
+        const source = fieldTextOf[id] ?? null;
+        const text = source ?? '';
         return {
           id,
           text,
           raw: text,
           dirty: false,
           anchor: null,
-          // 0 板块识别时整篇原文在【其他设定】里，说"这两个板块缺失"是误导：
-          // 不是缺，是这张卡本来就没有开场白/示例对话（与 personality 的处理一致）
-          missing: (id === 'initial-scene' ? greetingText : examplesText) === null && !(plan !== null && plan.wholeText),
+          // 0 板块识别时整篇原文在【其他设定】里，说这些板块"缺失"是误导：
+          // 不是缺，是这张卡本来就没有开场白/示例对话/场景（与 personality 的处理一致）
+          missing: source === null && !(plan !== null && plan.wholeText),
         };
       }
       if (id === 'personality') {
@@ -827,13 +857,41 @@ export function parseCardText(text: string, preset: TxtPreset, options: ParseCar
       structured: parsedDescription.structured,
       preface: parsedDescription.preface,
     };
-    // 开场白族与对话示例落在独立字段上，由板块文本解析而来。
-    // 空白开场白板块 → 单条空 first_mes（而不是"保留旧值"）：TXT 是本文件的事实源。
+    /*
+     * 开场白族与对话示例落在独立字段上，由板块文本解析而来。
+     * 空白开场白板块 → 单条空 first_mes（而不是"保留旧值"）：TXT 是本文件的事实源。
+     *
+     * ★★★ 三个字段必须**全部**来自 `sceneParsed`（2026-11-09 修）。
+     *
+     * 原来的写法是 `firstMes: greetings.firstMes`（一遍 `parseGreetings`
+     * 扫整段）+ `scenario: sceneParsed.scenario`（另一遍复合解析）——
+     * **两套解析并存**。而 `parseGreetings` 不认识 `@@开场白` 这个标记行，
+     * 于是把它当成了开场白正文的一部分：
+     *
+     * ```text
+     *   板块文本   "@@开场白
+开场白一
+
+@@情景
+场景一"
+     *   旧结果     firstMes = "@@开场白
+开场白一"     ← 标记混进正文
+     * ```
+     *
+     * 这是**累积性污染**：每导出再导入一次，开场白前面就多一行 `@@开场白`。
+     * 而它不会报任何错 —— 用户只会觉得"我的开场白怎么越改越乱"。
+     */
     card.residual = {
       ...card.residual,
-      firstMes: greetings.firstMes,
-      alternateGreetings: [...greetings.alternateGreetings],
+      firstMes: sceneParsed.firstMes,
+      alternateGreetings: [...sceneParsed.alternateGreetings],
       mesExample: examplesText ?? '',
+      /*
+       * 老格式没有 @@情景 段时 `parseCompositeScene` 返回空串 ——
+       * 与"本来就没写情景"一致（新建卡场景，不是"保留旧值"场景；
+       * 后者由 `applyCardText` 的条件回写负责）。
+       */
+      scenario: sceneParsed.scenario,
     };
     card.worldbook = {
       entries: worldbookParsed.entries,
@@ -882,13 +940,41 @@ export function applyCardText(card: UnifiedCard, text: string, preset: TxtPreset
   const next: UnifiedCard = structuredClone(card);
   next.blocks = result.card.blocks;
   next.description = result.card.description;
-  // 只回写"由 TXT 承载"的三个开场白族字段。其余 residual（scenario / system_prompt /
-  // 群聊开场白 / extensions 之类）TXT 里没有，绝不能因为解析结果是新建卡就被清空。
+  /*
+   * 只回写"由 TXT 承载"的字段。其余 residual（system_prompt / 群聊开场白 /
+   * extensions 之类）TXT 里没有，绝不能因为解析结果是新建卡就被清空。
+   *
+   * ## ★★★ scenario 是有条件的回写（2026-11-09）
+   *
+   * 「初始场景」是复合板块，情景段靠 `@@情景` 标记识别。于是有两种输入：
+   *
+   * ```text
+   *   本版导出的 TXT   → 一定有 @@情景 标记（渲染时标记始终写出）
+   *   v0.1.7 之前导出的 → 一定没有（那时还没有这个概念）
+   * ```
+   *
+   * 无条件回写会造成一个**静默丢数据**：
+   * 用户拿一份历史 TXT 点"应用"，`parseCompositeScene` 对无标记文本返回
+   * `scenario: ''`，于是卡里原本写好的情景被清空 —— 而界面上只是
+   * "情景那一段变空了"，看起来像"这文件里本来就没有情绪"，
+   * 用户不会意识到是自己刚才那一下把它抹掉的。
+   *
+   * 所以：**有标记才回写，没标记就保留**。
+   *
+   * 边界（如实记录）：用户若手写 TXT 时故意删掉整个 `@@情景` 段想清空情景，
+   * 这里会保留旧值。但正常路径（导出 → 改 → 导入）不会出现这种情况，
+   * 因为渲染永远写出标记；真要清空就保留标记、把内容删掉。
+   */
+  const sceneBlockAfter = result.card.blocks.find((block) => block.id === 'initial-scene');
+  const hasScenarioSection =
+    sceneBlockAfter !== undefined && sceneBlockAfter.text.includes(SCENE_SECTION_LABELS.scenario);
+
   next.residual = {
     ...card.residual,
     firstMes: result.card.residual.firstMes,
     alternateGreetings: [...result.card.residual.alternateGreetings],
     mesExample: result.card.residual.mesExample,
+    ...(hasScenarioSection ? { scenario: result.card.residual.scenario } : {}),
   };
   const merge = mergeWorldbookEntries(card.worldbook.entries, result.card.worldbook.entries);
   next.worldbook = {

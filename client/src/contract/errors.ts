@@ -48,6 +48,12 @@ export type ShellErrorCode =
   | 'PROBE_HOST_NOT_ALLOWED'
   /** 其它 IO 失败 */
   | 'IO_ERROR'
+  // T15.4 ST 的 HTTP 层。四个码对应四种**用户要做的动作不同**的情况，
+  // 不要合并成一个"ST 请求失败" —— 那会让界面无从给出下一步。
+  | 'ST_UNAVAILABLE'
+  | 'ST_FORBIDDEN'
+  | 'ST_HTTP_STATUS'
+  | 'ST_BAD_RESPONSE'
   /** 非壳错误（前端参数错误、插件异常等） */
   | 'SHELL_BRIDGE_ERROR';
 

@@ -5,3 +5,99 @@
 # `bad interpreter: /bin/sh^M`，**钩子静默失效**（提交照常通过，决策表序号与
 # 运维手册的一致性都没人检查了）。行尾问题只在"重新检出后"才暴露，很难联想到。
 scripts/hooks/* text eol=lf
+
+# 全部 shell 脚本必须是 LF —— 2026-10-28（v0.1.7 阶段 0）发现：
+#
+# 本机 core.autocrlf=true，而此前只有 scripts/hooks/* 声明了 eol=lf，
+# 于是 `git check-attr eol -- scripts/*.sh` 全是 `unspecified` —— 仓库里 16 个
+# .sh（以及新加的 vendor/node-android/build-node-android.sh）**在重新检出时
+# 会被转成 CRLF**。工作区现在是 LF 只是因为它们从来没被重新检出过。
+#
+# 后果不是报错，是**在 Linux/WSL 宿主上直接跑不起来**：
+#   bash: ./build.sh: /bin/bash^M: bad interpreter: No such file or directory
+# 而这条路径恰好是 CI 与交叉编译宿主才会踩到 —— 本机 Windows 上跑 bash 脚本
+# 走的是 Git Bash，它对 CRLF 有一定容忍，所以本地永远发现不了。
+#
+# 一行 `*.sh text eol=lf` 同时守住已有的 16 个和以后新增的。
+*.sh text eol=lf
+
+# 全部 .mjs 必须是 LF —— 2026-10-29（v0.1.7 收尾）发现与 `.sh` 完全同构的问题：
+#
+# 此前 `.mjs` 没有任何 eol 声明，而本机 core.autocrlf=true，所以：
+#   - 工作区里有大量 `w/crlf`（`scripts/build-client.mjs` 首行是
+#     `#!/usr/bin/env node\r`）；
+#   - 更糟的是 `scripts/lib/feature-sentinels.mjs` 的 **HEAD blob 本身就是 CRLF**
+#     （521 CR / 515 LF），即它已经被以 CRLF 形式提交进仓库了。
+#
+# 带 shebang 的 .mjs 有 19 个。它们在 Linux/CI 上直接执行（`./x.mjs`）会报
+#   bash: ./x.mjs: /usr/bin/env node^M: bad interpreter
+# 而 `package.json` 里全是 `node scripts/x.mjs` 的调用形式 —— **不经过 shebang**，
+# 所以本地永远发现不了。跟 `.sh` 那次一模一样，属于「只在另一台机器上炸」。
+#
+# 一行规则同时守住已有的 259 个和以后新增的。
+*.mjs text eol=lf
+
+# ── 源码文本一律 LF（2026-11-09 补）──────────────────────────────────
+#
+# ## 不加这条的后果不是报错，是「重新检出后测试变红」
+#
+# 本机 core.autocrlf=true，而此前只声明了 `.sh` / `.mjs` / hooks 三类。
+# 于是 `*.css` `*.ts` `*.json` `*.md` 在**重新检出**时被转成 CRLF（core.eol=native）。
+#
+# ```text
+#   test/input-width-and-nav-anim.test.mjs 用 css.indexOf('\n}\n') 切关键帧
+#   CRLF 下永远找不到 ⇒ slice 得到空串 ⇒
+#   「时间轴必须错开」「旧页要淡到 0」两条核心判据失败
+# ----------------------------------------------------------------
+#   反过来更危险：带 $ 的正则不加 /m 时，CRLF 会让它永不匹配，
+#   于是「违反红线」的代码反而通过 —— 判据空转，无人发现。
+# ```
+#
+# 这不是"为了让测试好看"，是**让仓库可重现**：同一份提交在 Windows / Linux /
+# macOS 检出后必须逐字节一致，否则"我这跑得通"没有意义。
+# 上一次同类缺陷真的坏过文件（`.mjs` 行尾统一 LF，2026-10）。
+#
+# ## 为什么不写 `* text=auto eol=lf`
+#
+# 那会把 `.png` / `.so` / `.msi` 也纳入文本判断。这里**逐类显式列出**，
+# 每类都能一眼核对；二进制已在下方单独标 `binary`。
+*.css text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.kt text eol=lf
+*.rs text eol=lf
+*.html text eol=lf
+*.toml text eol=lf
+*.wxs text eol=lf
+*.wxl text eol=lf
+
+# 二进制产物显式声明为 binary —— 2026-10-30（v0.1.7 Node 产物入库）。
+#
+# 上面几条 `text eol=lf` 是按后缀限定的（*.sh / *.mjs），目前碰不到 .so；
+# 但只要有人日后加一条更宽泛的 `* text=auto`，二进制就会被行尾转换**静默损坏**：
+# 文件能读、sha256 对不上、装到手机上 `dlopen` 失败而错误信息指向别处。
+#
+# `vendor/node-android/bin/*.so` 已被 .gitignore 排除（见那里的说明），
+# 这条规则是给「日后改成 LFS 或改主意入库」留的正确姿势。
+*.so binary
+*.exe binary
+*.msi binary
+*.png binary
+*.jpg binary
+
+# PS 脚本：CRLF + **必须带 UTF-8 BOM**（2026-10-30 实测）。
+#
+# PS 5.1 默认按 ANSI(GBK) 读 .ps1。写 UTF-8 无 BOM 时中文全变乱码、字符串引号被吃掉，
+# 报错指向一堆字符偏移，与真实原因（编码）毫无关系。
+#
+# `eol=crlf` 只规定行尾，**不会动 BOM**（git 不处理 BOM），所以这条不破坏它。
+# 但用编辑器另存为「UTF-8（无 BOM）」就会坏 —— 别那么存。
+*.ps1 text eol=crlf
+
+# 批处理同理（对 LF 容错，但 CRLF 更稳，双击运行依赖它）
+*.cmd text eol=crlf

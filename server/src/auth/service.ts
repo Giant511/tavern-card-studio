@@ -26,6 +26,7 @@ import { SessionStore } from './sessions.js';
 import { signJwt } from './jwt.js';
 import { UserStore, assertUsernameShape, normalizeUsername, type UserRow } from '../storage/users.js';
 import type { RepoStore } from '../storage/repos.js';
+import { inviteState, type InviteStore } from '../storage/invites.js';
 
 /** access token 有效期：2 小时（需求 F1.2 硬约束） */
 export const ACCESS_TOKEN_TTL_SECONDS = 2 * 60 * 60;
@@ -79,6 +80,14 @@ export interface AuthServiceOptions {
    */
   repos?: RepoStore;
   /**
+   * 邀请码仓库（v0.1.7）。
+   *
+   * 只在 `registerMode === 'invite'` 时用得到。为 null 时该模式直接报
+   * `SERVICE_UNAVAILABLE` —— 而**不是**退化成"不需要邀请码"。
+   * 那种"配置了却没接上依赖就放行"的降级是最坏的：它把门开着而不说。
+   */
+  invites?: InviteStore;
+  /**
    * 注册策略的**实时**取值（F12）。
    *
    * 面板与 worker 是两个进程，`config` 只是启动时的快照；不给这个回调时
@@ -97,6 +106,7 @@ export class AuthService {
   private readonly config: ServerConfigFile;
   private readonly now: () => Date;
   private readonly repos: RepoStore | null;
+  private readonly invites: InviteStore | null;
   private readonly liveRegisterMode: (() => ServerConfigFile['auth']['registerMode']) | null;
 
   constructor(options: AuthServiceOptions) {
@@ -106,6 +116,7 @@ export class AuthService {
     this.config = options.config;
     this.now = options.now ?? (() => new Date());
     this.repos = options.repos ?? null;
+    this.invites = options.invites ?? null;
     this.liveRegisterMode = options.liveRegisterMode ?? null;
   }
 
@@ -233,6 +244,13 @@ export class AuthService {
     userAgent: string;
     /** 调用者是否是已认证的管理员（admin-only 模式用） */
     callerIsAdmin: boolean;
+    /**
+     * 邀请码（v0.1.7，`registerMode === 'invite'` 时必填）。
+     *
+     * 允许带空格/连字符/小写 —— 规范化在 `InviteStore` 里做，
+     * 这里不做二次加工，避免"两处各转一次"导致对不上。
+     */
+    inviteCode?: string;
   }): Promise<{ user: UserRow; tokens: IssuedTokens }> {
     // 走 getter：面板改完立刻生效（跨进程热更，见 config-live.ts）
     const mode = this.registerMode;
@@ -247,6 +265,48 @@ export class AuthService {
     }
     if (mode === 'admin-only' && !input.callerIsAdmin) {
       throw new AuthError('FORBIDDEN', '仅管理员可以创建账户（auth.registerMode = admin-only）', 403);
+    }
+
+    /*
+     * ── invite 模式的前置校验（v0.1.7）─────────────────────────
+     *
+     * 这里只做**读**校验，目的是给出能指导下一步的错误。
+     * 真正的扣减在下面的事务里 —— 两处都判不是重复，而是分工：
+     *   · 这里：告诉用户"码写错了 / 过期了 / 用完了"；
+     *   · 事务里：保证并发下不超发（`consume` 的 changes===1）。
+     *
+     * 如果只在事务里判，用户拿到的是一句笼统的"注册失败"，
+     * 而"码过期"和"码打错"对他要做的事完全不同。
+     */
+    let inviteCode = '';
+    if (mode === 'invite') {
+      if (this.invites === null) {
+        throw new AuthError('SERVICE_UNAVAILABLE', '服务端未正确初始化邀请码功能', 500);
+      }
+      inviteCode = (input.inviteCode ?? '').trim();
+      if (inviteCode === '') {
+        throw new AuthError(
+          'INVITE_REQUIRED',
+          '本服务端需要邀请码才能注册，请向管理员索取',
+          403,
+        );
+      }
+      const row = this.invites.findByCode(inviteCode);
+      if (row === null) {
+        // 不存在与格式不对合并成一句：两者对用户而言都是"这个码不能用"，
+        // 分开报只会帮人试探哪些码存在
+        throw new AuthError('INVITE_INVALID', '邀请码无效，请检查是否输入正确', 403);
+      }
+      const state = inviteState(row, this.now());
+      if (state === 'expired') {
+        throw new AuthError('INVITE_INVALID', '邀请码已过期，请向管理员索取新的', 403);
+      }
+      if (state === 'exhausted') {
+        throw new AuthError('INVITE_INVALID', '邀请码已用完（每张最多 3 个账户）', 403);
+      }
+      if (state === 'revoked') {
+        throw new AuthError('INVITE_INVALID', '邀请码已被作废，请向管理员索取新的', 403);
+      }
     }
 
     // 先真算一次哈希：这样"密码不合规"与"用户名已占用"的耗时对齐
@@ -273,12 +333,39 @@ export class AuthService {
     }
 
     try {
-      const user = this.users.create({
-        username: input.username,
-        // 第一个账户自动管理员（与 CLI 行为一致：否则建完没人能管理）
-        passwordHash,
-        role: this.users.count() === 0 ? 'admin' : 'user',
-      });
+      /*
+       * ── invite 模式：扣码与建账户**必须同事务** ──────────────
+       *
+       * 分开做有两种坏结果，都不可接受：
+       *   · 先扣码后建账户 ⇒ 建账户失败（用户名撞车）⇒ 用户白丢一次机会；
+       *   · 先建账户后扣码 ⇒ 中途崩溃 ⇒ 超发（码没用掉但账户建出来了）。
+       *
+       * 事务里再扣一次（`consume`）不是重复校验，而是**并发正确性的唯一保证**：
+       * 上面那次只读校验与这里之间隔着一次 `await hashPassword`（约 100ms），
+       * 足够让另一个请求把这张码的最后一次用掉。
+       */
+      const createAccount = (): UserRow =>
+        this.users.create({
+          username: input.username,
+          // 第一个账户自动管理员（与 CLI 行为一致：否则建完没人能管理）
+          passwordHash: passwordHash as string,
+          role: this.users.count() === 0 ? 'admin' : 'user',
+        });
+
+      const user =
+        mode === 'invite'
+          ? (this.invites as InviteStore).withTransaction(() => {
+              if (!(this.invites as InviteStore).consume(inviteCode, this.now())) {
+                // 走到这里说明就在这 100ms 内被别人用光了
+                throw new AuthError(
+                  'INVITE_INVALID',
+                  '邀请码已用完（每张最多 3 个账户），请向管理员索取新的',
+                  403,
+                );
+              }
+              return createAccount();
+            })
+          : createAccount();
       // 默认仓库与账户同时诞生（T10.6）。失败不该阻断注册 ——
       // 仓库可以在第一次上传时由 `ensureDefault` 补上，而账户建不回来。
       try {

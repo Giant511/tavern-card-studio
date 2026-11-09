@@ -27,6 +27,21 @@ export interface CardRowView {
   summary: string;
   /** 是否已删除（列表默认不含，但 includeDeleted 时会有） */
   deleted: boolean;
+  /**
+   * 这张卡有没有卡面（v0.1.7 修订二）。
+   *
+   * 行上按钮的文案靠它区分「设置封面…」与「换封面…」——
+   * 一个字的差别，但"设置"告诉用户这里现在是空的，"换"告诉他已经有了。
+   */
+  hasFace: boolean;
+  /**
+   * 「无卡面」占位文案（v0.1.7 增补一）。
+   *
+   * 有卡面时是 `null` —— **不能返回空串**：空串仍然会占一个元素位，
+   * 列表里就会出现一排"看起来有东西但什么都不显示"的格子。
+   * 无卡面时是明确的四个字，让用户一眼看出"这张卡能推、但没有封面"。
+   */
+  facePlaceholder: string | null;
 }
 
 export function toCardRow(item: CardSummary): CardRowView {
@@ -34,6 +49,7 @@ export function toCardRow(item: CardSummary): CardRowView {
   const cardId = item.cardId;
   const repo = item.repoName === null || item.repoName === '' ? '未归属仓库' : item.repoName;
   const version = item.latestSeq > 0 ? `v${item.latestSeq}` : 'v—';
+  const hasFace = item.face !== null && item.face !== undefined;
 
   return {
     name,
@@ -42,6 +58,8 @@ export function toCardRow(item: CardSummary): CardRowView {
     version,
     summary: `${name} · ${cardId} · ${repo} · ${version}`,
     deleted: item.deleted,
+    hasFace,
+    facePlaceholder: hasFace ? null : '无卡面',
   };
 }
 

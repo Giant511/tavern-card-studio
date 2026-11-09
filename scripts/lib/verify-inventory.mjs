@@ -35,23 +35,36 @@
  * 与没写一样。
  */
 
-/** @typedef {'offline' | 'browser-dump' | 'live-browser' | 'live-server' | 'elevated'} VerifyStatus */
-
-/**
- * 合法的 status 值，**运行时也要校验**。
- *
- * 只有 JSDoc 类型是不够的：这个文件是纯 JS，类型注释不参与运行。
- * 2026-10-27 我给它写了一个 `needs-browser`（表里根本没有这个值），
- * 而测试与清点校验**全都绿**—— 因为它既不是 `offline`（不要求被导入），
- * 也不在任何 filter 的匹配范围内，等于静默地什么都不检查。
- * 那一格本该写 `live-browser`（需要真实浏览器 + CDP）。
- */
-export const VERIFY_STATUSES = new Set([
-  'offline',
-  'browser-dump',
-  'live-browser',
-  'live-server',
-  'elevated',
+/** @typedef {'offline' | 'browser-dump' | 'live-browser' | 'live-server' | 'elevated'} VerifyStatus */
+
+/**
+ * 合法的 status 值，**运行时也要校验**。
+ *
+ * 只有 JSDoc 类型是不够的：这个文件是纯 JS，类型注释不参与运行。
+ * 2026-10-27 我给它写了一个 `needs-browser`（表里根本没有这个值），
+ * 而测试与清点校验**全都绿**—— 因为它既不是 `offline`（不要求被导入），
+ * 也不在任何 filter 的匹配范围内，等于静默地什么都不检查。
+ * 那一格本该写 `live-browser`（需要真实浏览器 + CDP）。
+ */
+export const VERIFY_STATUSES = new Set([
+  'offline',
+  'browser-dump',
+  'live-browser',
+  'live-server',
+  'elevated',
+  /*
+   * 2026-10-30 新增：需要**真手机**（adb 授权 + 架构匹配）才能跑。
+   *
+   * 为什么必须单独一个值，而不是塞进现有五类：
+   * 这张表的全部价值是"看一眼就知道这个脚本我现在能不能跑"。
+   * 需要真机的脚本塞进 `offline` 会让那条"随时能跑"的承诺变成假的；
+   * 塞进 `elevated` 更错 —— 那是"缺管理员权限"，而这里缺的是一台手机。
+   *
+   * 触发场景：Spike ① 的四判据复验（`scripts/verify-spike.sh`）。
+   * 决策 #279 要求换设备/换 ROM 必须重做 tmp exec 实验，
+   * 也就是说这个脚本会**反复**被用到，值得有明确归类。
+   */
+  'device-required',
 ]);
 
 /**
@@ -65,6 +78,24 @@ export const VERIFY_STATUSES = new Set([
  * }>}
  */
 export const VERIFY_INVENTORY = [
+  /*
+   * T10.25 卸载端到端（v0.1.7，2026-10-30）。
+   *
+   * 状态是 `elevated` 而不是 `offline`：它要真的装卸载 MSI 三遍，
+   * 而非管理员下 `msiexec /qn` 必定失败（`MSI_LUA: Elevation prompt disabled`）。
+   * 这个前置条件没法在测试里伪造 —— 伪造出来的"通过"才是真的危险。
+   *
+   * 入口是 `scripts/run-as-admin.cmd`（右键以管理员身份运行），
+   * 它转调这个 .ps1 并把全过程写成日志，末尾一行 `VERDICT=PASS|FAIL`。
+   */
+  {
+    file: 'scripts/verify-uninstall-msi.ps1',
+    status: 'elevated',
+    run: '右键 scripts/run-as-admin.cmd → 以管理员身份运行',
+    why: '需要管理员：要真的装卸载双 MSI 并断言 Program Files / ProgramData 的清理结果；非管理员下 msiexec /qn 必定失败',
+    evidence: '2026-10-30 建脚本；非管理员下运行已验 exit=2 且给出提权指引（自检生效）。真机三条路径待用户提权执行',
+  },
+
   // ── offline：已挂进 npm test ─────────────────────────────
   {
     file: 'scripts/verify-import-atomic.mjs',
@@ -190,6 +221,112 @@ export const VERIFY_INVENTORY = [
   { file: 'scripts/capture-f5b-token-mode.sh', status: 'browser-dump', run: 'bash scripts/capture-f5b-token-mode.sh', why: '交付截图生成器（assets/f5b-*.png）；要真服务端 + headless Chrome', evidence: '2026-10-25 生成 5 张截图，逐张人工核验' },
   { file: 'scripts/capture-v13-extras.sh', status: 'browser-dump', run: 'npm run build:ui && bash scripts/capture-v13-extras.sh', why: '交付截图生成器（assets/preset-*.png 两新区 + assets/highlight-*.png 三板块高亮）；只要静态 dist + headless Chrome，不需要服务端', evidence: '2026-10-25 生成 5 张（两新区 + 三板块），逐张人工核验；两新区用 560 高视口，否则两区块一屏装得下、两张图字节相同' },
   { file: 'scripts/capture-v13-dumps.sh', status: 'browser-dump', run: 'bash scripts/capture-v13-dumps.sh', why: '给 verify-v13-extras.mjs 抓三板块高亮的 DOM 快照（.verify/v13-dumps）', evidence: '2026-10-25 与 verify-v13-extras.mjs 一起复跑通过（17 项）' },
+  {
+    file: 'scripts/capture-t156-voice.sh',
+    status: 'browser-dump',
+    run: 'bash scripts/capture-t156-voice.sh',
+    why: 'T15.6 语音全链路录屏（assets/t15.6-voice/*.png）；只要 headless Chrome，用假 transport 代替真麦克风',
+    evidence:
+      '2026-10-30 生成 7 帧（4 个不同画面）；实测状态 recording→inner→confirming，draft 已包裹',
+  },
+  {
+    file: 'scripts/capture-t156-voice.mjs',
+    status: 'browser-dump',
+    run: '（由 capture-t156-voice.sh 调用，不单独跑）',
+    why: '同上：CDP 驱动（按住/滑选/松手/逐帧 + DOM 事实采集）',
+    evidence: '2026-10-30 与 .sh 一起复跑通过',
+  },
+  {
+    file: 'scripts/probe-composer.mjs',
+    status: 'browser-dump',
+    run: 'npm run build:ui && bash scripts/run-probe.sh scripts/probe-composer.mjs',
+    why: '取证工具：量聊天页布局链（每项的 rect/computed），用于定位"输入区不贴底"这类几何问题；需要 headless Chrome',
+    evidence:
+      '2026-10-31 定位到 `.nb-chat` 在 chat.css 里零定义（flexGrow:0/display:block）；修复后再跑确认 h 从 501 → 743、composer bottom 从 501 → 743',
+  },
+  {
+    file: 'scripts/probe-shots.mjs',
+    status: 'browser-dump',
+    run: 'npm run build:ui && bash scripts/run-probe.sh scripts/probe-shots.mjs',
+    why: '验收截图生成器（assets/android/shot-*.png：聊天空态/API 折叠/API 展开/语音展开）；顺带 dump 手风琴与语音区块的 DOM 事实',
+    evidence:
+      '2026-10-31 生成 4 张；实测手风琴点第二项后 pressed/expanded 只有 custom 为 true、其余 false；语音面板 11 个 data-role 齐全',
+  },
+  {
+    file: 'scripts/run-probe.sh',
+    status: 'browser-dump',
+    run: 'bash scripts/run-probe.sh <probe.mjs>',
+    why: '探针启动器：起静态服务 + headless Chrome 再跑指定 probe。合成一个脚本是因为分两次 Bash 调用时后台进程会被回收（curl 返回 000）',
+    evidence: '2026-10-31 probe-composer / probe-shots 均经由它跑通',
+  },
+  {
+    file: 'scripts/verify-mobile-entry.sh',
+    status: 'browser-dump',
+    run: 'npm run build:ui && bash scripts/verify-mobile-entry.sh',
+    why: '移动端入口验收（14 项）：要 headless Chrome + 本地静态服务；判据是 DOM 里数 Tab、检查桌面元素不存在、UA 分流是否生效',
+    evidence:
+      '2026-10-31 14/14 通过并生成 assets/android/10-mobile-chat.png … 13-mobile-me.png 四张截图',
+  },
+  {
+    file: 'scripts/verify-mobile-entry.mjs',
+    status: 'browser-dump',
+    run: '（由 verify-mobile-entry.sh 调用，不单独跑）',
+    why: '同上：CDP 驱动 + 四 Tab 切换 + 截图',
+    evidence: '2026-10-31 与 .sh 一起复跑通过',
+  },
+  {
+    file: 'scripts/verify-android-device.sh',
+    status: 'device-required',
+    run: 'bash scripts/verify-android-device.sh [--report out.md]',
+    why:
+      '真机自动化测试入口（第三批问题四）：需要一台 arm64 Android 手机 + adb 授权。' +
+      '设备缺席时退出码 3（不是 0）—— 刻意与"失败"(4) 和"通过"(0) 区分开，' +
+      '避免"没测"被看成"测过了"',
+    evidence:
+      '2026-10-31 打通最小链路：Redmi Note 8 Pro / Android 11（SDK 30）/ arm64-v8a，' +
+      '覆盖安装 Success、lastUpdateTime 已更新、进程 pid 存在、Activity 在前台、' +
+      'logcat（--pid 过滤）无 FATAL，10 项全 PASS。' +
+      '设备缺席路径已验：ANDROID_SERIAL=FAKE 时退出码 3 且打印"设备缺席"',
+  },
+  {
+    file: 'scripts/build-android.sh',
+    status: 'device-required',
+    run: 'bash scripts/build-android.sh [--release]',
+    why: 'APK 构建唯一入口；需要 JDK17 + Android SDK/NDK + Rust aarch64 target + node，本机全在 D:/android-env 与 D:/tcs-bin（都是普通目录，不需管理员）',
+    evidence:
+      '2026-10-31 首次打通：产出 app-arm64-debug.apk 87 MB，解包核验三个 .so 均为 ELF 且 sizes 正确（157,079,600 / 99,498,384 / 1,822,720），含 mobile_entry_point 生成的 JNI 符号；装到 Redmi Note 8 Pro / Android 11 真机可启动',
+  },
+  {
+    file: 'scripts/fix-android-gen.py',
+    status: 'offline',
+    run: 'python scripts/fix-android-gen.py [--check]',
+    why: '修 gen/android 里三处「不修就跑不动」，可幂等重跑；只读写 gen/ 下的文本文件，无网络无浏览器',
+    evidence:
+      '2026-10-31 三处均实测有效：overridePathCheck 让 AGP 接受中文路径、compileSdk 37→36 省掉 20 分钟 SDK 下载、BuildTask 去掉会让 node 找错模块的 "tauri"',
+  },
+  {
+    file: 'scripts/verify-spike.sh',
+    status: 'device-required',
+    run: 'bash scripts/verify-spike.sh',
+    why: 'Spike ① 四判据跨机型复验（换设备/换 ROM 时必须重跑）；需要真机 + adb 授权 + 产物与 ST 包',
+    evidence:
+      '2026-10-30 在 Redmi Note 8 Pro / Android 11 上 8 项全过；证据 .verify/spike-Redmi_Note_8_Pro-20261030-201816/',
+  },
+  {
+    file: 'scripts/capture-t155-chat.sh',
+    status: 'browser-dump',
+    run: 'bash scripts/capture-t155-chat.sh',
+    why: 'T15.5 聊天页的截图 + 流式逐帧（assets/t15.5-*.png、assets/t15.5-streaming/）；只要 headless Chrome，不需要服务端',
+    evidence:
+      '2026-10-30 生成 2 张主截图 + 10 帧流式；逐帧文本长度 [8,28,47,61,69,...] 证明打字机是渐进的（陷阱 #10 的直接验证）；麦克风挂载点实测 48×48',
+  },
+  {
+    file: 'scripts/capture-t155-chat.mjs',
+    status: 'browser-dump',
+    run: '（由 capture-t155-chat.sh 调用，不单独跑）',
+    why: '同上：CDP 驱动（截图、逐帧、手势轨迹对拍），是上面那个 .sh 的实现部分',
+    evidence: '2026-10-30 与 .sh 一起复跑通过；手势两条轨迹在此脚本里用真实 touch 事件派发',
+  },
   { file: 'scripts/capture-f4-tls.sh', status: 'browser-dump', run: 'bash scripts/capture-f4-tls.sh', why: '传输安全的四态截图（assets/f4-*.png）；要真服务端（含真正热更出来的 HTTPS 监听）+ headless Chrome', evidence: '2026-10-25 生成 4 张截图（off 警告 / selfsigned 指纹 / custom 匹配 / custom 不匹配），逐张人工核验' },
   { file: 'scripts/capture-f3-account-purge.sh', status: 'browser-dump', run: 'bash scripts/capture-f3-account-purge.sh', why: '交付截图生成器（assets/f3-*.png）；要真服务端（serve，含面板）+ 真注销一次 + headless Chrome', evidence: '2026-10-25 生成 2 张截图（客户端确认弹窗含输入框、治理页注销审计），逐张人工核验' },
   { file: 'scripts/capture-e2e-dumps.sh', status: 'browser-dump', run: 'bash scripts/capture-e2e-dumps.sh', why: '抓取器本身不是断言脚本，是 verify-e2e 的输入生成器', evidence: '2026-10-25 生成 14 份快照 + 14 张截图' },
@@ -342,6 +479,18 @@ export const VERIFY_INVENTORY = [
       'app.ts 20 处验收入口文案。最终 72 个文件 0 命中',
     coveredBy: 'test/offline-verifiers.test.mjs',
   },
+
+  // 注：卡面存储体积的测量脚本在 `tools/measure-face-storage.mjs`，**不登记在这里** ——
+  // 这张表是「校验脚本清单」（每个都必须被某个测试导入并产出 pass/fail），
+  // 而那个脚本产出的是**数字**（50 版 PNG vs JSON+卡面各占多少），没有通过/失败的概念。
+  // 硬塞进来只会让 ④ 那条断言要么假红、要么逼着测试去跑 34 MB 的 IO。
+  // 它的结论已固化进 docs/08 §6.3.1 的体积账与决策 #282。
+
+  // 注：MSI 的 Upgrade 表复核脚本在 `tools/check-msi-upgrade.mjs`，同样**不登记** ——
+  // 它确实产出 pass/fail，但输入是 `release/*.wixpdb`，而 release/ 被 gitignore。
+  // 登记进这张表就要进 offline 套件，在没打服务端包的机器上必假红
+  // （同 docs/11 那条测试依赖不入库文件的老问题）。
+  // 正确用法：打完服务端 MSI 后手动跑一次，结论见 release/ACCEPTANCE-*.md。
 
   // ── live-browser：需要 CDP 调试端口 + 运行中的应用 ──────
   {

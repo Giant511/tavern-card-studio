@@ -88,7 +88,9 @@ before(() => {
   db.insertVersion(versionRow(2, HEX_SHA));
 
   // resolveVersion 只用到 db，其余依赖给空实现即可
-  cards = new CardService(db, null, null, null, { platformId: 'sillytavern', presetId: 'default' }, null);
+  // 第 3 个 null 是 faceBlobs（v0.1.7 修订二新增）—— 本条只测 resolveVersion，
+  // 不碰卡面，传 null 即可（卡面方法会先检查并用不到它）
+  cards = new CardService(db, null, null, null, null, { platformId: 'sillytavern', presetId: 'default' }, null);
 });
 
 after(() => {

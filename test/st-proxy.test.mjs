@@ -191,16 +191,25 @@ test('折叠条宽是个正数且小于下限（否则折叠等于没折叠）',
 
 function makeDeps(overrides = {}) {
   const written = [];
+  const names = { ...(overrides.initialNames ?? {}) };
   const deps = {
     written,
+    /** 名字映射表（v0.1.7 修订一）：测试可以直接断言它被写成什么样 */
+    names,
     probeDir: async () => ({ exists: true, reason: null }),
     scanDir: async () => ({ names: [], truncated: false }),
     writeBinary: async (path, base64, sha256) => {
       written.push({ path, base64, sha256 });
       return { verified: true };
     },
+    loadNames: async () => ({ ...names }),
+    saveName: async (key, fileName, dropKeys) => {
+      names[key] = fileName;
+      for (const stale of dropKeys) if (stale !== key) delete names[stale];
+    },
     ...overrides,
   };
+  delete deps.initialNames;
   return deps;
 }
 
@@ -211,7 +220,9 @@ const artifact = {
   face: { from: 'source', fileName: null, note: '' },
 };
 
-test('推送：同名就加序号，绝不覆盖（内容级判据是落盘路径）', async () => {
+// v0.1.7 修订一之后，这条测的是**首次占名**：目录里的文件是别人的（没有映射指向它），
+// 所以新卡不能抢这个位置。同名再推改成覆盖，那一条在下方单独测。
+test('推送：首次占名要避开目录里已有的文件（不覆盖别人的卡）', async () => {
   const deps = makeDeps({ scanDir: async () => ({ names: ['西奥.png', '西奥 (2).png'], truncated: false }) });
   const result = await pushCardToSt({
     charactersDir: 'C:\\ST\\data\\default-user\\characters',
@@ -287,4 +298,117 @@ test('推送：目录建不出来要说原因，不是"未知错误"', async () 
   });
   assert.equal(result.ok, false);
   assert.match(result.reason, /目录被占用/);
+});
+
+// ── ⑤ 更新式推送（v0.1.7 修订一）──────────────────────────
+//
+// 上面那条「首次占名」测的是"目录里的文件是别人的"。这四条测的是另一半：
+// **同一张卡再推时不该多出一个角色**。判据全部落在"落盘路径是哪个文件名"上 ——
+// 因为 ST 的角色身份就是文件名，多一个文件就是多一个角色。
+
+const CID = 'card-abc123';
+
+test('更新式推送：同 cardId 再推覆盖原文件，不加序号', async () => {
+  const deps = makeDeps({
+    initialNames: { [CID]: '西奥.png' },
+    scanDir: async () => ({ names: ['西奥.png'], truncated: false }),
+  });
+  const result = await pushCardToSt({
+    charactersDir: 'C://ST//characters',
+    cardName: '西奥',
+    cardId: CID,
+    build: async () => artifact,
+    deps,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.fileName, '西奥.png', '必须覆盖原文件，不能变成 西奥 (2).png');
+  assert.equal(result.isUpdate, true, '要告诉界面这是"更新"而不是"新建"');
+  assert.ok(deps.written[0].path.endsWith('西奥.png'));
+  assert.equal(deps.written.length, 1, '只写一份');
+});
+
+test('更新式推送：改名后再推，文件名不变（ST 身份不变 ⇒ 聊天记录保留）', async () => {
+  const deps = makeDeps({
+    initialNames: { [CID]: '西奥.png' },
+    scanDir: async () => ({ names: ['西奥.png'], truncated: false }),
+  });
+  const result = await pushCardToSt({
+    charactersDir: 'C://ST//characters',
+    cardName: '西奥·正式版',
+    cardId: CID,
+    build: async () => artifact,
+    deps,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.fileName, '西奥.png', '改名不动文件名');
+  assert.equal(result.isUpdate, true);
+});
+
+test('更新式推送：用户在 ST 侧删了角色文件，再推视为首次重新占名', async () => {
+  const deps = makeDeps({
+    // 映射还在，但目录里没有那个文件了
+    initialNames: { [CID]: '西奥.png' },
+    scanDir: async () => ({ names: [], truncated: false }),
+  });
+  const result = await pushCardToSt({
+    charactersDir: 'C://ST//characters',
+    cardName: '西奥',
+    cardId: CID,
+    build: async () => artifact,
+    deps,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.fileName, '西奥.png', '目录空着，占到的还是这个名字');
+  assert.equal(result.isUpdate, false, '文件不在了就不是"更新"');
+});
+
+test('更新式推送：首次推会登记映射，供下次覆盖', async () => {
+  const deps = makeDeps({ scanDir: async () => ({ names: [], truncated: false }) });
+  const result = await pushCardToSt({
+    charactersDir: 'C://ST//characters',
+    cardName: '西奥',
+    cardId: CID,
+    build: async () => artifact,
+    deps,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.isUpdate, false);
+  assert.equal(deps.names[CID], '西奥.png', '映射必须落下来，否则下次又加序号');
+});
+
+test('更新式推送：登记失败要中止并说原因（不能悄悄多一张卡）', async () => {
+  const deps = makeDeps({
+    scanDir: async () => ({ names: [], truncated: false }),
+    saveName: async () => {
+      throw new Error('配置目录只读');
+    },
+  });
+  const result = await pushCardToSt({
+    charactersDir: 'C://ST//characters',
+    cardName: '西奥',
+    cardId: CID,
+    build: async () => artifact,
+    deps,
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /对应关系/);
+  assert.equal(deps.written.length, 0, '登记失败就不该写盘（避免出现"文件在、映射无"）');
+});
+
+test('更新式推送：读映射失败不阻止推送（映射丢了最坏是下次加序号）', async () => {
+  const deps = makeDeps({
+    scanDir: async () => ({ names: [], truncated: false }),
+    loadNames: async () => {
+      throw new Error('读配置失败');
+    },
+  });
+  const result = await pushCardToSt({
+    charactersDir: 'C://ST//characters',
+    cardName: '西奥',
+    cardId: CID,
+    build: async () => artifact,
+    deps,
+  });
+  assert.equal(result.ok, true, '读失败不该让用户连改都改不了');
+  assert.equal(result.fileName, '西奥.png');
 });

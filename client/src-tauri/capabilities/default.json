@@ -1,10 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口最小权限：只允许单文件对话框与单个目录对话框（T9.8，非递归）、二次确认框；自身配置读写；刻意不授予任意路径 fs 访问与 opener 插件",
+  "description": "主窗口最小权限：只允许单文件对话框与单个目录对话框（T9.8，非递归）、二次确认框；自身配置读写；刻意不授予任意路径 fs 访问与 opener 插件。另有 core:app:allow-exit —— 2026-11-03 用户报「点狠心退出时没有退出APP」，真因是 core:default 不含 allow-exit，invoke 被权限系统静默拒绝；该权限只开放 exit 一个命令，不连带别的。注意本文件是严格 JSON，不能写 // 或 /* */ 注释。",
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:app:allow-exit",
 
     "dialog:allow-open",
     "dialog:allow-save",

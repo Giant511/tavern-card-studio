@@ -238,7 +238,7 @@ export class RulesDialog {
     const presetHint = el(
       'p',
       'field-hint',
-      '「选择预设」只改变导出时的标题与顺序；只有「应用预设」会重排原文，且会先列出变更让你确认。导入预设不会自动切换到它。',
+      '「选择预设」只改变导出时的标题与顺序；只有「应用预设」会重排原文。导入预设不会自动切换到它。',
     );
     presetSection.append(
       presetTitle,
@@ -283,9 +283,7 @@ export class RulesDialog {
     const greetingHint = el(
       'p',
       'field-hint',
-      '决定「初始场景」怎么写：多条开场白之间的分隔行、以及可选的段标签行。' +
-        '内置「标准初始场景」等价于 v0.1.3 冻结格式（空行+--- +空行，不写标签）。' +
-        '**只影响格式**，不评价开场白写得好不好。',
+      '决定多条开场白之间的分隔方式。',
     );
 
     this.greetingSelect = el('select', 'select wide') as HTMLSelectElement;
@@ -324,8 +322,7 @@ export class RulesDialog {
     const exampleHint = el(
       'p',
       'field-hint',
-      '决定「对话示例」怎么读：轮次分隔（只用于审计统计轮数，**不改写正文**）与轮次称呼。' +
-        '内置「标准对话示例」= 不切分，即 v0.1.3 冻结行为。',
+      '决定「对话示例」里的轮次怎么识别。',
     );
 
     this.chatExampleSelect = el('select', 'select wide') as HTMLSelectElement;
@@ -380,9 +377,8 @@ export class RulesDialog {
       foot,
     );
     this.overlay.append(panel);
-    this.overlay.addEventListener('click', (event) => {
-      if (event.target === this.overlay) this.close();
-    });
+    // 点遮罩**不关闭**（2026-10-29 用户要求）：子窗口只能由它自己的按钮或 × 关闭。
+    // 去掉这条监听是有意的，不是漏了 —— 误触空白处关掉正在填的表单比多点一次 × 更烦。
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && !this.overlay.hidden) this.close();
     });
@@ -557,7 +553,7 @@ export class RulesDialog {
     } else {
       this.greetingSourceNote.textContent =
         source === 'frozen'
-          ? '当前使用冻结默认分隔符（空行 + --- + 空行）。'
+          ? '当前使用默认分隔符（空行 + --- + 空行）。'
           : '当前生效的分隔符来自上选的初始场景预设。';
       this.greetingSourceNote.dataset['source'] = source;
     }

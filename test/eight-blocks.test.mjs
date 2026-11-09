@@ -15,6 +15,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
+  parseCompositeScene,
   BLOCK_IDS,
   BLOCK_DEFINITION_MAP,
   DEFAULT_GREETING_FORMAT,
@@ -63,7 +64,12 @@ test('两个新板块是字段板块，承载字段名实相符', () => {
   assert.equal(BLOCK_DEFINITION_MAP['chat-examples'].stField, 'mes_example');
   assert.equal(BLOCK_DEFINITION_MAP['initial-scene'].kind, 'field-backed');
   assert.equal(BLOCK_DEFINITION_MAP['initial-scene'].stField, 'first_mes');
-  assert.deepEqual(BLOCK_DEFINITION_MAP['initial-scene'].alsoWrites, ['alternate_greetings']);
+  /*
+   * ★ 2026-11-09：初始场景是复合板块，一块写**三个** ST 字段 ——
+   * 开场白（first_mes）+ 备用开场白（alternate_greetings）+ 情景（scenario）。
+   * `scenario` 不单独占板块（板块数仍是 8）。
+   */
+  assert.deepEqual(BLOCK_DEFINITION_MAP['initial-scene'].alsoWrites, ['alternate_greetings', 'scenario']);
 });
 
 test('createEmptyCard 从 BLOCK_IDS 派生：7 个块（worldbook 不在 blocks 里）', () => {
@@ -143,8 +149,23 @@ test('导入 JSON 后板块里能看到开场白与示例对话', () => {
   const scene = card.blocks.find((block) => block.id === 'initial-scene');
   const examples = card.blocks.find((block) => block.id === 'chat-examples');
   assert.ok(scene && examples);
-  // 1 条 first_mes + 2 条备用 = 3 段，两处分隔行
-  assert.equal(scene.text, '开场白一\n\n---\n\n备用一\n\n---\n\n备用二');
+  /*
+   * ★ 2026-11-09：初始场景是**复合板块**，板块文本形如
+   *
+   * ```text
+   *   @@开场白
+   *   开场白一 / 备用一 / 备用二（用分隔行切）
+   *   @@情景
+   *   深秋的午后…
+   * ```
+   *
+   * 所以这里不断言字面量（每加一段就要改一次），而是**解析回来断语义**：
+   * 三条开场白各归其位、情景落到自己的槽。
+   */
+  const parsedScene = parseCompositeScene(scene.text);
+  assert.equal(parsedScene.firstMes, '开场白一', '第一条开场白');
+  assert.deepEqual(parsedScene.alternateGreetings, ['备用一', '备用二'], '两条备用开场白');
+  assert.equal(parsedScene.scenario, card.residual.scenario, '情景要落在情景段');
   assert.equal(examples.text, '<START>\n{{user}}: 你好\n{{char}}: 你好呀');
 });
 
@@ -498,6 +519,23 @@ test('两个字段板块都缺失（旧格式卡）：只出 legacy 一条，不
     block.raw = '';
     block.missing = true;
   }
+  /*
+   * ★ 2026-11-09：光清板块文本不够，**必须把 residual 也清空**。
+   *
+   * 「六板块旧卡」的判据现在是**字段值**（`firstMes` / `alternateGreetings` /
+   * `mesExample` 是否为空），不是板块文本 —— 因为初始场景板块的 text 里
+   * 常驻 `@@开场白` / `@@情景` 两行标记，清空 text 之后 `refreshFieldBlockViews`
+   * 还会从 residual 重新渲染回来。
+   *
+   * 不同步清 residual，测的就不是"旧卡"，而是一张"板块被清空但字段还在"的
+   * 畸形卡 —— 那种卡本来就不该报 legacy（有内容就不是旧卡）。
+   */
+  card.residual = {
+    ...card.residual,
+    firstMes: '',
+    alternateGreetings: [],
+    mesExample: '',
+  };
   const issues = checkPresetConformance(card, defaultPreset());
   assert.equal(issues.filter((issue) => issue.ruleId === 'builtin:legacy-six-block').length, 1);
   assert.equal(

@@ -11,6 +11,12 @@
 import { isSyncReady, type ProbeResult } from '../net/server-probe';
 import { syncGateMessage, type SyncGateState } from '../auth/entry-policy';
 import type { RepoSummary } from './repo-client';
+// 别名导入：类里也有一个同名私有方法会很危险（方法体会递归调自己而不是这个函数）
+import { syncFaceAfterUpload as runFaceSync } from './face-sync.ts';
+import { uploadFace } from './server-sync.ts';
+// 增补一/二：上传时的「配一张封面」步骤 + 卡面压缩（压成 ≤250KB 的仓库资产）
+import { askFaceForUpload } from './upload-face-step.ts';
+import { buildStoreFace, decodeImage } from '../export/face-encode.ts';
 import { pickRepoId, shouldShowRepoPicker, toRepoOptions, type RepoTokenContext } from './repo-select';
 import { describeCapabilities } from '../auth/repo-token';
 import { connectLocalService, describeLocalSuccess } from '../net/local-connect';
@@ -58,6 +64,17 @@ export interface SyncDialogCallbacks {
   getUploadTarget: () => { cardId: string; name: string; baseSeq: number | null } | null;
   /** 上传成功后把 cardId 与 seq 一起记回会话（分叉判定要这两个一起才有意义） */
   onUploaded: (cardId: string, seq: number) => void;
+  /**
+   * 当前卡的图源字节（含卡数据块）；null = 这张卡没有图（v0.1.7 修订二）。
+   *
+   * 上传流程会把它剥掉卡数据块后作为**卡面**传给服务端 ——
+   * 卡面只存纯图，JSON 已经在版本流里了。
+   */
+  getFaceBytes: () => Uint8Array | null;
+  /** 上次成功上传的卡面摘要（用来判断"要不要传"） */
+  getLastUploadedFaceSha: () => string | null;
+  /** 卡面同步结束后把摘要记回会话（null = 当前没有卡面） */
+  onFaceUploaded: (sha256: string | null) => void;
   /**
    * 把远端版本内容应用回编辑器。
    *
@@ -114,6 +131,22 @@ export interface SyncDialogCallbacks {
    * 没接这个回调时回落到旧的 `isSyncReady`（单测里构造 panel 时方便）。
    */
   getGate?: () => SyncGateState;
+  /**
+   * 重新探测服务端（v0.1.7 生产反馈：版本号与服务端不一致）。
+   *
+   * ## 为什么需要它
+   *
+   * 状态行显示的是 `ProbeResult.message` —— 一个**一次性的字符串**，
+   * 里面烤着探测当时的服务端版本（"已连接（服务端 0.1.7），token 有效"）。
+   * 而 `getConnection()` 返回的是 App 里缓存的那份结果，`open()` 不重新探测。
+   *
+   * 于是出现一个很难自证的现象：用户升级了服务端、面板上明晃晃写着 `v0.1.7`，
+   * 同步面板却还坚持说"服务端 0.1.6"。用户只能怀疑是不是装错了。
+   *
+   * 修法就是**每次打开面板都重新问一次**。探测本身很轻（一个 GET），
+   * 失败也不打扰（保持原状），比让界面说谎强。
+   */
+  onReprobe?: () => Promise<void>;
   /** 未登录时的「登录…」入口 */
   onLogin?: () => void;
   notify: (message: string, kind?: 'ok' | 'warn' | 'bad' | 'info') => void;
@@ -316,9 +349,8 @@ export class SyncDialog {
     panel.append(head, statusRow, uploadSection, historySection, this.busyBox, foot);
     this.overlay.append(panel);
 
-    this.overlay.addEventListener('click', (event) => {
-      if (event.target === this.overlay) this.close();
-    });
+    // 点遮罩**不关闭**（2026-10-29 用户要求）：子窗口只能由它自己的按钮或 × 关闭。
+    // 去掉这条监听是有意的，不是漏了 —— 误触空白处关掉正在填的表单比多点一次 × 更烦。
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && !this.overlay.hidden) this.close();
     });
@@ -334,6 +366,27 @@ export class SyncDialog {
     this.clearWarning();
     this.renderTarget();
     void this.reload();
+    /*
+     * 重新探测一次服务端（见 `onReprobe` 的注释）。
+     *
+     * 先渲染一次再探测：面板要能立刻出现，不能等网络往返；
+     * 探测回来后重绘状态行，把可能过期的版本号纠正过来。
+     */
+    void this.reprobeThenRender();
+  }
+
+  /** 打开面板时刷新一次连接结论，让界面上的版本号不是历史值。 */
+  private async reprobeThenRender(): Promise<void> {
+    const reprobe = this.callbacks.onReprobe;
+    if (reprobe === undefined) return;
+    try {
+      await reprobe();
+    } catch {
+      // 探测失败保持原状：这不是错误状态，只是没能拿到最新结论
+      return;
+    }
+    if (this.overlay.hidden) return; // 探测期间用户已经关掉了
+    this.renderStatus();
   }
 
   close(): void {
@@ -401,6 +454,89 @@ export class SyncDialog {
       this.busy = false;
       this.connectButton.disabled = false;
     }
+  }
+
+  /**
+   * 同步卡面（内部）。失败只提示、不抛 —— 内容已经上传成功了。
+   *
+   * 单独抽一个方法而不是塞进 upload 里：上传那个方法已经 40 多行、
+   * 混着分叉判定与仓库选择，再叠一段二进制上传会让它彻底读不动。
+   *
+   * 名字刻意不叫 `syncFaceAfterUpload`（与导入的函数同名）：
+   * 同名时方法体里的调用会解析成"调用自己"，变成无声的无限递归。
+   */
+  private async pushFaceIfChanged(config: SyncConfig, cardId: string): Promise<void> {
+    const pngBytes = this.callbacks.getFaceBytes();
+
+    /*
+     * 本地**没有图源**时问一句要不要配封面（v0.1.7 增补一）。
+     *
+     * 为什么"没有图源"才问：从 PNG 导入的卡本来就带着封面，再问一遍是噪音；
+     * 而从 TXT / JSON 起手的卡没有任何图，用户很可能想补一张 ——
+     * 这正是需求里"首次推卡未选卡面"的场景。
+     */
+    if (pngBytes === null) {
+      const chosen = await askFaceForUpload(this.callbacks.getUploadTarget()?.name ?? '这张卡');
+      if (chosen === null) return; // 用户选了「暂不选，直接推送」：仓库记录为无卡面
+      try {
+        const result = await uploadFace(config, cardId, chosen.bytes, chosen.mime);
+        this.callbacks.onFaceUploaded(result.face.sha256);
+        this.callbacks.notify(
+          result.changed ? `封面已随内容入仓 · ${chosen.note}` : '封面没有变化，未重新上传',
+          result.changed ? 'ok' : 'info',
+        );
+      } catch (error) {
+        // 与下面同一条纪律：封面失败不上升到"上传失败"
+        this.callbacks.notify(
+          `卡片内容已保存，但封面没能上传：${error instanceof Error ? error.message : String(error)}`,
+          'warn',
+        );
+      }
+      return;
+    }
+
+    /*
+     * 本地有图源 ⇒ 先压成**仓库资产**（v0.1.7 增补二）。
+     *
+     * 这一段的产物是 WebP（或平涂的 PNG 原样），≤250KB。压不动就不传，
+     * 并如实说原因 —— 绝不要退回"传原图"，那会让仓库里出现 4MB 的封面，
+     * 而服务端 250KB 那条线会把它拒掉，用户看到的是"封面没能上传"，
+     * 与真实原因（图太复杂）对不上。
+     */
+    let prepared: { bytes: Uint8Array; mime: string } | null = null;
+    try {
+      const image = await decodeImage(pngBytes, 'source.png');
+      let built;
+      try {
+        // pngSource 一定是 PNG（导入时保留的原图），所以 originalIsPng 恒为 true
+        built = await buildStoreFace(image, pngBytes, true);
+      } finally {
+        image.bitmap.close();
+      }
+      if (built.ok && built.bytes !== null && built.mime !== null) {
+        prepared = { bytes: built.bytes, mime: built.mime };
+      } else {
+        this.callbacks.notify(`封面没有入仓：${built.note}`, 'warn');
+      }
+    } catch (error) {
+      // canvas 不可用等：不阻塞内容上传，只是这次没有封面
+      this.callbacks.notify(
+        `封面没有入仓：${error instanceof Error ? error.message : String(error)}`,
+        'warn',
+      );
+    }
+
+    const outcome = await runFaceSync({
+      pngBytes,
+      prepared,
+      lastUploadedSha: this.callbacks.getLastUploadedFaceSha(),
+      upload: async (bytes, mime) => {
+        const result = await uploadFace(config, cardId, bytes, mime);
+        return { changed: result.changed, sha256: result.face.sha256 };
+      },
+    });
+    this.callbacks.onFaceUploaded(outcome.sha256);
+    if (outcome.note !== '') this.callbacks.notify(outcome.note, 'warn');
   }
 
   private setBusy(text: string | null): void {
@@ -937,6 +1073,14 @@ export class SyncDialog {
       // cardId 与 seq 一起记回会话（分叉判定要这两个一起才有意义）
       this.callbacks.onUploaded(result.cardId, result.seq);
       this.renderTarget();
+
+      /*
+       * 卡面同步（v0.1.7 修订二）。放在 JSON 上传**之后**，因为：
+       *   · 卡面挂在 cardId 上，cardId 要等上传响应才有；
+       *   · 卡面失败不该让"内容已保存"这个事实被误报成失败
+       *     （见 `face-sync.ts` 文件头第 3 条）。
+       */
+      await this.pushFaceIfChanged(config, result.cardId);
 
       // 上传成功后刷新列表与版本历史
       await this.reload();

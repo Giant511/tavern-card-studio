@@ -58,6 +58,8 @@ import {
   readTextExact,
   scanCardsDir,
   shellInfo,
+  // v0.1.7 增补三：取回撞名的 mtime 判据
+  statFile,
   stProxyStart,
   stProxyStatus,
   stProxyStop,
@@ -66,6 +68,7 @@ import {
   writePresetLibrary,
   type ClientConfig,
   type ShellError,
+  type WriteReceipt,
 } from '../contract';
 
 import {
@@ -105,6 +108,8 @@ import { RepoDialog } from '../sync/repo-dialog';
 import { listRepos } from '../sync/repo-client';
 import type { RepoTokenContext } from '../sync/repo-select';
 import type { SyncConfig } from '../sync/server-sync';
+// 卡面拉取（v0.1.7 修订二）：值导入，取回/回滚时用它把封面也收下来
+import { fetchFace } from '../sync/server-sync';
 import { AuthSession } from '../auth/session';
 import { LoginDialog } from '../auth/login-dialog';
 import { AccountDeleteDialog } from '../auth/account-delete-dialog';
@@ -146,6 +151,7 @@ import { SaveFormatDialog, type SaveFormatDialogResult } from '../session/save-f
 import { StDialog } from '../session/st-dialog';
 import { isPaneWidthUsable } from '../session/st-pane-layout';
 import { pushCardToSt } from '../session/st-push';
+import { configNameDeps } from '../session/st-push-registry';
 import { StPane } from '../session/st-pane';
 import { locateSt, stStatusText } from '../session/st-install';
 import {
@@ -168,6 +174,14 @@ import {
 import { CardSession } from '../session/card-session';
 import { decodeBinaryFile, inspectPng, toPngSource } from '../session/png-source';
 import { effectiveCardsDir, suggestCardFileName } from '../session/cards-dir';
+import { joinPath } from '../session/cards-path';
+// 增补三：导出落 PNG 前的同名撞名守卫（决策纯函数在 face-drop.ts）
+import { saveTargetWithGuard } from '../sync/save-target-guard';
+import { askDirtyChoice, askUnknownChoice } from '../sync/save-guard-dialog';
+import { getBaseline, isNewerThanBaseline, recordBaseline } from '../sync/file-baseline';
+import { isPngBytes, parsePngCard } from '../../../shared/src/png-card.ts';
+// 取回的仓库卡面是 WebP（v0.1.7 增补二），而 pngSource 下游全要求 PNG 容器
+import { convertToPng } from '../export/face-convert.ts';
 import { TabBar, type TabItem } from '../session/tab-bar';
 import { generateCardId, readCardIdFromCard, withCardId } from '../session/card-id';
 import { collectDirtyNames, installUnloadGuard } from '../session/unload-guard';
@@ -1002,6 +1016,13 @@ class EditorApp {
 
     this.syncDialog = new SyncDialog({
       getConnection: () => this.connection,
+      /*
+       * 每次打开同步面板都重探一次（v0.1.7 生产反馈：版本号与服务端不一致）。
+       *
+       * 复用 `autoProbe()` 而不是新写一条探测：它已经是"读配置 → probeServer →
+       * applyConnection"的唯一实现，多写一份必然与它分叉（比如漏掉账户令牌优先）。
+       */
+      onReprobe: () => this.autoProbe(),
       getConfig: () => this.currentSyncConfig(),
       // 上传内容与「导出 JSON」同一份，保证服务端字节与本地可复现
       getPayload: () => {
@@ -1024,6 +1045,16 @@ class EditorApp {
       onUploaded: (cardId, seq) => {
         if (!this.hasSession) return;
         this.session.noteRemoteVersion(cardId, seq);
+      },
+      /*
+       * 卡面（v0.1.7 修订二）。三个回调都基于当前会话 ——
+       * 没有会话时 getFaceBytes 返回 null，上传流程会跳过卡面而不是报错。
+       */
+      getFaceBytes: () => (this.hasSession ? (this.session.pngSource?.bytes ?? null) : null),
+      getLastUploadedFaceSha: () => (this.hasSession ? this.session.lastUploadedFaceSha : null),
+      onFaceUploaded: (sha256) => {
+        if (!this.hasSession) return;
+        this.session.noteFaceUploaded(sha256);
       },
       onRemoteTextApplied: (text, version, remoteSeq, context) => {
         this.applyRemoteText(text, version.seq, remoteSeq, context);
@@ -1582,6 +1613,55 @@ class EditorApp {
    * 回滚时两者不同（回滚新建了一个版本）：基线必须记后者，否则下一次上传
    * 服务端会拿"我上次传的是 v2"去比"远端最新是 v4"，凭空报一个分叉。
    */
+  /**
+   * 从服务端拉卡面并替换会话的图源（v0.1.7 修订二）。
+   *
+   * ## 为什么"服务端没有卡面"时**不清空**本地图
+   *
+   * 两种解释都说得通：① 服务端是事实源，它没有就该没有；② 用户刚在本地选了
+   * 一张图还没上传，清掉等于让他白选一次。
+   *
+   * 选 ② 的理由是**损失不对称**：保留本地图的代价是"下次上传时会把这张图传上去"
+   * （用户看得见、也能改），清空的代价是他得重新找一次图（而且不会被告知为什么没了）。
+   * 导出的兜底链本来就能处理"卡面缺失"，所以保留在功能上也安全。
+   */
+  private async pullFaceFromServer(cardId: string): Promise<void> {
+    if (cardId === '') return;
+    const config = this.currentSyncConfig();
+    if (config === null) return;
+    try {
+      const face = await fetchFace(config, cardId);
+      if (face === null) return;
+      if (!this.hasSession) return;
+      /*
+       * keyword 固定给 'chara'：这里拿到的是**纯图**（服务端不收卡数据块），
+       * 它本身没有 keyword 概念；真正写进 PNG 时由导出链路按目标 spec 决定，
+       * 这个字段只在"保持原 spec"那条路上被读。
+       */
+      /*
+       * **必须先转成 PNG 容器**（v0.1.7 增补二之后）。
+       *
+       * 仓库卡面资产是 WebP（250KB 红线逼出来的），而 `pngSource` 的下游
+       * —— `buildPngCard` / 导出 / 推 ST —— 全都要求 PNG。
+       * 直接塞 WebP 的后果实测过：点推送抛
+       * `PngCardError: 不是 PNG 文件（文件签名不匹配）`，且那条链路没人 catch，
+       * 用户看到的是"点推送没反应"。
+       *
+       * 判据用**字节签名**而不是 MIME：MIME 来自 HTTP 头，可能是错的；
+       * 签名是内容本身。非 PNG 才转码，PNG 走原路（零重编码，决策 D1）。
+       */
+      let faceBytes = face.bytes;
+      if (!isPngBytes(faceBytes)) {
+        const converted = await convertToPng(faceBytes, 'face.webp');
+        faceBytes = converted.bytes;
+      }
+      this.session.setPngSource(toPngSource(faceBytes, null, 'chara'));
+      this.session.noteFaceUploaded(face.sha256 === '' ? null : face.sha256);
+    } catch {
+      // 拉卡面失败静默：内容已经载入，图只是可选资产
+    }
+  }
+
   private applyRemoteText(
     text: string,
     displaySeq: number,
@@ -1634,6 +1714,14 @@ class EditorApp {
       }
 
       this.setStatus(plan.status, plan.action === 'create' ? 'ok' : 'warn');
+
+      /*
+       * 卡面（v0.1.7 修订二）：取回/回滚时把服务端那份封面也收下来。
+       *
+       * fire-and-forget：内容已经载入成功了，卡面失败不该把这次操作判失败
+       * （而且用户看到的画面已经是对的 —— 编辑不需要图，图只在推 ST/导出时用）。
+       */
+      void this.pullFaceFromServer(plan.cardId);
     } catch (error) {
       this.setStatus(
         `载入服务端版本失败：${error instanceof Error ? error.message : String(error)}`,
@@ -3455,16 +3543,20 @@ class EditorApp {
         const outcome = await pushCardToSt({
           charactersDir: located.dir,
           cardName: this.session.card.meta.name,
+          cardId: this.session.cardId,
           build: () => this.buildStPushArtifact(),
           deps: {
             probeDir: (dir, options) => probeCardsDir(dir, options),
             scanDir: (dir, limit, extensions) => scanCardsDir(dir, limit, extensions),
             writeBinary: (path, base64, sha256) => writeBinaryFileAtomic(path, base64, sha256),
+            ...configNameDeps,
           },
         });
         if (!outcome.ok) return { error: outcome.reason };
+        if (outcome.nameNote !== '') this.setStatus(outcome.nameNote, 'warn');
         if (outcome.staleNote !== '') this.setStatus(outcome.staleNote, 'info');
-        return { fileName: outcome.fileName };
+        // 带上 isUpdate：面板据此说「已更新」还是「已推送」（v0.1.7 修订一）
+        return { fileName: outcome.fileName, isUpdate: outcome.isUpdate };
       },
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
       hasCard: () => this.hasSession,
@@ -3579,6 +3671,7 @@ class EditorApp {
     this.stDialog ??= new StDialog({
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
       getCardName: () => this.session.card.meta.name,
+      getCardId: () => this.session.cardId,
       buildStPush: () => this.buildStPushArtifact(),
       rememberPath: (path) => this.rememberStPath(path),
     });
@@ -3627,12 +3720,28 @@ class EditorApp {
     }
 
     const preset = this.rules?.preset ?? null;
+    /*
+     * 最后一公里防线：`buildPngCard` 只接受 PNG 容器。
+     *
+     * `resolveSaveFace()` 正常路径已经保证是 PNG（非 PNG 会走 `convertToPng`），
+     * 但 2026-10-29 的现场是：取回一侧把仓库的 WebP 直接塞进了 `pngSource`，
+     * 于是异常从这条链路最深处抛出来，而那里没人 catch ——
+     * 用户看到的是"点推送没反应"。
+     *
+     * 所以这里再挡一次。它不是重复校验，是**把失败变成一个可读的提示**：
+     * 宁可多转一次码，也不要让用户对着一个毫无反应的按钮猜。
+     */
+    let faceBytes = face.bytes;
+    if (!isPngBytes(faceBytes)) {
+      faceBytes = (await convertToPng(faceBytes, 'face.webp')).bytes;
+    }
+
     const artifact = await buildExportAsync(
       this.card,
       preset,
       'png',
       this.greetingFormat().format,
-      face.bytes,
+      faceBytes,
     );
     if (artifact.format !== 'png') throw new Error('内部错误：PNG 推送拿到了文本产物');
     return {
@@ -3869,9 +3978,8 @@ class EditorApp {
       cancel.addEventListener('click', () => finish('cancel'));
       discard.addEventListener('click', () => finish('discard'));
       save.addEventListener('click', () => finish('save'));
-      overlay.addEventListener('click', (event) => {
-        if (event.target === overlay) finish('cancel');
-      });
+    // 点遮罩**不关闭**（2026-10-29 用户要求）：子窗口只能由它自己的按钮或 × 关闭。
+    // 去掉这条监听是有意的，不是漏了 —— 误触空白处关掉正在填的表单比多点一次 × 更烦。
       document.addEventListener(
         'keydown',
         (event) => {
@@ -3931,7 +4039,11 @@ class EditorApp {
       // 默认落点 = cardsDir（F4）；文件名取角色名并按格式换扩展名，重名自动追加序号
       const dir = await effectiveCardsDir();
       const suggestedBase = await suggestCardFileName(session.card.meta.name, dir);
-      const target = await pickSavePath(
+      /*
+       * `let` 而不是 `const`：撞名守卫可能把落点改到「另存」的编号副本上
+       * （异卡撞名 / 用户在脏三选里选另存），后续 markSaved 必须记实际路径。
+       */
+      let target = await pickSavePath(
         withSaveExtension(suggestedBase, choice.format),
         choice.format,
         dir === '' ? undefined : dir,
@@ -3948,10 +4060,35 @@ class EditorApp {
 
       // PNG 是二进制：走二进制写；文本两种格式走文本写。
       // 两条都带 sha256 断言（壳写后回读重算，不一致就报错）。
-      const receipt =
-        artifact.format === 'png'
-          ? await writeBinaryFileAtomic(target, bytesToBase64(artifact.png), artifact.sha256)
-          : await writeFileAtomic(target, artifact.text, artifact.sha256);
+      let receipt;
+      if (artifact.format === 'png') {
+        /*
+         * 写盘前过一道"同名撞名"守卫（v0.1.7 增补三）。
+         *
+         * 系统保存对话框已经问过一次"要覆盖吗"，但它**只知道重名、
+         * 不知道身份**：用户手选了一个已有的 `西奥.png`，而那可能是另一张卡 ——
+         * 覆盖掉就等于毁了别人的文件，且没有任何提示。
+         * 这里按 PNG 里嵌的 `extensions.tcs.cardId` 判身份，五种情况分别处理。
+         */
+        const guarded = await this.savePngWithGuard(target, artifact.png, session);
+        if (guarded === null) return false; // 用户在三选里取消了
+        if (guarded.receipt === null) {
+          // 没落盘（查看差异 / 标签占用）：已经给过提示，不要伪装成保存成功
+          this.setStatus(
+            guarded.note === '' ? '这次没有写入文件' : guarded.note,
+            'warn',
+          );
+          return false;
+        }
+        receipt = guarded.receipt;
+        if (guarded.path !== target) {
+          // 另存了：后续 markSaved 必须记实际路径，否则下次保存还往旧路径写
+          target = guarded.path;
+        }
+        if (guarded.note !== '') this.setStatus(guarded.note, 'info');
+      } else {
+        receipt = await writeFileAtomic(target, artifact.text, artifact.sha256);
+      }
 
       session.markSaved(target);
       session.setSaveFormat(choice.format);
@@ -4017,6 +4154,117 @@ class EditorApp {
   }
 
   /** 解析"这张卡自己的封面"（原图 > 图库记住的那张 > 内置默认） */
+  /**
+   * 导出 PNG 前的同名撞名守卫（v0.1.7 增补三）。
+   *
+   * 决策与执行都在 `save-target-guard.ts`（依赖注入、12 项测试），这里只把
+   * 壳能力拼进去。**判据是 PNG 里嵌的 `extensions.tcs.cardId`，不是文件名** ——
+   * 这条在本项目已经用到第六次（推送、审计、取回…），每次的诱惑都是
+   * "同名就当同一张"，而那个假设在"两张卡都叫西奥"时立刻出事。
+   *
+   * ## `isNewer` 的判据链（2026-10-29 补齐 stat 后）
+   *
+   * "本地这份是不是被外部改过" = `当前 mtime > 上次与本客户端同步时的 mtime`。
+   *
+   * 基线存在 `ClientConfig.fileBaselines`（键是归一化路径），
+   * 在**每次成功读写**之后更新 —— 所以它记的是"我们最后一次碰它的时候它多大年纪"。
+   * 三个不判脏的情况（没有基线 / 取不到 mtime / 文件反而变旧）见 `file-baseline.ts` 文件头。
+   *
+   * 失败一律当"不脏"：这条判据的作用是**多问一句**，不是拦路。
+   * 它自己出错时让人正常导出，比让人导不出去好。
+   */
+  private async savePngWithGuard(
+    target: string,
+    png: Uint8Array,
+    session: CardSession,
+  ): Promise<{ path: string; receipt: WriteReceipt | null; note: string } | null> {
+    const incomingCardId = readCardIdFromCardJson(session.card);
+    const config = await configGet().catch(() => null);
+    const baselines = config?.fileBaselines ?? {};
+
+    const result = await saveTargetWithGuard(target, png, incomingCardId, {
+      readFile: async (path) => {
+        try {
+          const file = await readBinaryFile(path);
+          const decoded = await decodeBinaryFile(file);
+          return decoded.bytes;
+        } catch {
+          // 不存在是正常路径；读失败也当"没有"，让守卫走"直接写"
+          return null;
+        }
+      },
+      readCardId: (bytes) => {
+        const parsed = parsePngCard(bytes);
+        if (parsed.kind !== 'card') return null;
+        return readCardIdFromCardJson(parsed.json);
+      },
+      isOpenInTab: (path) =>
+        this.sessions.some((item) => item.filePath === path),
+      isDirty: (path) =>
+        this.sessions.some((item) => item.filePath === path && item.dirty),
+      isNewer: async (path) => {
+        try {
+          const stat = await statFile(path);
+          if (stat === null) return false;
+          return isNewerThanBaseline(stat.mtimeMs, getBaseline(baselines, path));
+        } catch {
+          // 见方法注释：判据出错时放行，不拦用户导出
+          return false;
+        }
+      },
+      writeAtomic: async (path, bytes) => {
+        const written = await writeBinaryFileAtomic(path, bytesToBase64(bytes));
+        return { sha256: written.sha256 };
+      },
+      listDir: async (dir) => {
+        const scan = await scanCardsDir(dir, undefined, ['png']);
+        return scan.names;
+      },
+      joinPath: (dir, name) => joinPath(dir, name),
+      askDirty: (options) => askDirtyChoice(options),
+      askUnknown: (options) => askUnknownChoice(options),
+      note: (message) => { this.setStatus(message, 'info'); },
+    });
+
+    if (result === null) return null;
+
+    /*
+     * 没落盘时 `sha256` 是空串（查看差异 / 标签占用这两支）。
+     * 用它当判据而不是另外加一个布尔：空摘要本身就不可能是一次成功写入的产物，
+     * 两个字段表达同一件事会分叉。
+     */
+    if (result.sha256 === '') {
+      return { path: result.path, receipt: null, note: result.note };
+    }
+
+    /*
+     * 写完立刻把**这份文件的新 mtime** 记成基线。
+     *
+     * 必须真去 stat 一次，不能拿"当前时间"顶替：文件的 mtime 由文件系统写、
+     * 与我们这边的时间可能有几百毫秒差（尤其在同步盘上）。拿当前时间记基线，
+     * 下次判定会得到 `fileMtime < baseline` ⇒ 永远判不脏 ⇒ 这条判据失效。
+     */
+    try {
+      const after = await statFile(result.path);
+      if (after !== null) {
+        await configPatch({ fileBaselines: recordBaseline(baselines, result.path, after.mtimeMs) });
+      }
+    } catch {
+      // 记基线失败不影响这次导出的结果：只是下次会少一层保护
+    }
+
+    return {
+      path: result.path,
+      receipt: {
+        pathDisplay: result.path,
+        bytesWritten: png.byteLength,
+        sha256: result.sha256,
+        verified: true,
+      },
+      note: result.note,
+    };
+  }
+
   private async resolveSaveFace(): Promise<ResolvedSaveFace | null> {
     return resolveSaveFace(
       defaultSaveFaceDeps({
@@ -5204,3 +5452,24 @@ async function boot(): Promise<void> {
 }
 
 void boot();
+
+/**
+ * 从卡 JSON 里取 `extensions.tcs.cardId`，取不到返回**空串**。
+ *
+ * 为什么返回空串而不是 null：调用方（`decideFaceDrop`）把"空串"当作
+ * "没有身份"处理，与 null 同义；而顶层用 string 能少一层 ?? 判断。
+ *
+ * 为什么不直接用卡模型的类型：`parsePngCard` 返回的是 `unknown`
+ * （它刻意不做 schema 校验，见 `shared/src/png-card.ts`），这里只是
+ * 取一个**标识**，不该为此跑一遍完整校验 —— 一个损坏的卡也要能读出
+ * 它属于谁，否则用户就会在"这份文件坏了"之外再收到"不知道它是谁的"。
+ */
+function readCardIdFromCardJson(json: unknown): string {
+  if (typeof json !== 'object' || json === null) return '';
+  const extensions = (json as { extensions?: unknown }).extensions;
+  if (typeof extensions !== 'object' || extensions === null) return '';
+  const tcs = (extensions as { tcs?: unknown }).tcs;
+  if (typeof tcs !== 'object' || tcs === null) return '';
+  const cardId = (tcs as { cardId?: unknown }).cardId;
+  return typeof cardId === 'string' ? cardId : '';
+}

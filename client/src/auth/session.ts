@@ -384,9 +384,19 @@ export class AuthSession {
     return bundle;
   }
 
-  async register(username: string, password: string): Promise<RegisterOutcome> {
+  /**
+   * 注册。
+   *
+   * `inviteCode` 只在服务端 `registerMode === 'invite'` 时必填（v0.1.7）；
+   * 其它模式传 undefined 即可，服务端不会读它。
+   */
+  async register(username: string, password: string, inviteCode?: string): Promise<RegisterOutcome> {
     const serverUrl = this.requireServerUrl();
-    const outcome = await this.api.register(serverUrl, { username, password });
+    const outcome = await this.api.register(serverUrl, {
+      username,
+      password,
+      ...(inviteCode === undefined || inviteCode === '' ? {} : { inviteCode }),
+    });
     // admin-only 建号不返回令牌：不能替被创建的人"登录"
     if (outcome.tokens) {
       await this.applyBundle(outcome.tokens);

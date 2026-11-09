@@ -1,0 +1,67 @@
+﻿[17:11:46] 
+[17:11:46] == 0. 管理员自检 ==
+[17:11:46]   已在管理员会话中
+[17:11:46]   OK 管理员权限 — IsInRole(Administrator) = True
+[17:11:46]   服务端 MSI：D:\Claw\代码开发\tavern-card-studio\release\TavernCardStudioServer-0.1.7.msi
+[17:11:46]   客户端 MSI：D:\Claw\代码开发\tavern-card-studio\release\Tavern Card Studio_0.1.7_x64_en-US.msi
+[17:11:46] 
+[17:11:46] == 0.5 清理上次运行留下的半成品 ==
+[17:11:46]   检测到上次留下的安装（服务或安装目录还在），先清理
+[17:11:46]   停服务 TavernCardStudioServer（当前 Running）
+[17:11:47]   OK 预清理 停服务 — TavernCardStudioServer
+[17:12:31]   OK 预清理：安装目录已清 — C:\Program Files\Tavern Card Studio Server
+[17:12:31] 
+[17:12:31] == 0.6 识别并还原上次留下的假数据 ==
+[17:12:31]   数据目录里是上次留下的假数据，从历史备份还原：C:\Users\PC\AppData\Local\Temp\tcs-t10.25-20261030-164553\backup-before\TavernCardStudio
+[17:12:31]   OK 还原上次的真实数据 — 54 个文件（来源 backup-before）
+[17:12:31] 
+[17:12:31] == 1. 备份现有数据 ==
+[17:12:31]   已备份到 C:\Users\PC\AppData\Local\Temp\tcs-t10.25-20261030-171146\backup-before（54 个文件）
+[17:12:31]   OK 备份现有数据 — 54 个文件 → C:\Users\PC\AppData\Local\Temp\tcs-t10.25-20261030-171146\backup-before
+[17:12:31] 
+[17:12:31] == 2. 路径 A：勾选「删除数据」 ==
+[17:12:31]   msiexec /i（静默安装）
+[17:12:48]   OK A 安装成功 — exit=0
+[17:12:48]   OK A 停服务 — TavernCardStudioServer
+[17:12:48]   OK A 数据已就绪 — C:\ProgramData\TavernCardStudio
+[17:12:48]   msiexec /x DELETEDATA=1
+[17:13:25]   OK A 卸载返回 0 — exit=0
+[17:13:28]   OK A 数据目录已删除 — C:\ProgramData\TavernCardStudio
+[17:13:28]   OK A 安装目录已清空 — C:\Program Files\Tavern Card Studio Server
+[17:13:28]   OK A 清理日志已产出 — install dir : D://tmp//t1025-lab2//install
+[17:13:28] 
+[17:13:28] == 3. 路径 B：不勾选「删除数据」 ==
+[17:13:28]   msiexec /i（静默安装）
+[17:13:48]   OK B 安装成功 — exit=0
+[17:13:48]   停服务 TavernCardStudioServer（当前 Running）
+[17:13:49]   OK B 停服务 — TavernCardStudioServer
+[17:13:49]   OK B 数据已就绪 — C:\ProgramData\TavernCardStudio
+[17:13:49]   msiexec /x （不勾删）
+[17:14:21]   OK B 卸载返回 0 — exit=0
+[17:14:24]   OK B 数据目录仍在 — C:\ProgramData\TavernCardStudio
+[17:14:24]   OK B 数据内容未变 — config.json 逐字节一致
+[17:14:24]   OK B 安装目录已清空 — C:\Program Files\Tavern Card Studio Server
+[17:14:24] 
+[17:14:24] == 4. 路径 C：安装目录里的残留（白名单外不许删） ==
+[17:14:24]   msiexec /i（静默安装）
+[17:14:40]   OK C 安装成功 — exit=0
+[17:14:40]   OK C 停服务 — TavernCardStudioServer
+[17:14:40]   已造：data\ + logs\（应清）与 user-notes.txt（应留）
+[17:14:40]   msiexec /x （不勾删）
+[17:15:15]   OK C 卸载返回 0 — exit=0
+[17:15:18]   OK C 安装目录仍存在 — 目录保留（触发了白名单清理）
+[17:15:19]   OK C 白名单外文件被保留 — user-notes.txt
+[17:15:19]   OK C data 子目录被清 — data\
+[17:15:19]   OK C logs 子目录被清 — logs\
+[17:15:19] 
+[17:15:19] == 5. 收尾 ==
+[17:15:19]   OK 环境已恢复 — 数据目录已用备份还原
+[17:15:19]   备份保留在 C:\Users\PC\AppData\Local\Temp\tcs-t10.25-20261030-171146\backup-before（可用 -KeepBackup 明确要求保留；不删是为了你事后能核对）
+[17:15:19] 
+[17:15:19] == 6. 结论 ==
+[17:15:19] 
+[17:15:19] [OK] 全部通过（27 项）
+VERDICT=PASS PASSED=27 TOTAL=27
+[17:15:19] 
+[17:15:19] 完整日志：C:\Users\PC\AppData\Local\Temp\tcs-t10.25-20261030-171146\result.log
+[17:15:19] （把这一行路径发给我，我读日志给结论；截图请另存在 C:\Users\PC\AppData\Local\Temp\tcs-t10.25-20261030-171146）

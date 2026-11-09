@@ -182,7 +182,26 @@ export function normalizeOnArrival(
   next = refreshFieldBlockViews(next, active.greeting);
   for (const block of next.blocks) {
     if (!isFieldBlock(block.id)) continue;
-    if (beforeFieldTexts.get(block.id) !== block.text) converted = true;
+    const before = beforeFieldTexts.get(block.id) ?? '';
+    if (before === block.text) continue;
+    /*
+     * ★★★ 空板块被补上标记**不算转换**（2026-11-09）。
+     *
+     * 「初始场景」是复合板块，它的规范文本里带 `@@开场白` / `@@情景`
+     * 两行标记（可发现性：用户得看到标记才知道这两段能写）。
+     * 而 `createEmptyCard()` 给的初始 `text` 是空串 —— 于是第一次经过
+     * 到达流程时，视图被刷新成"只有标记、没有内容"，`converted` 就会
+     * 变成 true，界面报一句"已按当前预设转换"。
+     *
+     * 那不是转换：**一个字的用户内容都没动**，只是把空的板块补上了
+     * 它该有的两行标记。所以这里按"原来为空"直接跳过。
+     *
+     * 判据用 `before === ''`（而不是"去掉标记后相等"）：前者是二值的、
+     * 可一眼核对的；后者要再写一遍标记剥离逻辑，两份实现在一处漂移
+     * 就又把"转换"判错。
+     */
+    if (before === '') continue;
+    converted = true;
   }
 
   /*

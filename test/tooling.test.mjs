@@ -277,10 +277,19 @@ test('版本号：载体文件缺失也是红灯（不是默认通过）', () =>
 
 test('版本号：Cargo.toml 只认 [package] 段，依赖内联表的 version 不算产品版本', () => {
   const dir = makeVersionFixture();
+  /*
+   * `[package]` 段的 version 必须写**当前真实版本**，不能硬编码。
+   *
+   * 第一版写死了 `0.1.6`，于是升到 0.1.7 之后这条必红 —— 而它测的本来是
+   * "依赖内联表里的 version 不参与比对"，跟具体版本号毫无关系。
+   * 硬编码版本号的测试会在每次升版时变成噪音，最后被人顺手改成新值了事，
+   * 那时它守的就不再是原来的语义了。
+   */
+  const current = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')).version;
   writeAt(
     dir,
     'client/src-tauri/Cargo.toml',
-    '[package]\nname = "tcs-shell"\nversion = "0.1.6"\n\n[dependencies]\nfoo = { version = "9.9.9" }\n',
+    `[package]\nname = "tcs-shell"\nversion = "${current}"\n\n[dependencies]\nfoo = { version = "9.9.9" }\n`,
   );
   assert.equal(checkVersionLiterals(dir).ok, true);
 });

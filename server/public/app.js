@@ -37,6 +37,25 @@
     return payload;
   }
 
+  /**
+   * HTML 转义（拼 innerHTML 时必须过一遍）。
+   *
+   * 面板里有几处必须用 innerHTML（表格行、带 `<code>` 的提示），
+   * 而其中会插入**用户可控的数据** —— 邀请码的 `note` 字段就是
+   * 管理员手填的，可能是 `<img onerror=...>`。
+   *
+   * 服务端生成的码本身是 8 位字母数字，理论上安全；但"理论上安全"不是
+   * 判据 —— 一旦哪天码的形态变了，这里不会跟着变。所以**一律转义**。
+   */
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
   function toast(message, isError = false) {
     const box = $('toast');
     box.textContent = message;
@@ -275,11 +294,17 @@
   //   ② 风险说明是**常驻**的（改完仍显示），不是关掉就忘的 toast；
   //   ③ 「最近注册账户」只在开放时出现 —— 平时它只是噪音，开放时它是
   //      唯一的可视性来源。
-  const REGISTER_MODE_LABEL = { closed: '关闭自助注册', 'admin-only': '仅管理员创建', open: '开放自助注册' };
+  const REGISTER_MODE_LABEL = {
+    closed: '关闭自助注册',
+    'admin-only': '仅管理员创建',
+    open: '开放自助注册',
+    invite: '邀请码注册',
+  };
   const REGISTER_MODE_HINT = {
     closed: '客户端不会出现注册入口。新账户只能由管理员在命令行创建。',
     'admin-only': '注册入口只对已登录的管理员显示；普通用户看不到——管理员在客户端里可以替别人建号。',
     open: '客户端会显示注册入口：任何能访问到这个 API 地址的人都能自行创建账户。',
+    invite: '客户端会显示注册入口，但必须填有效邀请码才能完成注册。邀请码由本页生成，可限时、可作废。',
   };
 
   function registerModeValue() {
@@ -308,6 +333,15 @@
     if (warn) warn.hidden = mode !== 'open';
     const wrap = $('recent-accounts-wrap');
     if (wrap) wrap.hidden = mode !== 'open';
+    /*
+     * 邀请码管理区只在 invite 模式显示。
+     *
+     * 与「最近注册账户只在 open 时出现」同一个理由：平时它是噪音，
+     * 只有在这个模式真正生效时，它才是唯一的可视性来源。
+     */
+    const invitePanel = $('invite-panel');
+    if (invitePanel) invitePanel.hidden = mode !== 'invite';
+    if (mode === 'invite') void loadInvites();
   }
 
   /**
@@ -330,6 +364,171 @@
       '确定要开放自助注册吗？',
     ];
     return window.confirm(lines.join('\n'));
+  }
+
+  // ── 邀请码（v0.1.7）────────────────────────────────────
+  //
+  // 与注册策略那个开关配套：切到「邀请码注册」时，这一块才是唯一的
+  // 「谁能进来」的控制手段，所以它必须**看得清剩余次数与到期时间**。
+  //
+  // ⚠ 端点在 **`/control/invites`**（控制端口），不是 `/api/invites`。
+  // 这个面板自己就跑在控制端口上、凭证是**全局令牌**（见 login-form →
+  // `/control/status`），数据面那套「账户 JWT + admin 角色」对它不成立。
+  // 第一版把路由挂在数据面，面板调过去直接 404 —— 因为连 origin 都不对。
+  //
+  // 三个刻意的取舍：
+  //   ① 码**完整显示**（不掩码）—— 管理员要把它复制发给别人，
+  //      掩码会让这一页失去唯一用途。能打开这一页的人本来就能生成新码；
+  //   ② 「已用完 / 已过期 / 已作废」三种状态分开显示，不合并成"不可用"：
+  //      用户来问时，管理员要知道是该重发还是该催对方快点用；
+  //   ③ 生成后把码**放到剪贴板并提示**，因为下一步一定是发给别人。
+
+  /** 状态 → 中文与样式。顺序与后端 inviteState 一致（作废优先） */
+  const INVITE_STATE_LABEL = {
+    active: '可用',
+    exhausted: '已用完',
+    expired: '已过期',
+    revoked: '已作废',
+  };
+
+  function fmtDateTime(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  async function loadInvites() {
+    const body = $('invite-body');
+    if (!body) return;
+    try {
+      const data = await api('/control/invites');
+      /* 上限从服务端拿，不在前端再写一份 —— 两处常量必然漂移 */
+      if (data.limits) {
+        const maxUsesEl = $('invite-max-uses');
+        if (maxUsesEl) maxUsesEl.textContent = String(data.limits.maxUses);
+        const maxDaysEl = $('invite-max-days');
+        if (maxDaysEl) maxDaysEl.textContent = String(Math.round(data.limits.maxValidityMs / 86400000));
+      }
+      renderInvites(Array.isArray(data.invites) ? data.invites : []);
+    } catch (error) {
+      body.innerHTML = `<tr><td colspan="6" class="muted">读取失败：${escapeHtml(error.message || '未知错误')}</td></tr>`;
+    }
+  }
+
+  function renderInvites(invites) {
+    const body = $('invite-body');
+    if (!body) return;
+    if (invites.length === 0) {
+      body.innerHTML = '<tr><td colspan="6" class="muted">还没有邀请码。选好有效期后点「生成邀请码」。</td></tr>';
+      return;
+    }
+    body.innerHTML = invites
+      .map((invite) => {
+        const usable = invite.state === 'active';
+        const pillClass = usable ? 'ok' : invite.state === 'exhausted' ? 'warn' : '';
+        return `
+        <tr>
+          <td><code>${escapeHtml(invite.code)}</code></td>
+          <td>${String(invite.remaining)} / ${String(invite.max_uses)}</td>
+          <td>${escapeHtml(fmtDateTime(invite.expires_at))}</td>
+          <td><span class="pill ${pillClass}">${escapeHtml(INVITE_STATE_LABEL[invite.state] || invite.state)}</span></td>
+          <td>${escapeHtml(invite.note || '—')}</td>
+          <td>${
+            usable
+              ? `<button class="btn btn-small" data-invite-copy="${escapeHtml(invite.code)}" type="button">复制</button>
+                 <button class="btn btn-small btn-danger" data-invite-revoke="${escapeHtml(invite.id)}" type="button">作废</button>`
+              : ''
+          }</td>
+        </tr>`;
+      })
+      .join('');
+
+    for (const btn of body.querySelectorAll('[data-invite-copy]')) {
+      btn.addEventListener('click', () => {
+        void copyInviteCode(btn.getAttribute('data-invite-copy') || '');
+      });
+    }
+    for (const btn of body.querySelectorAll('[data-invite-revoke]')) {
+      btn.addEventListener('click', () => {
+        void revokeInvite(btn.getAttribute('data-invite-revoke') || '');
+      });
+    }
+  }
+
+  async function copyInviteCode(code) {
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      toast(`已复制邀请码 ${code}`);
+    } catch {
+      /*
+       * 剪贴板 API 在非安全上下文（http + 非 localhost）下会被拒绝。
+       * 这时**不能静默失败** —— 用户会以为复制成功了，粘贴出来是旧的。
+       * 退化成"把码显示出来让他手选"。
+       */
+      toast(`复制失败，请手动记下：${code}`, true);
+    }
+  }
+
+  async function createInvite() {
+    const validityEl = $('invite-validity');
+    const noteEl = $('invite-note');
+    const validityMs = Number(validityEl ? validityEl.value : 86400000);
+    if (!Number.isFinite(validityMs) || validityMs <= 0) {
+      toast('请选择有效期', true);
+      return;
+    }
+    const btn = $('invite-create');
+    if (btn) btn.disabled = true;
+    try {
+      const data = await api('/control/invites', {
+        method: 'POST',
+        body: JSON.stringify({ validityMs, note: noteEl ? noteEl.value : '' }),
+      });
+      const created = data.invite;
+      const hint = $('invite-created');
+      if (hint && created) {
+        hint.hidden = false;
+        hint.innerHTML = `已生成 <code>${escapeHtml(created.code)}</code>，有效期至 ${escapeHtml(fmtDateTime(created.expires_at))}。`;
+      }
+      if (noteEl) noteEl.value = '';
+      if (created) await copyInviteCode(created.code);
+      await loadInvites();
+    } catch (error) {
+      toast(`生成失败：${error.message || '未知错误'}`, true);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function revokeInvite(id) {
+    if (!id) return;
+    /*
+     * 作废不可恢复，且用户手里的旧码会立刻失效 —— 必须二次确认。
+     *
+     * 用 `window.confirm` 与面板其他确认处（停用账户等）保持一致。
+     * 注意：这个面板跑在**浏览器**里，`window.confirm` 是原生同步函数；
+     * v0.1.3 那个 critical 缺陷是「壳里被改成 async 后恒真」，
+     * 如果将来把面板搬进 Tauri 壳，这处要跟着换成壳侧的异步确认
+     * （`memory.md` 里记过：判据是"调用点必须 await"，不是"不要用 confirm"）。
+     */
+    if (!window.confirm('作废后这张邀请码立即失效，已注册的账户不受影响。确定作废吗？')) return;
+    try {
+      await api(`/control/invites/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      toast('已作废');
+      await loadInvites();
+    } catch (error) {
+      toast(`作废失败：${error.message || '未知错误'}`, true);
+    }
+  }
+
+  function wireInviteInputs() {
+    const createBtn = $('invite-create');
+    if (createBtn) createBtn.addEventListener('click', () => void createInvite());
+    const refreshBtn = $('invite-refresh');
+    if (refreshBtn) refreshBtn.addEventListener('click', () => void loadInvites());
   }
 
   function wireRegisterModeInputs() {
@@ -780,6 +979,7 @@
 
   $('cfg-controlHost').addEventListener('input', updateControlHostWarning);
   wireRegisterModeInputs();
+  wireInviteInputs();
   $('recent-refresh').addEventListener('click', () => void loadRecentAccounts());
   $('cfg-trustProxy').addEventListener('input', updateTrustProxyWarning);
 

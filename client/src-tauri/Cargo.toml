@@ -1,6 +1,6 @@
 [package]
 name = "tcs-shell"
-version = "0.1.6"
+version = "0.1.7"
 description = "酒馆角色卡审计编辑工具链 · 桌面客户端壳（Tauri 2）"
 authors = ["Tavern Card Studio"]
 edition = "2021"
@@ -47,7 +47,28 @@ tauri-plugin-single-instance = "2"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# T15.4 ST 的 HTTP 层。注意**必须放 [dependencies]**：
+# 第一版我插到了 [build-dependencies] 段（`indexmap` 那行上面），
+# 于是 lib 编译时 `reqwest` 根本不在作用域，报了一堆 "unresolved module"。
+#
+# cookie_store 是这套方案的**前提**：cookie 由 Rust 侧 jar 持有并自动附着，
+# 不经过浏览器同源策略 —— 这正是绕开 "SameSite=Lax 在跨站 iframe 里不发送"
+# 那条坑的办法（memory §20）。
+#
+# 关掉默认特性再只开需要的：默认带 native-tls / system-proxy 等，
+# 而这里只访问 127.0.0.1、ST 走 http，不需要 TLS。
+# `stream` 是 T15.5 加的：聊天生成要逐块读 SSE（`bytes_stream()`）。
+# 不加这个 feature 的话 `Response::bytes_stream` 根本不存在，
+# 而退化成 `response.text()` 会等生成全部结束才返回 —— 打字机效果就没了。
+# `rustls-tls` 试过但**撤掉**了（2026-11-04）：它依赖 `ring`，而 ring 需要
+# 用 NDK 的 clang 编译 C 代码，在这套交叉编译环境里直接失败
+# （`failed to run custom build command for ring`）。
+#
+# 所以仓库的 HTTPS 走 **Android 原生 HttpURLConnection**（见 StBridge.httpRequest）：
+# 用系统证书链，比自带一份 TLS 栈更正确，也不用编译 C。
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "stream"] }
 bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "rt-multi-thread", "macros"] }
 # 代理的失败要能落到 client-error.log 同级（tauri-plugin-log 已注册）
 log = "0.4"

@@ -1,0 +1,336 @@
+=== Tavern Card Studio uninstall cleanup - 2026-10-24T00:20:00.000Z ===
+install dir : D://tmp//t1025-lab2//install
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers:
+  DELETED data                     41 B in 1 file(s)
+  DELETED logs                     25 B in 1 file(s)
+  DELETED foreground.log           20 B
+
+kept (not on the whitelist - listed for review, NOT deleted):
+  KEPT    app                      3 B (dir)
+  KEPT    user-notes.txt           48 B
+
+summary: deleted 3 file(s) / 86 B in 3 item(s); kept 2 item(s); failed 0 item(s)
+event log: written
+=== done 2026-10-24T00:20:05.000Z ===
+=== Tavern Card Studio uninstall cleanup — 2026-10-24T06:12:57.526Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      23.9 MB (dir)
+  KEPT    connect-guide.html       15.6 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-24T06:12:57.678Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-25T05:29:00.674Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      24.0 MB (dir)
+  KEPT    connect-guide.html       15.6 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-25T05:29:00.731Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-26T06:11:46.563Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      24.7 MB (dir)
+  KEPT    connect-guide.html       15.6 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-26T06:11:46.691Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-26T10:58:57.891Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      24.8 MB (dir)
+  KEPT    connect-guide.html       15.6 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-26T10:58:57.989Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-26T14:42:34.315Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      24.9 MB (dir)
+  KEPT    connect-guide.html       15.6 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-26T14:42:34.370Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-27T06:20:15.168Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      24.9 MB (dir)
+  KEPT    connect-guide.html       15.6 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-27T06:20:15.289Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-27T15:26:09.221Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      24.9 MB (dir)
+  KEPT    connect-guide.html       15.6 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-27T15:26:09.347Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-29T05:08:49.552Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      24.9 MB (dir)
+  KEPT    connect-guide.html       15.6 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-29T05:08:49.706Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-29T07:18:22.853Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      25.0 MB (dir)
+  KEPT    connect-guide.html       16.0 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-29T07:18:22.925Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-30T04:06:40.886Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      25.0 MB (dir)
+  KEPT    connect-guide.html       16.0 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-30T04:06:40.955Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-30T08:45:59.952Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      25.4 MB (dir)
+  KEPT    connect-guide.html       16.0 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-30T08:46:00.096Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-30T09:11:55.598Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      25.4 MB (dir)
+  KEPT    connect-guide.html       16.0 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-30T09:11:55.744Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-30T09:12:57.329Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      25.4 MB (dir)
+  KEPT    connect-guide.html       16.0 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-30T09:12:57.461Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-30T09:13:56.152Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers: none
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      25.4 MB (dir)
+  KEPT    connect-guide.html       16.0 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+
+summary: deleted 0 file(s) / 0 B in 0 item(s); kept 8 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-30T09:13:56.282Z ===
+
+=== Tavern Card Studio uninstall cleanup — 2026-10-30T09:14:47.095Z ===
+install dir : C:\Program Files\Tavern Card Studio Server
+log file    : C:\Users\PC\AppData\Local\Temp\TavernCardStudio-uninstall-cleanup.log
+policy      : whitelist only (dir:data, dir:logs, dir:cache, dir:temp, file:logfile, file:tmpfile)
+
+whitelisted leftovers:
+  DELETED data                     10 B in 1 file(s)
+  DELETED logs                     10 B in 1 file(s)
+
+kept (not on the whitelist — listed for review, NOT deleted):
+  KEPT    app                      25.4 MB (dir)
+  KEPT    connect-guide.html       16.0 KB
+  KEPT    install-layout.ini       170 B
+  KEPT    node.exe                 83.0 MB
+  KEPT    start-server.cmd         1.2 KB
+  KEPT    tcs-server.cmd           1.1 KB
+  KEPT    tcs-service-host.exe     832.5 KB
+  KEPT    tcs-service-host.xml     3.1 KB
+  KEPT    user-notes.txt           12 B
+
+summary: deleted 2 file(s) / 20 B in 2 item(s); kept 9 item(s); failed 0 item(s)
+event log: skipped
+=== done 2026-10-30T09:14:47.221Z ===
+

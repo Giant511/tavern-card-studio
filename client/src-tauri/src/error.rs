@@ -72,6 +72,38 @@ pub enum ShellError {
 
     #[error("IO 失败（{path}）：{message}")]
     Io { path: String, message: String },
+
+    /// 参数本身不合法（2026-11-03 / 预设导入）。
+    ///
+    /// 与 `Io` 分开：这不是"文件读写出错"，是"你给的内容不对"。
+    /// UI 要给的下一步动作完全不同 —— 前者让用户重试，后者让用户换个文件或改输入。
+    #[error("{message}")]
+    Invalid { message: String },
+
+    // ── ST 的 HTTP 层（T15.4）───────────────────────────────
+    //
+    // 四个变体对应四种**用户要做的动作完全不同**的情况：
+    //   · StUnavailable —— ST 没起来 / 地址不通 → 去检查 ST 有没有启动
+    //   · StForbidden   —— cookie 过期且重连重试后仍然 403 → 提示重新登录
+    //   · StHttpStatus  —— 服务端明确报错（4xx/5xx）→ 把状态码与响应摘要带出去
+    //   · StBadResponse —— 响应形状不是预期的 JSON → 契约可能变了（ST 升级）
+    //
+    // 合并成一句"ST 请求失败"会让用户无从下手，也让排查丢掉最有用的那个信息。
+    #[error("连不上 SillyTavern：{detail}")]
+    StUnavailable { detail: String },
+
+    #[error("{path} 返回 403（已重试：{retried}）—— 通常是 SillyTavern 的会话过期")]
+    StForbidden { path: String, retried: bool },
+
+    #[error("{path} 返回 HTTP {status}：{detail}")]
+    StHttpStatus {
+        path: String,
+        status: u16,
+        detail: String,
+    },
+
+    #[error("{detail}")]
+    StBadResponse { detail: String },
 }
 
 impl ShellError {
@@ -93,6 +125,11 @@ impl ShellError {
             Self::SpawnRejected { .. } => "SPAWN_REJECTED",
             Self::ProbeHostNotAllowed { .. } => "PROBE_HOST_NOT_ALLOWED",
             Self::Io { .. } => "IO_ERROR",
+            Self::Invalid { .. } => "INVALID_INPUT",
+            Self::StUnavailable { .. } => "ST_UNAVAILABLE",
+            Self::StForbidden { .. } => "ST_FORBIDDEN",
+            Self::StHttpStatus { .. } => "ST_HTTP_STATUS",
+            Self::StBadResponse { .. } => "ST_BAD_RESPONSE",
         }
     }
 
@@ -145,6 +182,26 @@ impl ShellError {
             Self::Io { path, .. } => {
                 map.insert("path".to_string(), path.clone().into());
             }
+            // ST 的四个变体：把"排查需要的那几个字段"结构化带出去。
+            // 特别是 StForbidden 的 `retried` —— 界面要能区分
+            // 「第一次就 403」与「重连重试后仍 403」，后者才是"真没权限/会话彻底失效"。
+            Self::StUnavailable { detail } => {
+                map.insert("detail".to_string(), detail.clone().into());
+            }
+            Self::StForbidden { path, retried } => {
+                map.insert("path".to_string(), path.clone().into());
+                map.insert("retried".to_string(), (*retried).into());
+            }
+            Self::StHttpStatus { path, status, .. } => {
+                map.insert("path".to_string(), path.clone().into());
+                map.insert("status".to_string(), (*status).into());
+            }
+            Self::StBadResponse { .. } => {}
+            /*
+             * `Invalid` 的 message 已经是一句给用户看的人话，
+             * 序列化时会作为 `message` 一起带出去，不需要额外的 details。
+             */
+            Self::Invalid { .. } => {}
             Self::EmptyPath | Self::RulesDirMissing => return None,
         }
         Some(map)

@@ -26,6 +26,7 @@ import { LoginLimiter, DEFAULT_RATE_LIMIT } from '../auth/login-limit.js';
 import { SessionStore } from '../auth/sessions.js';
 import { UserStore } from '../storage/users.js';
 import { RepoStore, TokenStore, checkTokenScope, type Operation } from '../storage/repos.js';
+import { InviteStore } from '../storage/invites.js';
 import { COMMON_HEADERS, methodNotAllowed, sendError, sendJson, sendRaw } from './responses.js';
 import { Router, type RouteContext } from './router.js';
 
@@ -268,6 +269,18 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
   const repos = new RepoStore(ctx.db.handle);
   const repoTokens = new TokenStore(ctx.db.handle);
   /**
+   * 邀请码（v0.1.7）。
+   *
+   * 建在 authService **之前**：`registerMode === 'invite'` 时注册流程要用它
+   * 扣减额度。文案口径见 `storage/invites.ts` 文件头。
+   *
+   * **只有注册流程用它**。邀请码的生成/列表/作废在**控制面**
+   * （`supervisor.ts` 的 `/control/invites`）—— 面板用的是全局令牌，
+   * 没有账户身份，数据面这套「账户 JWT + admin」的判据对它不成立。
+   * 这里**不要**再加一套管理路由，否则就是两处鉴权语义。
+   */
+  const invites = new InviteStore(ctx.db.handle);
+  /**
    * 注册策略的实时读取（F12）。
    *
    * 面板与 worker 是两个进程，配置只在启动时读进内存；面板改了 `auth.registerMode`
@@ -282,6 +295,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     sessions,
     limiter,
     repos,
+    invites,
     liveRegisterMode: () => liveRegisterMode.current(),
   });
 
@@ -714,6 +728,66 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       bytes,
       rawHeaders(_ctx, version.blob_sha256, version.byte_size, `${_ctx.params['id']}-v${version.seq}.json`),
     );
+  });
+
+  // ── 卡面资产（v0.1.7 修订二）─────────────────────────────────
+  //
+  // 三个端点，权限与卡片一致。**卡面不是版本**：换封面不进版本历史，
+  // 只改卡行上的四个字段 + 一条审计事件。理由见 `CardService.setFace`。
+
+  router.put('/api/cards/:id/face', async (_ctx) => {
+    assertPermission(gate, _ctx, 'write');
+    const bytes = _ctx.body;
+    if (bytes.byteLength === 0) {
+      throw new AppError(400, 'FACE_EMPTY', '请求体为空：需要图片原始字节');
+    }
+    /*
+     * MIME 来源：Content-Type 头优先，缺失时退回 `?mime=`。
+     *
+     * 为什么允许 query 兜底：有些 HTTP 客户端不方便设二进制 body 的
+     * Content-Type（会被当成文本），而 `application/octet-stream` 本身
+     * 不携带"这是 png 还是 jpeg"。服务端不嗅探（见 normalizeFaceMime 的注释）。
+     */
+    const headerMime = String(_ctx.req.headers['content-type'] ?? '').trim();
+    const declareMime = headerMime !== '' && headerMime.startsWith('image/')
+      ? headerMime
+      : (optional(_ctx.query, 'mime') ?? headerMime);
+    const actor = auditActor(gate, _ctx);
+
+    const result = await ctx.cards.setFace(_ctx.params['id']!, bytes, declareMime, {
+      scope: readScope(gate, _ctx),
+      actor: actor.actor,
+      ip: actor.ip,
+    });
+    // 200 而不是 201：资源（卡面）可能已存在，且"未变"时什么都没创建。
+    // changed=false 让客户端知道这次是空操作，不必再刷界面。
+    sendJson(_ctx.res, 200, { changed: result.changed, face: result.face });
+  });
+
+  router.get('/api/cards/:id/face', (_ctx) => {
+    assertPermission(gate, _ctx, 'read');
+    const face = ctx.cards.getFace(_ctx.params['id']!, { scope: readScope(gate, _ctx) });
+    sendRaw(_ctx.res, 200, face.bytes, {
+      // 卡面是图片，不是角色卡文件：这里给真实 MIME，浏览器才能直接渲染预览
+      'Content-Type': face.mime,
+      'Content-Disposition': `inline; filename="${_ctx.params['id']!}-face"`,
+      ETag: `"${face.sha256}"`,
+      'X-TCS-Sha256': face.sha256,
+      'X-TCS-Size': String(face.size),
+      'X-TCS-API-Version': API_VERSION,
+    });
+  });
+
+  router.delete('/api/cards/:id/face', (_ctx) => {
+    assertPermission(gate, _ctx, 'write');
+    const actor = auditActor(gate, _ctx);
+    const result = ctx.cards.deleteFace(_ctx.params['id']!, {
+      scope: readScope(gate, _ctx),
+      actor: actor.actor,
+      ip: actor.ip,
+    });
+    // 幂等：本来就没有也返回 200，但 deleted=false 说明这次没删到东西
+    sendJson(_ctx.res, 200, { deleted: result.deleted });
   });
 
   // ── T5.2 版本 ────────────────────────────────────────────────

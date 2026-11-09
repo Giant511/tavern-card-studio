@@ -112,7 +112,7 @@ export function checkJsonValidity(card: UnifiedCard, rawJsonText?: string | null
         ruleId: 'builtin:json-serialize-invalid',
         category: 'format',
         severity: 'error',
-        message: `序列化产物不是合法 JSON：${error instanceof Error ? error.message : String(error)}`,
+        message: `生成的内容不是合法 JSON：${error instanceof Error ? error.message : String(error)}`,
         hint: '通常是 passthrough 里混入了 undefined / BigInt / 循环引用',
         field: 'file',
       }),
@@ -194,10 +194,22 @@ export function checkPresetConformance(card: UnifiedCard, preset: TxtPreset): Au
   /**
    * 字段里真的有内容（判"是不是旧卡"的唯一硬判据）。
    *
-   * 不看 `missing`：JSON 路径下它恒为 false（只有 TXT 导入会打标），
-   * 只看文本是否为空白。空白 = 这块确实没有内容。
+   * ## ★★★ 必须按 residual 判，不能按板块文本（2026-11-09 修）
+   *
+   * 「初始场景」变成复合板块后，它的 `block.text` 里**常驻两行标记**
+   * （`@@开场白` / `@@情景`），空卡也有。于是 `block.text.trim() !== ''`
+   * 恒为 true —— `hasFieldContent` 永远成立，legacy 这条诊断**再也不会报**。
+   *
+   * 而这条诊断的意图是"六板块时代的卡，`first_mes` 与 `mes_example` 必然为空"。
+   * 那个判断只能看字段值。注意 **`scenario` 不参与**：它一直是 ST 的标准字段，
+   * 六板块时代的卡也可能有场景 —— 把它算进"有新内容"就把旧卡认成新卡了。
+   *
+   * 不看 `missing`：JSON 路径下它恒为 false（只有 TXT 导入会打标）。
    */
-  const hasFieldContent = fieldBlocks.some((block) => block.text.trim() !== '');
+  const hasFieldContent =
+    card.residual.firstMes.trim() !== '' ||
+    card.residual.alternateGreetings.some((text) => text.trim() !== '') ||
+    card.residual.mesExample.trim() !== '';
   const hasNewHeading =
     card.description.raw !== '' &&
     fieldBlocks.some((block) => descriptionHasHeadingFor(card, preset, block.id));

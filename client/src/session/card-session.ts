@@ -31,6 +31,7 @@ import {
   type CardInfo,
 } from './card-info.ts';
 import { generateCardId, readCardIdFromCard, validateCardId } from './card-id.ts';
+import { coerceVoiceMode, DEFAULT_VOICE_MODE, type VoiceMode } from '@tcs/shared';
 import type { PngSource } from './png-source.ts';
 import type { SaveFormat } from './save-format.ts';
 
@@ -136,6 +137,24 @@ export class CardSession {
   #highlightId: string;
   #presetId: string | null;
   #syncCardId: string | null;
+  /**
+   * 本会话上次使用的语音模式（v0.1.7 / T15.6 终版）。
+   *
+   * 需求原文：「模式按会话记忆（CardSession.voiceMode），新会话回默认"说话"」。
+   *
+   * ## 为什么按**会话**记忆而不是全局
+   *
+   * 一张卡在写动作戏（内心/动作），另一张在写对话（说话）。两种模式跟着
+   * **这张卡正在写的内容**走，而不是跟着用户走。做成全局偏好就会出现
+   * "切标签后模式没跟着切，发错一条"——而发出去就撤不回来了。
+   *
+   * ## 为什么**不置脏**
+   *
+   * 它只影响下一条语音怎么包裹，不改变卡片内容。置脏会让用户什么都没改
+   * 却看到标签上的 `●`，然后被"未保存"对话框拦一道 —— 那是纯噪音。
+   * 与 `highlightId` 同一口径。
+   */
+  #voiceMode: VoiceMode;
   #lastUploadedSeq: number | null = null;
   /**
    * 世界书的导入来源（T10.9）。
@@ -184,6 +203,8 @@ export class CardSession {
     // 「新建但没动过」不该显示为「已修改未落盘」，否则标签一打开就是脏的。
     this.#dirty = false;
     this.#platformId = options.platformId ?? 'sillytavern';
+    // 新会话一律回默认「说话」，不继承上一个会话 —— 见 #voiceMode 的注释
+    this.#voiceMode = DEFAULT_VOICE_MODE;
     this.#highlightId = options.highlightId ?? 'default';
     this.#presetId = options.presetId ?? null;
     this.#cardId = resolveCardId(options);
@@ -296,6 +317,11 @@ export class CardSession {
 
   get presetId(): string | null {
     return this.#presetId;
+  }
+
+  /** 语音模式：本会话上次用的那个，新会话为「说话」（T15.6） */
+  get voiceMode(): VoiceMode {
+    return this.#voiceMode;
   }
 
   // ── 读：服务端关联 ──────────────────────────────────────
@@ -431,6 +457,19 @@ export class CardSession {
   }
 
   /**
+   * 记录本次语音用的模式（T15.6）。
+   *
+   * 不置脏、不失效审计 —— 它不改变卡片内容。
+   * 入参走 `coerceVoiceMode` 收敛：这个值可能来自持久化的会话快照，
+   * 旧版本 / 手改配置都可能给出非法值，而"未知模式"不该让发送流程中断。
+   */
+  setVoiceMode(mode: unknown): void {
+    const next = coerceVoiceMode(mode);
+    if (this.#voiceMode === next) return;
+    this.#voiceMode = next;
+  }
+
+  /**
    * 切 TXT 预设。
    *
    * **会置脏**：预设决定导出时的板块标题与顺序，换预设等于换了导出产物。
@@ -459,6 +498,28 @@ export class CardSession {
   /** 上次上传（或取回/回滚）对应的远端 seq；null = 本会话还没和远端对齐过 */
   get lastUploadedSeq(): number | null {
     return this.#lastUploadedSeq;
+  }
+
+  /**
+   * 上次成功上传到服务端的**卡面摘要**（v0.1.7 修订二）；null = 还没传过 / 没有卡面。
+   *
+   * 为什么要在客户端记这个：用户要求「卡面 hash 未变则只传 JSON」。
+   * 不记的话每次上传都要把整张图（几百 KB）POST 一遍，
+   * 而服务端比对后只会回 `changed:false` —— 流量白花在链路上。
+   *
+   * 为什么不改成"查服务端摘要再决定"：那要多一次往返，
+   * 而这次往返的延迟（国内到自建服务端 50–200 ms）比"上传后拿到 changed:false"
+   * 更让人等得难受，且断网时连"要不要上传"都判断不了。
+   */
+  #lastUploadedFaceSha: string | null = null;
+
+  get lastUploadedFaceSha(): string | null {
+    return this.#lastUploadedFaceSha;
+  }
+
+  /** 卡面成功上传后调用；传 null 表示"当前没有卡面"（下次有图时会重新上传） */
+  noteFaceUploaded(sha256: string | null): void {
+    this.#lastUploadedFaceSha = sha256;
   }
 
   /**

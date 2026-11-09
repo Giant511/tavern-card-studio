@@ -5,6 +5,27 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Tavern Card Studio</title>
     <link rel="stylesheet" href="./src/styles.css" />
+    <script>
+      /*
+       * ★ 平台分流：**Android 上不要加载这个页面**（2026-10-31 加）。
+       *
+       * 本文件是**桌面编辑器**：顶栏九宫格按钮 + 左右分栏 + 审计面板。
+       * 它在竖屏里没法看（真机截图里顶栏按钮被屏幕边缘切掉），
+       * 而移动端有专门的 UI —— `mobile.html`（四 Tab + 夜航聊天页，T15.5 做的）。
+       *
+       * 为什么判据是 **UA 里的 Android** 而不是"窗口宽度 < 640"：
+       *   · 桌面端把窗口拖窄也应该是编辑器（那是它的形态），
+       *     按宽度分流会在拖动窗口时整页重载，把用户正在编辑的内容丢掉；
+       *   · 而 Android 不管横屏竖屏都必须是移动 UI。
+       * 两者是**设备类别**的区别，不是**尺寸**的区别。
+       *
+       * 用 `location.replace` 而不是 `href`：不留历史记录，
+       * 否则手机返回键会从 mobile 退回 index 再被弹回 mobile，看起来像死循环。
+       */
+      if (/Android/i.test(navigator.userAgent)) {
+        location.replace('./mobile.html');
+      }
+    </script>
   </head>
   <body>
     <header class="topbar">
@@ -52,11 +73,16 @@
         -->
         <button id="btn-st" type="button" class="btn ghost" title="把当前卡推送到本地 SillyTavern">在 SillyTavern 中测试</button>
         <button id="btn-preview" type="button" class="btn ghost">渲染预览</button>
-        <button id="btn-rules" type="button" class="btn ghost">规则与预设…</button>
-        <!--
-          v0.1.6：卡片级元数据（作者 / 版本 / 创作说明 / 标签 / 系统提示 / 世界书名称）。
-          这些字段原来一个编辑入口都没有，从示例卡起手时会一路导出别人的文案。
-        -->
+        <button id="btn-rules" type="button" class="btn ghost">规则与预设…</button>
+
+        <!--
+
+          v0.1.6：卡片级元数据（作者 / 版本 / 创作说明 / 标签 / 系统提示 / 世界书名称）。
+
+          这些字段原来一个编辑入口都没有，从示例卡起手时会一路导出别人的文案。
+
+        -->
+
         <button id="btn-card-info" type="button" class="btn ghost" title="作者 / 版本 / 创作说明 / 标签 / 系统提示 / 世界书说明">卡片信息…</button>
         <span id="conn-chip" class="conn-chip off" title="服务端连接状态">
           <span class="conn-dot"></span><span id="conn-text">未连接</span>

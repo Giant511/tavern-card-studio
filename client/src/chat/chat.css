@@ -1,0 +1,5080 @@
+/*
+ * 四 Tab 外壳 + 聊天页（v0.1.7 / T15.5）。
+ *
+ * ## 色值纪律
+ *
+ * 本文件**一个裸色值都没有** —— 全部 `var(--nb-*)`，来源见 `nebula-tokens.css`。
+ * 走查清单第 1 条的 grep 就是靠这条守的。
+ *
+ * ## 玻璃层预算（设计册 §2 约束 1）
+ *
+ * 同时 ≤ 3 层。本页的分配：
+ *   ① 顶部栏（glass）
+ *   ② 输入区（glass）
+ *   ③ 生成中的提示条（glass）
+ * 消息气泡**不用玻璃** —— 一屏十几条，每个都 backdrop-filter 会直接卡死。
+ * 气泡用 `--nb-surface-1` 与 `--nb-grad-soft` 铺色。
+ */
+
+/* ═══════════════════════════════════════════════════════════
+   一、外壳与 Tab
+   ═══════════════════════════════════════════════════════════ */
+
+/* ═══════════════════════════════════════════════════════════
+   全局禁止长按选中 / 复制（2026-11-02 用户要求）
+
+   > 除了聊天界面，其他界面原本文本可以输入的地方以外，全部都给我禁掉长按复制
+
+   ## 白名单只有两类
+
+   | 例外 | 为什么 |
+   |---|---|
+   | `.nb-msglist` 内的消息 | 用户明确允许聊天记录选中／复制 |
+   | `input` / `textarea` / `contenteditable` | 「原本文本可以输入的地方」 |
+
+   其余（标题、按钮、设置项、标签、提示）一律不可选中 —— 长按弹系统菜单
+   在这些地方只会碍事：用户想点按钮，结果弹出"复制/搜索/翻译"。
+   ═══════════════════════════════════════════════════════════ */
+
+body * {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/*
+ * 聊天记录保持可选中（用户明确允许）。
+ *
+ * ⚠ 这里**不写** `.nb-msglist { … }` —— 文件后面已经有一条同名的规则，
+ * 重复定义会被走查 12 拦下（改上面那条不生效）。可选中属性写进后面那条，
+ * 这里只补一个后代选择器（`.nb-msglist *` 是独立选择器，不算重复）。
+ */
+.nb-msglist * {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+/* 输入类元素保持可选中／可编辑 */
+input,
+textarea,
+[contenteditable='true'],
+[contenteditable=''] {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+.nb-app {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--nb-void);
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-16);
+  line-height: var(--nb-lh-body);
+  /* 长按不弹系统菜单、不选中文字（聊天区要能长按出"复制"菜单，那是自己实现） */
+  -webkit-tap-highlight-color: transparent;
+
+  /*
+   * ★★★ 软键盘避让写在这一层（2026-11-04，用户报「点的时候不会跟随键盘弹出」）。
+   *
+   * ## 为什么必须在这里，而不是 `.nb-page`
+   *
+   * `.nb-app` 是 `position: fixed; inset: 0` —— 它的高度**由 inset 决定**
+   * （等于视口高），是唯一能通过 padding 真正"缩矮"的那一层。
+   *
+   * 而 `.nb-page` 是它的 flex 子项（`flex: 1`），高度由父容器**分配**。
+   * 我第一版把 padding 加在 `.nb-page` 上，真机实测：
+   *
+   * ```text
+   *   --nb-kb-inset-native = 370px
+   *   .nb-page padding-bottom = 314px     ← 值确实算出来了
+   *   .nb-page 高 = 778（没变）           ← 因为 flex 撑满，padding 只压内容
+   *   .nb-scroll 高 = 43px                ← 内容区被压成一条，页面没上移
+   * ```
+   *
+   * 用户看到的就是"页面没动，输入框还是被盖住，而且内容缩成一条"。
+   *
+   * ## 为什么减 tabbar 高度
+   *
+   * 减了之后：page-host 底边正好落在**键盘上沿**，tabbar 落在键盘正上方
+   * 那 56px 里（仍然可见可点）。不减的话整块会多缩 56px，
+   * 聊天页的输入区会比修之前高出一条 tabbar。
+   */
+  box-sizing: border-box;
+  padding-bottom: max(
+    0px,
+    calc(
+      max(var(--nb-kb-inset, 0px), var(--nb-kb-inset-native, 0px)) -
+        var(--nb-tabbar-h)
+    )
+  );
+}
+
+/* 页面级背景：一层极淡的顶部光晕，让玻璃有东西可折射 */
+.nb-app::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: var(--nb-abyss);
+  background-image: var(--nb-grad-glow);
+  background-repeat: no-repeat;
+  background-size: 100% 40%;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.nb-page {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  /* 安全区：顶部状态栏与底部手势区 */
+  /*
+   * ★ 必须 `max(env(...), 24px)` 兜底，不能只写 `env(...)`。
+   *
+   * 2026-10-31 真机截图抓到的真缺陷：状态栏网速/信号/电池图标与
+   * 顶栏标题「聊天」**重叠在一起**（截图 `device-real-me.png`）。
+   *
+   * 根因：`env(safe-area-inset-top)` 在 Android WebView 里**解析为 0** ——
+   * 只有当 WebView 真的处于 edge-to-edge 布局、且系统把 inset 传下来时它才非零。
+   * 而这只写了 `env(..., 0px)`，取到 0 就等于**没有内边距**，
+   * 于是内容从 y=0 开始画，压在状态栏下面。
+   *
+   * 为什么不用固定值直接用 24px：支持 inset 的设备（将来切 edge-to-edge、
+   * 或有刘海的机型）上真实值更准，固定值会把内容推得太低。
+   * `max()` 同时满足两边：有真实值用真实值，取不到时至少不重叠。
+   *
+   * 24px 的依据：Android 状态栏常规高度是 24dp，而 WebView 的 CSS px
+   * 在这里与 dp 同尺度（360dp 宽的机器上 viewport 就是 360px）。
+   *
+   * ★ 根治方案（记在 PLAN.md v0.1.7 待办）：Android 侧读真实
+   * `WindowInsets` 并通过 CSS 变量注入，这样任何机型的任何刘海/挖孔都对。
+   * 本条的 `max()` 是**兜底**，不是最终解 —— 写清楚，免得以后有人
+   * 以为已经解决了。
+   */
+  /*
+   * ★★★ 安全区**不在这里**，值是 `--nb-page-inset-top`（定义在
+   * `nebula-tokens.css` §3c），由 `.nb-page-layer` 的 `top` 使用。
+   *
+   * ## 2026-11-05 真机 bug：顶栏和系统状态栏重叠（红米）
+   *
+   * 用户：
+   *
+   * > 新bug，我的红米的顶部和系统的重叠了，一定要做不同手机的适配啊
+   *
+   * 实测数据（Redmi Note 8 Pro，393×851）：
+   *
+   * ```text
+   *   --nb-safe-top            27px      ← 变量本身是对的（Android 侧注入了）
+   *   .nb-page  padding-top    27px      ← 这里也写了
+   *   .nb-page-layer  top      0         ← ★ 层从 0 开始，把 27px 整个盖住
+   *   .nb-topbar  top          0
+   *   .nb-topbar-title  top    6.5       ← 被状态栏压住
+   * ```
+   *
+   * 根因是**我对绝对定位包含块的理解错了**：`inset: 0` 的包含块是祖先的
+   * **padding box**，`top: 0` 对齐的是 border 内侧（y=0），
+   * **不是内容区顶边（y=padding-top）**。所以层从 0 铺满，
+   * 外壳那 27px 的安全区 padding 就白写了。
+   *
+   * 我上一轮在 `.nb-page-layer` 的注释里写的是"`inset: 0` 相对 padding box
+   * 定位，天然落在安全区下方"—— **那句话是错的，它就是这次 bug 的成因。**
+   *
+   * ## 为什么之前所有截图都看不出来
+   *
+   * 取证一直用 CDP 的 `Page.captureScreenshot`，它抓的是**页面**，
+   * 不含系统状态栏。页面贴顶在那种图里看起来完全正常。
+   * 只有 `adb exec-out screencap -p`（含系统 UI）才能看见重叠。
+   *
+   * ⇒ 判据不能只靠截图，必须加一条**纯几何**判据：
+   * 页面顶栏的 `top` ≥ 安全区值。见
+   * `.verify/probe-safe-area-all.mjs`（逐页跑 20 个页面）。
+   *
+   * ## 为什么外壳不再写 `padding-top`
+   *
+   * 外壳的子元素全是绝对定位的层，**padding 对它们不起作用** ——
+   * 写了也只是让人误以为安全区已经处理了（这次的坑正是这样）。
+   * 所以把数值定义成 token，交给真正决定位置的那一层用。
+   *
+   * 页面根（`.nb-page.nb-chat-settings` 等）也不再自己写 padding-top：
+   * 它们在层内部，安全区由层的 `top` 让出来，天然就对了。
+   * 原来那条 `.nb-page .nb-page { padding-top: 0 }`（为抵消二次叠加而加）
+   * 随之失效并删除 —— 没有两份 padding，就不需要"抵消一份"。
+   */
+
+  /*
+   * ★ 键盘避让**不在这里**，在 `.nb-app`（2026-11-04）。
+   *
+   * 一开始写在 `.nb-page`，真机实测无效：它是 `flex: 1` 子项，
+   * 高度由父容器分配，`padding-bottom` 只会把内容压扁（`.nb-scroll` 剩 43px），
+   * 页面底边**一点没动**。能真正缩矮的只有 `position: fixed; inset: 0`
+   * 的 `.nb-app`。原因与实测数据都在那边的注释里。
+   */
+
+  /*
+   * ★ `box-sizing: border-box` 仍要显式写。
+   *
+   * `.nb-page` 原来是 `content-box`（实测），顶部那条 `padding-top`
+   * （安全区，24px 以上）在 content-box 下会把盒子撑高 24px ——
+   * 页面比容器还高，底部那截溢出到 Tab 栏下面。
+   */
+  box-sizing: border-box;
+
+  /*
+   * ★ `box-sizing: border-box` 必须显式写。
+   *
+   * `.nb-page` 原来是 `content-box`（实测），上面那条 `padding-bottom`
+   * 在 content-box 下会**把盒子撑高**而不是压缩内容区 ——
+   * 结果页面底边反而跑得更远，键盘盖住的区域更多。
+   *
+   * border-box 之后：`height` 含 padding，内容区自动变矮，底边正好停在
+   * 键盘上沿。顶部那条 `padding-top` 同理变得更准（原来是页面溢出 24px）。
+   */
+  box-sizing: border-box;
+
+  /*
+   * ★ 裁掉滑出屏幕的那一层（2026-11-05 加）。
+   *
+   * 转场时旧层会 `translateX(100%)` 或 `translateX(-25%)` ——
+   * 它仍然在 DOM 里（那是"两层同时在屏上"的前提）。
+   * 外壳不裁的话，伸到右边的那 100% 会给整页造出横向滚动条，
+   * 真机上表现为"页面能左右拖"。
+   *
+   * 裁它安全：页面内部所有滚动都发生在 `.nb-scroll` / `.nb-list` /
+   * `.nb-msglist` 自己身上（它们各有 `overflow-y: auto`），
+   * 从不靠 `.nb-page` 溢出。
+   */
+  overflow: hidden;
+}
+
+/*
+ * ═══════════════════════════════════════════════════════════
+   页面切换：层叠滑动转场（2026-11-05，按用户给的参考视频做的）
+   ═══════════════════════════════════════════════════════════
+
+   用户原话 + 参考录屏（列表 ↔ 详情）：
+
+   > 我的意思是我想做这种的界面切换和返回动画
+
+   ## 形态（不是淡入，是**两层同时在动**）
+
+   ```text
+   进入下一级（push）
+   旧页  0% ──────────────▶ -25%，并压暗到 0.62
+   新页  100% ────────────▶ 0%
+
+   返回上一级（back）
+   当前页  0% ────────────▶ 100%（整个滑出屏幕）
+   上层页  -25%，0.62 ────▶ 0%（从左边浮回来，变亮）
+   ```
+
+   这两条**互为镜像**，所以"进得去、退得出"的方向感是一致的：
+   内容永远往左走 = 更深一层。
+
+   ## 为什么旧页要停在 -25% 而不是 -100%
+
+   那是 iOS / QQ 那套"卡片层叠"的关键：上一层不是被推走，而是被**按住**
+   退让一点，露出一点边缘表示"底下还有东西"。推走 100% 会变成
+   "翻页"，用户失去"我还在原来的位置"的感觉。
+
+   ## 为什么压暗
+
+   参考里旧页明显变灰。这一层暗色不是在页面上盖蒙版（那要多一个 DOM 层
+   和一次合层），而是直接 `opacity: 0.62` —— 底下的 `.nb-app` 是深色，
+   降低不透明度等价于"往背景里退"，视觉上就是变暗，且零额外开销。
+
+   ## 属性在谁身上
+
+   | 层 | 属性 | 由谁写 |
+   |---|---|---|
+   | 新页 | `data-nav="push-N"` / `"back-N"` | `finishPageTurn()` |
+   | 旧页 | `data-leaving="push"` / `"back"` | 同上，动画结束即 `remove()` |
+
+   `-N` 的序号**必须有**：CSS 动画只在"属性值变了"时重放，
+   连续两次返回都写 `back` 的话第二次没有动画（截图与单测都看不出来）。
+
+   ★ 只动 `transform` + `opacity`（合成层，不触发重排）。用 `left` 或
+   `margin` 会在低端 SoC 上掉帧。时长用 `--nb-dur-nav`，
+   `prefers-reduced-motion` 下它塌成 1ms 等于关闭动画。
+   =========================================================== */
+
+/*
+ * 层本身：绝对定位铺满外壳的 padding box。
+ *
+ * 为什么必须 `position: absolute`（而不是留在文档流里）：
+ * ① 两层要**重叠**在同一块区域上同时滑 —— 流式布局做不到；
+ * ② `inset: 0` 让层的包含块是外壳的 padding box，
+ *    于是外壳那条安全区 `padding-top` 自动生效、且转场时**不跟着动**
+ *    （参考里状态栏区域全程静止）。
+ *
+ * 为什么还要 `display: flex; flex-direction: column`：
+ * 层一旦绝对定位就脱离了父级的 flex 高度分配，必须自己重建这条链，
+ * 否则内部 `.nb-scroll` 的 `flex: 1` 会失效（高度塌成内容高度）。
+ */
+.nb-page-layer {
+  position: absolute;
+  /*
+   * ★★★ 不许写 `inset: 0`。
+   *
+   * 绝对定位的包含块是祖先的 **padding box**，`top: 0` 对齐 border 内侧
+   * （y=0），**不是内容区顶边**。写 `inset: 0` 的话，层会把外壳的
+   * `padding-top`（安全区）整个盖住 —— 页面内容顶到系统状态栏下面。
+   *
+   * 2026-11-05 真机就是这么撞的（红米上顶栏和状态栏重叠）。
+   * 实测：`--nb-safe-top = 27px`，但层的 `top = 0`、顶栏 `top = 0`。
+   *
+   * 正确写法：`top` 取外壳算好的安全区变量，其余三边贴 0。
+   * 数值只有一份（在 `.nb-page` 上定义），这里只是引用。
+   */
+  top: var(--nb-page-inset-top);
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  /*
+   * ★★★ 层必须**不透明**（2026-11-06）。
+   *
+   * 之前层是透明的，两层的内容直接画在 `.nb-app` 的**同一个**背景上 ——
+   * 于是转场时是"文字叠文字"，两个页面的正文压在一屏上，眼睛没法聚焦。
+   * 用户看出的正是这个：
+   *
+   * > 转场的时候正常应该是上一个页面在出去的时候应该是逐帧的透明度下降
+   * > 直到看不见，下一个页面进来的时候是逐帧的透明度上升直到**完全将
+   * > 上一个页面遮住**
+   *
+   * "遮住"这件事**需要一层不透明的底**才能做到 —— 内容自己是不透明的，
+   * 但页面之间有空白区域，只有页面级背景才能整体盖住。
+   *
+   * 用 `--nb-void`（与 `.nb-app` 同一个底），两层底色一致，
+   * 交叉淡化时不会出现"颜色跳一下"。
+   */
+  background: var(--nb-void);
+  /*
+   * 遮罩只在这一层：层内部的内容溢出（滑出屏幕的部分）
+   * 由外壳负责裁切（`.nb-page { overflow: hidden }`）。
+   * 这里保留 overflow 是为了让页面内部的滚动容器各自收敛。
+   */
+  overflow: hidden;
+}
+
+/*
+ * ★★★ 预热：动画开始**前一帧**，把层静态放到起点（2026-11-05 加，仍然需要）
+ *
+ * ```text
+ *   0 33 50 17 17 17 …   ← 首帧慢 2～3 帧
+ * ```
+ *
+ * 首帧慢不是性能不够，是那一帧要布局 + 栅格化整页 + 上传纹理，
+ * 而动画同时就开始了。所以先静态放好、隔一帧再启动。
+ *
+ * ★ pending 态现在只改透明度（不再有位移），但这一步**依然不能省** ——
+ * 它保证"纹理已就绪"才开始计时，否则开头几帧的不透明度会跳。
+ * ★ `will-change` 也挂在这里（这条规则是 pending 唯一的定义处）。
+ */
+.nb-page-layer[data-nav-pending] {
+  will-change: opacity;
+  opacity: 0;
+}
+
+/*
+ * ═══════════════════════════════════════════════════════════
+   转场形态：**先出后进的淡化**（fade-through），2026-11-06 第三版
+   ═══════════════════════════════════════════════════════════
+
+   用户两轮反馈合起来才说清这个形态：
+
+   > 转场的时候正常应该是上一个页面在出去的时候应该是逐帧的透明度下降
+   > 直到看不见，下一个页面进来的时候是逐帧的透明度上升直到完全将
+   > 上一个页面遮住
+
+   ## 第二版错在哪：我做成了"同时交叉淡化"
+
+   ```text
+   第二版   旧页 1 → 0  ┐
+            新页 0 → 1  ┘  同时在跑（old + new 恒等于 1）
+   ```
+
+   数学上很漂亮（互补偏差实测 0.000），**但中间态是两页各 50% 混合**。
+   真机中间帧一眼就露：左边"聊天"标题、右边"聊天设置"标题，
+   正文和列表项互相穿透 —— **眼睛没法聚焦**。
+
+   交叉淡化适合内容稀疏的画面（图片、封面）。而这里的页面是
+   **高密度正文**，半透明叠加必糊。
+
+   ## 现在：时间轴错开（Material 的 fade-through）
+
+   ```text
+   0 ───────── 35% ───────────── 100%
+      旧页淡出        新页淡入
+      1 → 0           0 → 1
+   ```
+
+   交接点（35%）两页都不可见 —— 只有**一帧**，而底色是深色，
+   肉眼几乎无感；换来的是**任何时刻最多只有一页可读**。
+
+   为什么 35% 而不是 50%：淡出比淡入"快一点"更自然。
+   人眼对"消失"的耐心低于"出现"，而且新页淡入占更长时间才显得从容。
+
+   ★ 两个关键帧的**百分比区间必须错开**，这是本版的核心。
+     写成 0→100% 各跑一遍就又回到第二版了。
+   =========================================================== */
+
+/*
+ * ★★★ 新页：后半段淡入。选择器**不区分 push / back** —— 淡化没有方向。
+ *
+ * ## 为什么把 `will-change` 写在这里（而不是单独一组）
+ *
+ * 项目有条走查纪律：**同一个选择器只许出现一次**（`nebula-walkthrough`
+ * 走查 12）。后一处会静默覆盖前一处，"改了没生效"多半就是这个。
+ * 所以 `will-change` 与 `animation` 合并进同一条规则 ——
+ * 顺带它只在动画期间挂着（`data-nav` 由 JS 在结束时摘掉），
+ * 不会让所有页面永久占一份合成层显存。
+ *
+ * ## 为什么 `will-change` 只写 opacity
+ *
+ * 原来写 `transform, opacity`（那时有位移）。`will-change: transform`
+ * 会让元素成为 `position: fixed` 后代的 **containing block** ——
+ * 而 `.nb-select-popover` / `.nb-pop`（下拉面板）正是 fixed 定位，
+ * 会被改成相对**层**定位，位置全错，且症状极难归因。
+ * 只写 `opacity` 没有这个副作用，同样能提升为合成层。
+ */
+.nb-page-layer[data-nav] {
+  will-change: opacity;
+  animation: nb-layer-fade-in var(--nb-dur-nav) var(--nb-ease-nav) both;
+}
+
+@keyframes nb-layer-fade-in {
+  /* 前 35% 全程透明 —— 让旧页先退干净（错开时间轴的关键） */
+  0% {
+    opacity: 0;
+  }
+
+  35% {
+    opacity: 0;
+  }
+
+  100% {
+    opacity: 1;
+  }
+}
+
+/* 旧页：前段淡出，动画结束由 JS 摘掉 */
+.nb-page-layer[data-leaving] {
+  will-change: opacity;
+  animation: nb-layer-fade-out var(--nb-dur-nav) var(--nb-ease-nav) forwards;
+}
+
+@keyframes nb-layer-fade-out {
+  /* 到 35% 就已经看不见了，后面保持 0（防一两帧回光） */
+  0% {
+    opacity: 1;
+  }
+
+  35% {
+    opacity: 0;
+  }
+
+  100% {
+    opacity: 0;
+  }
+}
+
+/*
+ * 聊天页的根（`ChatPanel.mount` 造的那个 div）。
+ *
+ * ★ 2026-10-31 补：这里原本**一条规则都没有**，于是这个 div 退回
+ * `display: block` / `flex-grow: 0`，高度由内容决定。
+ *
+ * 后果（实测数据，360×800 视口）：
+ *
+ *   .nb-page     h=743   ← 父容器，flex column
+ *   .nb-chat     h=501   ← 只撑了内容那么高（flexGrow:0, display:block）
+ *   .nb-composer top=436 bottom=501   ← 输入区停在内容末尾
+ *   .nb-tabbar   top=743              ← Tab 栏在页面底部
+ *
+ * 中间 **242px 是空的** —— 用户看到的就是「输入区悬浮在页面中部」。
+ *
+ * 这类问题特别容易误判：`.nb-msglist` 的 `flex:1` 是对的、
+ * `.nb-composer` 的定位也是对的，两个都"看起来没问题"，
+ * 问题在**它们俩的共同父元素**没被纳入 flex 高度链。
+ * 所以排查时不要只看嫌疑元素自己，要一路量到容器。
+ *
+ * 三个属性缺一不可：
+ *   · `flex: 1`     —— 撑满 `.nb-page` 剩下的高度；
+ *   · `min-height: 0` —— 允许内部 `.nb-msglist` 收缩并自己滚动
+ *     （不写的话 flex 子项的 min-height 默认 auto，内容会把它顶开、
+ *      整页跟着滚，输入区又被推出屏幕）；
+ *   · `display: flex; flex-direction: column` —— 让内部三段
+ *     （顶栏 / 消息列表 / 输入区）按列排，中间那段才能 `flex:1` 吃掉空余。
+ */
+.nb-chat {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+
+  /*
+   * ★ 软键盘避让**不在这里**（2026-11-04 上移到 `.nb-page`）。
+   *
+   * 2026-11-01 第七批把它写在 `.nb-chat` 上，于是只有聊天页会跟着键盘走；
+   * 仓库页 / 我的页 / 各种配置页全都被键盘直接盖住（用户报的就是这个）。
+   *
+   * `.nb-chat` 是 `.nb-page` 的子元素（实测），所以把同一条规则放到页面级
+   * 之后，聊天页的行为**完全不变**（父盒变矮 → 它跟着变矮 → 输入区照旧
+   * 贴在键盘上方），而其他页面同时被覆盖。
+   *
+   * 历史注释（为什么减 tabbar、为什么用 padding 而不是 transform、
+   * 为什么取两条变量的 max）都在 `.nb-page` 的那一段里，改之前先读那里。
+   *
+   * ★ 这里**绝不能**再写一遍 padding-bottom：父子都扣一次 =
+   * 聊天页多避让一个键盘高度，输入区会被推到屏幕外。
+   */
+}
+
+.nb-tabbar {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  /*
+   * 高度用 `min-height`，**保持默认的 content-box**（2026-11-04）。
+   *
+   * ## 为什么不能写 `box-sizing: border-box`
+   *
+   * 我第一版就是这么写的，然后自己算了一遍发现是错的：
+   *
+   * ```text
+   *   border-box + min-height: 56px + padding-bottom: 20px
+   *     ⇒ 内容区只有 36px ⇒ 图标 + 文字被压扁
+   * ```
+   *
+   * 而 `content-box`（默认）下：
+   *
+   * ```text
+   *   内容区 56px + padding 20px = 总高 76px ⇒ 图标正常、底部留出手势条
+   * ```
+   *
+   * 这正是我们想要的：**多出来的空间在内容下面，不是在内容里面**。
+   */
+  min-height: var(--nb-tabbar-h);
+  /*
+   * ★★★ 底部安全区（2026-11-04 修"红米上手势条压住 Tab 栏"）。
+   *
+   * 原来只写 `env(safe-area-inset-bottom, 0px)`，而这个 WebView 里
+   * `env(safe-area-inset-*)` **恒为 0**（顶部那条注释早就记过，
+   * 但底部漏了）。于是 padding 是 0，透明的系统手势条直接压在 Tab 上。
+   *
+   * 取值优先级：
+   *   ① `--nb-safe-bottom`  ← Android 侧从 WindowInsets 读的真值
+   *   ② `env(...)`          ← 浏览器/未来 edge-to-edge 时可能有值
+   *   ③ `20px`              ← 都拿不到时的兜底（手势条量级）
+   *
+   * 为什么要兜底而不是"拿不到就不留"：拿不到的后果是**控件被遮住点不动**，
+   * 而多留 20px 的后果只是稍微高一点。前者是功能故障，后者是观感。
+   */
+  padding-bottom: var(--nb-safe-bottom, env(safe-area-inset-bottom, 20px));
+  background: var(--nb-surface-1);
+  border-top: 1px solid var(--nb-glass-border);
+}
+
+.nb-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: var(--nb-hit-min);
+  border: 0;
+  background: none;
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-11);
+  line-height: var(--nb-lh-control);
+  cursor: pointer;
+  transition: color var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+.nb-tab[aria-selected='true'] {
+  color: var(--nb-text-1);
+}
+
+/* 当前 Tab 的指示条 —— 渐变只用在这一点（设计册 §1.2 穷举第 1 条） */
+.nb-tab[aria-selected='true']::after {
+  content: '';
+  width: 20px;
+  height: 3px;
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-grad-primary);
+}
+
+.nb-tab-icon {
+  width: 22px;
+  height: 22px;
+  display: block;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   二、顶部栏（玻璃 1/3）
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-topbar {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: var(--nb-sp-2);
+  min-height: 52px;
+  padding: 0 var(--nb-sp-4);
+  background: var(--nb-glass-bg);
+  backdrop-filter: blur(var(--nb-glass-blur)) saturate(var(--nb-glass-sat));
+  -webkit-backdrop-filter: blur(var(--nb-glass-blur)) saturate(var(--nb-glass-sat));
+  border-bottom: 1px solid var(--nb-glass-border);
+}
+
+.nb-topbar-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: var(--nb-fs-20);
+  font-weight: 600;
+  line-height: var(--nb-lh-title);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nb-topbar-sub {
+  display: block;
+  font-size: var(--nb-fs-12);
+  font-weight: 400;
+  color: var(--nb-text-2);
+  line-height: var(--nb-lh-control);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+ * ═══════════════════════════════════════════════════════════
+   副标题行 + 人设胶囊（2026-11-06）
+
+   用户：
+
+   > 找个地方加一个可以方便切换当前聊天的人设的东西
+
+   ## 为什么放在副标题行
+
+   顶栏已经有两个 40px 图标按钮（☰ / 齿轮）。再加第三个，标题只剩几十 px，
+   `聊天` 两个字都会被截断。副标题这一行本来就只放一行小字、横向有余量，
+   而且"当前是谁在聊"跟"当前是哪个存档"是同一类信息。
+
+   ## 两段都要能截断
+
+   文件名可能很长（`角色名 - 2026-11-6@20h44m42s`），人设名也可能很长。
+   两个都 `min-width: 0` + `ellipsis`，由 flex 自己按需分配：
+   文件名可以缩到很窄（它是次要信息），胶囊最多占 42%。
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-topbar-subrow {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-sp-2);
+  min-width: 0;
+  /* 覆盖 `.nb-topbar-sub` 原来是 block 的布局假设 */
+  overflow: hidden;
+}
+
+.nb-topbar-subrow > .nb-topbar-sub {
+  min-width: 0;
+  /* 文件名可以被压得很小，胶囊留出位置 */
+  flex: 0 1 auto;
+}
+
+.nb-persona-chip {
+  display: inline-flex;
+  align-items: center;
+  /* 图标 / 文字 / 箭头之间的气口。放在父级而不是各写 margin —— 走查 12
+     要求同一个选择器只出现一次，子元素只能有一条规则。 */
+  gap: 2px;
+  /*
+   * `0 1 auto` 而不是 `0 0 auto`（2026-11-07，跨设备）。
+   *
+   * `flex-shrink: 0` 的意思是"绝不收缩"。在窄屏（320dp）+ 大字号
+   * （系统字体 1.5×）的组合下，文件名 + 胶囊的总宽可能超出标题宽度 ——
+   * 而认死"不收缩"就只能靠 `max-width: 42%` 硬截，多出来的被父级
+   * `overflow: hidden` 裁掉，右半边（含 ▾ 箭头）就看不见了。
+   *
+   * 允许收缩之后，配合下面的 `nowrap + ellipsis`：先在文字里省略，
+   * 再不够才整体变窄 —— 任何宽度下都是"能读、有箭头"。
+   */
+  flex: 0 1 auto;
+  max-width: 42%;
+  /*
+   * ★ 有 `max-width` 就必须 `border-box`（走查 11 当场抓到的）。
+   *
+   * 默认 `content-box` 时，`max-width: 42%` 限制的是**内容**宽度，
+   * 再叠加 `padding: 0 var(--nb-sp-2)` 和 1px 边框，实际占位会比 42% 更宽
+   * —— 胶囊会反过来把文件名挤没。
+   */
+  box-sizing: border-box;
+  min-height: 22px;
+  padding: 0 var(--nb-sp-2);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-surface-2);
+  /*
+   * ★ 字色从 `--nb-text-2` 提到 `--nb-text-1`（2026-11-07）。
+   *
+   * 用户截图反馈"文字显示不清楚"。除了 `▾` 被截断（见下面三个子元素的
+   * 说明），另一半原因是这个胶囊在 `surface-2` 上用 muted 色，
+   * 12px 小字压在深底的副标题行里对比度不够。
+   * 人设是"我现在是谁"这种关键信息，不该比正文更淡。
+   */
+  color: var(--nb-text-1);
+  font-family: inherit;
+  font-size: var(--nb-fs-12);
+  line-height: var(--nb-lh-control);
+  /*
+   * ★ 这三个属性移到 `.nb-persona-chip-text` 上了（2026-11-07）。
+   *
+   * 留在容器上会让"省略"作用到整行内容 —— 包括 `👤` 和 `▾`，
+   * 于是文字超长时箭头被一起吃掉（用户截图里"文字后面叠着半个图形"）。
+   * 容器的职责只是"裁掉溢出"，省略交给里面那个可收缩的文字。
+   */
+  white-space: nowrap;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+/*
+ * 图标与箭头：**永远完整**，不参与收缩。
+ *
+ * ★ 两个选择器写在**同一组规则**里，且不再单独给某一个补规则 ——
+ *   走查 12 要求同一个选择器在 chat.css 只出现一次，
+ *   "共用一条 + 单独补一条"会被当场判红（改了两轮才对齐）。
+ *
+ * 图标与文字之间的气口交给父级的 `gap`，不在这里各写 margin。
+ */
+.nb-persona-chip-icon,
+.nb-persona-chip-caret {
+  flex: 0 0 auto;
+}
+
+/*
+ * 只有文字可以被省略。
+ *
+ * `min-width: 0` 不能省：flex 项默认 `min-width: auto`，
+ * 会拒绝收缩到内容宽度以下 —— 于是省略号根本不会出现，而是整体溢出被裁。
+ */
+.nb-persona-chip-text {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nb-persona-chip:active {
+  background: var(--nb-surface-3);
+}
+
+/* 不可点的形态（外壳没提供切换能力）：不要点了没反应的假按钮 */
+.nb-persona-chip[data-static='true'] {
+  cursor: default;
+}
+
+.nb-persona-chip[data-empty='true'] {
+  display: none;
+}
+
+/*
+ * ═══════════════════════════════════════════════════════════
+   仓库连通指示灯（2026-11-06，用户要求常驻）
+   ═══════════════════════════════════════════════════════════
+
+   用户：
+
+   > 可以在仓库里面加常驻的图标用来指示是否连上服务器，比如连上就是
+   > 绿色，没连上就是红色，**不影响页面的其他按钮**
+
+   ## 为什么是标题栏里的一个"药丸"，不是浮层角标
+
+   ```text
+     浮层角标   会盖住滚动内容；在小屏上还可能吃掉下方按钮的点击
+     标题栏内   .nb-topbar-title 是 flex:1，天然把右侧让出来；
+                完全在文档流里，不覆盖任何东西，也不改其它按钮的尺寸
+   ```
+
+   ## 为什么不像按钮
+
+   它常驻显示，外观必须轻 —— 一旦长得像主按钮，用户会以为要"点它才能用"。
+   所以只有 1px 描边 + 半透明底，尺寸压到 24px 高。
+
+   ## 颜色 + 文字双保险
+
+   红绿两色对红绿色盲（男性约 8%）是同一个灰度。所以：
+   **圆点给颜色，文字给结论**（已连接 / 连不上 / 检测中 / 未检测）。
+   */
+
+.nb-repo-link {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--nb-sp-1);
+  height: 24px;
+  margin: 0;
+  padding: 0 var(--nb-sp-2);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-pill);
+  background: transparent;
+  color: var(--nb-text-2);
+  font-family: inherit;
+  font-size: var(--nb-fs-11);
+  font-weight: 500;
+  line-height: 1;
+  /* 常驻元素不该抢焦点视觉，但要能点 */
+  -webkit-tap-highlight-color: transparent;
+  cursor: pointer;
+}
+
+/*
+ * 圆点：颜色由 `data-state` 决定。
+ *
+ * ★ 用 `box-shadow` 而不是 `outline` 做外圈光晕 —— `outline` 不跟随
+ * `border-radius` 在部分 WebView 上会画成方框。
+ */
+.nb-repo-link-dot {
+  display: block;
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--nb-text-3);
+}
+
+.nb-repo-link-text {
+  display: block;
+  white-space: nowrap;
+}
+
+/* 已连接：绿 */
+.nb-repo-link[data-state='online'] {
+  border-color: rgba(52, 211, 153, 0.45);
+  color: var(--nb-ok);
+}
+
+.nb-repo-link[data-state='online'] .nb-repo-link-dot {
+  background: var(--nb-ok);
+  box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.2);
+}
+
+/* 连不上：红 */
+.nb-repo-link[data-state='offline'] {
+  border-color: rgba(248, 113, 113, 0.45);
+  color: var(--nb-danger);
+}
+
+.nb-repo-link[data-state='offline'] .nb-repo-link-dot {
+  background: var(--nb-danger);
+  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.2);
+}
+
+/*
+ * 检测中：黄。
+ *
+ * ★ 这里**故意不做呼吸动画**。三个理由：
+ *
+ * ```text
+ *   ① 项目用 prefers-reduced-motion 把时长 token 塌成 1ms，
+ *      而 1ms × infinite 的动画 = 疯狂闪烁，比不动更糟
+ *   ② 走查 12 要求"同一选择器只出现一次"，关动画得再写一遍媒体查询
+ *   ③ 文字已经写着「检测中」了 —— 静止的黄灯 + 明确的字，
+ *      比闪动更能说明"正在试"，而且不耗一帧合成
+ * ```
+ */
+.nb-repo-link[data-state='checking'] {
+  border-color: rgba(251, 191, 36, 0.45);
+  color: var(--nb-warn);
+}
+
+.nb-repo-link[data-state='checking'] .nb-repo-link-dot {
+  background: var(--nb-warn);
+}
+
+/* 未检测 / 未配置：灰 */
+.nb-repo-link[data-state='unknown'] {
+  border-color: var(--nb-glass-border);
+  color: var(--nb-text-3);
+}
+
+/*
+ * ★★★ 嵌套的 `.nb-page` 不再加一次安全区（2026-11-04，用户报
+ *       「二级界面上方有空白，不像最上一级是没有空白的」）。
+ *
+ * ## 结构长这样
+ *
+ * ```text
+ *   一级页（聊天）     .nb-page(容器)  > .nb-chat          ← 只有一层 ✅
+ *   二级页（设置等）   .nb-page(容器)  > .nb-page.xxx      ← 两层 ❌
+ * ```
+ *
+ * 外层是 `shell.ts` 的 `pageHost`（容器），内层是各页面模块的根。
+ * 两层都带 `padding-top: max(safe-top, 24px)`：
+ *
+ * ```text
+ *   实测：容器 padding-top = 27px
+ *         topbar 顶边 = 54px = 27 + 27      ← 白多了整整一条状态栏
+ * ```
+ *
+ * 所以二级页的顶栏比一级页低 27px，上面空出一条 —— 这就是用户看到的
+ * "上方有空白"。它不难看得很明显，但和一级页来回切就能感到跳。
+ *
+ * ## ★★★ 2026-11-05：这条规则**已随架构调整删除**（下面是历史记录）
+ *
+ * 原文是 `.nb-page .nb-page { padding-top: 0 }`。两次改动之后它失去了对象：
+ *
+ * ```text
+ *   10-31  层级转场引入 .nb-page-layer，改了后代选择器（`>` 不再匹配）
+ *   11-05  安全区从 `.nb-page` 的 padding 改成变量 `--nb-page-inset-top`，
+ *          由 `.nb-page-layer` 的 `top` 使用 —— 于是**没有任何 `.nb-page`
+ *          再写 padding-top 了**
+ * ```
+ *
+ * 没有两份 padding，就不需要"抵消一份"。留着这条规则反而危险：
+ * 它会让后来的人以为"内层是有 padding 的，只是被压掉了"，
+ * 从而不敢动真正的机制。
+ *
+ * **现在的真值只有一处**：`.nb-page` 上定义的 `--nb-page-inset-top`，
+ * `.nb-page-layer` 拿它当 `top`。页面根（内层 `.nb-page.xxx`）不参与。
+ */
+
+/* 图标按钮：视觉 44 的图标 + 热区撑到 48（设计册 §3.4） */
+.nb-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--nb-icon-btn);
+  height: var(--nb-icon-btn);
+  margin-inline-end: calc(-1 * (var(--nb-icon-btn) - 28px) / 2);
+  border: 0;
+  border-radius: var(--nb-radius-pill);
+  background: none;
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-20);
+  cursor: pointer;
+  transition: background var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+.nb-icon-btn:active {
+  background: var(--nb-surface-3);
+}
+
+/*
+ * 「聊天设置」齿轮图标（2026-10-31 第三批问题二）。
+ *
+ * ## 为什么画在 CSS 里而不是在 TS 里写 innerHTML
+ *
+ * 第一版是 `settingsBtn.innerHTML = '<svg …>'`。虽然内容是静态常量、
+ * 没有注入面，但项目有一条硬门：**所有 innerHTML 必须走 renderMessageHtml**
+ * （2026-10-31 之前真的在流式路径上漏过一次 —— `bubble.innerHTML = state.text`，
+ * 模型吐出 `<img onerror>` 就会当场执行）。
+ *
+ * 给硬门开一个"我这是静态的"例外，下次就有人拿同样的理由去写动态内容。
+ * 所以图形挪到这里：`mask` 用内联 SVG 当蒙版，`background-color: currentColor`
+ * 跟着主题色走，切换主题不用改图标。
+ *
+ * ## 为什么用 mask 而不是 background-image
+ *
+ * `background-image` 的 SVG 无法着色（除非在 SVG 里再写一次 fill）。
+ * `mask` + `background-color` 让图标天然继承 `color`，
+ * 与 `.nb-icon-btn` 的 `color: var(--nb-text-1)` 自动一致。
+ *
+ * 图形用 Material 的 settings 轮廓：**齿形清晰**。
+ * 第一版画的"圆 + 8 条放射线"在 20px 上看起来像太阳/亮度图标，
+ * 不像设置 —— 那种偏差看代码发现不了，只有人眼看截图才知道。
+ */
+.nb-icon-btn[data-role='chat-settings-open']::before {
+  content: '';
+  width: 20px;
+  height: 20px;
+  background-color: currentColor;
+  -webkit-mask: var(--nb-gear-mask) center / contain no-repeat;
+  mask: var(--nb-gear-mask) center / contain no-repeat;
+}
+
+/* 齿轮蒙版 `--nb-gear-mask` 定义在 nebula-tokens.css 的 :root 里
+   （图标资源与 --nb-icon-btn 同一处，便于统一替换） */
+
+/* ═══════════════════════════════════════════════════════════
+   三、消息列表
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-msglist {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /*
+   * 底部留白 = 语音 chips 浮层的高度。
+   *
+   * 不留的话最后一条消息永远被浮层压住一截，而且**滚到底也露不出来**
+   * （浮层是 absolute，不参与滚动）。56px 是 chips 条的实际高度
+   * （44 热区 + 上下各 8 padding）。
+   */
+  padding: var(--nb-sp-4);
+  /*
+   * ★ 2026-11-02：底部那 56px 去掉了。
+   *
+   * 它原本是给"语音模式胶囊浮层"留的位置（浮层绝对定位在输入区上方，
+   * 不参与滚动，所以消息列表底部必须空出它的高度，否则最后一条被压住）。
+   *
+   * 但三圆布局改造后，三个圆已经**长在输入区里**（`.nb-voice-chips-slot`
+   * 在 `.nb-composer` 内，不是浮层），这块留白就变成了消息列表底部
+   * 一条 56px 的空隙 —— 用户截图红框圈的就是它：
+   *
+   * > 底部栏和聊天之间有空隙，看起来很不和谐，需要紧贴
+   */
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-sp-3);
+  /* 横向手势由聊天面板自己接管（左滑切候选），
+     所以这里禁止浏览器把横向位移解释成滚动/返回 */
+  overscroll-behavior-x: none;
+  touch-action: pan-y;
+  /*
+   * 聊天记录是全局禁选中的**白名单**（2026-11-02 用户要求：
+   * 「除了聊天界面…全部都给我禁掉长按复制」）。
+   * 写在这里而不是另起一条，是因为重复的选择器会被走查 12 拦下。
+   */
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+.nb-msg {
+  display: flex;
+  max-width: 82%;
+  animation: nb-msg-in var(--nb-dur-base) var(--nb-ease-out);
+}
+
+@keyframes nb-msg-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.nb-msg--char {
+  align-self: flex-start;
+}
+
+.nb-msg--user {
+  align-self: flex-end;
+}
+
+/* 气泡本体（设计册 §7.1） */
+.nb-bubble {
+  padding: var(--nb-sp-3) var(--nb-sp-4);
+  border-radius: var(--nb-radius-xl) var(--nb-radius-xl) var(--nb-radius-xl) 6px;
+  background: var(--nb-surface-1);
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-16);
+  line-height: var(--nb-lh-body);
+  /* 长词/URL 不撑破气泡 */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.nb-msg--user .nb-bubble {
+  border-radius: var(--nb-radius-xl) var(--nb-radius-xl) 6px var(--nb-radius-xl);
+  background: var(--nb-surface-2);
+  background-image: var(--nb-grad-soft);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   语音消息里的音频条（2026-10-31 用户要求）
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 用户原话：「语音气泡下是识别出来的文字」。
+ * 所以语音消息 = 上面一条音频条 + 下面文字气泡，而不是"纯文字 + 小徽标"。
+ *
+ * ★ 这条音频条**不可播放**：消息里只有转写文字，没有音频数据。
+ * 所以：
+ *   · 不给 `cursor: pointer`、不做 hover/active —— 视觉上不暗示可点；
+ *   · ▶ 是 span 不是 button，不进 tab 序；
+ *   · 语义靠 `aria-label="语音转写，3 秒"` 一次性说清（role=img），
+ *     不让读屏逐个子元素念。
+ */
+.nb-voice-bubble {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--nb-sp-2);
+  /*
+   * 宽度固定，**不按时长变化**（与草稿卡那条相反）。
+   *
+   * 草稿卡是"刚录完马上要发"，宽度随时长变是对用户动作的即时回应；
+   * 历史消息如果也变，列表右侧会参差不齐，滚动时很乱 ——
+   * 而时长已经用 `3"` 写出来了，宽度再表达一遍没有新信息。
+   */
+  width: 148px;
+  box-sizing: border-box;
+  padding: var(--nb-sp-2) var(--nb-sp-3);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-xl);
+  /* 与用户气泡同族、但更淡一档：它是气泡的"前缀"，不该比正文更抢眼 */
+  background: var(--nb-surface-2);
+  background-image: var(--nb-grad-soft);
+  /* 与下面的文字气泡之间留一点缝，看得出是"两行" */
+  margin-bottom: var(--nb-sp-2);
+}
+
+.nb-voice-bubble-play {
+  flex: 0 0 auto;
+  font-size: var(--nb-fs-11);
+  color: var(--nb-nebula-mid);
+  line-height: var(--nb-lh-control);
+}
+
+.nb-voice-bubble-wave {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2px;
+  height: 18px;
+}
+
+/* 静态波形柱：定高 + scaleY（只动合成层，与草稿卡/大按钮同一套做法） */
+.nb-voice-bubble-bar {
+  display: block;
+  width: 3px;
+  height: 16px;
+  transform: scaleY(calc(0.3 + var(--nb-wave-level, 0.5) * 0.7));
+  transform-origin: center;
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-nebula-mid);
+}
+
+.nb-voice-bubble-dur {
+  flex: 0 0 auto;
+  font-size: var(--nb-fs-12);
+  color: var(--nb-text-2);
+  line-height: var(--nb-lh-control);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * 语音消息里的文字气泡去掉上圆角朝向 —— 它与音频条是"同一条消息"，
+ * 两段都做成完整圆角会像两个独立气泡。
+ * 这是给"上面接了一条音频条"的视觉让步，不影响非语音消息。
+ */
+.nb-msg--user .nb-voice-bubble + .nb-bubble {
+  border-top-right-radius: 6px;
+}
+
+/* 气泡内 markdown 元素的间距：默认的 <p> 上下边距会让气泡虚胖 */
+.nb-bubble > :first-child {
+  margin-top: 0;
+}
+
+.nb-bubble > :last-child {
+  margin-bottom: 0;
+}
+
+.nb-bubble p {
+  margin: 0 0 var(--nb-sp-2);
+}
+
+.nb-bubble code {
+  padding: 1px 5px;
+  border-radius: var(--nb-radius-sm);
+  background: var(--nb-surface-3);
+  font-size: 0.92em;
+}
+
+.nb-bubble pre {
+  margin: var(--nb-sp-2) 0;
+  padding: var(--nb-sp-3);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-void);
+  overflow-x: auto;
+}
+
+.nb-bubble pre code {
+  padding: 0;
+  background: none;
+}
+
+.nb-bubble blockquote {
+  margin: var(--nb-sp-2) 0;
+  padding-left: var(--nb-sp-3);
+  border-left: 3px solid var(--nb-nebula-a);
+  color: var(--nb-text-2);
+}
+
+.nb-bubble ul,
+.nb-bubble ol {
+  margin: var(--nb-sp-2) 0;
+  padding-left: var(--nb-sp-5);
+}
+
+.nb-bubble a {
+  color: var(--nb-nebula-b);
+  text-decoration: underline;
+}
+
+.nb-bubble hr {
+  margin: var(--nb-sp-3) 0;
+  border: 0;
+  border-top: 1px solid var(--nb-glass-border);
+}
+
+/* 消息脚注：时间 + 语音徽标 + 候选指示 */
+.nb-msg-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-sp-2);
+  margin-top: var(--nb-sp-1);
+  padding: 0 var(--nb-sp-1);
+  font-size: var(--nb-fs-12);
+  color: var(--nb-text-3);
+  line-height: var(--nb-lh-control);
+}
+
+.nb-msg--user .nb-msg-meta {
+  justify-content: flex-end;
+}
+
+/* 语音徽标（T15.6 会写入 extra.tcs.voice；本期只渲染已有标记） */
+.nb-voice-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--nb-text-2);
+}
+
+/* 候选指示：3 / 5 */
+.nb-swipe-indicator {
+  font-variant-numeric: tabular-nums;
+  color: var(--nb-text-2);
+}
+
+/* 「正在生成」的呼吸点（设计册 §7.1）：渐变 + 透明度呼吸 */
+.nb-breathing {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-left: 2px;
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-grad-primary);
+  animation: nb-breath 1.2s ease-in-out infinite;
+  vertical-align: 1px;
+}
+
+@keyframes nb-breath {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   四、空状态（设计册 §7.3：一句人话 + 一个明确的下一步）
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--nb-sp-3);
+  padding: var(--nb-sp-8) var(--nb-sp-6);
+  text-align: center;
+}
+
+/* 空状态的插画光晕 —— 渐变穷举第 5 条 */
+.nb-empty-halo {
+  width: 96px;
+  height: 96px;
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-grad-glow);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--nb-fs-32);
+}
+
+.nb-empty-title {
+  margin: 0;
+  font-size: var(--nb-fs-20);
+  font-weight: 600;
+  line-height: var(--nb-lh-title);
+}
+
+.nb-empty-text {
+  margin: 0;
+  max-width: 260px;
+  font-size: var(--nb-fs-14);
+  color: var(--nb-text-2);
+  line-height: var(--nb-lh-body);
+}
+
+.nb-empty-actions {
+  display: flex;
+  gap: var(--nb-sp-3);
+  margin-top: var(--nb-sp-2);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   五、输入区（玻璃 2/3）
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-composer {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: flex-end;
+  /*
+   * 允许换行 —— 快捷输入条靠 `flex:0 0 100% + order:-1` 独占上面一行。
+   *
+   * 不改结构（不把 input/mic/send 包进 wrapper）的理由：
+   * 那会牵动 `syncSendButton()`、`data-voice` 的显隐规则和一串既有判据，
+   * 而这里只需要"多一行"。
+   */
+  flex-wrap: wrap;
+  gap: var(--nb-sp-2);
+  padding: var(--nb-sp-2) var(--nb-sp-4);
+  padding-bottom: calc(var(--nb-sp-2) + env(safe-area-inset-bottom, 0px));
+  background: var(--nb-glass-bg);
+  backdrop-filter: blur(var(--nb-glass-blur)) saturate(var(--nb-glass-sat));
+  -webkit-backdrop-filter: blur(var(--nb-glass-blur)) saturate(var(--nb-glass-sat));
+  border-top: 1px solid var(--nb-glass-border);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   快捷输入条（2026-11-02 用户要求）
+
+   > 在聊天界面添加三个快捷输入按键 "、（）、「」，这个要小一点，不遮挡文字；
+   > 再在快捷键那一排加一个重新生成按钮
+
+   `flex: 0 0 100%` 独占整行、`order: -1` 排到输入框上面；
+   高度 28px —— 用户明确要"小一点"，同时不能压住任何文字。
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-quickbar {
+  flex: 0 0 100%;
+  order: -1;
+  display: flex;
+  align-items: center;
+  gap: var(--nb-sp-1);
+  padding-bottom: var(--nb-sp-1);
+}
+
+.nb-quickkey {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  height: 28px;
+  padding: 0 var(--nb-sp-2);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-surface-2);
+  /*
+   * 用 `--nb-text-2` 而不是 `--nb-text-3`。
+   *
+   * 第一版给了 `text-3`（#6e6885，深灰紫），真机截图里那几个符号
+   * **几乎看不见** —— 用户要求的"小一点"是指尺寸，不是"淡到看不清"。
+   * 28px 高度已经够小了，颜色可以正常一档。
+   */
+  color: var(--nb-text-2);
+  font-family: inherit;
+  font-size: var(--nb-fs-12);
+  line-height: 1;
+  cursor: pointer;
+  /* 与全局禁选中一致：按钮上的符号不该被长按选中 */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  transition:
+    color var(--nb-dur-micro) var(--nb-ease-out),
+    background var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+.nb-quickkey:active {
+  background: var(--nb-surface-3);
+  color: var(--nb-text-1);
+}
+
+/*
+ * 语音态不显示快捷条。
+ *
+ * 那时输入框被 `.nb-voice-stage` 接管，插符号没有落脚点；
+ * 留着只会白占 36px 高度，而语音态恰恰最需要留空间给波形和三圆。
+ */
+.nb-composer[data-voice='true'] .nb-quickbar {
+  display: none;
+}
+
+.nb-input {
+  flex: 1;
+  min-width: 0;
+  /*
+   * ★★★ 必须显式给宽度（2026-11-05 用户报「文本输入框横向没有占满屏幕」）。
+   *
+   * `input` / `textarea` **不是块级元素** —— 它们的默认宽度来自
+   * `size` / `cols` 属性（textarea 默认 `cols=20`），真机上量到
+   * 父容器 361px 时它只有 **185px** 宽，看起来像"只占了一半"。
+   *
+   * 为什么原来只写 `flex: 1` 不够：
+   *
+   * ```text
+   *   .nb-field-body  display: block     ← 块级，不是 flex
+   *   .nb-input       flex: 1            ← flex 属性在块级父容器里**完全无效**
+   * ```
+   *
+   * `.nb-field-body` 是 `display: block`（见下方那条），所以发生在
+   * 表单里的每个输入框都拿不到 flex 布局，`flex: 1` 白写。
+   *
+   * 补 `width: 100%` 之后，聊天输入框（`.nb-composer` 里那个）
+   * 也不受影响 —— 那里父容器是 flex 行且 `flex: 1` 会把 `flex-basis`
+   * 定成 `0%`，`width` 让位给 flex-basis（这是 flex 规范的规定）。
+   *
+   * ★ `box-sizing: border-box` 与 `width: 100%` 必须成对出现：
+   * 只写宽度的话，`padding: 0 sp-4` 会加在 100% **之外**，右侧溢出
+   * 屏幕（草稿卡上踩过一次同样的坑，见 `.nb-pop` 那段注释）。
+   */
+  width: 100%;
+  box-sizing: border-box;
+  /* 自适应高度：1 行起步，最多 5 行后内部滚动 */
+  max-height: calc(5 * var(--nb-fs-16) * var(--nb-lh-body) + var(--nb-sp-4));
+  padding: var(--nb-sp-3) var(--nb-sp-4);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-surface-2);
+  color: var(--nb-text-1);
+  font-family: inherit;
+  font-size: var(--nb-fs-16);
+  line-height: var(--nb-lh-body);
+  resize: none;
+  outline: none;
+  transition: border-color var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+.nb-input::placeholder {
+  color: var(--nb-text-3);
+}
+
+/* 聚焦：边框转星云紫，1px 不发光（设计册 §7.2） */
+.nb-input:focus {
+  border-color: var(--nb-nebula-a);
+}
+
+.nb-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--nb-icon-btn);
+  height: var(--nb-icon-btn);
+  flex: 0 0 auto;
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-surface-2);
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-20);
+  cursor: pointer;
+  transition:
+    opacity var(--nb-dur-micro) var(--nb-ease-out),
+    transform var(--nb-dur-micro) var(--nb-ease-spring);
+}
+
+/* 发送按钮的强调：**文字/图标**用渐变（设计册 §1.2 第 3 条），底仍是玻璃 */
+.nb-send[data-ready='true'] {
+  color: var(--nb-nebula-b);
+  border-color: var(--nb-nebula-a);
+}
+
+.nb-send:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.nb-send:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   六、T15.6 三个语音挂载点（**本期只渲染占位，无功能**）
+   ═══════════════════════════════════════════════════════════
+   尺寸/位置按 T15.6 终版规格预留，目的是"语音接入时不改布局"。
+   三个挂载点的 DOM id 见 `chat-panel.ts` 的 VOICE_MOUNTS 常量。
+   ═══════════════════════════════════════════════════════════ */
+
+/* 挂载点①：麦克风按钮位（48×48，与发送按钮同尺寸，设计册 §3.4） */
+.nb-mic-slot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--nb-icon-btn);
+  height: var(--nb-icon-btn);
+  flex: 0 0 auto;
+  /*
+   * ★ 这三条是在"重置 UA 样式"，不是在加装饰。
+   *
+   * `.nb-mic-slot` 是 `<button>`（无障碍要求，见 voice-panel.ts 的注释），
+   * 而按钮有**浏览器默认外观**：深色模式下 Chrome 给的是
+   * `background: rgb(107,107,107)` + `border: 2px solid ButtonBorder` +
+   * `border-radius: 0`。不覆盖的话它就是一个**灰色方块**，
+   * 而紧挨着的 `.nb-send` 是圆角 + 夜空底色 —— 并排放着完全不像同一套 UI。
+   *
+   * 2026-10-31 真机截图里就是这样：输入框右边一个灰方块、右边一个圆按钮。
+   * 用户的原话是「感觉只是把电脑客户端的 UI 给完完全全打包进去了」，
+   * 这类"一个控件没跟设计语言"的问题单看代码看不出来，只有量 computed
+   * 才发现 `border-radius: 0px` / `background: rgb(107,107,107)` 是 UA 默认值。
+   *
+   * 与 `.nb-send` 用同一组 token，保证两个按钮是同一个视觉物件。
+   */
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-surface-2);
+  /*
+   * ★★★ 2026-11-05：`--nb-text-3` → `--nb-text-2`。
+   *
+   * 这条**必须**跟着图标一起改，否则换完反而更难看：
+   *
+   * ```text
+   *   emoji 🎤   自带颜色，CSS 的 color 对它**无效** ⇒ 写 text-3 也看得见
+   *   SVG 线稿   stroke: currentColor ⇒ 直接吃 color
+   *              text-3 = #6e6885，在 surface-1(#14121e) 上几乎糊住
+   * ```
+   *
+   * 用 text-2（#a8a2c0）：比正文暗一档（它是次要入口），但线看得清。
+   * 未配置 ASR 时由下面的 `[data-enabled='false']` 打回 text-3 置灰。
+   */
+  color: var(--nb-text-2);
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* 挂载点②：chips 浮层（三 chips 横排，浮在输入区上方） */
+/*
+ * 挂载点②：chips 浮层（T15.6 已接线，display 从 none 改成 flex）。
+ *
+ * 两种状态：
+ *   · 平时（`data-active="false"`）—— 只显示**当前模式**那一个 chip，
+ *     占位不抢空间（需求 1②「平时显示当前模式」）；
+ *   · 按住（`data-active="true"`）—— 三个都显示，可滑动切换。
+ *
+ * `pointer-events: none` 是关键：chips 浮在输入区上方，
+ * 如果它能接收事件，手指按住麦克风往上滑时会被 chip 拦住，
+ * 导致 pointermove 收不到、模式永远切不了。
+ */
+.nb-voice-chips-slot {
+  /*
+   * ★ 2026-11-02 改成**三圆横排**（用户给的布局图）。
+   *
+   * 原来是"绝对定位浮在输入区上方的三条胶囊"，现在改成语音态里的
+   * 一行三个圆：左「内心/动作」、中大圆「按住说话」、右「消息」。
+   *
+   * 为什么必须**同时可见**（而不是按住才浮起）：
+   * 手势是"按住中间那个圆，再滑到左右圆上"—— 滑动过程中手指要看得见
+   * 目标圆在哪。如果按住才浮起，用户得先按下去再看界面变没变，
+   * 而"按下去"本身已经开始录音了，他来不及反应。
+   */
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--nb-sp-3);
+  /*
+   * ★ `width: 100%` 必须配 `box-sizing: border-box`。
+   *
+   * 默认是 `content-box`，于是 `width:100%` + 左右各 20px padding
+   * = 实际 401px，而父容器只有 361px ⇒ **右边那个圆被推出视口**
+   * （真机截图里「消息」只露出半个）。
+   *
+   * 这个错在 DOM 上完全看不出来：`getBoundingClientRect().width` 是 401，
+   * 看上去"很宽很正常"，只有拿它和父容器宽度比才发现溢出。
+   *
+   * 同时去掉 `max-width: 420px` —— 那本来是给平板留的上限，
+   * 但它与 padding 组合后会让"居中"在窄屏上失效。需要限宽时应该由
+   * 父容器（composer）统一控制，而不是每行各自一个上限。
+   */
+  box-sizing: border-box;
+  width: 100%;
+  /*
+   * ★★★ 左右留够 40px：避开 **Android 系统侧滑返回**的感应区（2026-11-02）。
+   *
+   * 真机取证（`verify-one-finger.mjs`，`input swipe` 从大圆滑到右圆）：
+   *
+   * ```text
+   *   滑到左圆：pointermove=33  pointercancel=0   ✅
+   *   滑到右圆：pointermove=2   pointercancel=1   ❌ 手势被系统抢走
+   * ```
+   *
+   * 右圆中心 x=336、屏幕宽 393，右边缘只剩 **24px** —— 那正是系统
+   * 手势导航的返回热区（各家 ROM 约 20–30dp）。手指滑到那儿，
+   * 事件在**应用之前**就被 InputDispatcher 截走并派发 `pointercancel`。
+   *
+   * `touch-action: none` 管不到这一层：它约束的是**浏览器**的滚动判定，
+   * 而边缘返回是**系统级**手势。
+   *
+   * 后果正是用户说的「要两个手指」—— 右手拇指往右滑会触发返回，
+   * 他只能换另一只手/另一个手指绕开。
+   *
+   * 40px 是折中：够避开常见 ROM 的边缘区，又不至于把三个圆挤成一团
+   * （三圆总宽 220px，剩余 393-80-220=93px 分两份，每份 46px）。
+   *
+   * ⚠ 这是**设计稿与真机的必然冲突**：用户给的图里左右圆距边只有 24px，
+   * 但那是静态图、没有系统手势区。可用性优先，圆往里收。
+   */
+  padding: var(--nb-sp-2) var(--nb-sp-10);
+  /*
+   * 不做绝对定位、不铺底色：它就长在输入区里，不是浮层。
+   * 铺底色会让它看起来像另一条工具条（用户要的是"输入区变成语音"）。
+   */
+  pointer-events: auto;
+  /*
+   * ★★★ 必须 `touch-action: none`（2026-11-02 用户报"要两个手指才能完成"）。
+   *
+   * 默认值是 `auto`，浏览器的触摸判定会**抢走**这块区域里的滑动：
+   * 横向 → 页面横向滚动 / 侧滑返回，纵向 → 页面滚动。
+   * 抢走的表现不是"滑不动"那么温和，而是：
+   *
+   * ```text
+   *   手指按住大圆横向移动 ~40px
+   *   → 浏览器接管 → 派发 pointercancel
+   *   → 我们的 onPointerCancel 释放录音
+   *   → 录音作废、档位也切不了
+   * ```
+   *
+   * 真机取证（`diag-real-touch.mjs`，用 `input motionevent` 注入真实触摸）：
+   * ```text
+   *   只收到 1 条 pointermove，横向位移 0px，随后一条 pointercancel
+   *   hintState: recording → idle   ← 录音被 cancel 掉了
+   * ```
+   *
+   * 为什么之前的验证全绿：全部用 CDP **合成** `PointerEvent`
+   * （`dispatchEvent(new PointerEvent('pointermove'))`），
+   * 那**绕过了浏览器的触摸判定链** —— 合成事件不可能被 cancel。
+   *
+   * 这一条是本轮最贵的教训：**手势类改动必须用真实触摸验**。
+   */
+  touch-action: none;
+}
+
+/*
+ * ★ `hidden` 必须显式兜住。
+ *
+ * HTML 的 `hidden` 属性靠**浏览器默认样式** `[hidden] { display: none }`
+ * 生效，而那条默认规则的优先级**低于**任何类选择器。所以只要这里有
+ * `.nb-voice-chips-slot { display: flex }`，`hidden` 就完全失效 ——
+ * 元素明明 hidden=true 却照样显示。
+ *
+ * 这类问题很难查：DOM 上 `hidden` 是 true、开发者工具里看得见，
+ * 但屏幕上就是不消失。（`.nb-voice-confirm-slot` 同理，见文件末尾。）
+ */
+.nb-voice-chips-slot[hidden] {
+  display: none;
+}
+
+/*
+ * ★ 只在**语音态**显示。
+ *
+ * 键盘态时输入框占着位置，这里再出现三个圆就是重复。
+ *
+ * ## ★ 判据用面板自己的 `data-voice`，不用 composer 的
+ *
+ * 第一版写的是 `.nb-composer:not([data-voice='voice'])`，结果真机上
+ * **三个圆全部 0×0**（`getBoundingClientRect` 全零）——
+ * 因为 composer 上的值是**布尔字符串** `'true'/'false'`
+ * （`chat-panel.ts` 里 `stage === 'voice' ? 'true' : 'false'`），
+ * 而 `'true' !== 'voice'` 恒成立 ⇒ `:not()` 恒真 ⇒ 一直隐藏。
+ *
+ * 两个不同的值域（`'voice'/'keyboard'` 与 `'true'/'false'`）在同一个
+ * 属性名上，这类错**在 DOM 断言里完全看不见**（属性值都对，只是 CSS 判错），
+ * 只有真机量矩形才发现。
+ *
+ * 现在由 `syncAll()` 给 chips 自己写 `data-voice`（取 `this.voiceStage`），
+ * 与 stage 上那个属性**同源同值域** —— 不再跨组件猜对方的约定。
+ */
+.nb-voice-chips-slot[data-voice='keyboard'] {
+  display: none;
+}
+
+/*
+ * ★ 语音态下 composer 要改成**纵向**排列（2026-11-02）。
+ *
+ * `.nb-composer` 本来是 `flex-direction: row`（输入框 + 发送 + 麦克风挤一行）。
+ * 语音态里现在有两个块：舞台（顶部波形+计时+提示）和三圆行。
+ * 不改成纵向的话它们会被当成 row 的兄弟，挤在右边那条缝里 ——
+ * 真机截图就是这个样子：三圆跑到右上角、波形缩在左边。
+ *
+ * `align-items: stretch` + 子项 `width: 100%`：让两行都撑满整宽，
+ * 内部各自居中（舞台 `align-items: center`、三圆 `justify-content: space-between`）。
+ */
+.nb-composer[data-voice='true'] {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--nb-sp-1);
+}
+
+/*
+ * 左右两个小圆。
+ *
+ * 直径 64px：比 --nb-hit-min（48）大一圈，拇指滑过来时好落，
+ * 又明显小于中间那个 88px 的主按钮 —— 主次一眼能分出来。
+ */
+.nb-chip {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  flex: 0 0 auto;
+  width: 64px;
+  height: 64px;
+  padding: 0;
+  border: 1px solid var(--nb-glass-border);
+  border-radius: 50%;
+  background: var(--nb-surface-2);
+  color: var(--nb-text-2);
+  font-size: var(--nb-fs-12);
+  line-height: 1.15;
+  text-align: center;
+  white-space: nowrap;
+  transition:
+    color var(--nb-dur-micro) var(--nb-ease-out),
+    background var(--nb-dur-micro) var(--nb-ease-out),
+    transform var(--nb-dur-micro) var(--nb-ease-spring),
+    border-color var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+/* 两行文字（「内心」/「动作」），每行不折行 —— 断在字中间最难读 */
+.nb-chip-line {
+  display: block;
+}
+
+/* 当前命中的档位：边框转星云色 + 轻微放大（手指挡着时靠外圈才看得出） */
+.nb-chip[data-selected='true'] {
+  color: var(--nb-text-1);
+  border-color: var(--nb-nebula-a);
+  background: var(--nb-surface-3);
+  transform: scale(1.06);
+}
+
+/* 取消态：两个档位圆一起变暗，暗示"这次都不发" */
+.nb-voice-chips-slot[data-cancelling='true'] .nb-chip {
+  opacity: 0.5;
+}
+
+/*
+ * 挂载点⑤：待确认草稿（2026-10-30 改成草稿卡片）。
+ *
+ * 形态来自用户给的示意图：音频条 + 文字气泡 + 确认/取消，竖着排，
+ * **看起来像一条还没发出去的消息**。
+ *
+ * 它现在挂在消息列表末尾（由 chat-panel 的 render 放进去），
+ * 不再是输入区上方的绝对定位条 —— 那样在消息列表里"预览"更直观。
+ */
+.nb-voice-draft-card {
+  /*
+   * 贴右：确认后它就是一条"我发的消息"，草稿阶段先摆在同一侧，
+   * 避免确认前后位置跳变。
+   */
+  align-self: flex-end;
+  display: flex;
+  flex-direction: column;
+  /*
+   * ★ `flex-start` 而不是 `flex-end`。
+   *
+   * 音频条比文字气泡窄（宽度由录音时长决定），子项各靠右时两者**左端不齐** ——
+   * 2026-10-30 的 04 帧就是这样：音频条从 x=221 开始，文字气泡从 x=75 开始，
+   * 看起来像"两个不相干的东西"而不是一条消息。
+   *
+   * 左对齐之后它才像"一条消息"：音频条顶在上、文字在下面，同一条左边。
+   * 按钮不跟这条规则走，它自己 `align-self: flex-end`（在按钮组那边写）。
+   */
+  align-items: flex-start;
+  gap: var(--nb-sp-2);
+  max-width: 82%;
+  animation: nb-msg-in var(--nb-dur-base) var(--nb-ease-out);
+}
+
+/* hidden 必须显式兜住（类选择器的 display 会盖过浏览器默认的 [hidden]） */
+.nb-voice-draft-card[hidden] {
+  display: none;
+}
+
+/* ── ① 音频条 ── */
+
+.nb-voice-barbox {
+  /*
+   * 宽度由 JS 按录音时长算好，通过 `--nb-voice-bar-width` 传进来。
+   *
+   * 为什么宽度不在 CSS 里按时长算：时长是数据，CSS 拿不到。
+   * 算法在 `shared/src/voice/bar-width.ts`（有单测，含"不超过半屏"这条）。
+   *
+   * ★ `box-sizing: border-box` **不可省**。
+   *
+   * 少了它，`width` 只算内容盒，左右 padding 与边框会**加在宽度之外**：
+   * 2026-10-30 录屏实测 JS 给 120px，`getBoundingClientRect().width` 是 146px
+   * （120 + 12×2 padding + 1×2 border）。更糟的是 `max-width: 50vw` 同样只
+   * 约束内容盒 —— 于是"不超过半屏"这条硬约束**名义上写了、实际上没生效**：
+   * 内容顶到 180px 时可见宽度是 206px，在 360 宽屏上占 57%。
+   *
+   * 当时截图核对判的是"146 ≤ 180"**通过**了 —— 数字对得上不代表约束在起作用，
+   * 只是这次没顶到上限而已。所以这里直接钉死 border-box。
+   */
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: var(--nb-sp-2);
+  width: var(--nb-voice-bar-width, 96px);
+  /* 上限兜底：即使 JS 传错也不许超过半屏（需求硬约束） */
+  max-width: 50vw;
+  padding: var(--nb-sp-2) var(--nb-sp-3);
+  border: 1px solid var(--nb-glass-border);
+  /*
+   * 配色走夜航 token —— 用户要求「音频条的颜色设计要与整体符合」。
+   * 示意图里 QQ 是黄色，我们不用黄：用 `--nb-grad-soft`
+   * （星云紫 22% → 极光青 16% 的柔和渐变），与用户气泡同族但更淡，
+   * 这样"语音条"和"文字气泡"能区分，又不跳出整体色系。
+   */
+  background: var(--nb-surface-2);
+  background-image: var(--nb-grad-soft);
+  border-radius: var(--nb-radius-xl);
+  color: var(--nb-text-1);
+}
+
+/*
+ * 播放图标：纯装饰（需求"纯视觉不播放"），所以不做可点态。
+ *
+ * 颜色用 `--nb-nebula-mid` 而不是 `--nb-nebula-b`：
+ * 后者是极光青（#22d3ee），单独出现在这一小块上会跳出色系 ——
+ * 用户明确要求「音频条的颜色设计要与整体符合」，而整卡其余部分
+ * 都在星云紫这一段（气泡底 grad-soft、波形柱 nebula-mid）。
+ * 青色只留给"状态类"提示（发送就绪、流式光标那些），不用在装饰上。
+ */
+.nb-voice-bar-play {
+  flex: 0 0 auto;
+  font-size: var(--nb-fs-11);
+  color: var(--nb-nebula-mid);
+  line-height: var(--nb-lh-control);
+}
+
+/* 波形：占满中间剩余宽度 */
+.nb-voice-bar-wave {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2px;
+  height: 22px;
+}
+
+/* 时长 */
+.nb-voice-bar-dur {
+  flex: 0 0 auto;
+  font-size: var(--nb-fs-12);
+  color: var(--nb-text-2);
+  line-height: var(--nb-lh-control);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── ② 文字气泡（点一下变可编辑） ── */
+
+.nb-voice-textwrap {
+  max-width: 100%;
+  /* 撑满卡片宽度，文字气泡才与卡片同宽（否则宽度随文字长短来回跳） */
+  align-self: stretch;
+}
+
+.nb-voice-textview {
+  padding: var(--nb-sp-3) var(--nb-sp-4);
+  border-radius: var(--nb-radius-xl) var(--nb-radius-xl) 6px var(--nb-radius-xl);
+  background: var(--nb-surface-2);
+  background-image: var(--nb-grad-soft);
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-16);
+  line-height: var(--nb-lh-body);
+  overflow-wrap: anywhere;
+  cursor: text;
+  transition: background-color var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+/* 提示"这段字可以点"：按下时亮一档，不靠常驻装饰 */
+.nb-voice-textview:active {
+  background-color: var(--nb-surface-3);
+}
+
+.nb-voice-textview[hidden] {
+  display: none;
+}
+
+/* 气泡内的 markdown 元素收紧间距（与消息气泡同一套处理） */
+.nb-voice-textview > :first-child {
+  margin-top: 0;
+}
+
+.nb-voice-textview > :last-child {
+  margin-bottom: 0;
+}
+
+.nb-voice-textview p {
+  margin: 0 0 var(--nb-sp-2);
+}
+
+/* ── ③ 确认 / 取消 ── */
+
+.nb-voice-confirm-actions {
+  display: flex;
+  gap: var(--nb-sp-2);
+  /*
+   * 按钮组独立贴右 —— 卡片整体是左对齐的，但「确认 / 取消」放右下角
+   * 符合示意图，也符合"主要动作在拇指区"的习惯。
+   */
+  align-self: flex-end;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   七、通用：玻璃卡片 / 列表 / 按钮
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 这里**刻意没有** `.nb-glass` 通用类。
+ *
+ * 第一版写了它，但本页一个地方都没用 —— 顶栏、输入区、待确认条各自有具体规则。
+ * 而它的存在让"玻璃不超过 3 层"这条走查失效：静态数下来是 4 处声明，
+ * 虽然同屏最多 3 层，但判据变成"要人解释为什么不冲突"，那就不是判据了。
+ *
+ * 删掉死代码比放宽断言正确 —— 后者会让下一个人以为 4 层也可以。
+ */
+
+/* 列表项：**不用玻璃**（设计册 §2 约束 1），纯色 + 44 热区 */
+.nb-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--nb-sp-2) var(--nb-sp-4);
+}
+
+.nb-listitem {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-sp-3);
+  width: 100%;
+  min-height: var(--nb-hit-min);
+  padding: var(--nb-sp-3);
+  margin-bottom: var(--nb-sp-2);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-lg);
+  background: var(--nb-surface-1);
+  color: var(--nb-text-1);
+  font-family: inherit;
+  font-size: var(--nb-fs-16);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+.nb-listitem:active {
+  background: var(--nb-surface-3);
+}
+
+.nb-listitem-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.nb-listitem-title {
+  display: block;
+  font-size: var(--nb-fs-16);
+  line-height: var(--nb-lh-control);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+ * ═══════════════════════════════════════════════════════════
+   仓库二级：带缩略图头像的卡片行（2026-11-06）
+   ═══════════════════════════════════════════════════════════
+
+   用户：
+
+   > 并且可以展示缩略图头像（按照服务端仓库里的展示，如果服务端没有
+   > 就用兜底缩略图进行展示）
+
+   头像位是**固定尺寸的容器**，里面要么是 `<img>`、要么是首字兜底。
+   容器本身不改尺寸 —— 否则"有图/没图"两种行高度会差一点，
+   列表滚动时看着在抖。
+
+   尺寸 40px 与角色选择器一致（那里也是 40）。
+   */
+.nb-repo-face {
+  flex: 0 0 auto;
+  display: block;
+  width: 40px;
+  height: 40px;
+}
+
+/* 容器里的 img / 兜底圆都要填满容器 */
+.nb-repo-face > .nb-avatar,
+.nb-repo-face > img {
+  display: block;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+/*
+ * 兜底头像：没有卡面时显示首字。
+ *
+ * 底色用 `--nb-surface-2`（比列表底亮一档），不然在 `.nb-surface-1`
+ * 的行里会"看不见有个圆"——只有字浮着。
+ */
+.nb-avatar-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--nb-surface-2);
+  color: var(--nb-text-2);
+  font-size: var(--nb-fs-16);
+  font-weight: 600;
+  line-height: 1;
+  user-select: none;
+}
+
+.nb-listitem-sub {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--nb-fs-14);
+  color: var(--nb-text-2);
+  line-height: var(--nb-lh-control);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   接口源的「未配 key」标签（2026-11-07）
+
+   用户切到「DeepSeek 官方接口」时那个源从来没有 key，而界面上
+   两个源长得一模一样 ⇒ 他直接发消息，拿到 `HTTP 400 {"error":true}`
+   （ST 缺 key 的分支，且不带任何 message）。
+
+   标签用**警示色**而不是灰字：这不是"补充信息"，是"这么用在发不出去"。
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-src-badge {
+  display: inline-block;
+  /*
+   * `margin-top` 而不是让父级 flex：`main` 是 `nb-listitem-main`，
+   * 里面标题与副标题都是 block 流。加一条 flex 会改变现有两行的排版。
+   */
+  margin-top: 2px;
+  padding: 0 var(--nb-sp-2);
+  border-radius: var(--nb-radius-pill);
+  /*
+   * ★ 底色用 `rgba()` 而不是 `color-mix()` —— 后者在 Chrome 87 会让整条
+   *   规则失效（本项目走查里早有禁令，我这里差点又用一次）。
+   *
+   * ★ 文字色必须用 token（`--nb-warn`），**不能带 hex fallback**。
+   *   走查 1 当场抓到了我写的 `var(--nb-warn, #ffb020)`：
+   *   「裸色值只允许出现在 token 文件里」。那条规则的道理是改主题时一处生效；
+   *   写死 fallback 的话换主题这块不变色，而且 fallback 一旦生效就说明
+   *   token 没加载 —— 那时候颜色不一致只是最小的症状。
+   */
+  background: rgba(251, 191, 36, 0.16);
+  color: var(--nb-warn);
+  font-size: var(--nb-fs-12);
+  line-height: var(--nb-lh-control);
+  white-space: nowrap;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   接口源手风琴（2026-10-31 加）
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * ## 为什么需要这一段
+ *
+ * 之前 `api-page.ts` 里其实**已经把选中状态写对了**：
+ *
+ *   item.setAttribute('aria-pressed', String(source === currentSource));
+ *
+ * 但 `chat.css` 里 `grep aria-pressed` **零结果** —— 属性变了，
+ * 屏幕上什么都不变。用户点击六个选项时"无任何可见变化"，
+ * 根本原因是**状态有、视觉表达没有**，不是状态没建立。
+ *
+ * 所以这里的关键不是"加一组样式"，而是让样式**读那个已有的状态**。
+ * 加一组与状态脱钩的纯样式（比如自己维护一个 .is-active 类）
+ * 会在两处记录同一件事，迟早分叉 —— 那是本项目多次吃过亏的地方。
+ */
+
+/* 选项行右侧的展开指示 */
+.nb-src-chevron {
+  flex: 0 0 auto;
+  margin-left: var(--nb-sp-2);
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-16);
+  line-height: 1;
+  /* 动效只动 transform（走查第 6 条：不许触发 layout） */
+  transition: transform var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+/* 展开态：箭头转 90° 朝下 */
+.nb-src-item[aria-expanded='true'] .nb-src-chevron {
+  color: var(--nb-nebula-mid);
+  transform: rotate(90deg);
+}
+
+/*
+ * 选中态（当前正在用的源）—— 这是"选中反馈"的主体。
+ *
+ * ★ 2026-11-05：**去掉了左侧 3px 竖条**（原来是 `box-shadow: inset 3px 0 0 0`）。
+ *
+ * 用户对抽屉的两次反馈都指向同一件事："左边只有一个竖条太丑"、
+ * "要表示层级就全部框选"。竖条是个"半截的框"—— 它只贴在左边，
+ * 展开之后上下左右都不连续，看起来像没画完。
+ *
+ * 现在只用**边框色 + 底色**表达选中（与抽屉同一套语言），
+ * 判据 `test/mobile-ui-fixes.test.mjs` 只要求存在 `[aria-pressed='true']`
+ * 这条规则、且视觉有变化 —— 换掉竖条不违反它。
+ */
+.nb-src-item[aria-pressed='true'] {
+  border-color: var(--nb-nebula-a);
+  background: var(--nb-surface-3);
+}
+
+/*
+ * 展开态：变成"抽屉的上面那一半"（2026-11-05）。
+ *
+ * ## 改之前是什么样
+ *
+ * 行有紫边框 + 下圆角 16px（看起来是一张**完整的卡**），
+ * 而紧跟其后的 `.nb-acc-panel` 只有一圈极淡的白边、左边一条紫色竖条。
+ * 真机截图里就是「上半截一个亮框，下面一坨带一条左边线」——
+ * 与人设页抽屉第一版**一模一样**的那个缺陷，只是这页当时没一起改。
+ *
+ * ## 现在的规则（与人设 / 世界书抽屉同一套）
+ *
+ * ```text
+ *   ┏━━━━━━━━━━━━━━━┓   --nb-card-open-border（行与面板共用一个 token）
+ *   ┃ API 连接    ⌄  ┃
+ *   ┣━━━━━━━━━━━━━━━┫   由面板的 border-top:0 让出，不叠成 2px
+ *   ┃ （配置内容）    ┃   同一圈边框的延续
+ *   ┗━━━━━━━━━━━━━━━┛   下圆角 16
+ * ```
+ *
+ * 关键三条：下圆角归零、下外边距归零、底色换成与面板相同的一档。
+ * 少任何一条都会露出"两个块"的接缝。
+ *
+ * ## 为什么用 `[aria-expanded]` 而不是再加一个 `data-open`
+ *
+ * `aria-expanded` **已经**被两个产出方（`shell.ts` 的 `renderAccordion`、
+ * `api-page.ts` 的源列表）正确维护，而且它一定与实际展开状态同源。
+ * 再造一个 `data-open` 就是"同一状态两个属性"，迟早分叉 ——
+ * 这类分叉在本项目出现过不止一次（见 §106.14 的 `fieldRow` 两份实现）。
+ */
+.nb-src-item[aria-expanded='true'] {
+  border-color: var(--nb-card-open-border);
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  margin-bottom: 0;
+  /*
+   * 底色取 `--nb-surface-2`（与面板相同），**不是** surface-3。
+   *
+   * 面板里还嵌着一层列表（六个接口源），那些行是 surface-1（最深）。
+   * 如果卡片用 surface-1，内层行就与卡片同色 ⇒ 嵌套的层次感没了；
+   * 用 surface-2 则保持 "表层行(surface-1) < 卡片(surface-2)" 的方向，
+   * 且行与面板仍然完全同色。
+   */
+  background: var(--nb-surface-2);
+}
+
+/*
+ * 展开区（配置面板）。
+ *
+ * 视觉上要像"从选项行里长出来"：去掉上圆角、上边框、上外边距，
+ * 用与行**完全相同**的边框色与底色，拼成一张卡。
+ *
+ * ★ 2026-11-05 去掉了 `box-shadow: inset 3px 0 0 0 var(--nb-nebula-a)`
+ * （左侧紫色竖条）—— 理由见上面选中态那条注释。
+ */
+.nb-acc-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-sp-3);
+  margin: 0 0 var(--nb-sp-3);
+  padding: var(--nb-sp-3) var(--nb-sp-4) var(--nb-sp-4);
+  border: 1px solid var(--nb-glass-border);
+  /*
+   * ★★★ `border-top: 0` 必须写在 `border-color` **之前**。
+   *
+   * 它是简写，会展开成 `border-top-width: 0` + `border-top-style: none`
+   * + **`border-top-color: currentColor`**。写在后面就把颜色重置成文字色
+   * （近白）。宽度是 0 所以肉眼看不见，但只要有人把它改成 1px，
+   * 顶边立刻冒出一道白线 —— 这种"暂时看不见的错"最难查。
+   *
+   * 真机上量到过：面板 `borderTopColor = rgb(244, 242, 251)`（= --nb-text-1），
+   * 而其余三边是紫色。与人设抽屉踩的是同一个坑（§106.12）。
+   */
+  border-top: 0;
+  border-color: var(--nb-glass-border);
+  border-radius: 0 0 var(--nb-radius-lg) var(--nb-radius-lg);
+  background: var(--nb-surface-2);
+}
+
+/*
+ * ★★★ 与展开行拼成完整一圈（2026-11-05）。
+ *
+ * 用相邻兄弟选择器 `+` 而不是给面板单独写一遍色值：
+ * 两处各写一份，改一处忘另一处，"框只框了半截"就会回来。
+ * 这个写法同时保证"行亮 ⇒ 面板必然也亮"。
+ *
+ * ★ 顺序同样不能反：`border-top: 0` 在前、`border-color` 在后。
+ */
+.nb-src-item[aria-expanded='true'] + .nb-acc-panel {
+  border-top: 0;
+  border-color: var(--nb-card-open-border);
+  border-top-color: var(--nb-card-open-border);
+  background: var(--nb-surface-2);
+}
+
+/* hidden 必须显式兜住：类选择器的 display 会盖过浏览器默认的 [hidden] */
+.nb-acc-panel[hidden] {
+  display: none;
+}
+
+/*
+ * 展开入场动画（2026-10-31 第三批，用户要求"展开/收起动画走夜航动效 token"）。
+ *
+ * ## 为什么是 opacity + translateY，不是高度过渡
+ *
+ * 收起时面板内容被 `replaceChildren()` 清空（保证 `model-input` 这类字段
+ * 全局唯一，见 `shell.ts` 的 `renderAccordion` 注释）—— 内容没了，
+ * 高度就是 0，**高度过渡没有可补间的起点**。
+ *
+ * 所以做"展开淡入 + 轻微下移归位"，收起保持瞬时。
+ * 这也符合本项目一贯的 transform/opacity-only 动效纪律
+ * （宽度/高度动画会触发布局，在低端安卓上掉帧）。
+ *
+ * ## 为什么用属性选择器而不是一次性 class
+ *
+ * `data-enter="1"` 由 `renderAccordion` 每次展开时设置。属性值不变时
+ * 浏览器不重播动画，但每次展开都 `replaceChildren()` 重建了子节点 ——
+ * 子节点重新挂载会重放 `animation`。正好得到"每次展开都播一次"，
+ * 不需要 JS 去 `classList.remove` 再 `add`（那个写法还要 `forceReflow`）。
+ *
+ * `--nb-dur-base` = 200ms、`--nb-ease-out` = 弹入感；
+ * `prefers-reduced-motion` 下这两个 token 被改成 1ms，这里不用另写分支。
+ */
+@keyframes nb-acc-enter {
+  from {
+    opacity: 0;
+    transform: translateY(calc(var(--nb-sp-2) * -1));
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.nb-acc-panel[data-enter='1'] {
+  animation: nb-acc-enter var(--nb-dur-base) var(--nb-ease-out);
+}
+
+/* 一个设置区块（标题行 + 可折叠面板）。「我的」页的两个一级收纳项都用它 */
+.nb-section {
+  margin-top: var(--nb-sp-4);
+}
+
+/*
+ * 「我的」页的一级收纳项：两个条目之间只留间距，不要各自再撑一层留白。
+ *
+ * 第一个条目不加上边距（它紧跟顶栏，`nb-scroll` 自己的 padding 已经够），
+ * 否则会出现"顶栏下面先是 4 个间距单位"的怪异空隙。
+ */
+.nb-scroll > .nb-section:first-child {
+  margin-top: 0;
+}
+
+
+
+.nb-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--nb-sp-1);
+  min-height: var(--nb-hit-min);
+  padding: 0 var(--nb-sp-4);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-surface-2);
+  color: var(--nb-text-1);
+  font-family: inherit;
+  font-size: var(--nb-fs-14);
+  cursor: pointer;
+  transition: background var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+.nb-btn:active {
+  background: var(--nb-surface-3);
+}
+
+.nb-btn--primary {
+  border-color: var(--nb-nebula-a);
+  color: var(--nb-nebula-b);
+}
+
+.nb-btn--danger {
+  border-color: var(--nb-danger);
+  color: var(--nb-danger);
+}
+
+.nb-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/*
+ * ═══════════════════════════════════════════════════════════
+   按钮的三态反馈（2026-11-06，仓库三级页面用）
+   ═══════════════════════════════════════════════════════════
+
+   用户报的第一个问题：
+
+   > 点完下载没有反馈，用户无法得知具体情况
+
+   原来只把按钮 `disabled`，文字不变 —— 用户看不出是在下载、卡住了、
+   还是已经完成。现在按钮自己承载结果：
+
+   ```text
+     data-state="busy"    下载中…     （禁用，防连点）
+     data-state="done"    已下载 ✓    （绿色 800ms 后复位）
+     data-state="failed"  重试        （红色，留在原地可点）
+   ```
+
+   ★ 为什么不只靠 toast：toast 会消失、可能被别的东西盖住，
+     而按钮**就在用户手指下面**。两条一起用，不互相替代。
+   */
+
+.nb-btn[data-state='done'] {
+  border-color: rgba(52, 211, 153, 0.45);
+  background: rgba(52, 211, 153, 0.12);
+  color: var(--nb-ok);
+}
+
+.nb-btn[data-state='failed'] {
+  border-color: rgba(248, 113, 113, 0.5);
+  background: rgba(248, 113, 113, 0.12);
+  color: var(--nb-danger);
+}
+
+/*
+ * 危险操作按钮（"从仓库删除这张卡"）。
+ *
+ * ★ 只染边框与文字，不染整块底色 —— 设计册 §1.3 的规矩：
+ *   语义色只用于图标与短文本，大块高饱和在暗色下晃眼。
+ */
+.nb-btn-danger {
+  border-color: rgba(248, 113, 113, 0.42);
+  color: var(--nb-danger);
+}
+
+/* 提示条：语义色只用于图标与短文本 */
+.nb-note {
+  margin: var(--nb-sp-2) var(--nb-sp-4);
+  padding: var(--nb-sp-3);
+  border-radius: var(--nb-radius-md);
+  border: 1px solid var(--nb-glass-border);
+  background: var(--nb-surface-1);
+  font-size: var(--nb-fs-14);
+  line-height: var(--nb-lh-body);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   八、语音接线（T15.6）—— 录音态、波形、待确认条内部
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 麦克风：未配置时置灰，但仍可点（点击去配置页）。
+ *
+ * 注意是 `data-enabled` 而不是 `disabled` —— 用 disabled 的话点击事件
+ * 根本不会触发，而需求要求「点击弹引导去配置页」，那不是静默无响应。
+ */
+.nb-mic-slot[data-enabled='false'] {
+  color: var(--nb-text-3);
+}
+
+.nb-mic-slot[data-recording='true'] {
+  border-color: var(--nb-nebula-a);
+  background: var(--nb-surface-3);
+}
+
+/* 录音中麦克风里的小波形（5 根，塞在 48×48 里） */
+/*
+ * 这里原本还有一处 `.nb-mic-slot`（只加 `gap: 2px`）与 `.nb-mic-bar` 的
+ * 定义，是"录音波形画在 48×48 小图标里"那一版的残留。
+ *
+ * 2026-10-30 改成两级形态后，波形画在 **80×80 的大圆按钮**上
+ * （`.nb-bigmic-bar`），小图标永远只显示 🎤 —— 这两条成了死代码。
+ *
+ * 删的原因不是为了整洁：重复的 `.nb-mic-slot` 会把上面那处的
+ * `width/height/flex` 之外再补一条 `gap`，看起来无害，但**下次有人
+ * 想改麦克风的布局时，改上面那处不会生效**（他多半不会往下翻 400 行）。
+ * 走查 12 现在会拦这种情况。
+ */
+
+/* 待确认条里的可编辑文本 */
+.nb-voice-draft {
+  flex: 1;
+  min-width: 0;
+  /*
+   * ★ `box-sizing: border-box` + `width: 100%` 两条都不能少。
+   *
+   * textarea 默认 `content-box`，`width` 只算内容区 —— 左右 padding（12px×2）
+   * 与边框（1px×2）会**加在宽度之外**。2026-10-30 实测：
+   * 容器宽 226px，textarea 的 `right` 跑到 370px —— **超出 360 的视口**，
+   * 截图里文字直接被右边界切掉。
+   *
+   * 之所以所有 DOM 断言都没红：`hidden` 状态是对的、文字内容也是对的，
+   * 溢出的只是几何。只有量 `getBoundingClientRect()` 或看图才发现。
+   * 这也正是走查 11 管不到的情形（它只管写了 max-width 的块）。
+   */
+  box-sizing: border-box;
+  width: 100%;
+  max-height: 88px;
+  padding: var(--nb-sp-2) var(--nb-sp-3);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-surface-2);
+  color: var(--nb-text-1);
+  font-family: inherit;
+  font-size: var(--nb-fs-16);
+  line-height: var(--nb-lh-body);
+  resize: none;
+  outline: none;
+}
+
+.nb-voice-draft:focus {
+  border-color: var(--nb-nebula-a);
+}
+
+/* 待确认条显示时是 flex（`.nb-voice-confirm-slot` 的 display:none 由 hidden 属性接管） */
+.nb-voice-confirm-slot[hidden] {
+  display: none;
+}
+
+.nb-voice-confirm-slot {
+  display: flex;
+  align-items: center;
+}
+
+
+/* ═══════════════════════════════════════════════════════════
+   九、设置页表单（T15.6 语音输入设置）
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-sp-2);
+  margin-bottom: var(--nb-sp-4);
+}
+
+.nb-field--inline {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--nb-sp-3);
+}
+
+.nb-field-label {
+  font-size: var(--nb-fs-14);
+  color: var(--nb-text-2);
+  line-height: var(--nb-lh-control);
+}
+
+.nb-field-hint {
+  font-size: var(--nb-fs-12);
+  color: var(--nb-text-3);
+  line-height: var(--nb-lh-body);
+}
+
+/*
+ * 「暂不支持」的说明（2026-11-03）。
+ *
+ * 与普通 hint 用**同一位置**、不同的观感：普通 hint 是灰色的"怎么用"，
+ * 这条是琥珀色的"为什么用不了"。不用红色 —— 这不是错误，
+ * 是尚未实现的功能，红色会让用户以为出了故障。
+ */
+.nb-field-hint--unsupported {
+  color: var(--nb-warn);
+  /*
+   * 不加左侧竖线（2026-11-04 用户要求）。
+   *
+   * 原来这里有一条 `border-left`，本意是"让限制说明一眼可辨"。
+   * 但真机截图里它看起来像**折叠面板的层级指示线** ——
+   * 用户会以为这一条还能再展开，而它只是一句说明。
+   *
+   * 靠颜色（琥珀）+ 省略号位置已经足够区分，不需要额外的装饰。
+   */
+}
+
+/* 禁用态的输入框：明显暗淡，避免用户去点一个点不动的控件 */
+.nb-field[data-unsupported='true'] .nb-input {
+  opacity: 0.45;
+}
+
+/*
+ * 字段级校验错误（2026-10-31 第三批问题二）。
+ *
+ * 之前只有 HTML 里挂了 `class="nb-field-error"` 与 `data-role="settings-error"`，
+ * **CSS 里一条规则都没有** —— 于是校验失败时文字以默认黑色出现在深色底上，
+ * 几乎看不见，而 `[hidden]` 也没被兜住（`display` 由类选择器控制时会盖过
+ * 浏览器默认的 `[hidden]`，这个坑 `nb-acc-panel[hidden]` 那条注释里记过）。
+ *
+ * 所以这里三件事都要写：显隐兜住 + 语义色 + 与提示行区分开（12px 太小，
+ * 错误要能一眼看到）。
+ */
+.nb-field-error {
+  flex: 0 0 100%;
+  font-size: var(--nb-fs-12);
+  line-height: var(--nb-lh-body);
+  color: var(--nb-danger);
+}
+
+.nb-field-error[hidden] {
+  display: none;
+}
+
+/* 保存进行中：视觉上弱化，但仍可点（`ElLike` 删不掉 disabled，见 chat-settings.ts） */
+.nb-btn[data-busy='true'] {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+/* 开关型字段：label 一行 + 开关靠右 */
+.nb-field--switch {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--nb-sp-2);
+}
+
+.nb-field--switch .nb-field-label {
+  flex: 1;
+  font-size: var(--nb-fs-16);
+  color: var(--nb-text-1);
+}
+
+.nb-field--switch .nb-field-hint {
+  flex: 0 0 100%;
+}
+
+/*
+ * 开关本体。
+ *
+ * 用 `appearance: none` 自己画 —— 原生 checkbox 在 Android WebView 里
+ * 尺寸偏小（约 20px），达不到 44px 热区（走查第 2 条）。
+ * 这里给 48×28 的可视尺寸 + `min-height: var(--nb-hit-min)` 的热区。
+ */
+.nb-switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 48px;
+  height: 28px;
+  min-height: 28px;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-surface-2);
+  cursor: pointer;
+  transition: background var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+.nb-switch::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-text-3);
+  transition: transform var(--nb-dur-base) var(--nb-ease-spring);
+}
+
+.nb-switch:checked {
+  background: var(--nb-surface-3);
+  border-color: var(--nb-nebula-a);
+}
+
+.nb-switch:checked::after {
+  background: var(--nb-nebula-b);
+  transform: translateX(20px);
+}
+
+/*
+ * select：与 input 同观感
+ *
+ * ★ 2026-11-03：这一套**已经不再使用**了。
+ *
+ * 原来的做法是保留原生 `<select>` 再用两条 `linear-gradient` 画一个假箭头 ——
+ * 元素本身确实好看，但**点开后的系统弹窗改不了**，而那个弹窗在真机上是
+ * 白底白字（见 `select-sheet.ts` 的文件头）。所以整块换成了自己画的
+ * 自己画的下拉 `.nb-select-trigger` / `.nb-select-popover`（在本文件末尾）。
+ *
+ * 这里保留一条给"未来某个地方还需要原生 select"的说明，但不放进任何元素 —— 
+ * 留着一个不再被使用的选择器会让走查判据（同一选择器只许定义一次）失效，
+ * 所以直接删掉，需要时从 git 历史里取。
+ */
+
+/* 模型列表容器 */
+.nb-model-list {
+  max-height: 200px;
+  overflow-y: auto;
+  margin-bottom: var(--nb-sp-4);
+}
+
+/* 页面底部动作条 */
+.nb-page-foot {
+  display: flex;
+  gap: var(--nb-sp-3);
+  padding: var(--nb-sp-3) var(--nb-sp-4);
+  padding-bottom: calc(var(--nb-sp-3) + env(safe-area-inset-bottom, 0px));
+}
+
+.nb-page-foot .nb-btn {
+  flex: 1;
+}
+
+/*
+ * 「我的」页的滚动容器（2026-10-31 加）。
+ *
+ * ## 为什么必须有它
+ *
+ * `.nb-page` 只负责把子元素按列排开，**没有 `overflow-y`**：它是给
+ * "一屏放得下"的页面用的（聊天页的滚动由 `.nb-msglist` 自己在内部承担）。
+ * 而「我的」页装的是接口来源六项 + 每项的展开面板（地址、模型名、key
+ * 各带输入框与说明）+ 语音区块，高度远超一屏。没有这个容器时实测
+ * `.nb-page` 的 `scrollHeight === clientHeight === 743`——**溢出但不产生滚动**，
+ * 表现为展开项的说明被保存按钮压住截断、语音区块完全看不到。
+ *
+ * ## 三个属性各自的理由
+ *
+ *   · `flex: 1` + `min-height: 0` —— 在 `.nb-page` 的列布局里吃掉剩余高度，
+ *     且允许它比内容矮（不写 `min-height: 0` 的话 flex 子项最小高度是 `auto`，
+ *     内容会把它顶开、整页跟着长高，滚动条永远不出现）；
+ *   · `overflow-y: auto` —— 内容够长才出滚动条，短页面不显示滚动条；
+ *   · `-webkit-overflow-scrolling: touch` —— iOS 上的惯性滚动（Android 默认就有）。
+ *
+ * 底部额外留 `safe-area-inset-bottom`：Home 指示条会压住最后一项。
+ */
+.nb-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  /*
+   * ★★★ 上下都要留内边距（2026-11-06 补 `padding-top`）。
+   *
+   * ## 原来只有 bottom，顶部是 0
+   *
+   * 用户截图圈出「卡片」标题下面那条：标题栏底边和第一张卡片**完全贴住**。
+   * 真机实测：
+   *
+   * ```text
+   *   条目之间            16px
+   *   底部内边距          16px
+   *   顶栏 → 第一个条目    0px   ← 只有这里是 0
+   * ```
+   *
+   * 这就是"太挤"的来源。而且**四个页面全是 0**（仓库/我的/卡片都测了），
+   * 不是卡片页独有 —— 只是卡片页第一个条目是**实心大卡片**，
+   * 而顶栏有 `border-bottom`，两者一贴，卡片像被标题栏压着，最显眼。
+   * 仓库页和「我的」页第一个是小号分组标题，视觉冲突没那么刺眼，
+   * 所以一直没被发现。
+   *
+   * ## 为什么用 16px
+   *
+   * 与条目之间的 16px 一致、与底部内边距对称。间距体系只有一个值，
+   * 不用再引入新的档位。
+   *
+   * ★ 安全区不需要额外加：`.nb-page-layer` 的 `top` 已经让出了状态栏
+   *   （memory §121），这里只是内容区的呼吸空间。
+   */
+  padding-top: var(--nb-sp-4);
+  padding-bottom: calc(var(--nb-sp-4) + env(safe-area-inset-bottom, 0px));
+}
+
+/* 状态提示的语义色只作用于文字（设计册 §1.3：不做大面积填充） */
+.nb-note[data-kind='ok'] {
+  color: var(--nb-ok);
+}
+
+.nb-note[data-kind='warn'] {
+  color: var(--nb-warn);
+}
+
+.nb-note[data-kind='danger'] {
+  color: var(--nb-danger);
+}
+
+.nb-note[data-kind='info'] {
+  color: var(--nb-text-2);
+}
+
+/* 区块标题 */
+.nb-section-title {
+  margin: var(--nb-sp-5) 0 var(--nb-sp-2);
+  font-size: var(--nb-fs-16);
+  font-weight: 600;
+  line-height: var(--nb-lh-title);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   十、语音态：输入框消失、只留居中大圆按钮（T15.6 形态调整）
+   ═══════════════════════════════════════════════════════════
+   用户 2026-10-30 给的形态参考是 QQ 的"按住说话"，但**明确要求
+   不要整屏替换**：「整个范围不要像 QQ 那样不要整个界面只有语音按钮，
+   这样就会很空」。所以消息列表一直可见，只换输入区这一块。
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 语音态：打字三件套让位。
+ *
+ * 用的是 `composer[data-voice='true']` 后代选择器，而不是给每个元素
+ * 单独加 `hidden` —— 后者要 JS 记住"谁属于哪一态"，加一个元素就漏一次。
+ */
+.nb-composer[data-voice='true'] .nb-input,
+.nb-composer[data-voice='true'] .nb-send,
+.nb-composer[data-voice='true'] .nb-mic-slot {
+  display: none;
+}
+
+/*
+ * 语音舞台：默认隐藏，语音态才占位。
+ *
+ * 高度刻意压到 ~150px 而不是铺满剩余空间 ——
+ * 铺满就是用户说的"很空"。这里只占它需要的那点。
+ */
+.nb-voice-stage {
+  display: none;
+}
+
+.nb-voice-stage[data-voice='voice'] {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--nb-sp-2);
+  width: 100%;
+  padding: var(--nb-sp-3) 0 var(--nb-sp-2);
+  /*
+   * 手指从大圆往上滑（取消）会滑进这块区域。不设 `none` 的话，
+   * 纵向位移会被浏览器当成页面滚动 —— 上滑取消同样做不到。
+   */
+  touch-action: none;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   顶部「波形 · 计时 · 波形」一行（2026-11-02 用户给的布局图）
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 布局：`[左波形] 0:01 [右波形]`，三段在一条横线上水平居中。
+ *
+ * 计时放正中而不是左侧，是因为它的宽度会变（`0:01` → `1:02` 一样宽，
+ * 但 `10:00` 更宽）。若放左边，一分钟之后波形会被挤走，
+ * 看起来像界面在抖。
+ */
+.nb-voice-waveclock {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--nb-sp-2);
+  width: 100%;
+  min-height: 26px;
+}
+
+.nb-voice-wave {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  /* 两段各占一半可用宽度，但都设上限：屏幕宽时不该无限拉长 */
+  flex: 0 1 auto;
+  max-width: 38%;
+}
+
+/*
+ * 波形柱 —— **两处共用**：待确认条里的静态缩略图、语音态顶部的两段实时波形。
+ *
+ * ## 为什么合并成一条（走查 12）
+ *
+ * 原来这里有两份 `.nb-voice-wave-bar`：一份给草稿卡的静态缩略图、
+ * 一份给顶部实时波形。后一份会**静默覆盖**前一份的
+ * `transform` / `background` —— 于是草稿卡的缩略图被换成了实时波形的
+ * 低振幅下限（0.18），短录音下又变成一条虚线。
+ *
+ * 走查 12 就是拦这个的：同一个选择器出现两次，改上面那处不生效。
+ *
+ * ## 关键属性
+ *
+ * - 定高 + `scaleY`（不写 height）：走查第 6 条，不许触发 layout
+ * - 振幅唯一输入是 `--nb-wave-level`（由 `barHeights()` 算出，纯逻辑有测试）
+ * - 底色用 `--nb-text-3`：token 里**只有 text-1/2/3**，写 `--nb-text-4`
+ *   不报错但声明静默失效 ⇒ 柱子全透明（真机"看不见波形"，
+ *   而 DOM 里 32 根柱子都在、有宽高 —— 只有 `backgroundColor` 能揭穿）
+ * - 下限 0.34：短录音振幅接近静音，下限太低会缩成虚线
+ */
+.nb-voice-wave-bar {
+  display: block;
+  flex: 0 0 auto;
+  width: 3px;
+  height: 20px;
+  border-radius: var(--nb-radius-pill);
+  background: var(--nb-text-3);
+  transform: scaleY(calc(0.34 + var(--nb-wave-level, 0) * 0.66));
+  transform-origin: center;
+  transition: transform var(--nb-dur-micro) linear;
+}
+
+/*
+ * 未录音：所有柱子压到同一档，看起来是一条静止的音量条 ——
+ * 图片里未开始录音时两侧也确实是一条细密的静态刻度。
+ */
+.nb-voice-waveclock[data-recording='false'] .nb-voice-wave-bar {
+  transform: scaleY(0.18);
+  /* 空闲时用更亮的色阶（草稿卡缩略图仍用默认的 text-3） */
+  background: var(--nb-text-2);
+}
+
+/* 录音中：柱子跟着振幅跳，并换成主色渐变（"正在收声"） */
+.nb-voice-waveclock[data-recording='true'] .nb-voice-wave-bar {
+  background: var(--nb-grad-primary);
+}
+
+/* 取消态：整条波形转危险色，与"松手就放弃"同步 */
+.nb-voice-waveclock[data-cancelling='true'] .nb-voice-wave-bar {
+  background: var(--nb-danger);
+}
+
+/*
+ * 计时：等宽数字。
+ *
+ * `font-variant-numeric: tabular-nums` 让 `1:07` 与 `1:11` 占用同样宽度 ——
+ * 否则每一秒数字宽度变化，计时看起来会左右轻微抖动。
+ */
+.nb-voice-clock {
+  flex: 0 0 auto;
+  font-size: var(--nb-fs-14);
+  line-height: var(--nb-lh-control);
+  color: var(--nb-text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.nb-voice-clock[data-recording='true'] {
+  color: var(--nb-text-1);
+}
+
+/* 提示：告诉用户"按住"以及"上滑能取消"（后者不写没人会试） */
+.nb-voice-stage-hint {
+  font-size: var(--nb-fs-12);
+  color: var(--nb-text-3);
+  line-height: var(--nb-lh-control);
+}
+
+/*
+ * 大圆按钮 —— 真正"按住说话"的元素（图片正中那个）。
+ *
+ * ## 2026-11-02 尺寸与配色改成图片的样子
+ *
+ * | | 原来 | 现在 | 为什么 |
+ * |---|---|---|---|
+ * | 直径 | 80px | 88px | 左右两个档位圆 64px，主按钮要明显更大才分得出主次 |
+ * | 底色 | `surface-2`（暗） | **主色实心** | 图片里是亮蓝色实心圆，一眼就知道"按这里" |
+ * | 图标 | emoji 🎤 | 白色线稿 SVG | emoji 在每个 Android 版本上都不一个样 |
+ * | 外圈 | 无 | 一圈半透明光晕 | 图片里有；手指挡着时靠外圈也能看出"按到了" |
+ *
+ * ## 为什么底色敢用主色实心（原来按设计册禁止铺渐变）
+ *
+ * 设计册那条约束是"**按钮底色不许用渐变**"（只允许主行动按钮的文字走渐变）。
+ * 这里是**纯色**主色 + 一圈更浅的光晕，没有渐变，符合原意。
+ * 而语音态里唯一的动作就是"按住这个圆"，它必须有最强的主次对比。
+ */
+.nb-voice-bigmic {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 88px;
+  height: 88px;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 50%;
+  /*
+   * 光晕：外扩一圈半透明，不用 box-shadow 的模糊（走查第 6 条：不动 layout）
+   *
+   * ★ 半透明写 `rgba()` 字面量，不用 `color-mix()` ——
+   * 本机 WebView 是 Chrome 87，不支持 color-mix，整条 box-shadow 会在
+   * 计算值阶段失效（真机上这个光晕**一直没画出来**，只是没人报）。
+   */
+  box-shadow: 0 0 0 10px rgba(139, 92, 246, 0.18);
+  background: var(--nb-nebula-a);
+  /*
+   * 图标用 `--nb-text-1`（近白 #f4f2fb），不写裸 `#fff`（走查第 1 条）。
+   * 不用 `--nb-text-on-accent` —— 那个是给**浅色**强调底配的深字（#0a0810），
+   * 而这里的底是星云紫，深字看不清。
+   */
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-24);
+  cursor: pointer;
+  /* 长按不能触发选中文字或系统长按菜单 */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  /* 同理：这里的一切滑动（左右切档、上下取消）都归我们，不许浏览器接管 */
+  touch-action: none;
+  transition:
+    box-shadow var(--nb-dur-micro) var(--nb-ease-out),
+    background var(--nb-dur-micro) var(--nb-ease-out),
+    transform var(--nb-dur-micro) var(--nb-ease-spring);
+}
+
+/* 白色线稿麦克风（`makeMicIcon()` 造的 SVG）。颜色交给 currentColor */
+/*
+ * 麦克风线稿（两处共用：输入框入口 22px、语音面板大按钮 30px）。
+ *
+ * 类名原来是 `.nb-bigmic-icon` —— 叫 bigmic 会让人以为只有大按钮用它，
+ * 下一个要加图标的地方又会自己画一份。改成中性名。
+ */
+.nb-mic-icon {
+  display: block;
+  pointer-events: none;
+}
+
+/*
+ * 输入框入口那个：22px 在 48px 的圆按钮里偏小偏上时，
+ * 用 flex 居中已经能对齐（`.nb-mic-slot` 是 inline-flex + center），
+ * 这里不需要额外定位。
+ *
+ * 但它**不能**用 `.nb-mic-icon` 的 `pointer-events: none` 之外的东西 ——
+ * 按钮的点击区是 48×48 的 button 本身，图标只是内容。
+ */
+
+.nb-voice-bigmic:active {
+  /* 只动 transform —— 走查第 6 条：不许触发 layout */
+  transform: scale(0.96);
+}
+
+/*
+ * 录音中：光晕变亮变厚、圆本身轻微放大。
+ *
+ * 不再改 border-color —— 现在底色就是主色，"边框变色"看不出来了。
+ * 用**光晕**表达"正在录"：手指按在圆上，只有圆外那圈还能看见。
+ */
+.nb-voice-bigmic[data-recording='true'] {
+  box-shadow: 0 0 0 14px rgba(139, 92, 246, 0.3);
+  transform: scale(1.04);
+}
+
+/*
+ * ★ 下滑到"松手取消"的阈值内：按钮变暗、缩一圈，边框转危险色。
+ *
+ * 为什么必须在按钮上表达，而不只改顶部那行提示文字：
+ * 手指按住按钮时视线落在按钮上，提示文字在 60px 之外，
+ * 用户很容易完全没注意到 —— 结果他以为在录音、其实已经要取消了。
+ *
+ * 用 `--nb-danger` 而不是纯红：设计册只允许 token 里的语义色。
+ * 同时把 transform 从 1.04 收到 0.92 —— 形体上的"退缩"比颜色更快被感知。
+ */
+.nb-voice-bigmic[data-cancelling='true'] {
+  box-shadow: 0 0 0 8px rgba(248, 113, 113, 0.24);
+  background: var(--nb-danger);
+  transform: scale(0.86);
+  opacity: 0.82;
+}
+
+/* 三个状态的提示文字 */
+.nb-voice-stage-hint[data-state='cancel'] {
+  color: var(--nb-danger);
+}
+
+.nb-voice-stage-hint[data-state='recording'] {
+  color: var(--nb-text-2);
+}
+
+/* 切回键盘：没有它就进得去出不来，所以给足热区 */
+.nb-voice-stage-exit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--nb-sp-1);
+  min-height: var(--nb-hit-min);
+  padding: 0 var(--nb-sp-3);
+  border: 0;
+  border-radius: var(--nb-radius-pill);
+  background: none;
+  color: var(--nb-text-2);
+  font-family: inherit;
+  font-size: var(--nb-fs-14);
+  line-height: var(--nb-lh-control);
+  cursor: pointer;
+}
+
+.nb-voice-stage-exit:active {
+  background: var(--nb-surface-3);
+}
+
+/*
+ * 草稿编辑态 textarea 的样式只有**一处**：见上面「挂载点⑤」那一节的
+ * `.nb-voice-draft`。
+ *
+ * 这里原本还有一份重复定义（`display: block; width: 100%; min-width: 200px;
+ * max-height: 120px; ...`），是设计改版前"编辑框长在输入区"时的残留。
+ * 它排在后面，静默覆盖了新版的几条属性：
+ *
+ *   · `display: block` 盖掉 `flex: 1` —— 编辑框不再跟随卡片宽度；
+ *   · `min-width: 200px` 盖掉 `min-width: 0` —— 卡片被压窄时编辑框不肯缩，
+ *     一旦可用宽度不足 200px + padding 就会溢出（本次截图里是 right 370px
+ *     越过 360 视口，文字被右边界切掉）；
+ *   · `max-height: 120px` 盖掉 `88px` —— 编辑框比草稿卡其他部分高出一截；
+ *   · `border-color` 固定成 `--nb-nebula-a`，与 `:focus` 态那条冲突，
+ *     导致"聚焦了但看不出聚焦"。
+ *
+ * ★ 注意归因：**不是** `box-sizing` 被顶掉 —— 那份旧定义里根本没写
+ * `box-sizing`，而未声明的属性不会被覆盖，`border-box` 一直生效。
+ * 我一开始就是这么误判的，还据此"验证"了一遍（把旧块加回去，溢出
+ * 并没有复现，判据也没红）。技术注释写错归因比不写更糟：
+ * 后来的人会照着它去查一个不存在的机制。
+ *
+ * 真正的教训只有一句：**改 CSS 属性没效果时，先 grep 这个选择器出现了几次。**
+ */
+.nb-voice-draft[hidden] {
+  display: none;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   开屏加载（v0.1.7 / 第九批）
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 为什么要有开屏
+ *
+ * 冷启动时内置 ST 引擎要 7–57 秒才起来。那段时间界面上是**空聊天页** ——
+ * 用户看到「未选择聊天 / 还没有对话」，以为记录丢了（真实反馈）。
+ *
+ * 全部用 `--nb-*` 变量：写死色值换主题时会变成一块突兀的色块。
+ */
+.nb-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--nb-sp-5);
+  padding: var(--nb-sp-8);
+  /* 与 .nb-app 同一块底色：切换时不会有"从另一块底上浮出来"的割裂感 */
+  background: var(--nb-void);
+  background-image: var(--nb-grad-glow);
+  text-align: center;
+  /*
+   * 淡出由 JS 打 `data-leaving` 触发。用 opacity 而不是 display：
+   * display 不可过渡，会一帧就消失。
+   */
+  transition: opacity 240ms var(--nb-ease-out);
+}
+
+.nb-splash[data-leaving='true'] {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/*
+ * 三颗呼吸光点
+ *
+ * 只做 opacity/transform 动画（合成层，不触发重排）。
+ * 不用旋转 spinner：进度条已经在动，两个互不同步的运动源看起来像各转各的。
+ */
+.nb-splash-orbit {
+  display: flex;
+  gap: var(--nb-sp-3);
+}
+
+.nb-splash-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--nb-grad-primary);
+  animation: nb-splash-breathe 1600ms var(--nb-ease-in, ease-in-out) infinite;
+}
+
+.nb-splash-dot:nth-child(2) {
+  animation-delay: 220ms;
+}
+
+.nb-splash-dot:nth-child(3) {
+  animation-delay: 440ms;
+}
+
+@keyframes nb-splash-breathe {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: scale(0.82);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.nb-splash-title {
+  margin: 0;
+  font-size: var(--nb-fs-24);
+  line-height: var(--nb-lh-title);
+  color: var(--nb-text-1);
+  letter-spacing: 0.02em;
+}
+
+.nb-splash-track {
+  width: min(260px, 72vw);
+  height: 4px;
+  border-radius: 999px;
+  background: var(--nb-surface-2);
+  overflow: hidden;
+}
+
+.nb-splash-fill {
+  height: 100%;
+  /* 撑满轨道，靠 scaleX 表达进度 —— 见下面的 transition 注释 */
+  width: 100%;
+  border-radius: 999px;
+  background: var(--nb-grad-primary);
+  /*
+   * ★ 用 `transform: scaleX()` 而不是 `width`。
+   *
+   * `transition: width` 会**每帧触发布局**（layout）—— 而这条走查
+   * （`nebula-walkthrough.test.mjs` 走查 6）明确禁止 width/height/
+   * margin/padding/top/left 参与过渡。transform 走合成层，不重排。
+   *
+   * 所以进度由 JS 设 `transform: scaleX(0..1)`，`width` 恒为 100%。
+   * 视觉上等价，代价是"百分比"这个语义搬到 transform 上了 ——
+   * 这也是 aria-valuenow 仍然由 JS 维护的原因（读屏软件不认 scaleX）。
+   *
+   * 480ms 比实测的轮询间隔（1s）短，不会有"追不上"的拖影。
+   */
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 480ms var(--nb-ease-out);
+}
+
+/* 失败：进度条染成警示色，避免"满了但没进去"的误解 */
+.nb-splash[data-state='failed'] .nb-splash-fill {
+  background: var(--nb-danger);
+}
+
+.nb-splash-label {
+  margin: 0;
+  font-size: var(--nb-fs-14);
+  color: var(--nb-text-2);
+}
+
+/*
+ * 提示行保留高度：
+ * 提示出现时若不占位，会把上面整块顶上去，看起来像跳了一下。
+ */
+.nb-splash-hint {
+  margin: 0;
+  min-height: 1.4em;
+  max-width: 30em;
+  font-size: var(--nb-fs-12);
+  line-height: var(--nb-lh-body);
+  color: var(--nb-text-3);
+}
+
+/*
+ * 减少动态效果**不在这里另写分支**。
+ *
+ * 项目约定（见 `nebula-tokens.css:155`）：`prefers-reduced-motion` 下
+ * `--nb-dur-*` 被改成 1ms，本文件的过渡自动跟着变快。
+ * 呼吸点的缩放在 tokens 里也有专门处理（保留明暗、去掉缩放）。
+ *
+ * 自写 `@media` 会带来两个问题：
+ *   1. **同一个选择器出现两次** —— 而走查 12 正是为了抓这个
+ *      （后一处会静默覆盖前一处，2026-10-30 那个 box-sizing 坑就是这么来的）
+ *   2. 两处维护同一件事，改一处漏一处
+ */
+
+/* ═══════════════════════════════════════════════════════════
+   通知条（2026-11-02 用户要求重做）
+
+   四条要求，逐条对应下面的属性：
+
+   | 要求 | 实现 |
+   |---|---|
+   | 位置改到**顶端**（聊天栏下面） | `top` 由 JS 按 `.nb-topbar` 的底边算，不是写死 |
+   | 长按/点击不能选中、不弹复制菜单 | `user-select: none` + `-webkit-touch-callout: none` |
+   | 点一下空白处就能去掉 | JS 挂一次性 `pointerdown`（capture，不阻止原操作） |
+   | 底端会压住底部按钮 | 所以**不用** `bottom` |
+
+   ## 为什么 `top` 不能让 CSS 自己算
+
+   `.nb-topbar` 是 `min-height: 52px`，但真机上有状态栏，
+   实际底边到 77px（不同机型/刘海屏不同）。写死数值会在别的机器上错位。
+   所以 JS 读一次 `getBoundingClientRect().bottom` 再 +8。
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-notify {
+  /*
+   * ★★★ 相对 **`.nb-topbar`** 绝对定位，`top: 100%` 压在它下沿。
+   *
+   * ## 为什么不是 `.nb-chat`
+   *
+   * 真机实测：`.nb-chat` 的 `top` 是 **24**，而 `.nb-topbar` 底边是 **77** ——
+   * 两者**重叠 53px**（topbar 是浮在内容之上的玻璃层）。
+   * 挂进 `.nb-chat` 再 `top:8px` 会落在 topbar 底下、被它盖住。
+   *
+   * ## 为什么不是 `fixed` + JS 算 top
+   *
+   * 内联 `style` 被 CSP 拦（见 §81.5）：属性写得进去、样式不生效。
+   *
+   * ## 为什么 `top: 100%` 最稳
+   *
+   * 一行 CSS、零数值：随着 topbar 多高（52 / 77 / 刘海屏各不相同），
+   * 通知永远贴在它下沿。不需要 JS 量、不需要按机型写死。
+   */
+  position: absolute;
+  top: 100%;
+  margin-top: var(--nb-sp-2);
+  left: var(--nb-sp-3);
+  right: var(--nb-sp-3);
+  z-index: 60;
+  padding: var(--nb-sp-3) var(--nb-sp-4);
+  border-radius: var(--nb-radius-lg);
+  font-size: var(--nb-fs-14);
+  line-height: var(--nb-lh-control);
+  color: var(--nb-text-1);
+  background: var(--nb-surface-2);
+  border: 1px solid var(--nb-glass-border);
+  backdrop-filter: blur(var(--nb-glass-blur)) saturate(var(--nb-glass-sat));
+  -webkit-backdrop-filter: blur(var(--nb-glass-blur)) saturate(var(--nb-glass-sat));
+  box-shadow: 0 8px 24px rgb(0 0 0 / 28%);
+
+  /*
+   * ★ 三条一起才拦得住长按菜单：
+   *   · `user-select: none` —— 不许选中文字
+   *   · `-webkit-user-select: none` —— 老 WebView 只认带前缀的
+   *   · `-webkit-touch-callout: none` —— 拦住"长按弹出复制/搜索"
+   *
+   * 只写第一条时，Android WebView 长按仍会弹系统菜单（它不是"选择"，
+   * 是 callout）。
+   */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+
+  /*
+   * 通知本身**不接收指针事件**。
+   *
+   * 用户要"点空白处去掉通知"，如果通知条自己吃掉点击，
+   * 手指落在通知上时就不算"点空白"。而通知只是提示，没有交互，
+   * 让它透传更符合直觉 —— 点哪儿都能关。
+   */
+  pointer-events: none;
+
+  animation: nb-notify-in var(--nb-dur-base) var(--nb-ease-out);
+}
+
+/* 危险态：只改边框与左侧竖条，不改底色 —— 底色一变就成了"色块"，比文字更抢眼 */
+.nb-notify[data-kind='danger'] {
+  border-color: var(--nb-danger);
+  border-left: 3px solid var(--nb-danger);
+}
+
+.nb-notify[data-kind='warn'] {
+  border-color: var(--nb-warn, var(--nb-glass-border));
+  border-left: 3px solid var(--nb-warn, var(--nb-text-3));
+}
+
+@keyframes nb-notify-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   气泡操作菜单（2026-11-02 用户要求：点气泡可编辑/复制/删除）
+
+   > 聊天界面可以点击任意气泡修改文本或者一键复制或者删除消息
+
+   ## 为什么是底部 sheet 而不是浮动气泡菜单
+
+   浮动菜单要算位置（气泡可能在屏幕上沿也可能在下沿），算错就飞出屏幕。
+   底部 sheet 与输入区同侧，手指够得着，也不遮挡被操作的那条消息。
+
+   `z-index` 比通知（60）高一档：菜单是模态的，通知不是。
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-sheet-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: flex-end;
+  background: rgb(0 0 0 / 52%);
+  animation: nb-mask-in var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+.nb-sheet {
+  width: 100%;
+  max-height: 78vh;
+  overflow-y: auto;
+  padding: var(--nb-sp-4);
+  padding-bottom: calc(var(--nb-sp-4) + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-lg) var(--nb-radius-lg) 0 0;
+  background: var(--nb-surface-1);
+  box-shadow: 0 -12px 32px rgb(0 0 0 / 36%);
+  animation: nb-sheet-up var(--nb-dur-base) var(--nb-ease-out);
+}
+
+.nb-sheet-title {
+  margin-bottom: var(--nb-sp-2);
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-12);
+}
+
+/* 预览：截断成两三行，避免一条长回复把整个菜单撑满 */
+.nb-sheet-preview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  margin-bottom: var(--nb-sp-3);
+  padding: var(--nb-sp-3);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-surface-2);
+  color: var(--nb-text-2);
+  font-size: var(--nb-fs-14);
+  line-height: var(--nb-lh-body);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 编辑区默认不占位；点"编辑"后才展开 */
+.nb-sheet-editor {
+  display: none;
+  margin-bottom: var(--nb-sp-3);
+}
+
+.nb-sheet-editor--open,
+.nb-sheet-editor[data-open='true'] {
+  display: block;
+}
+
+.nb-sheet-textarea {
+  width: 100%;
+  min-height: 96px;
+  margin-bottom: var(--nb-sp-2);
+  /* textarea 默认带 resize 手柄，在手机上是纯粹的误触源 */
+  resize: none;
+}
+
+.nb-sheet-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-sp-2);
+}
+
+.nb-sheet-action {
+  width: 100%;
+  min-height: 48px;
+  padding: 0 var(--nb-sp-4);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-surface-2);
+  color: var(--nb-text-1);
+  font-family: inherit;
+  font-size: var(--nb-fs-16);
+  text-align: center;
+  cursor: pointer;
+}
+
+.nb-sheet-action:active {
+  background: var(--nb-surface-3);
+}
+
+.nb-sheet-action--primary {
+  /*
+   * ★ `--nb-accent` **不存在**（2026-11-03 发现）⇒ 这两条声明一直静默失效，
+   * 气泡菜单里的「保存」按钮从来没显示成主色。
+   * 改成与 `.nb-btn--primary` 同一对 token。
+   */
+  border-color: var(--nb-nebula-a);
+  color: var(--nb-nebula-b);
+}
+
+/* 删除用红色，但**不做成实心红块** —— 满屏红按钮比文字更吓人 */
+.nb-sheet-action[data-danger='true'] {
+  border-color: var(--nb-danger);
+  color: var(--nb-danger);
+}
+
+.nb-sheet-cancel {
+  margin-top: var(--nb-sp-1);
+  color: var(--nb-text-3);
+}
+
+@keyframes nb-mask-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes nb-sheet-up {
+  from {
+    transform: translateY(16px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   思考过程预览（2026-11-02）
+
+   推理模型先吐思维链、后吐正文。正文还没来时，把思维链显示出来 ——
+   否则气泡是空的，用户会以为卡死（真机录屏里就是这个样子：
+   一个空泡 + 一个呼吸点，十几秒没动静，其实后台在跑）。
+
+   视觉上必须**明显是"过程"而不是回复**：
+   · 更暗（`--nb-text-3`）
+   · 斜体
+   · 左侧一条竖线，暗示"旁注"
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-thinking {
+  padding-left: var(--nb-sp-2);
+  border-left: 2px solid var(--nb-glass-border);
+  color: var(--nb-text-3);
+  /* `--nb-fs-13` 不存在（令牌只有 11/12/14/16…）⇒ 退回 12 */
+  font-size: var(--nb-fs-12);
+  font-style: italic;
+  line-height: var(--nb-lh-body);
+  white-space: pre-wrap;
+  word-break: break-word;
+  /* 思维链会很长且频繁更新，限高避免把气泡撑到整屏 */
+  max-height: 120px;
+  overflow: hidden;
+}
+
+/*
+ * ★★★ 开关打开时：显示**完整**思考链（2026-11-05 用户要求）
+ *
+ * > 在 AI 响应里面做一个开关，打开显示完整思考链，关闭就只显示思考回复中
+ *
+ * 与默认态差三处，每一处都有理由：
+ *
+ * ```text
+ *   ① 不再限高，改成可滚      —— "完整"就不能截断；限高 + hidden 等于截断
+ *   ② 取消斜体、提亮一档      —— 要读的内容不该是"脚注"的观感
+ *   ③ 保留左侧竖线            —— 它仍然是"过程"而不是回复，这条边界不能丢
+ * ```
+ *
+ * ★ 这里**保留**左侧竖线是故意的：用户之前说过抽屉的竖条丑，
+ * 但那说的是"用竖条表达层级"（半截框）。这里竖线表达的是
+ * "这段是旁注、不是正文"，语义不同，去掉会让人误以为是回复内容。
+ */
+.nb-thinking[data-full='true'] {
+  max-height: 320px;
+  overflow-y: auto;
+  font-style: normal;
+  color: var(--nb-text-2);
+  /*
+   * 内容多时用户要能选中复制（默认 `.nb-bubble` 那段是禁止选中的，
+   * 见 `.nb-app` 的 `user-select`）—— 思考链是用户想细看的东西。
+   */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   聊天操作页 / 聊天文件页（2026-11-03）
+
+   复用 `.nb-list` / `.nb-listitem`（与设置菜单同一套），只补三处：
+   多行输入、禁用的行、文件行右侧的工具按钮。
+   ═══════════════════════════════════════════════════════════ */
+
+/* 作者注释 / 反向提示词这类多行文本 */
+.nb-input--multiline {
+  min-height: 72px;
+  padding-top: var(--nb-sp-2);
+  padding-bottom: var(--nb-sp-2);
+  line-height: var(--nb-lh-body);
+  /*
+   * ★★★ 多行输入框的圆角必须改小（2026-11-04 真机截图抓到）。
+   *
+   * `.nb-input` 是 `border-radius: var(--nb-radius-pill)` —— 那是给
+   * **单行**输入框看的"胶囊"，40px 高的框配 20px 圆角刚好。
+   *
+   * 但 textarea 高 72px 以上，同一个 pill 半径会把四个角拉到几乎相交，
+   * 视觉上变成**一个椭圆/圆形**。真机截图里用户设定描述那一段就是这样：
+   * 文字被挤在圆形区域里，左右两侧大量留白。
+   *
+   * 判据：圆角半径不该超过元素高度的一半 —— 超过就不会被浏览器夹住，
+   * 而是画成一整段弧。
+   */
+  border-radius: var(--nb-radius-md);
+  /*
+   * 手机上 textarea 右下角那个 resize 手柄是纯粹的误触来源 ——
+   * 它太小、又正好在滚动条旁边。禁掉。
+   */
+  resize: none;
+  font-family: inherit;
+}
+
+/* 禁用行（没打开对话时的"保存检查点"等）*/
+.nb-listitem[data-disabled='true'] {
+  opacity: 0.45;
+  /* 禁用时也不该有按下反馈，否则用户以为点到了 */
+  pointer-events: none;
+}
+
+/* 执行中的行：给一点反馈，避免用户连点 */
+.nb-listitem[data-busy='true'] {
+  opacity: 0.6;
+}
+
+/* 纯说明行（Token 概率那种"不做成按钮"的项）*/
+.nb-listitem--note {
+  /* 它没有 chevron、也不可点，所以不要手的指针 */
+  cursor: default;
+}
+
+/* ── 聊天文件行 ── */
+
+.nb-file-row {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-sp-2);
+}
+
+.nb-file-row .nb-listitem-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.nb-file-tools {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--nb-sp-1);
+}
+
+.nb-mini-btn {
+  min-height: 30px;
+  padding: 0 var(--nb-sp-2);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-sm);
+  background: var(--nb-surface-2);
+  color: var(--nb-text-2);
+  font-family: inherit;
+  font-size: var(--nb-fs-12);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.nb-mini-btn:active {
+  background: var(--nb-surface-3);
+  color: var(--nb-text-1);
+}
+
+.nb-mini-btn--primary {
+  /*
+   * 用 `--nb-nebula-a/b`（与既有 `.nb-btn--primary` 同一对）而不是 `--nb-accent`
+   * —— **`--nb-accent` 这个 token 不存在**，`var()` 取不到值时整条声明
+   * 静默失效（按钮就退回默认灰），而界面上看不出任何报错。
+   * 这是本项目踩过的同一类坑（memory §73：`--nb-text-4` 不存在）。
+   */
+  border-color: var(--nb-nebula-a);
+  color: var(--nb-nebula-b);
+}
+
+.nb-mini-btn--danger {
+  border-color: var(--nb-danger);
+  color: var(--nb-danger);
+}
+
+/* 「确认删除？」那一步：加粗，让用户看清这次真的会删 */
+.nb-mini-btn[data-armed='true'] {
+  font-weight: 600;
+}
+
+.nb-file-rename-input {
+  min-height: 30px;
+  font-size: var(--nb-fs-14);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   设置页：分组标题 / 下拉 / 预设行（2026-11-03）
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 分组标题。
+ *
+ * 「AI 响应配置」照 ST 原生面板补到 27 个字段之后，一条长列表滚下来
+ * 找不到"温度在哪段"。分组只是视觉分段，字段语义一点没变。
+ *
+ * ★ 只用**已存在**的 token。2026-11-02 踩过一次 `var(--nb-accent)`
+ * 根本不存在 ⇒ 整条声明静默失效（保存按钮一直不是主色）——
+ * 所以这里逐个都来自 nebula-tokens.css。
+ */
+.nb-settings-group {
+  margin: var(--nb-sp-4) 0 var(--nb-sp-3);
+  padding-top: var(--nb-sp-3);
+  border-top: 1px solid var(--nb-glass-border);
+  font-size: var(--nb-fs-12);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--nb-text-3);
+}
+
+/* 第一个分组不要顶部横线（紧跟在预设行下面，多一条线很碎） */
+.nb-settings-group:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+/*
+ * ═══════════════════════════════════════════════════════════
+   分组标题行 + 刷新按钮（2026-11-07）
+
+   用户：
+
+   > 一个是加一个刷新按钮，后续如果新增的仓库点刷新，可以重新获取仓库情况
+
+   ## 为什么把间距从标题挪到这一行
+
+   `.nb-settings-group` 自带 `margin` 与 `border-top`。放进 flex 行之后
+   它会变成行内元素的一部分，上下外边距会**在 flex 容器里失效**（flex 子项
+   的 margin 不折叠、且会挤压自身高度），横线也会只画在标题那一截。
+
+   所以把这两件事从子元素搬到容器上 —— 视觉与原来完全一致，
+   而"标题 + 右侧按钮"能共用一个基线。
+
+   ## 不加 `flex-direction`、不加 `wrap`
+
+   窄屏（320dp）上标题 + ↻ 一共也就 60px 左右，不会换行。
+   若将来这里塞更长的东西，**不能**改成 `wrap` —— 那会让按钮掉到第二行，
+   看起来像一个独立的操作区，而不是标题的工具按钮。
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-group-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-sp-2);
+  margin: var(--nb-sp-4) 0 var(--nb-sp-3);
+  padding-top: var(--nb-sp-3);
+  border-top: 1px solid var(--nb-glass-border);
+}
+
+/* 标题吃掉剩余空间，把按钮推到右边 */
+.nb-group-title-row > .nb-settings-group {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+/* 第一个分组不要顶部横线（与 `.nb-settings-group:first-child` 对齐） */
+.nb-group-title-row:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+/* 这个位置的图标按钮不要顶栏那套向右出血的负 margin */
+.nb-group-title-row > .nb-icon-btn {
+  margin-inline-end: 0;
+  color: var(--nb-text-3);
+}
+
+.nb-group-title-row > .nb-icon-btn:active {
+  color: var(--nb-text-1);
+}
+
+/*
+ * 刷新进行中：变淡 + 禁止连点。
+ *
+ * 用 `data-busy` 而不是 `disabled` 单独表达：`disabled` 已经用于"点不了"，
+ * 这里是"正在跑"——两个语义分开，将来要加转圈动画时不用再判断。
+ */
+.nb-icon-btn[data-busy='true'] {
+  opacity: 0.45;
+}
+
+/*
+ * 预设行里的下拉宽度
+ *
+ * ★ 原来写的是 `.nb-preset-bar .nb-select`（针对原生 select 的圆角补丁）。
+ * 原生 select 已整体换成 `.nb-select-trigger`，这里跟着改名 ——
+ * 留着一个指向不存在元素的规则，等于留下一条永远不生效的代码。
+ */
+.nb-preset-bar .nb-select-trigger {
+  flex: 1 1 8em;
+  min-width: 0;
+}
+
+/*
+ * 预设行：标签 + 下拉 + 导入按钮 + 说明。
+ *
+ * 放在表单**上面**（见 `chat-settings.ts` 的注释）：切换预设会整批改写下面
+ * 的字段，放下面的话用户改完再切就被覆盖了，而且界面上看不出发生过什么。
+ */
+.nb-preset-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--nb-sp-2);
+  margin-bottom: var(--nb-sp-4);
+  padding: var(--nb-sp-3);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-lg);
+  background: var(--nb-surface-2);
+}
+
+.nb-preset-label {
+  font-size: var(--nb-fs-14);
+  color: var(--nb-text-2);
+  line-height: var(--nb-lh-control);
+}
+
+/* 下拉在预设行里要占满剩下的宽度，但不能把按钮挤走 */
+.nb-preset-select {
+  flex: 1 1 8em;
+  min-width: 0;
+  min-height: var(--nb-sp-6);
+}
+
+/* 加载中/切换中：视觉上变淡，但**不禁用**（禁用会让某些 WebView 吞掉点击） */
+.nb-preset-select[data-loading='true'] {
+  opacity: 0.6;
+}
+
+/* 说明文字单独占一行 —— 与控件挤在一行会在窄屏上折成三四段 */
+.nb-preset-bar > .nb-field-hint {
+  flex-basis: 100%;
+}
+
+/* 「仅存 ST」的字段：左侧一条淡竖线，和会生效的项在视觉上分开 */
+.nb-field[data-sent='false'] .nb-field-label {
+  color: var(--nb-text-3);
+}
+
+
+
+/* ═══════════════════════════════════════════════════════════
+   下拉：触发器 + 贴着控件展开的面板（2026-11-03）
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 触发器：长得像输入框，点开是自己的下拉面板。
+ *
+ * ★ 为什么必须是 `button` 而不是 `select`：只要是 `<select>`，点击就
+ * **必然**弹系统面板，没有任何开关能关掉。而那个面板在真机上是白底白字
+ * （`<option>` 的样式写 CSS 全部无效，见 `select-popover.ts` 文件头）。
+ */
+.nb-select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--nb-sp-2);
+  /*
+   * `.nb-input` 是 `flex: 1` —— 在字段行（`flex-direction: column`）里
+   * 会被解释成 `flex-basis: 0`，把高度压塌。这里取消 flex 增长。
+   *
+   * 用 `min-height` 而不是 `height`：系统字号调大时盒子要跟着长，
+   * 写死 height 会把文字裁掉。
+   */
+  flex: 0 0 auto;
+  min-height: 48px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nb-select-trigger-value {
+  flex: 1;
+  min-width: 0;
+  /*
+   * 超长文案（「自上次用户消息起」）单行省略，不换行 ——
+   * 换行会让同一页的字段行高忽高忽低，看起来像没对齐。
+   */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * 右侧小三角。
+ *
+ * 与 ST 原生下拉一致朝下（▾）；展开时翻上来（--up），
+ * 用户扫一眼就知道"这个是不是开着"。
+ */
+.nb-select-trigger-chevron {
+  flex: 0 0 auto;
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-12);
+  transition: transform var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+.nb-select-trigger[aria-expanded='true'] .nb-select-trigger-chevron {
+  transform: rotate(180deg);
+}
+
+/* 展开时用紫边表示"这个正开着"（替代原先把紫边绑在 focus 上的做法） */
+.nb-select-trigger[aria-expanded='true'] {
+  border-color: var(--nb-nebula-a);
+}
+
+/* 正在切换预设：变淡，但**不禁用**（禁用会让某些 WebView 吞掉点击） */
+.nb-select-trigger[data-loading='true'] {
+  opacity: 0.6;
+}
+
+/*
+ * 触发器不许"一聚焦就变紫"。
+ *
+ * `.nb-input:focus` 会把边框转成星云紫 —— 那对文本框是对的（提示"可以打字了"），
+ * 但对下拉触发器不行：手机上点一次之后焦点会一直留在按钮上，
+ * 于是它**一直紫着**，看起来像"已经被选中/正在编辑"。
+ *
+ * 真机录屏里就是这样（用户点完下拉，触发器一直带紫边）。
+ * 只在真展开时（`aria-expanded='true'`）才用紫边表示状态。
+ */
+.nb-select-trigger:focus:not([aria-expanded='true']) {
+  border-color: var(--nb-glass-border);
+}
+
+/* 同理：去掉 WebView 的默认焦点圈（否则紫边之外还有一圈） */
+.nb-select-trigger:focus {
+  outline: none;
+}
+
+/* ── 面板 ── */
+
+/* （`.nb-popover-mask` 已移除：全屏遮罩会抢走触发器的点击，见 select-popover.ts 文件头） */
+
+/*
+ * 面板本体。
+ *
+ * ★ 位置全部来自 4 个 CSS 变量（由 JS 的 `style.setProperty` 写入）。
+ *
+ * 为什么不直接写 `top` / `left` 内联样式：本项目有条明确取舍 ——
+ * `main.ts` 的通知曾用内联 `style` 拼 `bottom`，被走查判据拦下
+ * （`test/notify-and-sound.test.mjs`：「不许再拼 bottom 内联样式」）。
+ * 用变量表达"位置由 JS 算"，CSS 仍然是唯一的排版来源。
+ */
+.nb-select-popover {
+  position: fixed;
+  top: var(--pop-top, 0);
+  left: var(--pop-left, 0);
+  /*
+   * ★★ `box-sizing: border-box` 必须有。
+   *
+   * `width` 由 JS 算成"与触发器同宽"，但面板自己有 `padding: 4px` 和 1px 边框。
+   * 默认的 `content-box` 会把这些**加**到 width 上：
+   *
+   * ```text
+   *   真机实测（r58）：触发器 361px → 面板 371px（多 10px = 4+4 padding + 1+1 border）
+   * ```
+   *
+   * 后果是面板右边比控件多出一截，看起来像没对齐 —— 而这种 10px 的错位
+   * 在截图上很显眼，在 DOM 断言里完全看不见（`width` 变量值是对的）。
+   *
+   * 同一个坑在 2026-11-02 的草稿卡上踩过一次（`width:100%` 缺 box-sizing 导致溢出）。
+   */
+  box-sizing: border-box;
+  width: var(--pop-width, 240px);
+  max-height: var(--pop-max-h, 320px);
+  overflow-y: auto;
+  /* 选项多时滚动，但不让滚动条把圆角切开 */
+  overscroll-behavior: contain;
+  padding: var(--nb-sp-1);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-lg);
+  background: var(--nb-surface-1);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 44%);
+  animation: nb-pop-in var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+/* 向上展开时，动画方向也要反过来，否则会有"从下面窜上来"的错觉 */
+.nb-select-popover[data-side='up'] {
+  animation-name: nb-pop-in-up;
+}
+
+/*
+ * 选项行。
+ *
+ * 左对齐 + 行高 44px：与 ST 原生下拉一致（用户给的截图就是这个密度）。
+ * 不用 `.nb-sheet-action` 那套 —— 它是居中 + 48px，给"编辑/复制/删除"用的。
+ */
+.nb-select-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--nb-sp-2);
+  width: 100%;
+  min-height: 44px;
+  padding: 0 var(--nb-sp-3);
+  border: none;
+  border-radius: var(--nb-radius-md);
+  background: transparent;
+  color: var(--nb-text-1);
+  font-family: inherit;
+  /*
+   * ★ 14px 而不是 16px（2026-11-07，用户第二次说这块"字号太大"）。
+   *
+   * 走查 4 要求 `.nb-bubble` / `.nb-input`（正文）必须是 16px，
+   * 理由是"桌面端的 14 搬到手机上偏小"。但**下拉选项不是正文**：
+   *
+   * ```text
+   *   它一次要列 5~10 行，是"挑一个"的列表，不是要通读的段落
+   *   与它同类的 .nb-listitem-sub（列表副标题）本来就是 14
+   *   16px × 长中文名 ⇒ 面板要么变很宽，要么被挤
+   * ```
+   *
+   * 用户第一次说的是"字数多而且字体太大"，我先只修了宽度；
+   * 第二次明确"还是不行，你的字号太大了" —— 那就是字号本身的问题。
+   */
+  font-size: var(--nb-fs-14);
+  text-align: left;
+  cursor: pointer;
+}
+
+.nb-select-option-label {
+  flex: 1;
+  min-width: 0;
+  /*
+   * ★★★ 单行 + 省略号（2026-11-07，用户截图「人设下拉里字竖着叠」）。
+   *
+   * 面板宽度不足时，中文会**逐字换行** —— 一行的宽度刚好只放得下一个字，
+   * 于是看起来像"字体特别大、挤成竖排"。用户的原话是
+   * 「字数多而且字体太大，导致看着不舒服」。
+   *
+   * 根因在宽度（`placePopover` 现在有 `POPOVER_MIN_WIDTH` 下限），
+   * 但这里再加一道：**无论宽度怎么变，都不许换行**。
+   * 放不下就省略，至少还是横着读得出来。
+   *
+   * 两道一起才可靠：只改宽度，将来又冒出个 60px 的触发器照样竖排；
+   * 只加 nowrap，宽度不够时会把选项互相挤成一串省略号。
+   */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+ * 选中项：整行浅色底 + 主色对勾。
+ *
+ * 这里用底色高亮（与 ST 截图一致）而不是描边 —— 描边在 44px 的行上
+ * 会显得很挤，而底色高亮一眼就能看出"当前选的是哪个"。
+ */
+.nb-select-option[data-selected='true'] {
+  background: var(--nb-surface-3);
+}
+
+.nb-select-option-tick {
+  flex: 0 0 auto;
+  color: var(--nb-nebula-a);
+  font-size: var(--nb-fs-14);
+}
+
+/* 空列表的一句话（不是空白面板 —— 空白看起来像坏了） */
+.nb-select-empty {
+  padding: var(--nb-sp-4);
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-14);
+  text-align: center;
+}
+
+@keyframes nb-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes nb-pop-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/*
+ * 上下文预算提示（2026-11-03，第十九批 ④）。
+ *
+ * 放在「AI 响应配置」表单最上面：`上下文长度` 与 `每次生成几个备选`
+ * 就在这张表单里，改完能立刻在这里看到预算结果。
+ */
+.nb-budget-hint {
+  margin: 0 0 var(--nb-sp-3);
+  padding: var(--nb-sp-3);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-glass-bg);
+}
+
+/* 必留项就超预算时整块转警示色 —— 这时候"发出去会报错"，必须看得见 */
+.nb-budget-hint[data-over='true'] {
+  /*
+   * 不写 `var(--nb-warn, #f0a020)` 的兜底值：
+   * 走查判据（走查 1）不允许 token 文件之外出现裸色值，
+   * 而 `--nb-warn` 在 `nebula-tokens.css` 里确实定义了 ——
+   * 加兜底只会让"变量被删掉"这件事**继续静默生效**，反而不如没有。
+   */
+  border-color: var(--nb-warn);
+}
+
+.nb-budget-hint-main {
+  color: var(--nb-text-1);
+  /*
+   * `--nb-fs-14`，不是 15 —— 这个 token 集里只有 11/12/14/16。
+   * 写一个不存在的变量**不会报错**，只会静默退回继承字号（§73 踩过）。
+   */
+  font-size: var(--nb-fs-14);
+  font-weight: 600;
+}
+
+.nb-budget-hint-sub {
+  margin-top: var(--nb-sp-1);
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-12);
+  line-height: 1.5;
+}
+
+/*
+ * 「提示词管理」页（2026-11-03 第二十二批）。
+ *
+ * 一行一条：名字 + role 标记 + 内容预览 + 右侧开关。
+ * 只使用 `nebula-tokens.css` 里**确实存在**的变量 ——
+ * 写不存在的变量不报错，只会静默退回继承值（§73 / §91.4 都踩过）。
+ */
+.nb-prompts-summary {
+  margin: var(--nb-sp-3);
+  padding: var(--nb-sp-3);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-glass-bg);
+}
+
+.nb-prompts-summary-main {
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-16);
+  font-weight: 600;
+}
+
+.nb-prompts-summary-sub {
+  margin-top: var(--nb-sp-1);
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-12);
+  line-height: 1.5;
+}
+
+.nb-prompt-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--nb-sp-2);
+  padding: var(--nb-sp-3);
+  border-bottom: 1px solid var(--nb-glass-border);
+}
+
+.nb-prompt-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.nb-prompt-head {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-sp-1);
+}
+
+.nb-prompt-name {
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-14);
+  font-weight: 600;
+  /*
+   * 名字可能很长（用户自己起的）。允许换行，但只占两行 ——
+   * 否则一条长名字会把整页挤散。
+   */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.nb-prompt-badge {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-sm);
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-11);
+}
+
+.nb-prompt-preview {
+  margin-top: var(--nb-sp-1);
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-12);
+  line-height: 1.5;
+  /* 预览默认收一行；展开后靠 data-expanded 放开 */
+  overflow: hidden;
+}
+
+.nb-prompt-preview[data-expanded='true'] {
+  color: var(--nb-text-2);
+  white-space: pre-wrap;
+}
+
+.nb-prompt-preview[data-empty='true'] {
+  color: var(--nb-text-3);
+  font-style: italic;
+}
+
+.nb-prompt-switch {
+  flex: none;
+  /* 开关区域独立：点它只切开关，不会触发展开全文 */
+  display: flex;
+  align-items: center;
+  padding: var(--nb-sp-1) 0;
+}
+
+
+/*
+ * 退出确认弹窗（2026-11-03）。
+ *
+ * 与夜航 Nebula 一致：玻璃背景 + 圆角 + 玻璃边框。
+ * 只使用 nebula-tokens.css 里确实存在的变量（§73 / §91.4 都踩过"变量不存在
+ * 静默失效"的坑，所以这里每一行都对过 token 清单）。
+ *
+ * 布局：全屏半透明遮罩 + 居中卡片。卡片用固定最大宽，竖屏手机也居中。
+ */
+.nb-exit-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--nb-sp-6);
+  /* 半透明黑遮罩即可，**不**用 backdrop-filter —— 走查 3 限制玻璃层 ≤ 3 */
+  background: rgb(0 0 0 / 55%);
+}
+
+.nb-exit-card {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 340px;
+  padding: var(--nb-sp-6) var(--nb-sp-5);
+  border-radius: var(--nb-radius-lg);
+  background: var(--nb-surface-2);
+  border: 1px solid var(--nb-glass-border);
+  box-shadow: 0 16px 48px rgb(0 0 0 / 40%);
+  text-align: center;
+  animation: nb-exit-in var(--nb-dur-page) var(--nb-ease-spring);
+}
+
+.nb-exit-title {
+  margin: 0;
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-20);
+  font-weight: 600;
+  line-height: var(--nb-lh-title);
+}
+
+.nb-exit-subtitle {
+  margin: var(--nb-sp-2) 0 0;
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-14);
+  line-height: var(--nb-lh-control);
+}
+
+.nb-exit-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-sp-2);
+  margin-top: var(--nb-sp-5);
+}
+
+/*
+ * ★★★ 危险操作是「离开」，主视觉是它；「再聊一会」退成次要。
+ *
+ * 主按钮用 App 主色紫（--nb-nebula-a）+ 强调色上的文字色，
+ * 语义与"这是本页的主操作"一致，也避免走查 1 的裸色值。
+ */
+.nb-exit-leave {
+  padding: var(--nb-sp-3);
+  border: none;
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-nebula-a);
+  color: var(--nb-text-on-accent);
+  font-size: var(--nb-fs-14);
+  font-weight: 600;
+}
+
+.nb-exit-stay {
+  padding: var(--nb-sp-3);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-md);
+  background: transparent;
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-14);
+}
+
+@keyframes nb-exit-in {
+  from {
+    opacity: 0;
+    transform: scale(0.94) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+
+/*
+ * 角色选择页：下拉刷新提示条（2026-11-04 第二十九批）。
+ *
+ * 它**不参与滚动**，固定在列表上方。用 `min-height` 而不是 `height`：
+ * 没有提示时高度归零、有提示时撑开，避免列表在有无提示之间跳动。
+ *
+ * 三种状态用颜色区分：pulling（灰，还没到阈值）、ready（主色，松手就刷）、
+ * loading / error（琥珀，正在忙或出错）。
+ */
+.nb-pull-hint {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  padding: 0 var(--nb-sp-4);
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-12);
+  /*
+   * 不加 transition（2026-11-04 走查 6 抓到）。
+   *
+   * `min-height` 是**布局属性**，过渡会让每一帧都触发重排，
+   * 在低端机上直接掉帧。走查 6 的规则是"动效只用 transform/opacity"。
+   *
+   * 这一条本来也不需要动画：它是"下拉时出现一行字"，
+   * 瞬间出现反而更像系统原生的下拉提示。
+   */
+  overflow: hidden;
+}
+
+.nb-pull-hint:not(:empty) {
+  min-height: 34px;
+  padding-top: var(--nb-sp-2);
+  padding-bottom: var(--nb-sp-2);
+}
+
+.nb-pull-hint[data-state='ready'] {
+  color: var(--nb-nebula-a);
+  font-weight: 600;
+}
+
+.nb-pull-hint[data-state='loading'] {
+  color: var(--nb-text-3);
+}
+
+.nb-pull-hint[data-state='error'] {
+  color: var(--nb-warn);
+  font-weight: 600;
+}
+
+
+/*
+ * 用户设定管理页（2026-11-04 第三十批）。
+ *
+ * 类名刻意避开 `.nb-chip` —— 那是语音面板的 64×64 大块，
+ * 复用会让"绑定角色"这几个小标签撑成大方块。
+ */
+.nb-tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--nb-sp-2);
+  margin-top: var(--nb-sp-2);
+}
+
+.nb-tag {
+  padding: var(--nb-sp-1) var(--nb-sp-3);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-pill);
+  background: transparent;
+  color: var(--nb-text-2);
+  font-size: var(--nb-fs-12);
+}
+
+/* 已绑定的角色：主色描边 + 实底，一眼看出选没选 */
+.nb-tag--on {
+  border-color: var(--nb-nebula-a);
+  background: var(--nb-nebula-a);
+  color: var(--nb-text-on-accent);
+  font-weight: 600;
+}
+
+/* 编辑区与列表之间的分隔：一条浅线，不抢视线 */
+.nb-persona-editor {
+  margin-top: var(--nb-sp-4);
+  padding-top: var(--nb-sp-3);
+  border-top: 1px solid var(--nb-glass-border);
+}
+
+/* 字段里放控件的那一层（名字/描述/下拉都塞在这里） */
+.nb-field-body {
+  display: block;
+  flex: 1 1 auto;
+  width: 100%;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   圆形角色头像（2026-11-04，用户要求「圆形的，类似于头像的感觉」）
+
+   ## 三个属性缺一不可
+
+   | 属性 | 不写会怎样 |
+   |---|---|
+   | `border-radius: 50%` | 方角 |
+   | `object-fit: cover` | 长图被压扁成椭圆（只写圆角时形状跟着图走） |
+   | `overflow: hidden` | 图溢出圆外（`border-radius` 不裁内容，只裁背景） |
+
+   真机上卡面常见 768×1024（竖图），只写圆角会得到一个**竖椭圆**，不像头像。
+   必须先把图裁成正方形，再对正方形做 50%。
+
+   `flex: 0 0 auto` 防止被压扁：`.nb-listitem` 是 flex 行，
+   不给固定 basis 的话头像会被长名字挤成一条。
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-avatar {
+  flex: 0 0 auto;
+  width: var(--nb-avatar-size, 40px);
+  height: var(--nb-avatar-size, 40px);
+  border-radius: 50%;
+  overflow: hidden;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--nb-surface-2, rgba(255, 255, 255, 0.06));
+  border: 1px solid var(--nb-glass-border);
+  color: var(--nb-text-3);
+  /* ★ 用 14 不用 15：项目里没有 `--nb-fs-15`（只有 11/12/14/16），
+     引用不存在的 token 会**静默退回**浏览器默认字体（§73 那个坑） */
+  font-size: var(--nb-fs-14);
+  line-height: 1;
+  /* 首字占位不参与选中，长按也不该弹复制菜单 */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.nb-avatar-img {
+  width: 100%;
+  height: 100%;
+  /* ★ 必须 cover：contain 会留黑边，默认会拉伸变形 */
+  object-fit: cover;
+  border-radius: 50%;
+  display: block;
+}
+
+/* 没取到图：占位圆稍淡一点，与"有图"区分开但不刺眼 */
+.nb-avatar[data-state='empty'] {
+  opacity: 0.75;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   人设抽屉（2026-11-04，用户要求「点击人设1后展开对应的人设1参数」）
+
+   原来选中那一套的编辑区单独吊在页面底部，选 A 改完想改 B 要滚上滚下；
+   而且"展开"与"正在使用"是同一个动作 —— 想改一套但先不切过去做不到。
+
+   现在每套人设在**自己那一行下面**就地展开，两个状态分开：
+     行点击   → 展开 / 收起
+     「使用这一套」 → 真正切换
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 人设抽屉：视觉与层级规则**全在** `.nb-drawer` 那一节，这里没有任何差异项。
+ *
+ * 原来这里还有一条 `padding: var(--nb-sp-4)` —— 与 `.nb-drawer` 的值一样，
+ * 属于"同一件事写两遍"。改一处忘另一处时，抽屉内边距就会和世界书那个
+ * 抽屉对不上（那个是真有差异：`sp-3`）。
+ */
+.nb-persona-drawer {
+  /* 故意留空：只作为语义钩子给判据和调试用 */
+}
+
+.nb-persona-drawer-top {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-sp-3);
+  margin-bottom: var(--nb-sp-3);
+}
+
+/* 抽屉里的头像比列表里的略大一点：这一块是"我在改谁"的锚点 */
+.nb-persona-avatar {
+  --nb-avatar-size: 56px;
+}
+
+.nb-persona-drawer-actions {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--nb-sp-2);
+  /* 按钮多时换行，不要挤出屏幕右边缘 */
+  flex-wrap: wrap;
+}
+
+.nb-persona-active-badge {
+  padding: 2px var(--nb-sp-2);
+  border-radius: var(--nb-radius-pill, 999px);
+  /* 半透明底写 rgba 字面量：Chrome 87 不支持 color-mix（见 tokens 里那段说明） */
+  background: rgba(139, 92, 246, 0.22);
+  color: var(--nb-nebula-a);
+  font-size: var(--nb-fs-12);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/*
+ * 「正在使用」那一行：边框提亮。
+ *
+ * ★ 注意这是 `data-active`（正在使用），**不是** `data-open`（抽屉展开）。
+ * 两者可以同时成立，也可以只成立一个 —— 展开 B 改描述时聊天里可能还在用 A。
+ * 原来这里的注释写成"展开的那一行"，与属性对不上，容易改错地方。
+ *
+ * 色值走同一个 token（`--nb-card-open-border`），这样"正在使用"与"展开"
+ * 是同一档强调，不会出现两种亮法让人以为状态不同。
+ */
+.nb-listitem[data-active='true'] {
+  border-color: var(--nb-card-open-border);
+}
+
+.nb-src-chevron[data-open='true'] {
+  transform: rotate(90deg);
+  transition: transform var(--nb-dur-micro) var(--nb-ease-out);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   世界书管理（2026-11-04）
+
+   三层：世界书列表 → 条目列表 → 就地展开的条目编辑。
+   全局激活设置参照原生那一组的排布：数字两列、勾选一列、策略一行。
+   ═══════════════════════════════════════════════════════════ */
+
+/* 条目行：开关在左，可点的正文在右 */
+.nb-wb-row {
+  gap: var(--nb-sp-3);
+}
+
+.nb-wb-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+/* 禁用的条目整行压暗：一眼看出"这条不生效" */
+.nb-wb-row[data-disabled='true'] .nb-wb-main {
+  opacity: 0.45;
+}
+
+/* 条目编辑抽屉：与人设抽屉共用 `.nb-drawer` 那套连体卡片 */
+.nb-wb-editor {
+  padding: var(--nb-sp-3);
+}
+
+.nb-textarea {
+  min-height: 120px;
+  padding: var(--nb-sp-3);
+  /*
+   * ★ 这里是**多行**文本框（开场白 / 世界书条目），但它同样靠
+   * `.nb-input` 那条 `width: 100%` + `box-sizing: border-box` 撑满 ——
+   * 两处都带 `nb-input` 类（见 `greeting-page.ts` / `worldbook-page.ts`）。
+   *
+   * ★★★ 别删 `.nb-input` 上的那两条。删掉的话 `textarea` 会退回
+   * `cols=20` 的固有宽度（真机 185px / 父容器 361px），
+   * 而这里**加了也不该加第二遍** —— 同一条声明写两处，将来必然分叉。
+   */
+  /*
+   * ★ 必须是 md 圆角，不能用 pill。
+   * `.nb-input` 的 pill 圆角套到 textarea 上会画成一个**椭圆**
+   * （§102 踩过：真机上存活了两个批次才被发现）。
+   */
+  border-radius: var(--nb-radius-md);
+  line-height: var(--nb-lh-body);
+  resize: vertical;
+}
+
+/* 全局激活设置 */
+.nb-wb-settings-toggle {
+  width: 100%;
+  border: 0;
+  border-top: 1px solid var(--nb-glass-border);
+  background: none;
+  font: inherit;
+  font-size: var(--nb-fs-12);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--nb-text-3);
+  text-align: left;
+  cursor: pointer;
+  padding: var(--nb-sp-3) 0;
+  margin: var(--nb-sp-4) 0 var(--nb-sp-3);
+}
+
+.nb-wb-settings {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-sp-3);
+  padding-bottom: var(--nb-sp-4);
+}
+
+/* 数字项两列：截图里就是 2×3 的排布 */
+.nb-wb-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--nb-sp-3);
+}
+
+.nb-wb-grid .nb-field {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--nb-sp-2);
+}
+
+/* 勾选项：一行一个，左勾选右文字 */
+.nb-wb-checks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-sp-2);
+}
+
+.nb-check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--nb-sp-2);
+  min-height: var(--nb-hit-min);
+  padding: var(--nb-sp-2) 0;
+  cursor: pointer;
+}
+
+.nb-check {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  margin: 2px 0 0;
+  accent-color: var(--nb-nebula-a);
+}
+
+.nb-check-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.nb-check-title {
+  font-size: var(--nb-fs-16);
+  color: var(--nb-text-1);
+}
+
+.nb-check-sub {
+  font-size: var(--nb-fs-12);
+  color: var(--nb-text-3);
+  line-height: var(--nb-lh-control);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   抽屉（2026-11-04 重做，用户否掉了左侧竖线方案）
+
+   ## 用户原话
+
+   > 这个太丑了，要表示层级就全部框选，别整成左边只有一个竖条，
+   > 或者你干脆全部都不要框起来，有别的办法更美观你也可以按那个来，
+   > 你全部排查一遍，**后面如果要做抽屉式就按本轮的方法来**
+
+   ## 为什么竖线方案被否
+
+   一条 2px 的紫色竖线**只圈住了抽屉的高度**，它表达的是"这一坨是独立的"，
+   而实际要表达的是"这一坨**属于上面那一行**"。方向反了。
+   而且竖线把内容整体右移，左右内边距不对称，看起来像排版出错。
+
+   ## 现在的做法：**连体卡片**
+
+   ```text
+     ┌─────────────────────────┐  ← 行：上圆角 16
+     │ 格兹          ✓   ›/⌄   │
+     ├─────────────────────────┤  ← 一条分隔线（行的下边框）
+     │ [头像]  上传  正在使用   │  ← 抽屉：下圆角 16
+     │ 名字  [        ]         │
+     └─────────────────────────┘
+   ```
+
+   两段拼成**一张卡**，层级关系不需要额外装饰 —— "在同一张卡里"就是层级。
+   规则只有两条：
+
+   1. 展开的那一行 `[data-open='true']`：下圆角归零、下外边距归零
+   2. 抽屉 `.nb-drawer`：上边框与上圆角归零，其余三边与行一致
+
+   ## 新做抽屉时照抄这三步
+
+   ```text
+   ① 根节点加 class="nb-drawer"
+   ② 触发它的那一行（展开状态下）加 data-open="true"
+   ③ 不要在抽屉上写 border-left —— 判据 test/drawer-visual.test.mjs 会拦
+   ```
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * ① 展开的那一行
+ *
+ * **只有一个** `.nb-listitem[data-open='true']` 规则块 —— 几何与颜色都写在
+ * 这里。曾经把它们拆成两块（一块管圆角、一块管颜色），走查判据当场报红：
+ * `同一个选择器只许出现一次`。那条判据是对的：同一选择器写两处时，
+ * 后一处会静默覆盖前一处，"改了没生效"多半就是这么来的。
+ *
+ * - `margin-bottom: 0` + 下圆角归零：好让抽屉直接接上，中间不裂缝
+ * - `border-color` 走同一个 token，与抽屉拼成完整一圈
+ */
+.nb-listitem[data-open='true'] {
+  margin-bottom: 0;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  /* 四边与抽屉同色。底边这一条同时也是行与抽屉之间的分隔线 */
+  border-color: var(--nb-card-open-border);
+  border-bottom-color: var(--nb-card-open-border);
+}
+
+/*
+ * ② 抽屉本体
+ *
+ * 底色用 `--nb-surface-1`（与行同色）：换一种底色会让"这是一张卡"
+ * 的错觉断掉，变成"行 + 另一个方块"。
+ *
+ * 上边框 0：那条边已经由行的下边框画了。两边都画会得到 2px，
+ * 在 1px 的世界里非常显眼（像一道缝）。
+ */
+.nb-drawer {
+  margin: 0 0 var(--nb-sp-2);
+  padding: var(--nb-sp-4);
+  border: 1px solid var(--nb-glass-border);
+  border-top: 0;
+  border-radius: 0 0 var(--nb-radius-lg) var(--nb-radius-lg);
+  background: var(--nb-surface-1);
+}
+
+/*
+ * ③ 抽屉里的第一个分组标题不要顶到边框
+ *
+ * `.nb-settings-group` 自带 `margin-top: sp-4` + `padding-top` + `border-top`，
+ * 抽屉已经有足够的留白与边界，再加一条横线就成了"框里还有一条线"。
+ */
+.nb-drawer > .nb-settings-group:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+/*
+ * ★★★ 整张卡**一起**提亮（用户第二次反馈后修正）
+ *
+ * ## 第一版错在哪
+ *
+ * 我只给"展开的那一行"提亮了边框，抽屉仍然用默认的淡边框。真机截图里
+ * 就成了「上半截有个亮框，下面一坨没有框」—— 用户说的
+ * **"要表示层级就全部框选"** 正是在指这个。
+ *
+ * ## 现在
+ *
+ * 行与它的抽屉用**同一个**边框色，看起来是完整一圈：
+ *
+ * ```text
+ *   ┏━━━━━━━━━━━━━━━┓   亮边框
+ *   ┃ 格兹      ⌄    ┃
+ *   ┣━━━━━━━━━━━━━━━┫   同色分隔线
+ *   ┃ [头像] 上传     ┃   同一圈亮边框的延续
+ *   ┗━━━━━━━━━━━━━━━┛
+ * ```
+ *
+ * 用相邻兄弟选择器 `+ .nb-drawer` 而不是给抽屉单独写一遍色值 ——
+ * 两处各写一份，改一处忘另一处，就又会变成"框只框了半截"。
+ *
+ * 行那一侧的颜色写在上面 ① 那一个规则块里（同一个选择器不许出现两次）。
+ *
+ * 这条与"正在使用"（`data-active`）无关：两个状态可能同时成立、
+ * 也可能只有其中一个。
+ */
+
+/*
+ * 抽屉：与上面那一行同色边框，拼成完整一圈。
+ *
+ * ★★★ 顺序不能反。
+ *
+ * `border-top: 0` 是**简写**，它展开成
+ * `border-top-width: 0; border-top-style: none; border-top-color: currentColor`。
+ * 也就是说它会把 `border-top-color` 重置成**文字色**。
+ *
+ * 我第一版写成「先 border-color、后 border-top: 0」，结果真机上：
+ *
+ * ```text
+ *   行   四边 = rgba(139, 92, 246, 0.55)   ✅
+ *   抽屉 上边 = rgb(244, 242, 251)          ❌ 被 border-top 重置了
+ *        其余 = rgba(139, 92, 246, 0.55)   ✅
+ * ```
+ *
+ * 宽度是 0 所以肉眼看不出，但只要有任何人把 `border-top: 0` 改成
+ * `border-top: 1px`（或者改成一个变量），顶部立刻会冒出一条白边。
+ * 判据 `test/drawer-visual.test.mjs` 现在直接比对这两个属性的先后顺序。
+ */
+.nb-listitem[data-open='true'] + .nb-drawer {
+  border-top: 0;
+  /* ↑ 简写，必须在 border-color 之前 */
+  border-color: var(--nb-card-open-border);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   「思考」设置区块（2026-11-07，P0 第三步）
+
+   三块：主开关（三态分段）+ 思考长度（滑杆/下拉）+ 高级设置（折叠）
+
+   ★ 三态用自绘分段而不是原生 radio：三个选项横排一次点中，
+     不用弹面板。原生 `<select>` 在项目里已证实会被系统弹窗画成白底白字
+     （见 `.nb-select-trigger` 那段注释）。
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-reasoning {
+  margin-bottom: var(--nb-sp-4);
+}
+
+/* 三态分段：一行三个等宽按钮，选中项用底色区分 */
+.nb-seg {
+  display: flex;
+  width: 100%;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--nb-radius-pill);
+  /* 用表面色而不是纯黑/纯白，跟随主题 */
+  background: var(--nb-surface-2);
+  box-sizing: border-box;
+}
+
+.nb-seg-btn {
+  flex: 1 1 0;
+  /*
+   * `min-width: 0` 不能省：flex 项默认 `min-width: auto`，
+   * 里面是中文两个字，窄屏上会拒绝收缩并把第三个挤出容器。
+   */
+  min-width: 0;
+  /*
+   * 热区走 `--nb-hit-min`（走查 2：可点元素 44）。
+   * 写裸像素会被那条判据当场红 —— 而且 44 是 iOS/Android 的公共下限。
+   */
+  min-height: var(--nb-hit-min);
+  padding: 0 var(--nb-sp-2);
+  border: none;
+  border-radius: var(--nb-radius-pill);
+  background: transparent;
+  color: var(--nb-text-2);
+  font-family: inherit;
+  font-size: var(--nb-fs-14);
+  line-height: var(--nb-lh-control);
+  cursor: pointer;
+  /* 文字不换行：两个字本来就短，换行只会在窄屏上把行高顶起来 */
+  white-space: nowrap;
+}
+
+.nb-seg-btn[data-active='true'] {
+  background: var(--nb-surface-3);
+  color: var(--nb-text-1);
+}
+
+/*
+ * 置灰态。
+ *
+ * ★ 置灰时**仍然要能看出哪个是选中的**（`data-active` 保留）——
+ *   分支 B（强制降级）靠它把「开启」高亮出来。
+ *   如果 disabled 一律淡化，用户就看不出"模型其实在思考"。
+ */
+.nb-seg-btn[disabled] {
+  cursor: default;
+  opacity: 0.75;
+}
+
+.nb-seg-btn[disabled][data-active='false'] {
+  opacity: 0.4;
+}
+
+/* 思考长度的数值回显 */
+.nb-reasoning-budget {
+  display: flex;
+  align-items: center;
+  gap: var(--nb-sp-3);
+  width: 100%;
+}
+
+.nb-range {
+  flex: 1 1 auto;
+  min-width: 0;
+  /*
+   * 原生滑杆的高度由 UA 决定，这里只固定热区高度。
+   * 不要写 `height` —— 那会把轨道压扁，滑块变得难点。
+   */
+  min-height: var(--nb-hit-min);
+  /*
+   * ★ 这里原来写的是 `accent-color: var(--nb-accent, currentColor)` ——
+   *   `--nb-accent` **在 token 里不存在**，而 fallback 让这条规则
+   *   "看起来能用"，于是肉眼也发现不了。
+   *
+   * 判据「新样式用的每个 token 都必须有定义」当场抓到（§73 那一类：
+   * 引用不存在的 CSS 变量 → 整条声明静默失效）。
+   *
+   * 改用真实存在的强调色 token。
+   */
+  accent-color: var(--nb-text-1);
+}
+
+.nb-reasoning-readout {
+  flex: 0 0 auto;
+  min-width: 4ch;
+  font-size: var(--nb-fs-14);
+  color: var(--nb-text-2);
+  text-align: right;
+  /* 数字等宽：拖动时宽度不跳动 */
+  font-variant-numeric: tabular-nums;
+}
+
+/* 长度行整体置灰（分支 C） */
+.nb-reasoning[data-branch='unsupported'] .nb-reasoning-budget,
+.nb-field[data-disabled='true'] .nb-reasoning-budget {
+  opacity: 0.5;
+}
+
+/* ── 高级设置折叠区 ── */
+
+/*
+ * ★★★ 带 `hidden` 的行必须显式 `display: none`（2026-11-07 真机抓到的）。
+ *
+ * `.nb-field` 有 `display: flex`。而 `[hidden]` 的浏览器默认样式是
+ * `display: none`，**优先级低于类选择器** —— 于是 `row.hidden = true`
+ * 之后属性设上了、探针读到的也是 `hidden: true`，但**视觉上仍占着一整行**。
+ *
+ * 真机现象：DeepSeek（没有长度旋钮）那一屏里「思考长度」标题下面
+ * 是空的，还白占一行高度 —— 用户会以为"控件没加载出来"。
+ *
+ * 这就是本项目 §103 那条坑的同款（`.nb-acc-panel[hidden]`）。
+ * **我自己在下面那段注释里写了这个坑，却还是在 budgetRow 上犯了。**
+ */
+.nb-field[hidden],
+.nb-reasoning-adv[hidden],
+.nb-reasoning-adv-panel[hidden] {
+  display: none;
+}
+
+/*
+ * 手选参数族那一行（2026-11-07 兜底）。
+ *
+ * 只在"自动识别失败"或"用户手选过"时出现。给一点上边距和更淡的字色，
+ * 视觉上像"补充说明"而不是主控件 —— 它不是常规路径，
+ * 不该跟「思考」三态抢注意力。
+ *
+ * ★ 第一版用了 `border-left: 2px` 表达"从属关系"，被判据当场拦下：
+ *   用户明确否掉过这种写法（见 `test/drawer-visual.test.mjs`
+ *   「表示层级不许用 border-left」）。层级/从属要靠间距与字色表达。
+ */
+.nb-reasoning-manual {
+  margin-top: var(--nb-sp-3);
+  padding-top: var(--nb-sp-2);
+  border-top: 1px dashed var(--nb-glass-border);
+}
+
+.nb-reasoning-adv {
+  margin-top: var(--nb-sp-2);
+  border-top: 1px solid var(--nb-glass-border);
+}
+
+.nb-reasoning-adv-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: var(--nb-hit-min);
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--nb-text-2);
+  font-family: inherit;
+  font-size: var(--nb-fs-14);
+  text-align: left;
+  cursor: pointer;
+}
+
+.nb-reasoning-adv-title {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.nb-reasoning-adv-chevron {
+  flex: 0 0 auto;
+  color: var(--nb-text-3);
+}
+
+.nb-reasoning-adv-panel {
+  padding-top: var(--nb-sp-2);
+}
+
+/* 折叠面板的 `[hidden]` 规则写在上面的 `.nb-field[hidden]` 那条里（同一处，避免重复定义） */
+
+/* 高级项被禁用时，整行淡一点（与 `.nb-field[data-unsupported]` 同一视觉语言） */
+.nb-field[data-disabled='true'] > .nb-field-label {
+  color: var(--nb-text-3);
+}
+
+/* 提示文字的语义色。
+   ★ 只用 token，不写裸色值（走查 1 会红）。 */
+.nb-field-hint[data-kind='warn'] {
+  color: var(--nb-warn);
+}
+
+.nb-field-hint[data-kind='muted'] {
+  color: var(--nb-text-3);
+}
+
+/*
+ * 「当前按 X 的规则控制」那一行（2026-11-07）。
+ *
+ * 它跟三态的说明文字同样挂在 `.nb-field` 的纵向 flex 里，
+ * 但语义是"元信息"（我在用什么规则），不是"操作后果"。
+ * 靠更小的字号 + 更淡的颜色区分，不用额外线条（层级不靠边框表达）。
+ */
+.nb-reasoning-model-hint {
+  margin-top: calc(-1 * var(--nb-sp-1));
+  font-size: var(--nb-fs-11);
+}
+
+/*
+ * ═══════════════════════════════════════════════════════════
+   提示词编辑页（2026-11-07）
+   ═══════════════════════════════════════════════════════════
+
+   与「AI 响应配置」同一套 `.nb-field` 骨架（标签在上、控件在中、
+   说明在下），所以这里只补三处这一页独有的东西。
+*/
+
+/* 可编辑的行给一点"按下去"的反馈 —— 不给的话用户不知道能点 */
+.nb-prompt-row[data-editable='true'] .nb-prompt-main {
+  cursor: pointer;
+}
+
+.nb-prompt-row[data-editable='true']:active {
+  background: var(--nb-surface-2);
+}
+
+/* 内置槽位的提醒：不是错误，但要让用户知道"改了通常没用" */
+.nb-prompt-edit-note {
+  margin: var(--nb-sp-3);
+  padding: var(--nb-sp-3);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-surface-2);
+  color: var(--nb-text-2);
+  font-size: var(--nb-fs-12);
+  line-height: var(--nb-lh-body);
+}
+
+/* 触发器只读值：与输入框区分开（不可编辑的东西不该长得像输入框） */
+.nb-prompt-trigger-text {
+  color: var(--nb-text-2);
+  font-size: var(--nb-fs-14);
+  line-height: var(--nb-lh-control);
+}
+
+/* 正文文本框：多行、可纵向拉一点，别让长提示词憋在 3 行里 */
+.nb-prompt-content {
+  width: 100%;
+  min-height: 220px;
+  resize: vertical;
+  box-sizing: border-box;
+  font-family: inherit;
+  line-height: var(--nb-lh-body);
+}
+
+/* 操作区：保存与删除并排，保存占主位 */
+.nb-prompt-edit-actions {
+  display: flex;
+  gap: var(--nb-sp-2);
+  padding: var(--nb-sp-4) var(--nb-sp-3);
+}
+
+.nb-prompt-edit-actions > .nb-btn {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 深度在"跟随顺序"时置灰 —— 置灰但留着，别让表单高度跳 */
+.nb-field[data-disabled='true'] .nb-input {
+  opacity: 0.5;
+}

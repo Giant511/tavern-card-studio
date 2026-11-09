@@ -75,6 +75,9 @@ export class LoginDialog {
   private readonly passwordInput: HTMLInputElement;
   private readonly usernameField: HTMLElement;
   private readonly passwordField: HTMLElement;
+  /** 邀请码字段（v0.1.7）：仅 `registerMode === 'invite'` 且注册态时显示 */
+  private readonly inviteField: HTMLElement;
+  private readonly inviteCodeInput: HTMLInputElement;
   private readonly repoTokenField: HTMLElement;
   private readonly repoTokenInput: HTMLTextAreaElement;
   private readonly repoTokenNote: HTMLElement;
@@ -132,6 +135,32 @@ export class LoginDialog {
     this.passwordField = passField;
 
     /*
+     * 邀请码（v0.1.7）。
+     *
+     * **默认隐藏**，只在 `registerMode === 'invite'` 且处于注册态时显示。
+     *
+     * 为什么不常显：`open` / `closed` / `admin-only` 三种模式下这个输入框
+     * 没有任何意义，常显会让用户以为"随便填点什么就行"，甚至在 `open` 模式下
+     * 把密码错填到这里。字段的可见性本身就是策略的一部分。
+     *
+     * 为什么用 `spellcheck=false` + `autocapitalize=off`：邀请码是大写字母数字，
+     * 但手机输入法会自作主张改名大小写或加空格 —— 服务端能容错，可用户看到
+     * "码明明是对的却失败"时无从自证。让输入层少犯错比事后容错更省事。
+     */
+    const inviteField = el('label', 'field');
+    inviteField.append(el('span', 'field-label', '邀请码'));
+    this.inviteCodeInput = el('input', 'input');
+    this.inviteCodeInput.type = 'text';
+    this.inviteCodeInput.autocomplete = 'off';
+    this.inviteCodeInput.spellcheck = false;
+    this.inviteCodeInput.setAttribute('autocapitalize', 'characters');
+    this.inviteCodeInput.placeholder = '8 位邀请码，向管理员索取';
+    this.inviteCodeInput.dataset['role'] = 'auth-invite-code';
+    inviteField.append(this.inviteCodeInput);
+    this.inviteField = inviteField;
+    this.inviteField.hidden = true;
+
+    /*
      * 仓库令牌输入（v0.1.3 / F5 后半）。
      *
      * 用 textarea 而不是 input：令牌 47 个字符，窄输入框里看不全，
@@ -161,7 +190,7 @@ export class LoginDialog {
     this.errorBox.dataset['role'] = 'auth-error';
     this.errorBox.setAttribute('role', 'alert');
 
-    body.append(this.hint, userField, passField, tokenField, this.errorBox);
+    body.append(this.hint, userField, passField, inviteField, tokenField, this.errorBox);
 
     const foot = el('div', 'modal-foot');
     this.cancelButton = el('button', 'btn', '取消');
@@ -211,9 +240,8 @@ export class LoginDialog {
     this.panel.append(head, body, foot);
 
     this.overlay.append(this.panel);
-    this.overlay.addEventListener('click', (event) => {
-      if (event.target === this.overlay) this.close();
-    });
+    // 点遮罩**不关闭**（2026-10-29 用户要求）：子窗口只能由它自己的按钮或 × 关闭。
+    // 去掉这条监听是有意的，不是漏了 —— 误触空白处关掉正在填的表单比多点一次 × 更烦。
     // 回车提交：用户名/密码框里回车是最自然的动作。
     // 令牌框是 textarea（要能换行显示/粘贴），回车交给它自己 —— 不劫持。
     for (const input of [this.usernameInput, this.passwordInput]) {
@@ -345,6 +373,22 @@ export class LoginDialog {
     this.passwordField.hidden = isRepoToken;
     this.repoTokenField.hidden = !isRepoToken;
 
+    /*
+     * 邀请码：**只在注册态 + invite 模式**显示（v0.1.7）。
+     *
+     * 三个条件缺一不可：
+     *   · `mode === 'register'` —— 登录时不需要码，显示了会让用户以为登录也要码；
+     *   · `registerMode === 'invite'` —— 其它模式这个字段没意义；
+     *   · 非令牌模式 —— 与用户名/密码同一组，跟着它们一起隐藏。
+     *
+     * 从注册切回登录时**清空**：否则用户以为码被记住了，下次注册看到已填的值
+     * 就不再检查，而服务端可能已经把它用掉了。
+     */
+    const policy = this.policy;
+    const needsInvite = mode === 'register' && policy?.registerMode === 'invite';
+    this.inviteField.hidden = !needsInvite;
+    if (!needsInvite) this.inviteCodeInput.value = '';
+
     this.registerButton.hidden = isRepoToken ? true : !shouldShowRegister(this.policy, this.deps.session.user);
 
     if (isRepoToken) {
@@ -412,6 +456,23 @@ export class LoginDialog {
       return;
     }
 
+    /*
+     * 邀请码必填（v0.1.7）。
+     *
+     * 本地先拦一道，判据是"能不能给出可执行的下一步"，不是为了省一次请求：
+     * 让用户带着空码发一次请求、再收到服务端那句 `INVITE_REQUIRED`，
+     * 中间隔了几百毫秒且文案更泛。这里直接说清"去要码"。
+     *
+     * 但**只拦空值**，不校验格式：格式判断归服务端（它才是唯一真相），
+     * 客户端再加一层"看起来不像 8 位"的校验，只会在服务端改了码长时变成误拦。
+     */
+    const inviteCode = this.inviteCodeInput.value.trim();
+    if (this.mode === 'register' && this.policy?.registerMode === 'invite' && inviteCode === '') {
+      this.showError('本服务端需要邀请码才能注册，请向管理员索取后填入。');
+      this.inviteCodeInput.focus();
+      return;
+    }
+
     this.setBusy(true);
     this.clearError();
     try {
@@ -423,7 +484,12 @@ export class LoginDialog {
         return;
       }
 
-      const outcome = await this.deps.session.register(username, password);
+      const outcome = await this.deps.session.register(
+        username,
+        password,
+        // 非 invite 模式传 undefined；服务端不会读它
+        this.policy?.registerMode === 'invite' ? inviteCode : undefined,
+      );
       if (outcome.tokens) {
         this.deps.notify(`已创建并登录：${outcome.user.username}`, 'ok');
         this.deps.onAuthenticated?.(outcome.user);

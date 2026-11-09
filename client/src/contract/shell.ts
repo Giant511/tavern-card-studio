@@ -20,6 +20,7 @@ import {
   DEFAULT_CLIENT_CONFIG,
   type BinaryFile,
   type CardsDirScan,
+  type FileStat,
   type ClientConfig,
   type DirProbe,
   type ExtractReceipt,
@@ -460,6 +461,25 @@ export async function pickDirectory(defaultPath?: string | null): Promise<string
   return typeof selected === 'string' ? selected : null;
 }
 
+/**
+ * 选一张图片作为卡片封面（v0.1.7 修订二）。
+ *
+ * 不是新的原生能力 —— 与 `pickCardFile` / `pickRuleFile` 一样只是 `open()` 的
+ * 过滤器包装，所以不需要走 docs/11 的四步契约（types → Rust → capabilities → 文档）。
+ *
+ * 过滤器只列 png/jpg/webp：与服务端 `FACE_MIME_ALLOWED` 同一份白名单。
+ * 列上别的格式（比如 gif）会让用户选中之后才被服务端 415 拒掉 ——
+ * 那时候他已经点完确定了，错误提示只会显得"这软件不让我用我的图"。
+ */
+export async function pickImageFile(): Promise<string | null> {
+  const selected = await open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+  });
+  return typeof selected === 'string' ? selected : null;
+}
+
 /** 选一个用户自定义规则文件（单文件，不含目录） */
 export async function pickRuleFile(): Promise<string | null> {
   const selected = await open({
@@ -567,6 +587,29 @@ export function scanCardsDir(
     limit: limit ?? null,
     extensions: extensions ?? null,
   });
+}
+
+/**
+ * 取单个文件的元信息：`{ mtimeMs, size, sha256 }`（v0.1.7 增补三）。
+ *
+ * ## 为什么需要它（而不是拿 `scanCardsDir` 凑）
+ *
+ * `scanCardsDir` 只列文件名 —— 契约明确写"不读内容"，也没带任何时间。
+ * 而取回撞名要回答"本地这份文件是不是被人在外面改过"，唯一的客观依据是
+ * **mtime**。没有这条命令，那个判据只能是恒 false（假装检查过）。
+ *
+ * ## 文件不存在返回 `null`，**不抛错**
+ *
+ * 这是它与同族命令唯一不同的地方，也是刻意的：
+ * "目标位置还没有同名文件"是**正常路径**（守卫据此直接写）。
+ * 若这里抛错，调用方就得用 try/catch 表达一个完全正常的控制流，
+ * 而且分不清"不存在"（`null`）与"无权限 / 是个目录"（仍会抛）。
+ *
+ * 其余错误与既有命令同形：非绝对路径 `PATH_NOT_ABSOLUTE`、
+ * 目录 `NOT_A_FILE`、IO `IO`。
+ */
+export function statFile(path: string): Promise<FileStat | null> {
+  return call<FileStat | null>('stat_file', { path });
 }
 
 // ─────────────────────────────────────────────────────────────

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Gradle wrapper 启动脚本（Windows 上走 gradlew.bat；Git Bash 里跑这个）。
+# 逻辑与官方生成的一致，只保留必需部分。
+APP_HOME=$(cd "$(dirname "$0")" && pwd)
+CLASSPATH="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+JAVACMD="${JAVA_HOME:+$JAVA_HOME/bin/}java"
+if [ ! -x "$JAVACMD" ] && [ ! -x "${JAVACMD}.exe" ] && ! command -v java >/dev/null 2>&1; then
+  echo "✘ 找不到 java。请设 JAVA_HOME（如 D:/android-env/jdk-17）" >&2
+  exit 1
+fi
+exec "$JAVACMD" -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"

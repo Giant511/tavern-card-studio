@@ -46,6 +46,12 @@ import { Db } from './storage/db.js';
 import { certsBackupDir, ensureSelfSigned } from './tls/certificate.js';
 import { inspectTlsInputs, resolveTlsPath, tlsSecurityBanners, type TlsInputCheck } from './tls/panel.js';
 import { UserStore } from './storage/users.js';
+import {
+  INVITE_MAX_USES,
+  INVITE_MAX_VALIDITY_MS,
+  InviteError,
+  InviteStore,
+} from './storage/invites.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 const PANEL_PUBLIC_PATHS = ['/', '/index.html', '/app.js', '/styles.css', '/favicon.ico', '/healthz', '/api/health'];
@@ -465,6 +471,70 @@ export async function startSupervisor(loaded: LoadedConfig, options: SupervisorO
       // 「最后一个管理员」这类业务规则不是程序崩溃，回 400 并把话原样带出去
       throw new AppError(400, 'BAD_REQUEST', (error as Error).message);
     }
+  });
+
+  /*
+   * ── 邀请码（v0.1.7）────────────────────────────────────
+   *
+   * 放在**控制面**而不是 worker 的数据面，这是刻意的：
+   *
+   *   · 需求要求「可在浏览器面板生成」，而面板的凭证是**全局令牌**
+   *     （`TokenGate(config.auth.token)`），它没有账户身份。数据面那套
+   *     「必须是账户 JWT + admin 角色」的判据在这里**恒不成立** ——
+   *     第一版就是把路由挂在 worker 上，于是面板根本调不到（连路径都不在
+   *     同一个 origin：面板是控制端口，`/api/*` 在数据端口）。
+   *
+   *   · 邀请码是**治理动作**（决定谁能进来），与 `/control/accounts`、
+   *     `/control/token/rotate` 同类，本来就属于控制面。
+   *
+   * ⇒ 唯一的鉴权口径：**能打开这个面板 = 能发邀请码**。
+   *   不维护第二套判据，避免两处漂移（同日已因"枚举写两遍"栽过一次）。
+   *
+   * 每次请求开/关库（`withInvites`），与 `/control/accounts` 同一个理由：
+   * 人工点击级别的频率，常驻连接换来的是生命周期问题而不是性能。
+   */
+
+  router.get('/control/invites', (_ctx) => {
+    const invites = withInvites(config.dataDir, (store) => store.list());
+    sendJson(_ctx.res, 200, {
+      invites,
+      /*
+       * 上限一并下发，界面不再维护一份常量。
+       * 两处各写一份必然漂移 —— 界面显示"最长 15 天"而服务端改了 7 天时，
+       * 用户只会看到一个没有解释的 400。
+       */
+      limits: { maxUses: INVITE_MAX_USES, maxValidityMs: INVITE_MAX_VALIDITY_MS },
+    });
+  });
+
+  router.post('/control/invites', (_ctx) => {
+    const patch = JSON.parse(_ctx.body.toString('utf8') || '{}') as Record<string, unknown>;
+
+    const validityMs = patch['validityMs'];
+    if (typeof validityMs !== 'number' || !Number.isFinite(validityMs)) {
+      throw new AppError(400, 'BAD_REQUEST', 'validityMs 必须是数字（毫秒）');
+    }
+    const note = typeof patch['note'] === 'string' ? patch['note'] : '';
+
+    try {
+      const invite = withInvites(config.dataDir, (store) => store.create({ validityMs, note }));
+      /*
+       * 码本身**不进日志**：日志会被收集/转发，而码是凭证。
+       * 只记 id 与到期时间，需要定位时用 id 回查。
+       */
+      logger.warn('invite.created', { id: invite.id, expiresAt: invite.expires_at });
+      sendJson(_ctx.res, 201, { invite });
+    } catch (error) {
+      if (error instanceof InviteError) throw new AppError(400, 'BAD_REQUEST', error.message);
+      throw error;
+    }
+  });
+
+  router.delete('/control/invites/:id', (_ctx) => {
+    const invite = withInvites(config.dataDir, (store) => store.revoke(_ctx.params['id'] ?? ''));
+    if (invite === null) throw new AppError(404, 'NOT_FOUND', '邀请码不存在');
+    logger.warn('invite.revoked', { id: invite.id });
+    sendJson(_ctx.res, 200, { invite });
   });
 
   /**
@@ -1090,6 +1160,23 @@ function withUsers<T>(dataDir: string, run: (users: UserStore) => T): T {
   const db = new Db(join(dataDir, 'state.db'));
   try {
     return run(new UserStore(db.handle));
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * 邀请码仓储（v0.1.7）。与 `withUsers` 同构：每次请求开/关库。
+ *
+ * 为什么不复用 `withUsers`：那个回调签名是 `(users) => T`，而邀请码要的是
+ * `InviteStore`。把两者塞进同一个回调（`run(users, invites)`）会让每次调用
+ * 都构造一个用不到的仓储 —— 更麻烦的是，将来任一方需要额外初始化时，
+ * 调用点会被迫跟着改。保持两个单职责的小函数。
+ */
+function withInvites<T>(dataDir: string, run: (invites: InviteStore) => T): T {
+  const db = new Db(join(dataDir, 'state.db'));
+  try {
+    return run(new InviteStore(db.handle));
   } finally {
     db.close();
   }
