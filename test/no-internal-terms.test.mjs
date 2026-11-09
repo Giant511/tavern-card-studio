@@ -407,3 +407,46 @@ test('★★★ 多行输入框的圆角必须小于它的高度（否则画成�
     '多行输入框用了胶囊圆角 —— 高框会被画成椭圆',
   );
 });
+
+/* ═══════════════════════════════════════════════════════════
+   Rust 的错误文案也要扫（2026-11-09 补）
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★★ Rust 的 #[error] 文案同样不许出现 SillyTavern / ST', () => {
+  /*
+   * ## 这个洞是怎么被发现的
+   *
+   * 用户报「连不上 ST」，而 `UI_FILES` 里**一个 .rs 都没有** ——
+   * 判据一直在扫"我以为的 UI 层"，而用户看到的文案有一大半来自 Rust：
+   *
+   * ```rust
+   *   #[error("连不上 SillyTavern：{detail}")]
+   *   StUnavailable { detail: String },
+   * ```
+   *
+   * 它的 `Display` 会被序列化成 message 交给前端，前端规则是
+   * `message === '' ? 默认人话 : message` —— Rust 给什么就显示什么，
+   * 前端那层兜底完全被绕过。
+   *
+   * ## 为什么只扫 #[error(..)] 的字面量
+   *
+   * Rust 源码的注释里大量提到 SillyTavern（解释背景必需），
+   * 全文件扫会把注释一起命中。而 `#[error("...")]` 里的字符串
+   * **恰好就是用户会看到的那些字**，是精确的判据面。
+   */
+  const rs = readFileSync(join(REPO, 'client/src-tauri/src/error.rs'), 'utf8');
+  const literals = [...rs.matchAll(/#\[error\("((?:[^"\\]|\\.)*)"\)\]/g)].map((m) => m[1] ?? '');
+
+  assert.ok(literals.length > 0, '没读到任何 #[error] 文案（正则或文件格式变了）');
+
+  for (const text of literals) {
+    assert.ok(
+      !/SillyTavern/i.test(text),
+      `面向用户的错误文案里出现 SillyTavern：${JSON.stringify(text)}`,
+    );
+    assert.ok(
+      !/(?<![A-Za-z_])ST(?![A-Za-z_])/.test(text),
+      `面向用户的错误文案里出现 ST：${JSON.stringify(text)}`,
+    );
+  }
+});

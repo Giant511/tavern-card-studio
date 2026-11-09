@@ -89,10 +89,30 @@ pub enum ShellError {
     //   · StBadResponse —— 响应形状不是预期的 JSON → 契约可能变了（ST 升级）
     //
     // 合并成一句"ST 请求失败"会让用户无从下手，也让排查丢掉最有用的那个信息。
-    #[error("连不上 SillyTavern：{detail}")]
+    /*
+     * ★★★ 2026-11-09：文案里不许出现 SillyTavern / ST。
+     *
+     * ## 为什么这条特别要紧
+     *
+     * 这个 `Display` **会被序列化成 message 交给前端**，而前端的规则是
+     *
+     * ```ts
+     *   message: message === '' ? '连不上聊天服务' : message
+     * ```
+     *
+     * 也就是说 **Rust 给什么就显示什么**，前端那层"人话"兜底被完全绕过。
+     * 用户报的就是「连不上 ST」——他从没见过 SillyTavern 这个词，
+     * 看到只会以为是自己不懂的东西坏了。
+     *
+     * ## 为什么判据一直没抓到
+     *
+     * `no-internal-terms.test.mjs` 的 `UI_FILES` 全是 `.ts`，**从不扫 Rust**。
+     * 判据扫的是"我以为的 UI 层"，不是"用户真能看到的每一处文案"。
+     */
+    #[error("连不上聊天服务：{detail}")]
     StUnavailable { detail: String },
 
-    #[error("{path} 返回 403（已重试：{retried}）—— 通常是 SillyTavern 的会话过期")]
+    #[error("{path} 返回 403（已重试：{retried}）—— 通常是会话过期了")]
     StForbidden { path: String, retried: bool },
 
     #[error("{path} 返回 HTTP {status}：{detail}")]
