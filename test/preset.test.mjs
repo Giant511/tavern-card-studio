@@ -88,7 +88,17 @@ test('三份内置预设全部加载成功', () => {
   assert.deepEqual(presets.map((preset) => preset.id).sort(), ['default', 'divider', 'markdown']);
 });
 
-test('每个预设的 blockOrder 都是八板块的完整排列，别名表覆盖八个板块', () => {
+test('每个预设的 blockOrder 都是全部板块的完整排列，别名表覆盖每个板块', () => {
+  /*
+   * 板块数**仍是 8**（2026-11-09 用户用编辑器截图确认）。
+   *
+   * 「初始场景」一个板块内部含 `@@开场白` / `@@情景` 两段
+   * （见 `shared/src/format/composite-scene.ts`），所以 scenario
+   * **不占板块位** —— 曾误加成第九板块，已撤回。
+   *
+   * 判据意图：预设必须覆盖 `BLOCK_IDS` 每一项、每个板块都有别名。
+   * 数字逐字写出而不用 `BLOCK_IDS.length`，否则"少一个板块"会被同一份常量掩盖。
+   */
   for (const preset of presets) {
     assert.equal(preset.blockOrder.length, 8, `${preset.id}: blockOrder 长度应为 8`);
     assert.deepEqual(
@@ -122,7 +132,7 @@ test('默认预设的板块顺序固定为 基本→性格→其他→特殊→�
 test('非法预设被拒绝：缺板块 / 别名冲突 / pattern 缺 {title} / 分隔符无换行', () => {
   const base = structuredClone(DEFAULT_PRESET);
 
-  // v0.1.3 起「缺板块」不再是错误：补成八板块并给 info 提示（旧预设不能被拒之门外）。
+  // v0.1.3 起「缺板块」不再是错误：补成全部板块并给 info 提示（旧预设不能被拒之门外）。
   const partial = structuredClone(base);
   partial.blockOrder = ['basic', 'personality', 'settings', 'special', 'user'];
   const partialResult = parsePreset(partial);
@@ -249,7 +259,7 @@ test('分隔线预设：重复解析不会叠加 ---，再次应用预设为无�
   assert.equal((second.text.match(/^---$/gm) ?? []).length, 2);
 });
 
-test('自定义顺序预设：按用户给定顺序渲染，别名表仍覆盖八板块', () => {
+test('自定义顺序预设：按用户给定顺序渲染，别名表仍覆盖全部板块', () => {
   const custom = structuredClone(DEFAULT_PRESET);
   custom.id = 'custom-reverse';
   custom.name = '反序测试';

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>聊天页视觉验收 · 夜航</title>
+    <!--
+      视觉验收 demo（v0.1.7 / T15.5）—— **不进产物**。
+
+      用途：在真实浏览器里渲染 chat.css + chat-view.ts，供截图与录屏。
+      真机 + 真 ST 的端到端验证不靠它（见 docs/t15.5-chat-panel.md）。
+
+      尺寸按 360×800（常见手机逻辑分辨率）固定，让截图可横向对比。
+    -->
+    <link rel="stylesheet" href="./nebula-tokens.css" />
+    <link rel="stylesheet" href="./chat.css" />
+    <style>
+      /* demo 专用：把手机尺寸模拟出来，并把内容居中 */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #05040a;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+      }
+
+      #phone {
+        width: 360px;
+        height: 800px;
+        position: relative;
+        overflow: hidden;
+        border-radius: 28px;
+        /* demo 外框：为了截图里能看出"这是一块屏幕" */
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.7);
+      }
+
+      #app {
+        width: 100%;
+        height: 100%;
+      }
+
+      /* .nb-app 是 fixed 定位（真实应用里占满视口），demo 里改成贴合 #phone */
+      #app .nb-app {
+        position: absolute;
+        inset: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="phone"><div id="app"></div></div>
+    <script type="module" src="./demo.bundle.js"></script>
+  </body>
+</html>

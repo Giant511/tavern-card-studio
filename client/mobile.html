@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      移动端必须带 viewport-fit=cover：iPhone 有刘海、Android 有手势条，
+      不给的话底部 Tab 栏会被系统手势区盖住一截。
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>Tavern Card Studio</title>
+    <link rel="stylesheet" href="./src/chat/nebula-tokens.css" />
+    <link rel="stylesheet" href="./src/chat/chat.css" />
+    <style>
+      /*
+       * 移动端根样式。
+       *
+       * 这里刻意**只做"铺满屏幕"这一件事**，所有视觉都交给 nebula-tokens.css
+       * 与 chat.css —— 那两份是 T15.5 按设计册做的单一真相。
+       * 在这里覆盖颜色/字号就等于开了第二个真相源，改一处漏一处。
+       */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: var(--nb-bg, #05040a);
+        color: var(--nb-text-1, #f2f0f7);
+        /*
+         * 禁止整页滚动：聊天页自己内部滚动（.nb-msglist）。
+         * 不锁的话在 Android 上会出现"整页跟着橡皮筋弹"，
+         * 而消息列表滚到底时会顶不动 —— 看起来像卡死。
+         */
+        overflow: hidden;
+        overscroll-behavior: none;
+        -webkit-text-size-adjust: 100%;
+        font-family: var(--nb-font, system-ui, -apple-system, 'Segoe UI', sans-serif);
+      }
+
+      #app {
+        height: 100%;
+        width: 100%;
+      }
+
+      /* 首屏骨架：bundle 加载前先给一块同色底，避免白闪 */
+      #boot {
+        display: grid;
+        place-items: center;
+        height: 100%;
+        font-size: 14px;
+        color: var(--nb-text-3, #8b8799);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"><div id="boot">正在启动…</div></div>
+    <script type="module" src="./src/mobile/main.ts"></script>
+  </body>
+</html>

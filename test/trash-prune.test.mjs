@@ -513,6 +513,7 @@ test('保留期：purgeExpired 只清超过 retentionDays 的；0 表示不自�
     const cards = new CardService(
       db,
       new BlobStore(join(dir, 'blobs')),
+      new BlobStore(join(dir, 'faces')),
       new GitStore(join(dir, 'repos')),
       {
         analyze: () => {

@@ -96,6 +96,15 @@ export interface CardSummary {
   /** ID 来源：client = 用户指定；auto = 服务端发号（旧版客户端）；legacy = v0.1.1 之前入库 */
   idSource: 'client' | 'auto' | 'legacy' | null;
   versionCount: number;
+  /**
+   * 卡面摘要（v0.1.7 修订二）。`null` = 这张卡没有卡面。
+   *
+   * 服务端说"没有卡面"就是这个字段为 null，而不是字段缺失 ——
+   * 两者在 TypeScript 里都是 falsy，但一个是契约、一个是服务端版本过旧。
+   * 需要区分时用 `face !== undefined` …这里选择信任契约：
+   * 服务端 v0.1.7 之后总给这个字段。
+   */
+  face: { sha256: string; size: number; mime: string; updatedAt: string } | null;
 }
 
 /** 服务端返回的不阻断警告 */
@@ -125,6 +134,15 @@ const DEFAULT_TIMEOUT_MS = 15000;
 interface RequestOptions {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /**
+   * 除 2xx 之外也**当作正常结果**返回的状态码（v0.1.7 修订二）。
+   *
+   * 为什么需要：`GET /api/cards/:id/face` 在没有卡面时返回 404，而那是一条
+   * **正常路径**（客户端据此走默认卡面兜底链），不是错误。
+   * 没有这个选项的话，`request` 会把 404 包成 SyncError，于是每个调用点
+   * 都得 try/catch 一次 —— 漏一处就会让"给没封面的卡取回历史"直接失败。
+   */
+  acceptStatus?: readonly number[];
 }
 
 async function request(
@@ -152,15 +170,27 @@ async function request(
     });
   } catch (error) {
     const aborted = error instanceof Error && error.name === 'AbortError';
-    throw new SyncError(
+    /*
+     * `cause` 保留原始错误链（2026-11-04）。
+     *
+     * 原来这里把底层失败压成一句「无法连接服务端」，丢掉了可操作信息：
+     * 自签证书失败 → 界面上只显示"连不上"，用户不知道还能确认风险后继续。
+     *
+     * 对外文案与 code 完全不变，只是让上层能看穿这一层。
+     */
+    const wrapped = new SyncError(
       aborted ? 'TIMEOUT' : 'NETWORK',
       aborted ? `请求超时（${timeoutMs} ms）` : '无法连接服务端',
     );
+    (wrapped as Error & { cause?: unknown }).cause = error;
+    throw wrapped;
   } finally {
     clearTimeout(timer);
   }
 
   if (response.ok) return response;
+  // 显式声明为"正常结果"的状态码直接返回（见 acceptStatus 的注释）
+  if (options.acceptStatus?.includes(response.status) === true) return response;
 
   // 错误体：服务端统一 { error: { code, message, detail? } }
   let body: Record<string, unknown> | null = null;
@@ -365,8 +395,28 @@ export async function listCards(
           ? (item['idSource'] as 'client' | 'auto' | 'legacy')
           : null,
       versionCount: Number(item['versionCount'] ?? 0),
+      face: parseFaceSummary(item['face']),
     };
   });
+}
+
+/**
+ * 解析服务端下发的 `face` 摘要。
+ *
+ * 为什么单独一个函数而不是内联三元：列表与详情两处都要解析它，
+ * 而内联写法在"字段缺失"时的默认值选择很容易两处不一致
+ * （一处给 null、一处给空对象）—— 那正是"有没有卡面"这个判据最怕的分叉。
+ */
+export function parseFaceSummary(value: unknown): FaceSummary | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record['sha256'] !== 'string' || record['sha256'] === '') return null;
+  return {
+    sha256: record['sha256'],
+    size: typeof record['size'] === 'number' ? record['size'] : 0,
+    mime: typeof record['mime'] === 'string' ? record['mime'] : 'image/png',
+    updatedAt: typeof record['updatedAt'] === 'string' ? record['updatedAt'] : '',
+  };
 }
 
 /** 拉取版本历史（按 seq 倒序，服务端已排好） */
@@ -532,4 +582,122 @@ export async function fetchVersionText(
     options,
   );
   return response.text();
+}
+
+// ───────────────────────── 卡面资产（v0.1.7 修订二） ─────────────────────────
+//
+// 三个端点对应 `PUT|GET|DELETE /api/cards/:id/face`（契约见 docs/08 §6.3.1）。
+//
+// **卡面不是版本**：换封面不产生新版本，也不动 `updated_at`。
+// 所以这三个函数刻意不返回任何 VersionSummary —— 拿到 `changed` 就够了。
+
+/** 卡面摘要（与服务端 DTO 同形） */
+export interface FaceSummary {
+  sha256: string;
+  size: number;
+  mime: string;
+  updatedAt: string;
+}
+
+export interface UploadFaceResult {
+  /**
+   * `false` = 服务端比对新旧 sha256 后发现内容一模一样，什么都没做。
+   *
+   * 这个字段是**省流量的关键**：客户端每次上传都会带上当前卡面，
+   * 而绝大多数时候它没变。有了它，界面可以安静地跳过，不误报「已更新封面」。
+   */
+  changed: boolean;
+  face: FaceSummary;
+}
+
+/**
+ * 上传/替换卡面。
+ *
+ * `mime` 走 Content-Type；服务端不嗅探文件头（见 docs/08 的说明），
+ * 所以这里必须给准确值 —— 给错会导致回读时浏览器渲染失败。
+ */
+export async function uploadFace(
+  config: SyncConfig,
+  cardId: string,
+  bytes: Uint8Array,
+  mime: string,
+  options: RequestOptions = {},
+): Promise<UploadFaceResult> {
+  const response = await request(
+    config,
+    `/api/cards/${encodeURIComponent(cardId)}/face`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': mime },
+      // 二进制体：不能转成字符串（`Uint8Array` 直接给 fetch 即可）。
+      // 断言成 BodyInit 是因为 TS 的 DOM 类型对 Uint8Array<ArrayBufferLike> 有分歧。
+      body: bytes as unknown as BodyInit,
+    },
+    options,
+  );
+  const body = (await response.json()) as Record<string, unknown>;
+  const face = body['face'];
+  return {
+    changed: body['changed'] === true,
+    face: isFaceSummary(face) ? face : { sha256: '', size: bytes.byteLength, mime, updatedAt: '' },
+  };
+}
+
+/**
+ * 取卡面。**没有卡面返回 null**，不抛异常。
+ *
+ * 为什么不是抛 `SyncError('FACE_NOT_FOUND')`：调用方（取回 / 回滚 / 导出）
+ * 对「这张卡没封面」的处理是**继续走兜底链**，而不是中断整个操作。
+ * 让 404 走异常路径，每个调用点都得包一层 try —— 而漏包一处就会让
+ * 「给一张没封面的卡取回历史」直接失败。
+ */
+export async function fetchFace(
+  config: SyncConfig,
+  cardId: string,
+  options: RequestOptions = {},
+): Promise<{ bytes: Uint8Array; mime: string; sha256: string } | null> {
+  const response = await request(
+    config,
+    `/api/cards/${encodeURIComponent(cardId)}/face`,
+    {
+      method: 'GET',
+      // 默认的 `Accept: application/json` 对二进制下载不合适：
+      // 某些反代会按它做内容协商。这里显式要图片。
+      headers: { Accept: 'image/*' },
+    },
+    // 404 = 这张卡没有卡面，属于正常结果（见 fetchFace 的注释）
+    { ...options, acceptStatus: [...(options.acceptStatus ?? []), 404] },
+  );
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new SyncError('SERVER', `取卡面失败：HTTP ${String(response.status)}`);
+  }
+  const buffer = await response.arrayBuffer();
+  return {
+    bytes: new Uint8Array(buffer),
+    mime: response.headers.get('content-type') ?? 'image/png',
+    sha256: response.headers.get('x-tcs-sha256') ?? '',
+  };
+}
+
+/** 删除卡面。幂等：本来就没有时返回 `deleted: false`。 */
+export async function deleteFace(
+  config: SyncConfig,
+  cardId: string,
+  options: RequestOptions = {},
+): Promise<{ deleted: boolean }> {
+  const response = await request(
+    config,
+    `/api/cards/${encodeURIComponent(cardId)}/face`,
+    { method: 'DELETE' },
+    options,
+  );
+  const body = (await response.json()) as Record<string, unknown>;
+  return { deleted: body['deleted'] === true };
+}
+
+function isFaceSummary(value: unknown): value is FaceSummary {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record['sha256'] === 'string' && typeof record['mime'] === 'string';
 }

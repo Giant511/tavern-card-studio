@@ -48,6 +48,35 @@ const FORBIDDEN = [
     re: /creator_notes|character_book|post_history_instructions|system_prompt|character_version/,
     why: 'JSON 键名，界面应显示中文名',
   },
+  /*
+   * ── 「开发阶段文案」这一族（2026-10-29 用户第三次提同一类问题）──
+   *
+   * 前两次修的是「测试性措辞」（示例卡 / 落盘 / 哨兵…），这一次报的是更宽的一类：
+   * 界面在向用户解释**我们内部是怎么实现的**——
+   *   · 预设名后面挂「（v0.1.3 冻结）」
+   *   · 「内置标准初始场景等价于 v0.1.3 冻结格式（空行 + --- + 空行）」
+   *   · 「Verdict 依据：package.json 存在，且 scripts.start 非空」
+   *   · 「不改写正文」「不补齐」
+   *
+   * 用户的原话是：「用户不需要知道这是什么，有没有冻结」。
+   * 也就是说判据不是"这句话有没有错"，而是"**用户知道了能做什么**"——
+   * 知道了也做不了任何事的解释，就是在跟开发者说话。
+   *
+   * 这三条只抓**无争议**的：内部状态名、内部判据名、内部实现承诺。
+   * 「同名文件不覆盖」那种**行为**承诺不在此列 —— 那是用户做决策需要的信息。
+   */
+  {
+    re: /冻结/,
+    why: '内部状态名（预设版本冻结），用户既不需要知道也从中学不到东西',
+  },
+  {
+    re: /判据|Verdict/i,
+    why: '「我们凭什么这么判断」是实现细节，界面只该给结论（装了 / 没装）',
+  },
+  {
+    re: /不改写|不补齐|不会替你改|不修改你的/,
+    why: '「我们不会动你什么」是给开发者的实现承诺；用户只关心结果对不对',
+  },
 ];
 
 /**
@@ -136,6 +165,7 @@ function quotedChinese(line) {
 export function runUiCopyCheck(root = '.') {
   const files = [
     ...collect(join(root, 'client/src')),
+    ...collect(join(root, 'shared/src')),
     ...collect(join(root, 'server/public')),
     join(root, 'client/index.html'),
   ];

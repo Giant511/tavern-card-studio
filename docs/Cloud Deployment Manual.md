@@ -48,7 +48,7 @@
 管理员权限运行 MSI（非管理员会话里 `msiexec /qn` 必定失败，这是设计如此）：
 
 ```powershell
-msiexec /i TavernCardStudioServer-0.1.3.msi /qb
+msiexec /i TavernCardStudioServer-0.1.7.msi /qb
 sc.exe query TavernCardStudioServer     # STATE 应为 RUNNING
 ```
 
@@ -58,7 +58,7 @@ sc.exe query TavernCardStudioServer     # STATE 应为 RUNNING
 |---|---|
 | 程序 + 自带 node | `C:\Program Files\Tavern Card Studio Server\` |
 | 配置 | `C:\ProgramData\TavernCardStudio\config.json` |
-| 数据（卡片 / 仓库 / `state.db`） | `C:\ProgramData\TavernCardStudio\store\` |
+| 数据（卡片 / 仓库 / `state.db` / 封面） | `C:\ProgramData\TavernCardStudio\store\` |
 | 自签证书（仅拓扑 B） | `C:\ProgramData\TavernCardStudio\store\tls\` |
 | 旧证书备份 | `C:\ProgramData\TavernCardStudio\store\certs-backup\` |
 | 日志 | `C:\ProgramData\TavernCardStudio\logs\` |
@@ -89,10 +89,31 @@ sc.exe query TavernCardStudioServer     # STATE 应为 RUNNING
 | 值 | 谁能注册 | 备注 |
 |---|---|---|
 | `closed`（默认） | 谁都不能，只能用命令行建 | 单人或固定小团队 |
-| `admin-only` | 只有已登录管理员能加人 | **公网推荐** |
+| `admin-only` | 只有已登录管理员能加人 | 公网推荐 |
 | `open` | 任何人 | 公网不建议；非回环监听时启动日志会警告 |
+| `invite` | 任何人，但**必须持有效邀请码** | **公网推荐的中间档**（v0.1.7 新增）|
+
+#### 公网场景怎么选：`invite` 与 `open` 的差别
+
+公网上 `open` 的实际问题是**没有边界**：任何扫到这个端口的人都能建号，
+而服务端按账户隔离数据、并不限制账户数量。`invite` 把"谁能进来"这件事
+从"网络边界"收回成"你亲手发出去的码"：
+
+- 每张码最多注册 **3 个**账户，最长有效 **15 天**，随时可作废；
+- 码泄露的损失是**有限的**（三个账户 + 一个到期日），而不是无限；
+- 入口仍然对所有人可见 —— 想用的人会来问你要码，这正是你要的漏斗。
+
+在管理面板「参数配置 → 注册策略」里选「邀请码注册」即可，选完下方会出现
+邀请码管理区（生成 / 复制 / 作废）。**保存后立即生效，不用重启服务。**
+
+> 邀请码本身就是凭证：**发给谁就等于允许谁注册**。
+> 建议在备注里写清给了谁，方便日后对账与作废。
 
 `admin-only` 的鸡生蛋问题用命令行解决（不依赖 HTTP，因此不受注册开关影响）：
+
+> ⚠ 这也解释了为什么**不能用 `admin-only` 引导首账户**：它的语义是
+> "只有已登录管理员能建号"，而首账户本身还没建出来。
+> 空库时请用 `closed` + 命令行，或临时用 `open` 建出首管理员后立刻改回。
 
 ```powershell
 cd "C:\Program Files\Tavern Card Studio Server"
@@ -394,7 +415,9 @@ systemctl reload apache2
 
 ## 4. 已知交互：反代 + `tls.mode=off` 时的明文横幅
 
-**这是当前版本（v0.1.3）的已知不足，已登记为 v0.1.4 需求。**
+**这是至今（v0.1.7）仍未修的一处文案缺陷**：它在 v0.1.4 就登记了，但一直没做。
+横幅本身不算错（明文段确实存在），缺的是"TLS 已由反向代理终止"这个上下文。
+（下面 §4.3 记的仍是当初那份需求原文，保留不动。）
 
 ### 4.1 会看到什么
 
@@ -462,7 +485,8 @@ systemctl reload apache2
 - [ ] 外网 `curl https://域名/api/token` → **403**（§3.2 事故二）
 - [ ] `https://域名/api/health` → 200，证书链完整（`curl -vI` 无警告）
 - [ ] 上传一张接近 32 MiB 的卡成功，不出现 413（§2 的请求体上限）
-- [ ] `registerMode` 是 `admin-only`（或你确实要 `open` 并接受风险）
+- [ ] `registerMode` 是 `admin-only` 或 `invite`（或你确实要 `open` 并接受风险）
+- [ ] 用 `invite` 时：发出的码都没超期、备注写清了给谁（`GET /control/invites` 可查，控制端口 8731 + 全局令牌）
 - [ ] 第一个管理员已创建，能登录并看到默认仓库
 - [ ] 防火墙/安全组只放通 80、443
 - [ ] 备份策略已确认（配置 + `store\` 目录；`custom` 拓扑还要备份证书与私钥）
@@ -491,4 +515,4 @@ systemctl reload apache2
 
 ---
 
-*本文件随版本更新。最近核对：v0.1.3（2026-10-25）。*
+*本文件随版本更新。最近核对：v0.1.7（2026-10-29）。*

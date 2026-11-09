@@ -778,6 +778,88 @@ body {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════
+   窄屏 / 手机（2026-10-31 加）
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * ## 为什么需要这一段
+ *
+ * 这个编辑器是**桌面优先**做的：顶栏 9 个按钮排一行、正文按左右分栏。
+ * 1080 断点只是把分栏改成上下，顶栏那排按钮从来没打算放进竖屏。
+ *
+ * 2026-10-31 真机（Redmi Note 8 Pro / 1080×2340 / 逻辑宽 ~392dp）装上 APK
+ * 之后，截图里顶栏「新建 / 打开… / 另存为… / 导出… / 在 SillyTavern …」
+ * **右侧被屏幕边缘切掉**，中间那行「同步 / 上传到服务端 / …」也一样。
+ *
+ * 判据是截图，不是"有没有媒体查询"—— 加之前我先数了 `@media` 只有 3 处，
+ * 其中 2 处是 `prefers-reduced-motion`，真正管布局的只有 1080 那一处。
+ *
+ * ## 做法：只管"排不下就不排"，不改视觉语言
+ *
+ * 竖屏时把横向排布改成纵向堆叠，字号与配色一律不动 ——
+ * 这里不是重做移动端设计（那是 T15.5 聊天面板的活），
+ * 而是**先让桌面编辑器在手机上不残缺**。
+ * 真正的移动端体验由聊天面板那条线承载。
+ */
+@media (max-width: 640px) {
+  /*
+   * 顶栏：按钮区不再 `margin-left: auto` 靠右，改成占满一整行并允许换行。
+   *
+   * 为什么不只是加 `flex-wrap`：`.actions` 现在是 `flex-shrink: 0`，
+   * 它自己不会换行，`margin-left: auto` 又把它推到右侧 ——
+   * 结果就是**整体溢出**而不是换行（这正是截图里被切掉的原因）。
+   */
+  .topbar {
+    padding: 8px 10px;
+    gap: 8px;
+  }
+
+  .actions {
+    margin-left: 0;
+    width: 100%;
+    flex-wrap: wrap;
+    flex-shrink: 1;
+    /* 按钮在窄屏上等宽排两列，比"挤成一排然后被切掉"好读 */
+    gap: 6px;
+  }
+
+  .actions .btn {
+    /*
+     * `flex: 1 1 auto` + `min-width` 让按钮自然折行成 2~3 列，
+     * 且短文案的按钮不会被拉得特别宽（`min-width` 兜住下限）。
+     */
+    flex: 1 1 auto;
+    min-width: 96px;
+    padding: 8px 10px;
+    /* 竖屏上手指比鼠标粗，热区抬到 40px */
+    min-height: 40px;
+    font-size: 13px;
+  }
+
+  /* 正文区域：左右分栏在窄屏上没有意义，一律上下堆叠 */
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(160px, 40vh);
+  }
+
+  /* 审计面板从"右侧栏"变成"下半屏"，分隔线也要跟着从竖改横 */
+  .issues-panel {
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  /* 弹窗：避免 90vh 在窄屏上把内容压成一条缝 */
+  .modal-overlay {
+    padding: 10px;
+  }
+
+  .modal {
+    width: 100%;
+    max-height: 92vh;
+  }
+}
+
 /* ── 设置面板（模态）───────────────────────────────────── */
 .modal-overlay {
   position: fixed;
@@ -2467,6 +2549,120 @@ body {
   font-size: 12px;
   text-align: right;
   color: var(--muted);
+}
+
+/*
+ * 「无卡面」占位（v0.1.7 增补一）。
+ *
+ * 刻意做成**虚线框的小标签**而不是一行灰字：
+ * 它要传达的是"这里缺一张图"，虚线框本身就在暗示"待填"。
+ * 用 `flex: 0 0 auto` + 不设宽度，是因为它只在缺封面时出现 ——
+ * 给它定宽会让有封面/无封面的行里其它字段对不齐。
+ *
+ * 注意 memory §23 记过的那类错：这类小标签**不要**加 `flex: 0 0 5.5em`
+ * 这种定值宽度，否则在窄面板里会把右侧按钮挤出视口。
+ */
+/*
+ * 「配一张封面」的压缩预览（v0.1.7 增补一）。
+ *
+ * ## 这组样式不是装饰，是修一个真缺陷
+ *
+ * 第一版只写了 class 名、**没写 CSS**，于是 `<img>` 按原始像素渲染
+ * （上传的卡面可能是 2560×1520），直接把对话框撑爆 ——
+ * 用户反馈的"窗口尺寸不对"就是这个。
+ *
+ * 当时它没立刻暴露，是因为 Tauri 的 CSP `img-src 'self' data:` 里没有
+ * `blob:`，缩略图压根没显示出来（只剩一个破图图标），
+ * 于是"撑爆"被"不显示"掩盖了。修好 CSP 之后如果不加这组约束，
+ * 问题会立刻变成"对话框变成一整屏、按钮跑出视口"。
+ *
+ * 所以两件事必须一起做：**换 data URL** + **给缩略图固定尺寸**。
+ */
+/*
+ * 卡片列表里的**操作反馈条**（v0.1.7 生产反馈：「换封面后没有任何提示」）。
+ *
+ * 它必须在这个窗口里出现：原来只调 `notify` 写主窗口状态栏，
+ * 而本对话框是模态的，状态栏被遮住 ⇒ 用户点完什么都看不到。
+ */
+.cards-action-note {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #f6f7f9;
+  font-size: 12px;
+  line-height: 1.6;
+  /* 长文案要能换行，不能撑破对话框 */
+  overflow-wrap: anywhere;
+}
+
+.cards-action-note.ok {
+  border-color: #b7e3c4;
+  background: #f0faf3;
+  color: #1f6b3a;
+}
+
+.cards-action-note.warn {
+  border-color: #f0d9a8;
+  background: #fffaf0;
+  color: #8a5a00;
+}
+
+.cards-action-note.bad {
+  border-color: #f2c2c2;
+  background: #fdf3f3;
+  color: #a12a2a;
+}
+
+.cards-action-note.info {
+  border-color: var(--border);
+  background: #f6f7f9;
+  color: var(--muted);
+}
+
+.upload-face-preview {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  /* 长文件名不许把对话框撑宽 */
+  min-width: 0;
+}
+
+.upload-face-thumb {
+  /* 固定 96px：128 太大挤掉元信息，64 又看不清是不是选对了图 */
+  flex: 0 0 96px;
+  width: 96px;
+  height: 96px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #f6f7f9;
+}
+
+.upload-face-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  /* flex 子项默认 min-width:auto，长文件名会把父容器顶开 */
+  min-width: 0;
+}
+
+.upload-face-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cards-row-face-none {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 .cards-empty {

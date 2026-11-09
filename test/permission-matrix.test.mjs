@@ -75,7 +75,7 @@ const card = (name) => JSON.stringify({ spec: 'chara_card_v2', data: { name, des
 before(async () => {
   workDir = mkdtempSync(join(tmpdir(), 'tcs-matrix-'));
   configPath = join(workDir, 'config.json');
-  port = 27800 + Math.floor(Math.random() * 150);
+  port = 28500 + Math.floor(Math.random() * 150);
 
   const config = createDefaultConfig({
     token: 'M'.repeat(43),

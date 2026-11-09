@@ -145,6 +145,10 @@ export function registerAuthRoutes(router: Registrar, deps: AuthRouteDeps): void
       const result = await auth.register({
         username: str(body, 'username'),
         password: str(body, 'password'),
+        // v0.1.7：邀请码注册模式必填。非 invite 模式下传了也**不影响**任何判断
+        // （服务端只在 mode==='invite' 时读它），这样客户端可以无条件带上这个字段，
+        // 不必先问服务端"要不要"——少一次往返，也少一处两端可能不一致的判断。
+        ...(typeof body['inviteCode'] === 'string' ? { inviteCode: body['inviteCode'] } : {}),
         ip: deps.clientIp(ctx),
         userAgent: userAgent(ctx),
         callerIsAdmin: caller?.role === 'admin',

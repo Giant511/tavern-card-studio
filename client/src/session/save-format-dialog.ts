@@ -50,7 +50,7 @@ export class SaveFormatDialog {
       head.append(el('h2', 'modal-title', '另存为'));
 
       const body = el('div', 'modal-body');
-      body.append(el('p', 'confirm-text', '选择保存格式。三种格式的产物与「导出」完全一致。'));
+      body.append(el('p', 'confirm-text', '选择保存格式。'));
 
       const list = el('div', 'save-format-list');
       let selected: SaveFormat = options.defaultFormat;
@@ -115,9 +115,8 @@ export class SaveFormatDialog {
       };
       cancel.addEventListener('click', () => finish(null));
       confirm.addEventListener('click', () => finish({ format: selected, remember: rememberBox.checked }));
-      overlay.addEventListener('click', (event) => {
-        if (event.target === overlay) finish(null);
-      });
+    // 点遮罩**不关闭**（2026-10-29 用户要求）：子窗口只能由它自己的按钮或 × 关闭。
+    // 去掉这条监听是有意的，不是漏了 —— 误触空白处关掉正在填的表单比多点一次 × 更烦。
       document.addEventListener(
         'keydown',
         (event) => {

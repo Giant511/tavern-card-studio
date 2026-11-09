@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  T15.3 生死项。
+
+  两处关键配置，缺一不可：
+
+  1. android:extractNativeLibs="true"
+     让系统把 APK 里的 lib/arm64-v8a/*.so 解到 nativeLibraryDir（只读）。
+     不解出来的话 nativeLibraryDir 里没有 libnode.so，我们想 exec 的路径不存在。
+     AGP 在 minSdk>=23 时默认 false，所以必须显式覆盖。
+
+  2. usesCleartextTraffic="true"
+     后面接 ST 是 http（127.0.0.1），但**这个包现在并不发请求** ——
+     写在这里是为了"下一步接 ST 时不必再改 manifest 才能验证"。
+     它不影响本包的判据。
+
+  largeHeap 不是必需（node 是独立进程，不占本进程堆），故不开。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:extractNativeLibs="true">
+
+    <application
+        android:label="TCS Node 探针"
+        android:usesCleartextTraffic="true"
+        android:allowBackup="false"
+        android:supportsRtl="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="TCS Node 探针">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

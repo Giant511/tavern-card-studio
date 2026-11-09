@@ -84,7 +84,25 @@ test('两个新板块从 card.blocks 读到文本（字段板块走文本路径�
   data.mes_example = '<START>\n{{user}}: 你好';
   const card = parseStCard(JSON.stringify(raw)).card;
   const blocks = collectBlocks(card);
-  assert.equal(blocks.find((block) => block.id === 'initial-scene').text, '开场白');
+  /*
+   * ★ 2026-11-09：初始场景是**复合板块**，板块文本里含 `@@开场白` / `@@情景`
+   * 两段标记（见 `composite-scene.ts`）。所以不能直接等于 `'开场白'` ——
+   * 要断言"标记在、正文在、情景段为空"这三件事。
+   */
+  const sceneText = blocks.find((block) => block.id === 'initial-scene').text;
+  assert.ok(sceneText.includes('@@开场白'), `要有开场白标记，实际：${sceneText}`);
+  assert.ok(sceneText.includes('开场白'), '开场白正文要在');
+  assert.ok(sceneText.includes('@@情景'), '要有情景标记（可发现性）');
+  /*
+   * ★ 样本卡 JSON 里**本来就有 scenario**（"深秋的午后，旧城区下着小雨…"）——
+   * 这正是当初做这个功能的原因：它一直进 prompt，但以前任何界面都看不到。
+   * 现在它必须出现在板块文本的 `@@情景` 段里。
+   */
+  assert.ok(card.residual.scenario.length > 0, '样本卡的 scenario 要被读进 residual');
+  assert.ok(
+    sceneText.includes(card.residual.scenario),
+    `情景正文要显示在板块里，实际：${sceneText}`,
+  );
   assert.equal(blocks.find((block) => block.id === 'chat-examples').text, '<START>\n{{user}}: 你好');
 });
 

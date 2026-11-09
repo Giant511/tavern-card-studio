@@ -110,6 +110,13 @@ export class SettingsDialog {
   private readonly stStatus: HTMLParagraphElement;
   private readonly stSkipCheckbox: HTMLInputElement;
   /**
+   * 「语音发送前需确认」（v0.1.7 / T15.6 终版）。
+   *
+   * 独立于 ASR 三字段（base_url / key / model）—— 那是外部服务凭据，
+   * 这是本地交互偏好。隔离断言在 test/voice-config-isolation.test.mjs。
+   */
+  private readonly voiceConfirmCheckbox: HTMLInputElement;
+  /**
    * 本次打开面板时"检测已通过"的地址（归一后）。
    *
    * 只在**保存**时用来判断"这个值已经验过了吗"：用户点了「检测」通过后再点「保存」，
@@ -446,6 +453,38 @@ export class SettingsDialog {
     //
     // 放在设置里而不是顶栏：它是"出问题时才用"的功能，顶栏每多一个按钮，
     // 常用按钮就被稀释一次。位置紧邻「角色卡目录」—— 两者都是"文件去哪了"类问题。
+    /*
+     * ── 语音输入（v0.1.7 / T15.6 终版）──────────────────────
+     *
+     * 需求里这一项的位置写的是「我的 → 语音输入 → 发送前确认」。
+     * 本项目的设置面板就是「我的」这一层（没有单独的"我的"页），
+     * 所以落在设置面板的一个 section 里，标题用「语音输入」保持对应关系。
+     *
+     * 现在只有这一个开关 —— ASR 的 base_url / key / model 与厂商模板还没接
+     * （等 T15.5 聊天面板与录音链路）。**不要**因为"这一节只有一个开关"就把它
+     * 塞进别的小节：它会在接入后长出三个字段，那时再拆就得改布局。
+     */
+    const voiceSection = el('section', 'form-section');
+    voiceSection.append(el('h3', 'form-title', '语音输入'));
+
+    const voiceConfirmRow = el('label', 'st-skip-row');
+    this.voiceConfirmCheckbox = el('input') as HTMLInputElement;
+    this.voiceConfirmCheckbox.type = 'checkbox';
+    this.voiceConfirmCheckbox.dataset['role'] = 'voice-confirm-before-send';
+    voiceConfirmRow.append(
+      this.voiceConfirmCheckbox,
+      el('span', '', '语音发送前需确认'),
+    );
+    voiceSection.append(
+      voiceConfirmRow,
+      el(
+        'span',
+        'field-hint',
+        '默认关闭：按住说话、松手就发出，中间不打断。' +
+          '打开后每次转写完成会先出一条待确认条，可以改字再发。',
+      ),
+    );
+
     const diagSection = el('section', 'form-section');
     diagSection.append(el('h3', 'form-title', '诊断'));
     // 版本号摆在这儿而不是只藏在诊断导出里：装完/升级后"这是不是我要的那一版"
@@ -489,13 +528,12 @@ export class SettingsDialog {
     cancel.addEventListener('click', () => this.close());
     foot.append(browserWarn, cancel, this.saveButton);
 
-    panel.append(head, serverSection, stSection, dirSection, diagSection, foot);
+    panel.append(head, serverSection, stSection, dirSection, voiceSection, diagSection, foot);
     this.overlay.append(panel);
 
     // 点遮罩关闭
-    this.overlay.addEventListener('click', (event) => {
-      if (event.target === this.overlay) this.close();
-    });
+    // 点遮罩**不关闭**（2026-10-29 用户要求）：子窗口只能由它自己的按钮或 × 关闭。
+    // 去掉这条监听是有意的，不是漏了 —— 误触空白处关掉正在填的表单比多点一次 × 更烦。
     // Esc 关闭
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && !this.overlay.hidden) this.close();
@@ -564,6 +602,9 @@ export class SettingsDialog {
        * 用户一眼就知道"现在实际连的是哪"。非法值（手改配置文件）也回落成默认值，
        * 但要标出来 —— 否则用户会以为自己配的 8001 生效了。
        */
+      // 语音确认开关：只有显式 true 才算开（旧配置缺键 / 坏值一律当关）
+      this.voiceConfirmCheckbox.checked = config.voiceConfirmBeforeSend === true;
+
       const stResolved = resolveStAddress(config.stAddress);
       this.stAddressInput.value = stResolved.text;
       const stRaw = (config.stAddress ?? '').trim();
@@ -1171,6 +1212,8 @@ export class SettingsDialog {
         // 归一后的 `主机:端口`（不是用户原样输入的串）：去掉 http:// 与空白，
         // 让"配置里存的"与"探测用的"逐字相同
         stAddress: stParsed.text,
+        // 语音确认开关也一起存（独立字段，不碰 ASR 三字段）
+        voiceConfirmBeforeSend: this.voiceConfirmCheckbox.checked,
       });
       // 回写归一化后的地址，让用户看到最终存储值
       this.urlInput.value = saved.serverUrl;

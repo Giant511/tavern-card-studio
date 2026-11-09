@@ -12,7 +12,7 @@ import { CardService } from './storage/cards.js';
 import { Db } from './storage/db.js';
 import { GitStore } from './storage/git-store.js';
 
-export const SERVER_VERSION = '0.1.6';
+export const SERVER_VERSION = '0.1.7';
 export const API_VERSION = 'v1';
 
 export interface ServerContext {
@@ -21,6 +21,8 @@ export interface ServerContext {
   paths: ReturnType<typeof ensureDataDirs>;
   db: Db;
   blobs: BlobStore;
+  /** 卡面资产库（v0.1.7 修订二）。与 `blobs` 分目录，详见 dataPaths() */
+  faceBlobs: BlobStore;
   git: GitStore;
   registry: RuleRegistry;
   audit: AuditService;
@@ -90,6 +92,9 @@ export function createContext(loaded: LoadedConfig, options: { logDir?: string; 
 
   const db = new Db(paths.database);
   const blobs = new BlobStore(paths.blobs);
+  // 卡面资产走独立目录（v0.1.7 修订二）：与版本 blob 的生命周期不同，
+  // 详见 `dataPaths()` 里 faces 字段的注释
+  const faceBlobs = new BlobStore(paths.faces);
   const git = new GitStore(paths.repos);
   const registry = new RuleRegistry(config.rulesDir);
   const audit = new AuditService(registry, {
@@ -99,6 +104,7 @@ export function createContext(loaded: LoadedConfig, options: { logDir?: string; 
   const cards = new CardService(
     db,
     blobs,
+    faceBlobs,
     git,
     audit,
     { platformId: config.defaultPlatformRule, presetId: config.defaultPreset },
@@ -139,6 +145,7 @@ export function createContext(loaded: LoadedConfig, options: { logDir?: string; 
     paths,
     db,
     blobs,
+    faceBlobs,
     git,
     registry,
     audit,

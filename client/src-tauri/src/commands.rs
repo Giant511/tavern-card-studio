@@ -470,6 +470,89 @@ pub fn read_binary_file(path: String, max_bytes: Option<u64>) -> ShellResult<Bin
     })
 }
 
+/// 单个文件的元信息（对应 `client/src/contract/types.ts` 的 `FileStat`）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStat {
+    pub mtime_ms: u64,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// 超过这个大小就不算摘要（`sha256` 返回空串）。
+///
+/// 这条命令是给**卡文件**用的（PNG 卡通常几百 KB 到几 MB）。
+/// 不设上限的话，有人拿它去 stat 一个 4 GB 的视频，`fs::read` 会直接把
+/// 渲染层卡死几十秒 —— 而 mtime 和 size 本来就从 metadata 免费拿到，
+/// 不该为了一个附加字段把主字段也拖死。
+pub const STAT_SHA256_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 取单个文件的元信息：修改时间 / 大小 / 摘要。
+///
+/// ## 与 `read_binary_file` 的边界
+///
+/// 它**不返回内容**。调用方（取回撞名的判定）只需要回答"这个文件还是不是
+/// 上次那份 / 有没有被人在外面改过"，把几 MB 字节搬过 IPC 纯属浪费。
+///
+/// ## 文件不存在返回 `None` 而不是报错
+///
+/// 这是本命令唯一的语义分叉，必须写清：**"不存在"是正常答案**。
+/// 导出/取回落盘前要先问"目标有没有同名文件"，没有就直接写 ——
+/// 若这里报错，调用方就得用 try/catch 表达一个完全正常的控制流，
+/// 而且分不清"不存在"与"无权限"（两者都会走到 Err 分支）。
+///
+/// 其余错误与既有命令**同形**：非绝对路径 `PATH_NOT_ABSOLUTE`、
+/// 是个目录 `NOT_A_FILE`、IO 失败 `IO`。
+///
+/// ## mtime 精度
+///
+/// NTFS 约 100ns、FAT32 只有 2 秒。所以调用方**只能拿它判断"变没变"**
+/// （与基线比 `>`），不能用来排序或判断"两次写入的先后"。
+#[tauri::command]
+pub fn stat_file(path: String) -> ShellResult<Option<FileStat>> {
+    let target = paths::absolute_path(&path)?;
+
+    // 不存在 = 正常答案，见上面第二条注释
+    if !target.exists() {
+        return Ok(None);
+    }
+    if !target.is_file() {
+        return Err(ShellError::NotAFile {
+            path: target.display().to_string(),
+        });
+    }
+
+    let meta = fs::metadata(&target).map_err(|error| ShellError::io(&target, error))?;
+    let size = meta.len();
+
+    /*
+     * mtime 取不到时给 0，**不报错**：
+     * 文件系统不支持 mtime 是极罕见的情况，此时"不知道"比"整个功能不可用"好。
+     * 0 会让调用方判成"比任何基线都旧"⇒ 不判脏 ⇒ 退回编辑器脏态判定，
+     * 正是这条命令缺席时的行为。
+     */
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|delta| delta.as_millis() as u64)
+        .unwrap_or(0);
+
+    let sha256 = if size <= STAT_SHA256_MAX_BYTES {
+        let bytes = fs::read(&target).map_err(|error| ShellError::io(&target, error))?;
+        sha256_hex(&bytes)
+    } else {
+        // 见 STAT_SHA256_MAX_BYTES：太大就不算，空串表示"没算"而不是"内容为空"
+        String::new()
+    };
+
+    Ok(Some(FileStat {
+        mtime_ms,
+        size,
+        sha256,
+    }))
+}
+
 /// 原子写 + 摘要断言 + 回读校验。
 ///
 /// `expected_sha256` 与传入文本的实际摘要不符时，一个字节都不写。
@@ -2357,6 +2440,67 @@ mod tests {
             }
             other => panic!("超过上限应当报 TooManyPaths，实际 {other:?}"),
         }
+    }
+
+    // ── v0.1.7 增补三：stat_file（取回撞名的 mtime 判据）──────
+
+    #[test]
+    fn stat_file_returns_mtime_size_and_digest() {
+        let dir = temp_dir("stat_basic");
+        // `temp_dir(tag)` 只拼路径、不建目录（与既有用例一致），这里必须先建
+        fs::create_dir_all(&dir).expect("建目录");
+        let path = dir.join("card.png");
+        fs::write(&path, b"hello").expect("写测试文件");
+
+        let stat = stat_file(path.display().to_string())
+            .expect("stat 应成功")
+            .expect("文件存在，不该是 None");
+
+        assert_eq!(stat.size, 5);
+        // mtime 应当是一个像样的 epoch 毫秒值（> 2000-01-01）
+        assert!(stat.mtime_ms > 946_684_800_000, "mtime 看着不像 epoch 毫秒：{}", stat.mtime_ms);
+        // "hello" 的 sha256（固定值，用来证明摘要算的是内容而不是别的东西）
+        assert_eq!(
+            stat.sha256,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stat_file_returns_none_for_missing_file() {
+        /*
+         * 这是它与同族命令**唯一**的语义分叉：不存在是正常答案，不是错误。
+         * 守卫要靠它决定"直接写"，若这里 Err，调用方就得用 try/catch
+         * 表达一个完全正常的控制流，还分不清"不存在"与"无权限"。
+         */
+        let dir = temp_dir("stat_missing");
+        fs::create_dir_all(&dir).expect("建目录");
+        let path = dir.join("nope.png");
+
+        let result = stat_file(path.display().to_string()).expect("不存在不该报错");
+        assert!(result.is_none(), "缺文件必须返回 None");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stat_file_rejects_directory_and_relative_path() {
+        let dir = temp_dir("stat_dir");
+        fs::create_dir_all(&dir).expect("建目录");
+
+        match stat_file(dir.display().to_string()) {
+            Err(ShellError::NotAFile { .. }) => {}
+            other => panic!("目录应当报 NotAFile，实际 {other:?}"),
+        }
+
+        assert!(
+            stat_file("relative/card.png".to_string()).is_err(),
+            "相对路径必须拒绝（与既有命令同形）"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ── F15 生产反馈：回环端口探测 ──────────────────────────

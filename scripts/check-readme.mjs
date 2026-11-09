@@ -39,8 +39,40 @@ const h2 = lines.filter((l) => /^##\s+/.test(l)).map((l) => l.replace(/^##\s+/, 
 for (const s of requiredSections) {
   if (!h2.some((h) => h.includes(s))) fail(`缺少章节「${s}」（现有：${h2.join(' / ')}）`);
 }
-if (h2.length !== requiredSections.length + 1) {
-  fail(`正文应为 ${requiredSections.length} 节 + 许可证，实际 ${h2.length} 个二级标题：${h2.join(' / ')}`);
+/*
+ * 允许**一个**额外二级标题：「更新说明」。
+ *
+ * ## 为什么原来的"恰好 4 节"要放宽（2026-11-09）
+ *
+ * 那条判据的本意是**别让 README 长回开发手册**（T9.13 把 README 从开发文档
+ * 改成用户向文档时立的）。它用一个数字守住这件事，但数字不是意图 ——
+ * 用户装上新版本时最想知道"这次更新了什么"，那属于**用户向**内容，
+ * 为它守着数字反而违背判据的目的。
+ *
+ * ## 放宽的边界（不是"随便加节"）
+ *
+ * · 最多 5 节：再多就说明 README 又开始堆东西了；
+ * · 额外那节**必须叫「更新说明」** —— 不允许出现「部署」「架构」「API」
+ *   这类开发向二级标题；
+ * · 内容纯净度仍由下面第 2/3 条守着（无 docs 死链、无开发命令），
+ *   所以放宽标题数不会让 README 变脏。
+ */
+const extraAllowed = h2.filter((h) => !requiredSections.some((s) => h.includes(s)) && h !== '许可证');
+const unexpectedExtra = extraAllowed.filter((h) => !h.includes('更新说明'));
+if (unexpectedExtra.length > 0) {
+  fail(`出现了非预期的二级标题（只允许再加一节「更新说明」）：${unexpectedExtra.join(' / ')}`);
+}
+if (extraAllowed.length > 1) {
+  fail(`除四个正文章节外最多只能有一个「更新说明」，实际多了 ${extraAllowed.length} 个：${extraAllowed.join(' / ')}`);
+}
+if (h2.length > requiredSections.length + 1 + extraAllowed.length) {
+  fail(`正文应为 ${requiredSections.length}~${requiredSections.length + 1} 节 + 许可证，实际 ${h2.length} 个二级标题：${h2.join(' / ')}`);
+}
+/* 「更新说明」若存在必须排在简介之前（用户先看更新内容，再看长介绍） */
+const updateIdx = h2.findIndex((h) => h.includes('更新说明'));
+const introIdx = h2.findIndex((h) => h.includes('简介与功能一览'));
+if (updateIdx >= 0 && introIdx >= 0 && updateIdx > introIdx) {
+  fail('「更新说明」应排在「简介与功能一览」之前');
 }
 notes.push(`章节：${h2.join(' / ')}`);
 
@@ -86,7 +118,18 @@ lines.forEach((line, i) => {
     const encoded = encodeURI(path);
     if (encoded !== path) withoutPublishedDocs = withoutPublishedDocs.split(encoded).join('');
   }
-  if (/docs\//.test(withoutPublishedDocs)) {
+  /*
+   * ★ 只匹配**仓库根**的 docs 引用，不匹配任意含 `docs/` 的路径（2026-11-09）。
+   *
+   * 原判据是 `/docs\//`，于是 `client/src-tauri/gen/android/docs/android-user-guide.md`
+   * 这种**已入库**的文档也被判成死链 —— 而那是安卓端用户手册的正式位置
+   * （用户明确要求放在安卓工程自己的 docs 下，且已在 .gitignore 放行）。
+   *
+   * 真正的死链只会形如 `docs/xxx.md`（根目录、未入库）或 `./docs/xxx.md`。
+   * 所以要求 docs/ 前面**不是单词字符、也不是斜杠**：`android/docs/` 前面是
+   * 斜杠 ⇒ 不匹配；`(docs/` 或行首 ⇒ 匹配。全角括号同样算边界字符。
+   */
+  if (/(^|[^\w/])docs\//.test(withoutPublishedDocs)) {
     fail(`第 ${i + 1} 行引用了 docs/ 路径（GitHub 上死链）：${line.trim().slice(0, 80)}`);
   }
   // 代码围栏里的内容不算"开发命令残留"，但要单独标记，避免误判成用户步骤

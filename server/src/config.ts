@@ -56,12 +56,35 @@ export interface ServiceConfig {
  *   · `closed`     —— 默认。谁都不能自助注册，账户只能由管理员通过 CLI/面板创建；
  *   · `open`       —— 任何能访问到 API 的人都能注册（**只在可信网络/内网**开）；
  *   · `admin-only` —— 注册接口只允许已登录的管理员调用（等价于"面板建号"）。
+ *   · `invite`     —— v0.1.7 新增。自助注册入口开放，但**必须填有效邀请码**；
+ *                     每张码最多 3 个账户、最长 15 天（见 `storage/invites.ts`）。
+ *                     它是 `open` 与 `closed` 之间的中间档：入口可见，但进来要有凭证。
  *
  * 默认 `closed` 是刻意的：v0.1.1 之前服务端只有"一个全局 token"，没有账户概念，
  * 升级后如果默认开放注册，等于把一个原本只有持有 token 才能用的服务
  * 变成"公网任何人可注册"——这是**权限放大**，不能作为默认行为。
  */
-export type RegisterMode = 'closed' | 'open' | 'admin-only';
+export type RegisterMode = 'closed' | 'open' | 'admin-only' | 'invite';
+
+/**
+ * 合法的注册模式（**单一真相**）。
+ *
+ * 为什么放在这里而不是 `config-live.ts`：`config.ts` 是 `RegisterMode` 的
+ * 定义处，而 `normalizeConfig` 必须用它校验。这个枚举**曾经写了两遍** ——
+ * `config-live.ts` 一份、`normalizeConfig` 里一份三元素数组 —— 于是 v0.1.7
+ * 加 `invite` 时只改了前者，后者把 `invite` 判成非法值、静默回落到 `closed`。
+ *
+ * 症状极具误导性：`PUT /control/config` 返回 **200**，但磁盘上的
+ * `registerMode` 变成了 `closed`（既不是改前的 `open`，也不是期望的 `invite`）。
+ * 面板上表现为"点了邀请码注册、保存成功，刷新又变回关闭"。
+ *
+ * 判据：**同一件事写两遍是缺陷温床**；能一处定义就不要两处。
+ */
+export const REGISTER_MODES = ['closed', 'open', 'admin-only', 'invite'] as const;
+
+export function isRegisterMode(value: unknown): value is RegisterMode {
+  return typeof value === 'string' && (REGISTER_MODES as readonly string[]).includes(value);
+}
 
 export interface AuthConfig {
   /** 访问令牌；空串表示「未生成」——启动时若 require 为 true 会自动生成 */
@@ -415,10 +438,9 @@ export function normalizeConfig(input: unknown, overrides: ConfigOverrides = {})
         ? authRaw['publicPaths'].filter((item): item is string => typeof item === 'string')
         : [...DEFAULT_PUBLIC_PATHS],
       // 非法值一律回落到 closed：宁可拒绝注册，也不能因为拼错一个词
-      // 就把服务变成"谁都能建号"
-      registerMode: (['closed', 'open', 'admin-only'] as const).includes(authRaw['registerMode'] as never)
-        ? (authRaw['registerMode'] as RegisterMode)
-        : 'closed',
+      // 就把服务变成"谁都能建号"。
+      // 校验走 REGISTER_MODES（上方常量），不要在这里再写一份数组。
+      registerMode: isRegisterMode(authRaw['registerMode']) ? authRaw['registerMode'] : 'closed',
       // 老配置里没有这一项 —— 自动补一个并会在下次写盘时落下去。
       // 不能留空：空密钥会让 AuthService 拒绝签发令牌（宁可报错也不用弱密钥）。
       //
@@ -644,6 +666,19 @@ export function dataPaths(dataDir: string): {
   root: string;
   repos: string;
   blobs: string;
+  /**
+   * 卡面资产（v0.1.7 修订二：每张卡 0..1 张封面图）。
+   *
+   * **与 `blobs` 分开两个目录**，理由不是"内容不同"而是**生命周期不同**：
+   * 版本 blob 是只增不改的（回滚要能取到任意历史），而卡面是**可替换的**
+   * （换卡面不产生版本）。将来若要给 blob 做回收，两者的判据也完全不同 ——
+   * 混在一个目录里，回收逻辑就必须知道"哪些摘要是版本、哪些是卡面"，
+   * 而那个信息只存在数据库里；分目录之后，扫错目录本身就会漏。
+   *
+   * 仍然共用 `BlobStore` 的实现（内容寻址 + 原子写 + 读后校验），
+   * 所以同一张图被多张卡用只存一份。
+   */
+  faces: string;
   logs: string;
   tmp: string;
   database: string;
@@ -654,6 +689,7 @@ export function dataPaths(dataDir: string): {
     root,
     repos: join(root, 'repos'),
     blobs: join(root, 'blobs'),
+    faces: join(root, 'faces'),
     logs: join(root, 'logs'),
     tmp: join(root, 'tmp'),
     database: join(root, 'state.db'),
@@ -665,6 +701,7 @@ export function ensureDataDirs(dataDir: string): ReturnType<typeof dataPaths> {
   const paths = dataPaths(dataDir);
   mkdirSync(paths.repos, { recursive: true });
   mkdirSync(paths.blobs, { recursive: true });
+  mkdirSync(paths.faces, { recursive: true });
   mkdirSync(paths.logs, { recursive: true });
   mkdirSync(paths.tmp, { recursive: true });
   return paths;

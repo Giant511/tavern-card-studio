@@ -122,7 +122,7 @@ export const FIELD_FORMAT_KEYS = ['separator', 'labelMap'] as const;
 export const DEFAULT_GREETING_PRESET: FieldPreset = {
   schemaVersion: 1,
   id: 'default',
-  name: '标准初始场景（v0.1.3 冻结）',
+  name: '标准初始场景',
   version: '1.0.0',
   description: '多条开场白用空行 + --- + 空行切分，不写段标签。等价于逐字节的既有行为。',
   builtin: true,
@@ -133,7 +133,7 @@ export const DEFAULT_GREETING_PRESET: FieldPreset = {
 export const DEFAULT_CHAT_EXAMPLES_PRESET: FieldPreset = {
   schemaVersion: 1,
   id: 'default',
-  name: '标准对话示例（v0.1.3 冻结）',
+  name: '标准对话示例',
   version: '1.0.0',
   description: '示例对话按原文整段保存（mes_example），不切分轮次、不写标签。',
   builtin: true,

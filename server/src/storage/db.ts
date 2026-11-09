@@ -63,6 +63,14 @@ export interface CardRow {
   audit_warning_count: number | null;
   audit_info_count: number | null;
   audit_exportable: number | null;
+  /** 卡面 blob 摘要（v0.1.7 修订二）；null = 这张卡没有卡面，导出走默认兜底链 */
+  face_sha256: string | null;
+  /** 卡面字节数（给客户端估算下载量；也是 blob 完整性的一次交叉校验） */
+  face_size: number | null;
+  /** 卡面 MIME（`image/png` / `image/jpeg` / `image/webp`）；null = 无卡面 */
+  face_mime: string | null;
+  /** 卡面最后更新时间；换卡面不改 `updated_at`（那是"内容变了"的时间） */
+  face_updated_at: string | null;
 }
 
 export interface VersionRow {
@@ -280,6 +288,35 @@ CREATE TABLE IF NOT EXISTS repo_tokens (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_tokens_hash ON repo_tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_repo_tokens_owner ON repo_tokens(owner_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_repo_tokens_repo ON repo_tokens(repo_id, created_at DESC);
+
+-- ── 邀请码（v0.1.7 新增）────────────────────────────────────
+--
+-- 用途：auth.registerMode = 'invite' 时，注册必须填一张有效邀请码。
+-- 每张码最多 3 次、最长 15 天 —— 这两个上限写在 InviteStore 的常量里，
+-- 不落成列，因为它们是产品口径而不是每张码可调的参数。
+--
+-- code_key 独立于 code 的原因：用户手打会带空格/连字符/小写，
+-- 查询要走规范化键才能用上唯一索引（在 SQL 里 UPPER(REPLACE(...)) 用不上索引）。
+--
+-- ⚠ 这张表不能带外键指向 users：码是发给"还没成为用户的人"的，
+-- 创建者可能后来被注销（created_by 故意不设外键，只做审计线索）。
+--
+-- ⚠ 注意：这段是 TS 模板字符串里的 SQL，**注释里不要写反引号** ——
+-- 反引号会提前结束模板，报一堆"',' expected"（本轮踩过一次）。
+CREATE TABLE IF NOT EXISTS invite_codes (
+  id TEXT PRIMARY KEY,
+  code TEXT NOT NULL,
+  code_key TEXT NOT NULL,
+  max_uses INTEGER NOT NULL DEFAULT 3,
+  used_count INTEGER NOT NULL DEFAULT 0,
+  expires_at TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT '',
+  revoked_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_invite_codes_key ON invite_codes(code_key);
+CREATE INDEX IF NOT EXISTS idx_invite_codes_created ON invite_codes(created_at DESC);
 `;
 
 /**
@@ -321,6 +358,25 @@ export class Db {
     // 老库的 cards 表在这行执行之前还没有 repo_id 列。
     ensureColumn(this.handle, 'cards', 'repo_id', "repo_id TEXT NOT NULL DEFAULT ''");
     this.handle.exec('CREATE INDEX IF NOT EXISTS idx_cards_repo ON cards(repo_id, updated_at DESC)');
+
+    /*
+     * v0.1.7 修订二：卡面资产（每张卡 0..1 张封面图）。
+     *
+     * 为什么放 cards 表而不是新建一张表：
+     *   · 关系是 1..0-1（一张卡要么有卡面要么没有），表的开销换不来任何东西；
+     *   · 查询永远跟着卡走（列表要显示卡面、导出要取卡面），同表免一次 JOIN。
+     *
+     * 为什么默认是 NULL 而不是空串：**"没有卡面"是一个有意义的状态**
+     * （导出时走默认卡面兜底链），而空串是个假摘要 —— 拿它去 BlobStore
+     * 会被 SHA256_PATTERN 拦下并报 BLOB_CORRUPTED，把一个正常状态变成错误。
+     *
+     * 换卡面**不进版本历史**（用户明确要求"换卡面 ≠ 新版本"）：它只改这四列，
+     * 外加一条审计事件。版本 blob 保持纯 JSON 不变。
+     */
+    ensureColumn(this.handle, 'cards', 'face_sha256', 'face_sha256 TEXT');
+    ensureColumn(this.handle, 'cards', 'face_size', 'face_size INTEGER');
+    ensureColumn(this.handle, 'cards', 'face_mime', 'face_mime TEXT');
+    ensureColumn(this.handle, 'cards', 'face_updated_at', 'face_updated_at TEXT');
 
     // v0.1.2（T10.18 / F13.3）：版本内容清除（prune）。
     //
@@ -411,6 +467,29 @@ export class Db {
       .prepare(`SELECT * FROM cards WHERE ${where.join(' AND ')}`)
       .get(params) as CardRow | undefined;
     return row;
+  }
+
+  /**
+   * 只改卡面四列（v0.1.7 修订二）。
+   *
+   * **不动 `updated_at`** —— 那是"卡的内容变了"的时间，列表按它排序。
+   * 换封面不改内容，如果把它也刷新，用户会看到一张明明没改过设定的卡
+   * 跳到列表最前面；更糟的是"最近修改"这个判据整体失真。
+   */
+  setCardFace(
+    cardId: string,
+    face: { sha256: string | null; size: number | null; mime: string | null; at: string },
+  ): void {
+    this.handle
+      .prepare(
+        `UPDATE cards SET
+          face_sha256 = @sha256,
+          face_size = @size,
+          face_mime = @mime,
+          face_updated_at = @at
+        WHERE id = @cardId`,
+      )
+      .run({ cardId, sha256: face.sha256, size: face.size, mime: face.mime, at: face.at });
   }
 
   updateCardFromLatest(cardId: string, version: NewVersionRow, meta: { name: string; updatedAt: string }): void {

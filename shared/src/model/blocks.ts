@@ -2,7 +2,23 @@
  * 八大板块定义（客户端分块编辑的核心枚举）。
  * 板块 id 是全局稳定标识：平台规则、高亮规则、审计报告中一律使用这些 id 引用板块。
  *
- * ── v0.1.3 / F6 起从六板块扩到八板块 ──────────────────────────────
+ * ── 板块演进：六 → 八（v0.1.3）；v0.1.7 收尾：情景并入初始场景，**仍是八板块** ──
+ *
+ * ```text
+ *   ✅ 板块总数仍是 8 个（用户 2026-11-09 用编辑器截图确认）
+ *   ✅ scenario 不单独成板块，并入 initial-scene 的「@@情景」段
+ *   ✅ chat-examples 保持独立（示例对话不重复出现在两处）
+ * ```
+ *
+ * 用户原话「我编辑器里面的初始场景板块其实是包含三个字段的内容，一个就是开场白，
+ * 一个就是情景，还有一个是示例对话」—— 其中"示例对话"由**独立的
+ * `chat-examples` 板块**承载（编辑器里就是「对话示例」那一项）。
+ * 所以「初始场景」内部实为**两段**：开场白、情景。
+ *
+ * 为什么不让示例对话也进初始场景：同一段内容两个编辑入口，
+ * 改一处另一处不跟着变，是最难向用户解释的一类不一致。
+ *
+ * 复合段的序列化与解析在 `format/composite-scene.ts`（单一来源）。──
  *
  * 六板块里有四种是"description 的分段"（靠标题行切分），加上独立的 personality
  * 与结构化的世界书。新增的两块是**字段板块（field-backed）**：它们的内容有自己的
@@ -31,8 +47,29 @@ export type BlockKind =
   | 'field-backed';
 
 /** 板块承载的 ST 字段 */
-export type BlockStField = 'description' | 'personality' | 'character_book' | 'first_mes' | 'mes_example';
+export type BlockStField =
+  | 'description'
+  | 'personality'
+  | 'character_book'
+  /* 初始场景是**复合板块**：主字段是 first_mes，另两个见 alsoWrites */
+  | 'first_mes'
+  /* 对话示例独占 mes_example */
+  | 'mes_example';
 
+/*
+ * 顺序即 UI 展示顺序（也是 description 的默认拼装顺序，只对
+ * `description-segment` 生效）。
+ *
+ * ★★★ 新板块只能追加在**前两位之后**（2026-11-08 新增 scenario 时确认）。
+ *
+ * `client/src/editor/block-doc.ts` 有一条红线：首屏默认展开的板块数恒为 2，
+ * 而"哪些板块默认展开"是按本数组下标算的（`index < 2`）。前两位固定是
+ * `basic` 与 `personality` —— 这是**结构保证**，不是运气。把新板块插到
+ * 前两位会凭空多建两个 CodeMirror 实例（折叠即销毁，展开即实例）。
+ *
+ * `scenario` 放在 `initial-scene` 与 `worldbook` 之间：它与"场景/开场"
+ * 同属叙事前置信息，索引 7，天然在懒渲染边界之外。
+ */
 export const BLOCK_IDS = [
   'basic',
   'personality',
@@ -119,19 +156,41 @@ export const BLOCK_DEFINITIONS: readonly BlockDefinition[] = [
     kind: 'field-backed',
   },
   {
+    /*
+     * ★★★ 复合板块（v0.1.7 收尾，2026-11-09 用户澄清）。
+     *
+     * 一个板块、两段内容、三个 ST 字段：
+     *
+     * ```text
+     *   @@开场白      first_mes + alternate_greetings（多条用分隔行切）
+     *   @@情景        scenario
+     * ```
+     *
+     * 「示例对话」**不在这里** —— 它是独立的 `chat-examples` 板块。
+     * 两处都给入口会让同一段内容有两个编辑点，改一处另一处不跟着变。
+     *
+     * 序列化/解析全部在 `format/composite-scene.ts`，本文件只管声明。
+     *
+     * ## 为什么 `alsoWrites` 里有两项
+     *
+     * `stField` 只能写一个（first_mes），但实际要写三个。
+     * `alsoWrites` 的作用是**给"这个板块会碰哪些字段"一个可查的清单** ——
+     * 导出、审计、迁移脚本据此判断"用户改了这块要回写什么"。
+     */
     id: 'initial-scene',
     label: '初始场景',
-    description: '开场白（ST 的 first_mes）；多条开场白之间用分隔行切分，导出为 alternate_greetings',
+    description:
+      '两段合一：开场白（多条用分隔行切）· 情景。写进 ST 的 first_mes / alternate_greetings / scenario',
     defaultHeading: '初始场景',
     stField: 'first_mes',
-    alsoWrites: ['alternate_greetings'],
+    alsoWrites: ['alternate_greetings', 'scenario'],
     allowEmpty: true,
     kind: 'field-backed',
   },
   {
     id: 'worldbook',
     label: '世界书',
-    description: '世界观条目（关键词触发），落盘为 character_book',
+    description: '世界观条目（关键词触发），保存时写入角色卡的世界书字段',
     defaultHeading: '世界书',
     stField: 'character_book',
     allowEmpty: true,

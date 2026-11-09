@@ -98,10 +98,28 @@ async function request(
     });
   } catch (error) {
     const aborted = error instanceof Error && error.name === 'AbortError';
-    throw new RepoClientError(
+    /*
+     * ★ `{ cause: error }` 不可省（2026-11-04）。
+     *
+     * 原来这里把任何底层失败都压成一句「无法连接服务端」，
+     * **丢掉了可操作的信息**。真机实测的后果：
+     *
+     * ```text
+     *   自签证书失败 → 原生侧说"证书校验失败，确认风险后可继续"
+     *                → 这里改写成"无法连接服务端"
+     *                → 上层认不出是证书问题 ⇒ 那个确认框永远不弹
+     *                → 用户只看到"连不上"，不知道有出路
+     * ```
+     *
+     * 加 `cause` 保留原始错误链（标准 Error cause 机制），
+     * **对外文案与错误码完全不变** —— 只是让上层能"看穿"这一层。
+     */
+    const wrapped = new RepoClientError(
       aborted ? 'TIMEOUT' : 'NETWORK',
       aborted ? `请求超时（${timeoutMs} ms）` : '无法连接服务端',
     );
+    (wrapped as Error & { cause?: unknown }).cause = error;
+    throw wrapped;
   } finally {
     clearTimeout(timer);
   }
