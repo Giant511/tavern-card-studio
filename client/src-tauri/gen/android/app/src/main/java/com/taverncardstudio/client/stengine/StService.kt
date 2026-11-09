@@ -49,6 +49,10 @@ class StService : Service() {
         /** 通知里刷新 RSS 的周期。10 秒够用，太频繁会被系统限流 */
         private const val RSS_REFRESH_MS = 10_000L
 
+        /** 超时后"继续盯"的间隔与总上限（见 `watchUntilReady`） */
+        private const val WATCH_INTERVAL_MS = 2_000L
+        private const val WATCH_TOTAL_MS = 10 * 60 * 1000L
+
         /**
          * 最近一次失败原因。
          *
@@ -251,6 +255,26 @@ class StService : Service() {
             StLauncher.markStopped()
             Log.e(TAG, "启动失败：${result.message}")
             updateNotification(result.message, null)
+            /*
+             * ★★★ 超时不等于放弃（2026-11-09）。
+             *
+             * ## 真机实测的矛盾
+             *
+             * ```text
+             *   App：等了 120 秒，报"引擎还在启动"
+             *   而 node 进程一直活着，几分钟后 8000 真的 LISTEN 了
+             * ```
+             *
+             * 这时 `ready` 会一直是 false（它只在成功路径里被置 true），
+             * 于是**界面永远显示没连上**，而引擎其实是好的。
+             * 用户要么点重试（现在能成功），要么以为坏了。
+             *
+             * ## 所以要有个"后来补上"的机制
+             *
+             * 进程还活着就说明它还在初始化，值得继续等。
+             * 起了程就别管，到点了它自己会就绪。
+             */
+            if (StLauncher.isOurProcessAlive()) watchUntilReady()
             return
         }
 
@@ -259,6 +283,50 @@ class StService : Service() {
 
         // ③ RSS 周期刷新（通知里的数字必须真实）
         startRssRefresh()
+    }
+
+    /**
+     * 引擎还没就绪就一直盯着（2026-11-09）。
+     *
+     * ## 为什么需要它
+     *
+     * `awaitListening` 有 120 秒上限，超时后返回"还在启动"。
+     * 但**超时只是我们不再等，不是引擎停了** —— 真机上它往往在
+     * 120~300 秒之间才 LISTEN。
+     *
+     * 而 `StLauncher.ready` 只在 `publishReady()` 里被置 true。
+     * 超时路径只调 `markStopped()`（把 ready 清成 false），
+     * 于是引擎后来起来了，界面也永远显示没连上 —— 用户只能靠点重试。
+     *
+     * 这个方法把"后来就绪"这件事补上：后台每 2 秒探一次，
+     * 一旦 ST 应答就清掉 lastError、置 ready、刷新通知。
+     *
+     * ## 三个约束
+     *
+     * ```text
+     *   进程死了   → 立刻退出（那不是"还在启动"，是真失败）
+     *   10 分钟    → 兜底上限，避免线程永久占着
+     *   daemon     → 不阻止进程退出
+     * ```
+     */
+    private fun watchUntilReady() {
+        Thread({
+            val deadline = System.currentTimeMillis() + WATCH_TOTAL_MS
+            while (System.currentTimeMillis() < deadline) {
+                if (!StLauncher.isOurProcessAlive()) {
+                    Log.w(TAG, "看守结束：引擎进程已退出")
+                    return@Thread
+                }
+                if (StLauncher.probe(StLauncher.activePort).state == StLauncher.ProbeState.ST) {
+                    Log.i(TAG, "引擎后来就绪了（超出探活上限，由看守补上）")
+                    lastError = null
+                    publishReady("引擎后来就绪了")
+                    return@Thread
+                }
+                Thread.sleep(WATCH_INTERVAL_MS)
+            }
+            Log.w(TAG, "看守超时：${WATCH_TOTAL_MS / 1000} 秒内引擎仍未就绪")
+        }, "st-watch-ready").apply { isDaemon = true }.start()
     }
 
     /** 引擎就绪后把通知换成"已就绪 + 实时 RSS" */
