@@ -868,6 +868,33 @@ export function explainGenerateError(status: number, bodyPreview: string): strin
     );
   }
   /*
+   * 400 + **上游明确在怪 key**（2026-11-09）。
+   *
+   * 与上面那条的区别：上面是 ST 自己说"没有 key"（裸 `{error:true}`），
+   * 这里是**请求确实发出去了**、上游收到了、但上游说这个 key 不行。
+   *
+   * 三种可能必须一起给出来，因为从我们这边分不清：
+   *
+   * ```text
+   *   没存进去       App 显示已配置但 ST 读出来是空（secrets 数组没 active 项）
+   *   key 本身不对   复制时少了字符、填了别家的 key
+   *   额度用完/过期  中转站最常见，而它的措辞也是"Key 错误"
+   * ```
+   *
+   * ★ 必须提"额度"这一条：用户看到"Key 错误"第一反应是重新粘贴 key，
+   *   而真实原因是额度用完了 —— 重粘一百次也没用。
+   */
+  if (status === 400 && looksLikeKeyRejection(bodyPreview)) {
+    return (
+      '上游拒绝了这次请求里的 key。可能是三种情况之一：\n' +
+      '① key 没真的存进去 —— 到「我的 → API 连接」展开当前接口，' +
+      '重新粘贴一次 key 再点保存（保存时请确认下面的提示变成"已配置"）；\n' +
+      '② key 填错或已被换掉 —— 重新从服务商那里复制完整的一串；\n' +
+      '③ key 还能用但**额度用完 / 已过期** —— 中转站通常也用这句话报额度问题，' +
+      '去服务商后台看一下余额与有效期。'
+    );
+  }
+  /*
    * ★★★ 500 分两种，给的指引完全不同（2026-11-07 实测后改）。
    *
    * ## 裸 `{error:true}` 的 500 不是"上游偶尔抽风"
@@ -924,6 +951,42 @@ export function explainGenerateError(status: number, bodyPreview: string): strin
  * 容忍度：`{"error":true}` / `{ error: true }` / `{"error": true}` 都认；
  * 只要还带了别的键（例如 `message`），就**不算**裸的。
  */
+/**
+ * 上游是不是在**怪这个 key**（2026-11-09，用户真机报的那条）。
+ *
+ * ## 为什么要单独认这一种
+ *
+ * 用户的错误长这样（来自中转站，不是 ST）：
+ *
+ * ```text
+ *   400 {"error":{"code":"","message":"Key 错误：Key 填错、过期或未设置
+ *        Bearer。请检查 Key。（request id: …）"}}
+ * ```
+ *
+ * 这句话对用户没有信息量：他不知道是"没存进去""填错了"还是"额度用完了"，
+ * 而三种处置完全不同。原来它落到兜底分支，界面原样打印这段英文+中文混排，
+ * 用户只能来问。
+ *
+ * ## 判据为什么用关键词而不是精确匹配
+ *
+ * 中转站、各家代理、官方 API 的措辞都不一样，但都在说同一件事：
+ *
+ * ```text
+ *   Key 错误 / 无效的令牌 / Incorrect API key / invalid_api_key
+ *   Unauthorized / 未设置 Bearer / 鉴权失败 / authentication
+ * ```
+ *
+ * 认关键词，不认某一句原文 —— 否则换个中转站就又认不出了。
+ */
+function looksLikeKeyRejection(bodyPreview: string): boolean {
+  const text = bodyPreview.toLowerCase();
+  return (
+    /key\s*错误|密钥|秘钥|令牌|鉴权|未设置\s*bearer/.test(bodyPreview) ||
+    /invalid[ _-]?api[ _-]?key|incorrect[ _-]?api[ _-]?key|unauthorized|authentication/.test(text) ||
+    /bearer/.test(text)
+  );
+}
+
 function isBareErrorTrue(bodyPreview: string): boolean {
   const text = bodyPreview.trim();
   /* 只取第一层：找最外层对象 */

@@ -468,9 +468,21 @@ test('★★★★★ 读不到世界书列表时不许当成"空表"（否则�
   const decl = shellSrc.slice(at, at + 200);
   assert.match(decl, /Promise<string\[\] \| null>/, '签名要三态');
   const body = shellSrc.slice(at, at + 1600);
-  const catchAt = body.indexOf('} catch {');
+  /*
+   * ★ 2026-11-09：原来钉的是 `} catch {`（不带参数）。
+   * 而"世界书失败要留下原因"这个新需求必须 `catch (error)` 才能拿到原因，
+   * 判据就红了 —— 它守的性质（失败返回 null 而不是空数组）一个字没变。
+   *
+   * 现在只要求"catch 之后的第一件事是 return null"，
+   * 不关心 catch 有没有参数。
+   */
+  const catchAt = body.search(/\}\s*catch\s*(\([^)]*\))?\s*\{/);
   assert.ok(catchAt > 0, '找不到 catch 分支');
-  assert.match(body.slice(catchAt, catchAt + 120), /return null;/, 'catch 要返回 null 而不是空数组');
+  assert.match(
+    body.slice(catchAt, catchAt + 200),
+    /return null;/,
+    'catch 要返回 null 而不是空数组',
+  );
 
   const callerAt = shellSrc.indexOf('private async persistEmbeddedWorldbook');
   assert.ok(callerAt > 0);

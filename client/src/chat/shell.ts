@@ -91,6 +91,7 @@ import {
   parseStCardText,
   planCardImport,
   convertEmbeddedWorldbook,
+  readEmbeddedWorldbook,
   attachWorldToCard,
   resolveRepoOrigin,
   stringifyStCard,
@@ -281,6 +282,33 @@ interface TabDef {
   id: TabId;
   label: string;
   icon: string;
+}
+
+/**
+ * 一次"把卡写进角色库"的结果（2026-11-09）。
+ *
+ * 只为一件事：**世界书到底进没进来，要能如实告诉用户**。
+ *
+ * ## 为什么必须区分 `none` 与 `failed`
+ *
+ * `persistEmbeddedWorldbook` 返回 `null` 同时覆盖两种情况，而它们的
+ * 处置完全相反：
+ *
+ * ```text
+ *   none    卡里本来就没有 character_book ⇒ 什么都不该说
+ *   failed  卡里带了书但没落地           ⇒ 必须说，否则用户以为卡没带书
+ * ```
+ *
+ * 把两者混成一句"世界书未导入"，会让**本来就没有书**的卡也弹提示 ——
+ * 那是拿噪音换消息，用户很快就不看了。
+ */
+interface CardWriteResult {
+  /** `ok` = 落地成功；`none` = 卡里没有内嵌书；`failed` = 有书但失败 */
+  worldbook: 'ok' | 'none' | 'failed';
+  /** 落地后的书名（`worldbook === 'ok'` 时才有） */
+  worldbookName?: string;
+  /** 失败原因（`worldbook === 'failed'` 时才有） */
+  worldbookFailure?: string;
 }
 
 /** Tab 顺序即从左到右（聊天是第一页 —— 它是这个 App 的主用途） */
@@ -2700,14 +2728,37 @@ export class AppShell {
         this.bridge.importWorldbook(name, JSON.stringify(plan.entries)),
       );
       return name;
-    } catch {
+    } catch (error) {
       /*
-       * 失败静默：卡已经写好了，世界书是加分项。
-       * 弹通知会让用户以为"导入失败"，而实际上角色是可用的。
+       * ★★★ 失败不能再静默（2026-11-09 用户报「导入卡片后却没有导入角色的世界书」）。
+       *
+       * 原来这里是一个空 catch，只 `return null`。后果是：
+       *
+       * ```text
+       *   卡面写好了 → 用户能用角色 → 但世界书没进来
+       *   而界面上一个字的提示都没有 → 用户以为"这张卡本来就没世界书"
+       * ```
+       *
+       * 真实原因可能是：ST 的 worldinfo/import 被拒、名字撞了加序号后
+       * 仍失败、引擎连接在半路断了……**每一种处置都不同**，
+       * 静默等于把这四种都压成"没有"。
+       *
+       * 现在记下原因，由调用方在**导入成功之后**补一条 warn（不是 danger：
+       * 角色确实可用了，不该让用户以为整个导入失败）。
        */
+      this.lastWorldbookFailure = describeBridgeError(error).message;
       return null;
     }
   }
+
+  /**
+   * 上一次世界书落地失败的原因（空串 = 没失败 / 没尝试）。
+   *
+   * 只有一条用途：导入完成后如实告诉用户"书没进来，因为……"。
+   * 不用返回值是因为 `persistEmbeddedWorldbook` 的返回类型已经被
+   * "世界书名"占用了（`null` 同时表示"没有书"和"失败"，分不开）。
+   */
+  private lastWorldbookFailure = '';
 
   /**
    * 现有世界书的名字列表。
@@ -2731,7 +2782,8 @@ export class AppShell {
         if (value !== '') out.push(value);
       }
       return out;
-    } catch {
+    } catch (error) {
+      this.lastWorldbookFailure = describeBridgeError(error).message;
       return null;
     }
   }
@@ -2771,7 +2823,14 @@ export class AppShell {
     /* 仓库是权威版本，覆盖本地同名卡是预期行为，不弹确认 */
     const plan = await this.resolveCardPlacement({ jsonText, cardId, confirmOverwrite: false });
     if (plan === null) return;
-    await this.writeCardToLibrary({ plan, jsonText, base: null });
+    const written = await this.writeCardToLibrary({ plan, jsonText, base: null });
+    /* 书没落地要说一声（角色可用了，所以是 warn 不是 danger） */
+    if (written.worldbook === 'failed') {
+      this.options.onNotify?.(
+        `卡已导入，但内嵌世界书没进来：${written.worldbookFailure ?? '未知原因'}`,
+        'warn',
+      );
+    }
   }
 
   /**
@@ -2844,7 +2903,7 @@ export class AppShell {
      * 用 `null` 而不是空数组：空数组是合法值，混用分不清「没图」和「图是空的」。
      */
     base: Uint8Array | null;
-  }): Promise<void> {
+  }): Promise<CardWriteResult> {
     const { plan, jsonText } = input;
 
     /*
@@ -2852,10 +2911,37 @@ export class AppShell {
      * 失败**不阻断导入** —— 卡本身能用；阻断会让用户连卡都拿不到，
      * 那比"世界书没进来"更糟。
      */
+    /* 先清掉上一次的失败痕迹，否则这一次"没有书"会被上一次的失败原因污染 */
+    this.lastWorldbookFailure = '';
+
     const worldName = await this.persistEmbeddedWorldbook(jsonText, plan.displayName);
     const cardText = worldName === null ? jsonText : JSON.stringify(
       attachWorldToCard(JSON.parse(jsonText) as unknown, worldName),
     );
+
+    /*
+     * ★ 卡里到底有没有书，与"落地成没成"是**两件事**（2026-11-09）。
+     *
+     * `persistEmbeddedWorldbook` 返回 `null` 同时覆盖两种情况，
+     * 所以这里再问一次源头，才能给出对的话：
+     *
+     * ```text
+     *   卡里没有 character_book  → 本来就没有，"缺书"不是问题，不该提示
+     *   有书但落地失败          → 必须告诉用户，否则他会以为卡没带书
+     * ```
+     */
+    const worldbook: CardWriteResult['worldbook'] = (() => {
+      if (worldName !== null) return 'ok';
+      if (this.lastWorldbookFailure !== '') return 'failed';
+      /* 没失败但也没书名 ⇒ 卡里没有内嵌书 */
+      let hasBook = false;
+      try {
+        hasBook = readEmbeddedWorldbook(JSON.parse(jsonText) as unknown) !== null;
+      } catch {
+        hasBook = false;
+      }
+      return hasBook ? 'failed' : 'none';
+    })();
 
     /*
      * 没有底图就按卡名画一张（v0.1.8，用户口径）。
@@ -2895,6 +2981,12 @@ export class AppShell {
     await this.withConnection(() =>
       this.bridge.writeCharacterPng(plan.avatar, charactersDir, png, !plan.overwrite),
     );
+
+    return {
+      worldbook,
+      ...(worldName === null ? {} : { worldbookName: worldName }),
+      ...(this.lastWorldbookFailure === '' ? {} : { worldbookFailure: this.lastWorldbookFailure }),
+    };
   }
 
   /**
@@ -2959,11 +3051,12 @@ export class AppShell {
     if (plan === null) return; /* 用户取消覆盖 */
 
     const target = plan;
+    let written: CardWriteResult | null = null;
     await runBusy(
       button,
       { idle: '从手机导入卡片', busy: '导入中…', done: '已导入 ✓', retry: '重试' },
       async () => {
-        await this.writeCardToLibrary({ plan: target, jsonText: parsed.jsonText, base });
+        written = await this.writeCardToLibrary({ plan: target, jsonText: parsed.jsonText, base });
       },
       { doneKind: 'ok' },
     ).then(() => {
@@ -2971,12 +3064,27 @@ export class AppShell {
        * 成功后才通知，且**这时候不会重绘**（卡片页不列卡片），
        * 所以挂 topbar 的通知不会被删掉。
        */
-      this.options.onNotify?.(
-        target.overwrite
-          ? `已覆盖「${target.displayName}」`
-          : `已导入「${target.displayName}」`,
-        'ok',
-      );
+      const done = target.overwrite
+        ? `已覆盖「${target.displayName}」`
+        : `已导入「${target.displayName}」`;
+      /*
+       * ★ 世界书那半句必须单独说（2026-11-09）。
+       *
+       * 卡写成功但书没进来时，只说"已导入"就是在撒谎 ——
+       * 用户以为设定齐了，实际角色会在聊天里"忘事"，而且找不到原因。
+       */
+      const result = written as CardWriteResult | null;
+      if (result !== null && result.worldbook === 'failed') {
+        this.options.onNotify?.(
+          `${done}，但内嵌世界书没进来：${result.worldbookFailure ?? '未知原因'}`,
+          'warn',
+        );
+        return;
+      }
+      const extra = result !== null && result.worldbook === 'ok'
+        ? `，含世界书「${result.worldbookName ?? ''}」`
+        : '';
+      this.options.onNotify?.(`${done}${extra}`, 'ok');
     }).catch((error: unknown) => {
       const text = error instanceof Error ? error.message : String(error);
       this.options.onNotify?.(`导入失败：${text}`, 'danger');
