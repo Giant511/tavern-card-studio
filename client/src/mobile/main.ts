@@ -784,14 +784,31 @@ async function boot(): Promise<void> {
 
   if (!waited.ok) {
     /*
-     * 失败时的提示必须**可操作**：
-     * · 超时 → 告诉他在等什么、可以先进去
-     * · 引擎报错 → 把引擎自己的话带出来（那是它的原话，比我们猜的准）
+     * ★★★ 「超时」与「失败」不是一回事（2026-11-09 修）。
+     *
+     * 用户报的是这样一句矛盾的话：
+     *
+     * > 还是提示没有进入世界，但是界面过了几秒又自动跳转了
+     *
+     * 矛盾的原因就在原来这三行：**超时也调 `setPhase('failed')`**，
+     * 于是标题被写成「世界没能打开」—— 而引擎其实还在后台启动，
+     * 几秒后（甚至就在他看这句话的时候）就好了。
+     *
+     * ```text
+     *   超时   = 我们等够了，但它还在启动    → 标题应保持"正在加载"
+     *   失败   = 引擎明确报了错 / 进程死了    → 标题才该说"没能打开"
+     * ```
+     *
+     * 把前者说成后者，用户会去做"重启、重装、卸载"这些动作 ——
+     * 而重启恰好会杀掉正在启动的引擎，是最坏的一步。
+     *
+     * 所以超时只补一句 hint，**不动标题**。
      */
-    splash.setPhase('failed');
+    const timedOut = waited.reason === null || waited.reason === '等待超时';
+    if (!timedOut) splash.setPhase('failed');
     splash.setHint(
-      waited.reason === null || waited.reason === '等待超时'
-        ? `等了 ${String(Math.round(waited.elapsedMs / 1000))} 秒还没就绪，先进去吧 —— 之后可以手动选角色重试。`
+      timedOut
+        ? `等了 ${String(Math.round(waited.elapsedMs / 1000))} 秒，引擎还在启动 —— 先进去吧，进去之后它会自己就绪。`
         : `引擎没能启动：${waited.reason}。先进去吧，里面能看到连接状态。`,
     );
     // 让用户看清这句话再走；不设这个延时的话失败提示会一闪而过

@@ -4775,11 +4775,47 @@ export class AppShell {
     /* ── ① 秘钥：写 ST 的 secrets（`api_key_<源>`）── */
     let keyWritten = false;
     if (apiKey !== null && apiKey.trim() !== '') {
+      const secretKey = secretKeyOf(state.source);
       try {
-        await this.withConnection(() =>
-          this.bridge.writeSecret(secretKeyOf(state.source), apiKey.trim()),
-        );
-        keyWritten = true;
+        /*
+         * ★★★ 这里**不再写 key**，只回读确认（2026-11-09）。
+         *
+         * ## 为什么把写入让给 api-page
+         *
+         * 两处都写会让 ST 的 secrets.json 每次保存多出一条
+         * （`writeSecret` 是追加语义）。api-page 是用户点"保存"的直接处理者，
+         * 由它写最自然；这一层负责**核实**。
+         *
+         * ## 为什么要核实（这是本轮修的核心）
+         *
+         * 用户报：
+         *
+         * > 我明明填了秘钥……报 Key 错误：Key 填错、过期或未设置 Bearer
+         *
+         * 真机取证（直连 ST 的 `/api/secrets/read`）：整张表**全是 null**，
+         * 包括 `api_key_custom`。也就是 key 一个字节都没进去，而界面说成功。
+         * 于是请求带 `Authorization: Bearer `（空），上游回"未设置 Bearer"。
+         *
+         * `writeSecret` 返回 200 只说明 ST **收下了请求**，不代表 secrets.json
+         * 里真有一条 `active: true`。而 ST 的 `readSecret()` 只认 active 那条：
+         *
+         * ```js
+         *   const activeSecret = secretArray.find(s => id ? s.id === id : s.active);
+         *   return activeSecret?.value || '';      // 没有 active ⇒ 空串
+         * ```
+         *
+         * 所以判据要用 ST 自己的口径：**`secretPresent()` 里有没有这个名字**。
+         * 那个函数已改成与 `readSecret` 完全一致（只认 active:true）。
+         */
+        const present = await this.withConnection(() => this.bridge.secretPresent());
+        if (!present.includes(secretKey)) {
+          problems.push(
+            `秘钥没在引擎里生效（${secretKey} 找不到 active 记录）。` +
+              '再点一次保存；还不行就说明引擎没连上。',
+          );
+        } else {
+          keyWritten = true;
+        }
       } catch (error) {
         /*
          * 写不进去**必须报**：只改源和模型而不写 key，等于把用户

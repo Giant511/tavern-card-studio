@@ -185,9 +185,25 @@ test('★★★ 建议数值要按实际思维链长度算，不能给固定数'
 });
 
 test('★★ 输入值要夹在合理范围（防止手改 localStorage 塞天文数字）', () => {
-  /* 太小连正常回复都装不下；太大弱模型会卡死、预付费站点可能直接拒 */
-  assert.match(apiPage, /n\s*>=\s*256/, '下界 256');
-  assert.match(apiPage, /n\s*<=\s*8192/, '上界 8192');
+  /*
+   * ★ 2026-11-09：原来钉的是 `n >= 256` 与 `n <= 8192` 两个字面量。
+   *
+   * 而用户报「最大回复长度是否有限制？正常这个地方不应该有限制」——
+   * 8192 那道闸就是他改了不生效的真因（填 100000 被静默换成 2048）。
+   *
+   * **判据守的性质没变**：输入值要被夹在合理区间，防止手改 localStorage
+   * 塞进天文数字。只是区间本身变了，而且改成了共享常量（三处共用）。
+   */
+  assert.match(apiPage, /MAX_TOKENS_MIN/, '要有共享下界常量');
+  assert.match(apiPage, /MAX_TOKENS_MAX/, '要有共享上界常量');
+
+  const min = Number(/export const MAX_TOKENS_MIN = ([0-9_]+)/.exec(apiPage)?.[1]?.replace(/_/g, '') ?? '0');
+  const max = Number(/export const MAX_TOKENS_MAX = ([0-9_]+)/.exec(apiPage)?.[1]?.replace(/_/g, '') ?? '0');
+  assert.ok(min >= 1, `下界至少是 1，实际 ${String(min)}`);
+  assert.ok(max >= 1_000_000, `上界不能被限制在模型能力之下，实际 ${String(max)}`);
+
+  /* 三处夹紧都要用常量，不许再出现裸数字 */
+  assert.doesNotMatch(apiPage, /8192|8_192/, '8192 这个夹紧值必须清掉');
 });
 
 test('★★★ 保存时必须落进 ST 设置（否则请求体里还是旧值）', () => {

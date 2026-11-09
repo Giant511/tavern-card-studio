@@ -375,3 +375,183 @@ test('★★★ 等待循环必须能识别"进程已退出"（否则白等满�
   assert.match(body, /exitValue/, '退出要报退出码');
   assert.match(body, /PROBE_INTERVAL_MS/, '要有探活间隔');
 });
+
+test('★★★★★ lastError 必须在启动开始时清掉（否则旧失败毒化新启动）', () => {
+  /*
+   * 用户报：
+   *
+   * > 还是提示没有进入世界，但是界面过了几秒又自动跳转了
+   *
+   * ## 这条链路值得完整记住
+   *
+   * ```text
+   *   status() 交出： running = isOurProcessAlive()   error = lastError
+   *   前端判据：      running === false && error !== null ⇒ 立刻放弃
+   *
+   *   t=0   这次启动刚开始，node 还没 spawn ⇒ running = false
+   *         lastError 还是**上一次**的"引擎启动超时"⇒ error ≠ null
+   *   t=0+  前端立刻判失败（不等 120 秒）
+   *   几秒后 开屏的 2200ms 延时到 ⇒ 自动进主界面
+   *   而引擎在后台照常启动，最后是好的
+   * ```
+   *
+   * 用户看到的那句"没进入世界"其实是**上一次**的旧文案。
+   *
+   * ## 判据
+   *
+   * `prepareAndStart()` 一进来就要把 `lastError` 置 null。
+   * `error` 的语义是"这一次失败的原因"——这次才刚开始，还没有失败可言。
+   *
+   * 清掉不损失反应速度：这次真失败时 `ensureRunning` 会立刻返回并写回，
+   * 前端下一次轮询（500ms）就能看到。
+   */
+  const svc = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StService.kt',
+  );
+  const at = svc.indexOf('private fun prepareAndStart()');
+  assert.ok(at > 0, '找不到 prepareAndStart');
+  /* 取方法开头一小段就够 —— 清空必须在最前面 */
+  const head = svc.slice(at, at + 1800);
+
+  const clearAt = head.indexOf('lastError = null');
+  assert.ok(clearAt > 0, 'prepareAndStart 里必须清掉 lastError');
+
+  /*
+   * 顺序也要守：清理必须发生在 `ensureRunning` **之前**。
+   * 放在后面等于这次已经失败了才清 —— 那时清不清都没意义。
+   */
+  const runAt = head.indexOf('ensureRunning(');
+  if (runAt > 0) {
+    assert.ok(clearAt < runAt, '清空必须排在 ensureRunning 之前');
+  }
+});
+
+test('★★★★★ 超时不许用"世界没能打开"这个标题', () => {
+  /*
+   * 超时 = 我们等够了，但引擎还在启动。
+   * 失败 = 引擎明确报错 / 进程死了。
+   *
+   * 把前者说成后者，用户会去重启、重装 —— 而**重启恰好会杀掉
+   * 正在启动的引擎**，是最坏的一步。
+   *
+   * 这就是用户那句自相矛盾的话的来源：
+   * 「还是提示没有进入世界，但是界面过了几秒又自动跳转了」
+   */
+  const mainTs = stripComments(read('client/src/mobile/main.ts'));
+
+  const at = mainTs.indexOf('if (!waited.ok)');
+  assert.ok(at > 0, '找不到开屏失败分支');
+  const body = mainTs.slice(at, at + 1600);
+
+  /* 必须有 timedOut 这个区分 */
+  assert.match(body, /timedOut/, '要把"超时"与"失败"分开');
+  /* 超时时不许 setPhase('failed') */
+  assert.match(body, /if \(!timedOut\) splash\.setPhase\('failed'\)/, '只有非超时才切失败态');
+  /* 超时的 hint 要说"还在启动"，而不是"没能打开" */
+  assert.match(body, /还在启动/, '超时要说明引擎还在启动');
+  assert.doesNotMatch(
+    body,
+    /setPhase\('failed'\);\s*\n\s*splash\.setHint\(\s*waited\.reason === null/,
+    '不许无条件先切失败态再判断',
+  );
+});
+
+/* ═══════════════════════════════════════════════════════════
+   ⑤ 最大回复长度：API 连接页也有夹紧（用户改的就是这一页）
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★★ API 连接页不许再把 maxTokens 夹在 8192', () => {
+  /*
+   * 用户报「最大回复长度是否有限制」时，我先只改了
+   * `settings-schema.ts`（AI 响应配置页那份）。
+   *
+   * **不够。** 用户真正编辑的是「我的 → API 连接」这一页，而它在
+   * 三个地方各写了一遍 8192：
+   *
+   * ```text
+   *   input 的 max 属性    max="8192"
+   *   草稿校验             n >= 256 && n <= 8192
+   *   保存校验             rawMax >= 256 && rawMax <= 8192
+   * ```
+   *
+   * 三处都是"越界**静默替换**成默认值" —— 用户填 100000，保存后界面
+   * 显示 2048，没有任何提示说被改了。这就是"改了不生效"的经典形态。
+   */
+  const src = stripComments(read('client/src/chat/api-page.ts'));
+
+  /* ① 不许再有裸 8192 */
+  assert.doesNotMatch(src, /8192|8_192/, '8192 这个夹紧值必须清掉');
+
+  /* ② 三处都要走共享常量 */
+  assert.match(src, /MAX_TOKENS_MIN/, '要有共享下界常量');
+  assert.match(src, /MAX_TOKENS_MAX/, '要有共享上界常量');
+  assert.match(src, /setAttribute\('max', String\(MAX_TOKENS_MAX\)\)/, 'input 的 max 要用常量');
+
+  /* ③ 上界要与 settings-schema 一致（两页不能各说一套） */
+  const maxConst = Number(/export const MAX_TOKENS_MAX = ([0-9_]+)/.exec(src)?.[1]?.replace(/_/g, '') ?? '0');
+  assert.ok(maxConst >= 1_000_000, `API 页上界不能低于一百万，实际 ${String(maxConst)}`);
+});
+
+/* ═══════════════════════════════════════════════════════════
+   ⑥ key 写入：只写一次，且要核实真的生效
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★★ 写 key 只能有一个地方（两处都写会让 secrets 无限膨胀）', () => {
+  /*
+   * ST 的 `writeSecret` 是**追加**语义：新写一条、把别的置为 active:false。
+   *
+   * 曾经 `api-page.ts` 与 `writeApiConnectionToSt()` 各写一遍 ⇒
+   * 每保存一次就往 secrets.json 加两条，保存一百次积两百条历史 key。
+   *
+   * 现在分工：api-page 写，外壳只回读校验。
+   */
+  const api = stripComments(read('client/src/chat/api-page.ts'));
+  const shell = stripComments(read('client/src/chat/shell.ts'));
+
+  /* api-page 必须是写入点 */
+  assert.match(api, /await bridge\.writeSecret\(/, 'api-page 要负责写入');
+
+  /* shell 的 writeApiConnectionToSt 里不许再调 writeSecret */
+  const at = shell.indexOf('private async writeApiConnectionToSt');
+  assert.ok(at > 0, '找不到 writeApiConnectionToSt');
+  const body = shell.slice(at, at + 4000);
+  assert.doesNotMatch(body, /bridge\.writeSecret\(/, '外壳不该再写一遍 key，否则 secrets 会翻倍');
+});
+
+test('★★★★★ 写完必须回读确认，不许只信 200', () => {
+  /*
+   * 用户报「我明明填了秘钥」，而真机取证发现 ST 那边**全是 null**。
+   *
+   * `writeSecret` 返回 200 只说明 ST 收下了请求，不代表 secrets.json 里
+   * 真有一条 `active: true`。而 ST 的 `readSecret()` 只认 active 那条：
+   *
+   * ```js
+   *   const activeSecret = secretArray.find(s => s.id === id : s.active);
+   *   return activeSecret?.value || '';
+   * ```
+   *
+   * 所以保存流程必须用 `secretPresent()` 确认"引擎读得到"，
+   * 而不是假定写成功。
+   */
+  const shell = stripComments(read('client/src/chat/shell.ts'));
+  const at = shell.indexOf('private async writeApiConnectionToSt');
+  assert.ok(at > 0, '找不到 writeApiConnectionToSt');
+  const body = shell.slice(at, at + 4000);
+
+  /*
+   * ★ 判据必须钉"present 来自真实回读"，不能只钉"这两句话存在"。
+   *
+   * 变异验证抓到的：把调用换成 `const present: string[] = [secretKey];`
+   * 之后，`secretPresent()` 与 `present.includes(secretKey)` 仍然各在——
+   * 原来的两条断言**全绿**，而回读其实已经没了。
+   *
+   * 所以要求 `present` 的**赋值表达式本身**含 `secretPresent()`。
+   */
+  assert.match(
+    body,
+    /const present\s*=\s*await[^;]*secretPresent\(\)/,
+    'present 必须由 secretPresent() 真实回读得到（不许用本地数组冒充）',
+  );
+  assert.match(body, /present\.includes\(secretKey\)/, '要按名字核对，不是"有返回值就算成功"');
+  assert.match(body, /problems\.push/, '不一致要进 problems（会被显示出来）');
+});
