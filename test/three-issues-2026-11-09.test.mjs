@@ -306,3 +306,72 @@ test('★★★★ 超时提示不许叫用户"重启应用"', () => {
   assert.match(body, /不要重启/, '要明确劝阻重启');
   assert.match(body, /主界面/, '要给出"进主界面等"这条路');
 });
+
+test('★★★★★ 「进程活着」不等于「端口在听」', () => {
+  /*
+   * 这是"世界没能打开"的第二层原因，比超时更隐蔽。
+   *
+   * ## 原来的死循环
+   *
+   * ```text
+   *   ① 启动超时（进程还活着、还在初始化）
+   *   ② 用户点重试 → ensureRunning 走复用分支
+   *               → 直接 return StartResult(true, "引擎正在运行")
+   *               → **一次 probe 都不做**
+   *   ③ 调用方以为好了，马上发请求
+   *   ④ 端口还没 LISTEN → 请求失败
+   *   ⑤ 用户再点重试 → 回到 ②
+   * ```
+   *
+   * 也就是说「重试」永远不可能成功：它只回答"进程在不在"，
+   * 而用户要的是"能不能用"。
+   *
+   * ## 判据
+   *
+   * 复用分支必须也去等端口（与 spawn 那条路径共用 `awaitListening`），
+   * 不许直接返回成功。
+   */
+  const java = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StLauncher.kt',
+  );
+
+  /* ① 有共用的等待方法 */
+  assert.match(java, /private fun awaitListening\(/, '要有共用的等待方法');
+
+  /* ② 复用分支调它，而不是直接返回 true */
+  const reuseAt = java.indexOf('if (isOurProcessAlive())');
+  assert.ok(reuseAt > 0, '找不到复用分支');
+  const reuseBlock = java.slice(reuseAt, reuseAt + 1400);
+
+  assert.match(reuseBlock, /awaitListening\(/, '复用分支必须等端口，不能直接返回成功');
+  assert.doesNotMatch(
+    reuseBlock,
+    /return StartResult\(true[^)]*reused = true\)/,
+    '不许在没 probe 的情况下就说"引擎正在运行"',
+  );
+
+  /* ③ spawn 分支也用它（两处同一份逻辑，不许各写一套） */
+  const calls = (java.match(/awaitListening\(port/g) ?? []).length +
+    (java.match(/awaitListening\(/g) ?? []).length;
+  assert.ok(calls >= 2, `两条路径都要用它，实际调用 ${String(calls)} 次`);
+
+  /* ④ 复用时可以传 null 进程（没法查 isAlive，只能靠 probe + 超时） */
+  assert.match(java, /awaitListening\(port, PROBE_TIMEOUT_MS, null\)/, '复用路径传 null 进程');
+});
+
+test('★★★ 等待循环必须能识别"进程已退出"（否则白等满时限）', () => {
+  /*
+   * 进程崩了还继续等满 120 秒，是最差的失败方式：
+   * 用户干等两分钟，最后看到的是"超时"而不是真正原因（退出码）。
+   */
+  const java = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StLauncher.kt',
+  );
+  const at = java.indexOf('private fun awaitListening');
+  assert.ok(at > 0, '找不到 awaitListening');
+  const body = java.slice(at, at + 2600);
+
+  assert.match(body, /proc != null && !proc\.isAlive/, '要看自己 spawn 的进程是否还活着');
+  assert.match(body, /exitValue/, '退出要报退出码');
+  assert.match(body, /PROBE_INTERVAL_MS/, '要有探活间隔');
+});
