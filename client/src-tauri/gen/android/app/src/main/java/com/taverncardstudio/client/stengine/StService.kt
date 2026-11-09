@@ -147,6 +147,51 @@ class StService : Service() {
 
     private fun prepareAndStart() {
         /*
+         * ★★★ 开工第一件事：清掉上一次的失败（2026-11-09 修）。
+         *
+         * ## 用户报的
+         *
+         * > 还是提示没有进入世界，但是界面过了几秒又自动跳转了
+         *
+         * ## 真因：`lastError` 从不清空，会**毒化下一次启动**
+         *
+         * `status()` 把 `lastError` 原样交给前端：
+         *
+         * ```kotlin
+         *   json.put("running", StLauncher.isOurProcessAlive())
+         *   json.put("error", StService.lastError ?: JSONObject.NULL)
+         * ```
+         *
+         * 而前端 `waitForEngine` 有一条**立即放弃**的判据：
+         *
+         * ```js
+         *   if (probe.running === false && probe.error !== null) → 立刻失败
+         * ```
+         *
+         * 两条凑在一起的后果：
+         *
+         * ```text
+         *   t=0    这次启动刚开始，node 还没 spawn ⇒ running = false
+         *          lastError 还是**上一次**的"引擎启动超时" ⇒ error ≠ null
+         *   t=0+   前端一看 running=false + error 有值 ⇒ 立刻判失败
+         *   几秒后  开屏的 2200ms 延时到 ⇒ 自动进主界面
+         *   而引擎其实在后台照常启动，最后是好的
+         * ```
+         *
+         * 这与用户描述的"还是提示没进入世界，但过几秒又跳转了"完全吻合 ——
+         * 而且那句提示是**上一次的**旧文案，不是本次的。
+         *
+         * ## 为什么清在这里
+         *
+         * `error` 的语义应当是"这一次启动失败的原因"。既然这次才刚开始，
+         * 就还没有失败可言。留着旧值唯一的作用就是骗前端。
+         *
+         * 清掉不损失反应速度：这次若真失败，`ensureRunning` 会立刻返回
+         * 并写回 `lastError`，前端下一次轮询（500ms 后）就能看到。
+         */
+        lastError = null
+
+        /*
          * 是否"首次启动"：解包完成之后的那一次。
          *
          * 判据用 `isUnpacked()` 的**调用时机**而不是时间戳文件：

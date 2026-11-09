@@ -297,11 +297,26 @@ test('★★ 三处都走同一个连接门（不能绕过 withConnection）', (
    * `StUnavailable`（memory §71 记过这个坑，那时表现是"连不上 SillyTavern"）。
    */
   const shell = shellSrc();
+
+  /*
+   * ★ 2026-11-09：写秘钥的位置从 `writeApiConnectionToSt` 挪到了
+   *   api-page 经注入的 `SecretWriter`（避免两处都写导致 secrets 翻倍）。
+   *
+   *   **它守的性质没变**：写秘钥必须过连接门，不许直接调 Tauri 命令。
+   *   只是现在那道门在**注入处**，所以判据跟到注入处。
+   */
+  assert.match(
+    shell,
+    /writeSecret:\s*\(key[^)]*\)\s*=>\s*\n?\s*this\.withConnection\(\(\) => this\.bridge\.writeSecret/,
+    '注入给 api-page 的 writeSecret 必须包连接门',
+  );
+
   const start = shell.indexOf('private async writeApiConnectionToSt');
   assert.ok(start > 0);
-  const block = shell.slice(start, start + 3000);
+  const block = shell.slice(start, start + 4000);
 
-  assert.match(block, /this\.withConnection\(\(\) =>\s*this\.bridge\.writeSecret/, '写秘钥要过连接门');
+  /* 这一层现在只回读校验 —— 校验同样必须过连接门 */
+  assert.match(block, /this\.withConnection\(\(\) => this\.bridge\.secretPresent\(\)\)/, '回读要过连接门');
   assert.match(block, /getRaw: \(\) => this\.withConnection/, '读设置要过连接门');
   assert.match(block, /save: \(settings\) => this\.withConnection/, '存设置要过连接门');
 });
