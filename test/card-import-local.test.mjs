@@ -50,6 +50,43 @@ function stripComments(source) {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/[^\n]*$/gm, '');
 }
 
+/**
+ * 按**方法边界**切出一段源码。
+ *
+ * ## 为什么不用 `slice(at, at + 3000)`
+ *
+ * 固定长度有两个坑，v0.1.8 两个都踩了：
+ *
+ * ```text
+ *   ① 太短  → 方法一长就把断言要的后半段切掉
+ *   ② 太长  → 跨进下一个方法，断言会命中"别处"的代码
+ *              （实例：查 importRepoVersion 不该有 readDefaultFaceBytes，
+ *                结果切到了 writeCardToLibrary，那里正好有）
+ * ```
+ *
+ * 按"下一个 `private ` 出现的位置"切，方法增删都不影响。
+ */
+function methodBody(source, signature) {
+  const at = source.indexOf(signature);
+  if (at < 0) return '';
+  const next = source.indexOf('\n  private ', at + signature.length);
+  return source.slice(at, next < 0 ? source.length : next);
+}
+
+/**
+ * 剥注释时会误伤字符串里的 `/*`。
+ *
+ * 实例：`this.pickFileBytes('image/` + 星号 + `')` 里的「斜杠+星号」被块注释正则
+ * 当成注释开头，一直吞到下一个「星号+斜杠」—— 于是那行代码在"剥过注释"的
+ * 源码里**整段消失**，断言自然找不到它。
+ *
+ * ★ 这段注释本身就差点踩同一个坑：写成字面量的「星号+斜杠」会把这段
+ * 注释提前结束，后半句变成代码，直接语法错误。所以这里用文字说，不写字面量。
+ *
+ * 所以凡是断言**这行代码本身存在**（而不是断言某段里没有某句话），
+ * 一律用原文（`shellRaw`），不要剥。
+ */
+
 const FIXTURES = join(ROOT, 'test', 'fixtures', 'png');
 function fixture(name) {
   return new Uint8Array(readFileSync(join(FIXTURES, name)));
@@ -169,9 +206,8 @@ test('★ 优先用卡内自带 cardId，没有再退回文件名', () => {
    ═══════════════════════════════════════════════════════════ */
 
 test('★★★ 卡片 Tab 有导入入口，且它是动作不是 accordion', () => {
-  const at = shellSrc.indexOf('private renderCardsTab');
-  assert.ok(at > 0, '找不到 renderCardsTab');
-  const body = shellSrc.slice(at, at + 2400);
+  const body = methodBody(shellSrc, 'private renderCardsTab');
+  assert.ok(body !== '', '找不到 private renderCardsTab');
 
   assert.match(body, /this\.renderImportAction\(\)/, '卡片 Tab 要渲染导入入口');
   /*
@@ -185,9 +221,8 @@ test('★★★ 卡片 Tab 有导入入口，且它是动作不是 accordion', (
 });
 
 test('★★★ 入口是按钮、有 data-state，且点下去真的调导入', () => {
-  const at = shellSrc.indexOf('private renderImportAction');
-  assert.ok(at > 0, '找不到 renderImportAction');
-  const body = shellSrc.slice(at, at + 1600);
+  const body = methodBody(shellSrc, 'private renderImportAction');
+  assert.ok(body !== '', '找不到 private renderImportAction');
 
   assert.match(body, /data-role', 'card-import-entry'/, '入口要有稳定的 data-role');
   assert.match(body, /data-state', 'idle'/, '初始状态要标出来（三态判据靠它）');
@@ -210,9 +245,8 @@ test('★★★★ 本地导入与仓库下载共用同一套落盘，不另写'
     'private async importRepoVersion',
     'private async importLocalCard',
   ]) {
-    const at = shellSrc.indexOf(fnName);
-    assert.ok(at > 0, `找不到 ${fnName}`);
-    const body = shellSrc.slice(at, at + 3000);
+    const body = methodBody(shellSrc, fnName);
+    assert.ok(body !== '', `找不到 ${fnName}`);
     assert.match(
       body,
       /resolveCardPlacement\(/,
@@ -234,8 +268,8 @@ test('★★★★ allowCreate 与 overwrite 必须成对反传', () => {
    * 传反会立刻暴露，但前提是这里真的写成 `!overwrite`。
    * 写成 `overwrite` 就是"该新建时去覆盖上一张同名卡" —— 不可逆。
    */
-  const at = shellSrc.indexOf('private async writeCardToLibrary');
-  const body = shellSrc.slice(at, at + 3000);
+  const body = methodBody(shellSrc, 'private async writeCardToLibrary');
+  assert.ok(body !== '', '找不到 private async writeCardToLibrary');
 
   assert.match(
     body,
@@ -245,8 +279,8 @@ test('★★★★ allowCreate 与 overwrite 必须成对反传', () => {
 });
 
 test('★★ 世界书先落地、卡后写（顺序反了会留下指向空书的卡）', () => {
-  const at = shellSrc.indexOf('private async writeCardToLibrary');
-  const body = shellSrc.slice(at, at + 3000);
+  const body = methodBody(shellSrc, 'private async writeCardToLibrary');
+  assert.ok(body !== '', '找不到 private async writeCardToLibrary');
 
   const worldAt = body.indexOf('persistEmbeddedWorldbook(');
   const buildAt = body.indexOf('buildPngCard(');
@@ -262,8 +296,8 @@ test('★★ 世界书先落地、卡后写（顺序反了会留下指向空书�
    ═══════════════════════════════════════════════════════════ */
 
 test('★★★★ 本地导入会覆盖时先弹确认，仓库下载不弹', () => {
-  const at = shellSrc.indexOf('private async resolveCardPlacement');
-  const body = shellSrc.slice(at, at + 2600);
+  const body = methodBody(shellSrc, 'private async resolveCardPlacement');
+  assert.ok(body !== '', '找不到 private async resolveCardPlacement');
 
   /* 确认要以 overwrite 为条件，不是每次都弹 */
   assert.match(body, /planned\.plan\.overwrite && input\.confirmOverwrite/, '只有会覆盖且要求确认时才弹');
@@ -281,8 +315,8 @@ test('★★★★ 本地导入会覆盖时先弹确认，仓库下载不弹', (
 });
 
 test('★★★ 确认框挂在 root，不挂 pageHost（否则换页时 Promise 永不 resolve）', () => {
-  const at = shellSrc.indexOf('private async confirmOverwriteCard');
-  const body = shellSrc.slice(at, at + 2400);
+  const body = methodBody(shellSrc, 'private async confirmOverwriteCard');
+  assert.ok(body !== '', '找不到 private async confirmOverwriteCard');
 
   assert.match(body, /const host = this\.root/, '要挂在稳定的外壳上');
   assert.match(body, /data-role', 'card-import-confirm'/, '弹层要有 data-role');
@@ -295,8 +329,13 @@ test('★★★ 确认框挂在 root，不挂 pageHost（否则换页时 Promise
 });
 
 test('★★ 选文件读的是 ArrayBuffer，不是文本', () => {
-  const at = shellSrc.indexOf('private async pickLocalCardFile');
-  const body = shellSrc.slice(at, at + 2600);
+  /*
+   * v0.1.8 加"换封面"时，选文件那段抽成了 `pickFileBytes(accept)` ——
+   * 导入卡与选封面只差一个 accept 字符串，其余（隐藏 input、change/cancel
+   * 双保险、60 秒超时、finally remove）完全一样。写两遍必然漏一处。
+   */
+  const body = methodBody(shellSrc, 'private async pickFileBytes');
+  assert.ok(body !== '', '找不到 private async pickFileBytes');
 
   /*
    * `readAsText` 读 PNG 会把二进制掰成文本，写进角色目录就是一个坏文件，
@@ -314,8 +353,8 @@ test('★★ 选文件读的是 ArrayBuffer，不是文本', () => {
    ═══════════════════════════════════════════════════════════ */
 
 test('★★★ 导入按钮有三态与四条文案', () => {
-  const at = shellSrc.indexOf('private async importLocalCard');
-  const body = shellSrc.slice(at, at + 3600);
+  const body = methodBody(shellSrc, 'private async importLocalCard');
+  assert.ok(body !== '', '找不到 private async importLocalCard');
 
   assert.match(body, /runBusy\(/, '复用三态按钮，不另写一份');
   for (const word of ['从手机导入卡片', '导入中…', '已导入 ✓', '重试']) {
@@ -344,4 +383,171 @@ test('★★ 开场页的空态也指向具体入口（原来指的是不存在�
 
   assert.doesNotMatch(greetingSrc, /还角色库里还没有角色/, '原文开头多一个"还"，是笔误');
   assert.match(greetingSrc, /从手机导入卡片/, '要指到具体入口');
+});
+
+/* ═══════════════════════════════════════════════════════════
+   七、卡面：JSON 卡的封面从哪来
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★ JSON 卡导入时问封面，PNG 卡不问', () => {
+  const body = methodBody(shellSrc, 'private async importLocalCard');
+  assert.ok(body !== '', '找不到 private async importLocalCard');
+
+  /*
+   * `parsed.base === null` 就是"这个文件里没有图"。
+   * 只在那一刻问 —— PNG 卡自带图，问了是骚扰。
+   */
+  assert.match(body, /if \(base === null\)/, '只在没有图时问');
+  assert.match(body, /askCardFace\(\)/, '要问一句');
+  /* 三个出口都要能走，不能悄悄替用户决定 */
+  assert.match(body, /choice === 'cancel'/, '要能取消导入');
+  assert.match(body, /choice === 'pick'/, '要能选图');
+  assert.match(body, /pickFaceImage\(\)/, '选图要真的走选图');
+});
+
+test('★★★★ 没有封面时按卡名生成，而不是塞统一的默认图', () => {
+  /*
+   * 用户口径（2026-11-09）：「按卡名生成首字图」。
+   *
+   * 为什么这条重要：选角色列表**显示头像**。所有没有封面的卡长得一模一样
+   * 的话，用户只能靠名字分辨 —— 等于把"有没有封面"变成了"能不能认出自己的卡"。
+   */
+  const body = methodBody(shellSrc, 'private async writeCardToLibrary');
+  assert.ok(body !== '', '找不到 private async writeCardToLibrary');
+
+  assert.match(body, /base: Uint8Array \| null/, 'base 要允许 null（用 null 表示没图）');
+  assert.match(body, /faceFromName\(/, '没图时按卡名生成');
+  /*
+   * 顺序：先生成首字图，失败才退回内置卡面。
+   * 反过来的话首字图永远用不上。
+   */
+  const genAt = body.indexOf('faceFromName(');
+  const fallbackAt = body.indexOf('readDefaultFaceBytes(');
+  assert.ok(genAt > 0, '要调 faceFromName');
+  assert.ok(fallbackAt > genAt, '内置卡面只做兜底，排在生成之后');
+});
+
+test('★★★ 仓库下载也走同一条封面逻辑（它也曾经全是同一张图）', () => {
+  const body = methodBody(shellSrc, 'private async importRepoVersion');
+  assert.ok(body !== '', '找不到 private async importRepoVersion');
+
+  /*
+   * 传 `base: null` ⇒ 让 writeCardToLibrary 按卡名生成。
+   * 如果这里还自己调 readDefaultFaceBytes，仓库下载的卡就仍是统一默认图，
+   * 与本地导入的卡长得不一样 —— 同一件事两套行为。
+   */
+  assert.match(body, /base: null/, '仓库下载也要走按卡名生成');
+  assert.doesNotMatch(
+    body,
+    /readDefaultFaceBytes\(\)/,
+    '仓库下载不该再自己取内置卡面（会与本地导入分叉）',
+  );
+});
+
+test('★★★ 首字图：同名同色、异名不同色、跳过装饰标点', async () => {
+  const { initialOf, hueOf, CARD_FACE_EDGE } = await import('../client/src/chat/card-face.ts');
+
+  assert.equal(CARD_FACE_EDGE, 512, '规格要与桌面端 ST 头像一致');
+
+  /* 取字：中文首字 / 英文首字母 / 跳过【】这类装饰 */
+  assert.equal(initialOf('林晚照'), '林');
+  assert.equal(initialOf('Alice'), 'A');
+  assert.equal(initialOf('【测试】小明'), '测');
+  assert.equal(initialOf('  spaced  '), 's');
+  assert.equal(initialOf(''), '?', '空名字要有兜底，不能画一张空白图');
+
+  /*
+   * 颜色必须**稳定**：同一个名字两次算出同一个色相。
+   * 不稳定的后果是用户重导同一张卡时封面突然换色，以为导错了。
+   */
+  assert.equal(hueOf('林晚照'), hueOf('林晚照'));
+  assert.ok(hueOf('林晚照') >= 0 && hueOf('林晚照') < 360);
+
+  /* 不同名字要能落在不同色相上（不要求全不同，但常见的几个得岔开） */
+  const hues = new Set(['林晚照', '小明', 'Alice', '夜航小助手', '西奥'].map(hueOf));
+  assert.ok(hues.size >= 4, '颜色区分度不够：' + hues.size + '/5');
+});
+
+test('★★★ 换封面用 canvas 缩成方形，且不依赖 CompressionStream', async () => {
+  /* 剥注释：文件头注释里解释了「为什么不用 CompressionStream」，字面量在那儿 */
+  const faceSrc = stripComments(read('client/src/chat/card-face.ts'));
+
+  /* 居中裁方形：竖图不裁的话在圆形头像里会被拉成椭圆（本项目踩过） */
+  assert.match(faceSrc, /Math\.min\(bitmap\.width, bitmap\.height\)/, '要居中裁方形');
+  assert.match(faceSrc, /drawImage\(/, '要真的重绘');
+  /* ImageBitmap 占原生内存，不关会在连续导入时堆起来 */
+  assert.match(faceSrc, /bitmap\.close\(\)/, '要释放 ImageBitmap');
+
+  /*
+   * 不用 CompressionStream：那是桌面端"压到 250KB"的量化管线要的，
+   * 卡面不需要那个限制。硬用会让缺少该 API 的老 WebView 整条走不通。
+   */
+  assert.doesNotMatch(faceSrc, /CompressionStream/, '卡面不该依赖 CompressionStream');
+
+  /* HEIC 读不出来时要说"换一张"，不能只说"失败" */
+  assert.match(faceSrc, /HEIC|PNG 或 JPG/, '要提示换个格式');
+});
+
+test('★★ 封面提问框挂在 root（换页不会让 Promise 悬空）', () => {
+  const body = methodBody(shellSrc, 'private async askCardFace');
+  assert.ok(body !== '', '找不到 private async askCardFace');
+
+  assert.match(body, /const host = this\.root/, '要挂在稳定的外壳上');
+  assert.match(body, /data-role', 'card-face-ask'/, '弹层要有 data-role');
+  assert.match(body, /data-role', 'card-face-pick'/, '选图按钮');
+  assert.match(body, /data-role', 'card-face-default'/, '用默认按钮');
+  /* 「不导了」必须有独立按钮：只靠点遮罩的话，用户会以为导入已经开始 */
+  assert.match(body, /data-role', 'card-face-cancel'/, '取消按钮');
+  assert.match(body, /'不导了'/, '取消文案要说人话');
+});
+
+/* ═══════════════════════════════════════════════════════════
+   八、选文件只写一份
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★ 导入卡与选封面共用同一个选文件实现', () => {
+  /*
+   * 两处只差 accept 字符串。复制一份的话，将来修超时或修 remove 会漏一处
+   * —— 本项目对"写两遍"的后果有过明确结论（见 busy-button 与 runBusy）。
+   */
+  const importBody = methodBody(shellSrc, 'private async importLocalCard');
+  assert.ok(importBody !== '', '找不到 private async importLocalCard');
+  assert.match(importBody, /pickFileBytes\('image\/png,application\/json/, '导入卡要传卡片的 accept');
+
+  /*
+   * ★ 这一条必须用**原文**（`shellRaw`），不能用剥过注释的 `shellSrc`。
+   *
+   * 因为 accept 的字面量是 `'image/*'`，其中「斜杠+星号」会被块注释正则
+   * 当成注释开头，一直吞到下一个「星号+斜杠」—— 这行代码在剥过注释的
+   * 源码里整段消失，断言永远找不到它（而实际上代码是对的）。
+   */
+  const faceBodyRaw = methodBody(shellRaw, 'private async pickFaceImage');
+  assert.ok(faceBodyRaw !== '', '找不到 private async pickFaceImage');
+  assert.match(faceBodyRaw, /pickFileBytes\('image\/\*'\)/, '选封面要传图片的 accept');
+
+  /*
+   * 精确断言：`pickFileBytes` 只定义一处、被调两处。
+   *
+   * 不用"数 `type','file'` 出现几次"这种写法 —— 世界书导入里还有一份
+   * **老实现**（`onPickFile`，读的是文本不是字节，接口不同），
+   * 数下去会把它算进来，然后这条判据就会因为一件与本次无关的事变红。
+   *
+   * ★ 那份老实现确实也是重复（同一个隐藏 input + change/cancel + 超时），
+   *   但改它要动世界书导入，不在本次范围。已记进 PLAN 的待办。
+   */
+  const defs = (shellSrc.match(/private async pickFileBytes\(/g) ?? []).length;
+  assert.equal(defs, 1, 'pickFileBytes 应只定义一次，实际 ' + defs + ' 次');
+
+  const calls = (shellSrc.match(/await this\.pickFileBytes\(/g) ?? []).length;
+  assert.equal(calls, 2, '导入卡与选封面各调一次，实际 ' + calls + ' 次');
+
+  /*
+   * 允许存在的另一份：世界书导入的老实现。
+   * 超过 2 处说明又有人写了一份，该合并了。
+   */
+  const fileInputs = (shellSrc.match(/setAttribute\('type', 'file'\)/g) ?? []).length;
+  assert.ok(
+    fileInputs <= 2,
+    '选文件实现有 ' + fileInputs + ' 份（pickFileBytes + 世界书老实现 = 2 是上限）',
+  );
 });
