@@ -127,6 +127,36 @@ export interface ApiPageState {
  */
 export const DEFAULT_MAX_TOKENS = 2048;
 
+/**
+ * 「最大回复长度」允许的区间（2026-11-09）。
+ *
+ * ## 为什么要有这一对常量
+ *
+ * 原来这个数在**三个地方各写了一遍 8192**：
+ *
+ * ```text
+ *   input 的 max 属性          max="8192"        （浏览器层面的夹紧）
+ *   草稿校验                   n >= 256 && n <= 8192
+ *   保存校验                   rawMax >= 256 && rawMax <= 8192
+ * ```
+ *
+ * 三处都是"越界**静默替换**成默认值" —— 用户填 100000 保存后，
+ * 界面上看到的是 2048，而**没有任何提示说被改了**。
+ *
+ * 这就是用户报「最大回复长度是否有限制？正常这个地方不应该有限制」的真因：
+ * 他改了，但被夹回去，然后回复写到一半截断。
+ *
+ * 现在三处共用这一对常量，改一处全动。
+ *
+ * ## 为什么上限定成一百万
+ *
+ * 那只是拦明显误触（多按几个零），不构成对任何现役模型的限制 ——
+ * Claude 4 / Gemini 2.5 的输出上限只有用户和上游知道，我们不该替他们拍。
+ * 与 `shared/src/chat/settings-schema.ts` 的 `max` 保持一致。
+ */
+export const MAX_TOKENS_MIN = 1;
+export const MAX_TOKENS_MAX = 1_000_000;
+
 export const DEFAULT_API_STATE: ApiPageState = {
   source: 'openai',
   model: '',
@@ -383,7 +413,8 @@ export function renderApiPage(
     const maxInput = el(doc, 'input', 'nb-input') as unknown as HTMLInputElement;
     maxInput.setAttribute('type', 'number');
     maxInput.setAttribute('min', '256');
-    maxInput.setAttribute('max', '8192');
+    maxInput.setAttribute('max', String(MAX_TOKENS_MAX));
+    maxInput.setAttribute('min', String(MAX_TOKENS_MIN));
     maxInput.setAttribute('step', '64');
     maxInput.setAttribute('inputmode', 'numeric');
     maxInput.setAttribute('data-role', 'max-tokens-input');
@@ -394,7 +425,7 @@ export function renderApiPage(
     maxInput.addEventListener?.('input', () => {
       const n = Number.parseInt(String((maxInput as unknown as HTMLInputElement).value ?? ''), 10);
       /* 非法输入不写进 draft —— 留着上一次有效值，保存时不会变成 NaN */
-      if (Number.isFinite(n) && n >= 256 && n <= 8192) draft.maxTokens = n;
+      if (Number.isFinite(n) && n >= MAX_TOKENS_MIN && n <= MAX_TOKENS_MAX) draft.maxTokens = n;
     });
     const maxHint = el(doc, 'span', 'nb-field-hint');
     maxHint.textContent =
@@ -788,14 +819,29 @@ export function renderApiPage(
          * `'••••••••••••'` 会被当成新 key 写进 SillyTavern，
          * 把用户真实的 key 覆盖成一串圆点 —— 之后所有请求 401。
          */
+        /*
+         * ★★★ 这里是**唯一的写入点**（2026-11-09 明确）。
+         *
+         * 之前 `writeApiConnectionToSt()` 里也写了一遍同样的 key，
+         * 而 ST 的 `writeSecret` 是**追加**语义（新写一条、把别的置为
+         * `active: false`）。两处都写 ⇒ 每保存一次就往 secrets.json 加两条，
+         * 保存一百次就积两百条历史 key，越用越脏。
+         *
+         * 现在分工：
+         *
+         * ```text
+         *   这一页   写 key（用户操作的直接处，写完立刻切掩码态）
+         *   外壳     只**回读校验**（secretPresent 确认引擎真的读得到）
+         *            —— 不写，避免重复
+         * ```
+         */
         if (rawKey !== null) {
-          // 走外壳注入的 SecretWriter（已包连接门），不是直连 Tauri 命令
           await bridge.writeSecret(`api_key_${currentSource}`, rawKey);
           /*
            * ★ 写完之后**不**清空输入框，改成回到 masked 态。
            *
            * 原来是 `keyInput.value = ''`，用户看到的是"我刚填的 key 消失了"
-           * —— 这正是他这次报的「秘钥看不见了，我不知道有没有配置」。
+           * —— 这正是他报的「秘钥看不见了，我不知道有没有配置」。
            * 现在改成显示一串星号：既证明"存进去了"，又不泄露真值。
            */
           markKeyConfigured();
@@ -828,7 +874,7 @@ export function renderApiPage(
           ? Number.parseInt(String(maxTokensInput.value ?? ''), 10)
           : Number.NaN;
         const draftMax = draft === undefined ? undefined : draft.maxTokens;
-        const maxTokens = Number.isFinite(rawMax) && rawMax >= 256 && rawMax <= 8192
+        const maxTokens = Number.isFinite(rawMax) && rawMax >= MAX_TOKENS_MIN && rawMax <= MAX_TOKENS_MAX
           ? rawMax
           : (draftMax ?? DEFAULT_MAX_TOKENS);
 
