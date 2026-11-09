@@ -264,6 +264,7 @@
               <label class="check"><input type="radio" name="cfg-registerMode" value="closed" /> 关闭自助注册（默认）</label>
               <label class="check"><input type="radio" name="cfg-registerMode" value="admin-only" /> 仅管理员创建</label>
               <label class="check"><input type="radio" name="cfg-registerMode" value="open" /> 开放自助注册</label>
+              <label class="check"><input type="radio" name="cfg-registerMode" value="invite" /> 邀请码注册</label>
             </div>
             <p class="hint" id="regmode-hint"></p>
             <div class="warn-box" id="regmode-open-warn" hidden>
@@ -275,6 +276,46 @@
                 <li>若 API 监听非回环地址（当前 <code id="regmode-host">—</code>），
                   启动日志与配置检查都会给出同一条安全警告，那是同一个判据。</li>
               </ul>
+            </div>
+            <div id="invite-panel" hidden>
+              <div class="card-head" style="margin-top:14px">
+                <h3>邀请码</h3>
+                <button class="btn btn-small" id="invite-refresh" type="button">刷新</button>
+              </div>
+              <p class="hint">
+                每张邀请码最多注册 <strong id="invite-max-uses">3</strong> 个账户，
+                有效期最长 <strong id="invite-max-days">15</strong> 天。过期或用完即失效，
+                也可以随时作废。
+              </p>
+              <div class="grid three" style="margin-bottom:12px">
+                <label class="field"><span>有效期</span>
+                  <select id="invite-validity">
+                    <option value="3600000">1 小时</option>
+                    <option value="21600000">6 小时</option>
+                    <option value="86400000" selected>1 天</option>
+                    <option value="259200000">3 天</option>
+                    <option value="604800000">7 天</option>
+                    <option value="1296000000">15 天</option>
+                  </select>
+                </label>
+                <label class="field"><span>备注（可选）</span>
+                  <input type="text" id="invite-note" maxlength="60" placeholder="发给谁 / 为什么发" />
+                </label>
+                <label class="field"><span>&nbsp;</span>
+                  <button class="btn" id="invite-create" type="button">生成邀请码</button>
+                </label>
+              </div>
+              <p class="hint" id="invite-created" hidden></p>
+              <table class="data-table">
+                <thead>
+                  <tr><th>邀请码</th><th>剩余</th><th>有效期至</th><th>状态</th><th>备注</th><th></th></tr>
+                </thead>
+                <tbody id="invite-body"><tr><td colspan="6" class="muted">读取中…</td></tr></tbody>
+              </table>
+              <p class="hint">
+                邀请码本身就是凭证，<strong>发给谁就等于允许谁注册</strong>。
+                作废后无法恢复，用户手里的旧码会立刻失效。
+              </p>
             </div>
             <div id="recent-accounts-wrap" hidden>
               <div class="card-head" style="margin-top:14px">

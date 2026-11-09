@@ -9,11 +9,19 @@
     "spec": "any"
   },
   "placeholders": {
-    "char": ["{{char}}"],
-    "user": ["{{user}}"],
+    "char": [
+      "{{char}}"
+    ],
+    "user": [
+      "{{user}}"
+    ],
     "custom": {
-      "persona": ["{{persona}}"],
-      "original": ["{{original}}"]
+      "persona": [
+        "{{persona}}"
+      ],
+      "original": [
+        "{{original}}"
+      ]
     }
   },
   "fields": [
@@ -56,7 +64,10 @@
       "type": "placeholder-min-count",
       "token": "char",
       "min": 1,
-      "scope": ["block:basic", "block:settings"],
+      "scope": [
+        "block:basic",
+        "block:settings"
+      ],
       "severity": "info",
       "message": "正文中未出现 {{char}} 占位符，角色名硬编码后换卡易失效",
       "hint": "建议用 {{char}} 代替角色名，SillyTavern 会自动替换。"
@@ -95,12 +106,49 @@
       "scope": "block:basic",
       "severity": "warning",
       "message": "「基本信息」板块为空，角色外貌/身份缺失会影响扮演质量"
+    },
+    {
+      "id": "example-uses-start-marker",
+      "type": "pattern-required",
+      "pattern": "<START>",
+      "scope": "field:mes_example",
+      "severity": "warning",
+      "message": "对话示例没有用 <START> 分成段落",
+      "hint": "每段示例开头单独一行写 <START>，模型才分得清这是「示范」而不是聊天正文。"
+    },
+    {
+      "id": "example-speaker-halfwidth-colon",
+      "type": "pattern-forbid",
+      "pattern": "^\\s*(用户|角色|助手|USER|User|CHAR|Char|BOT|Bot|AI|Assistant)\\s*：",
+      "flags": "m",
+      "scope": "field:mes_example",
+      "severity": "warning",
+      "message": "对话示例用了「用户：」「角色：」这类中文冒号说话人行",
+      "hint": "改成 {{user}}: 和 {{char}}:（冒号用半角）。写别的说法时，读卡的一方可能一整段都读不到。"
+    },
+    {
+      "id": "example-macro-halfwidth-colon",
+      "type": "pattern-forbid",
+      "pattern": "^\\s*\\{\\{\\s*(char|user)\\s*\\}\\}\\s*：",
+      "flags": "m",
+      "scope": "field:mes_example",
+      "severity": "warning",
+      "message": "{{char}} / {{user}} 后面跟的是中文冒号",
+      "hint": "冒号要用半角 :，全角的匹配不上。"
+    },
+    {
+      "id": "first-mes-not-empty",
+      "type": "non-empty",
+      "scope": "field:first_mes",
+      "severity": "warning",
+      "message": "开场白为空，开始新对话时会是空白",
+      "hint": "至少写一段开场白；想给多个开局就用「备用开场白」。"
     }
   ],
   "autoFix": [],
   "metadata": {
     "author": "Tavern Card Studio",
     "license": "MIT",
-    "updatedAt": "2026-10-21"
+    "updatedAt": "2026-11-05"
   }
 }

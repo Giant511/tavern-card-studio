@@ -21,7 +21,43 @@ installer/obj/
 
 # 客户端（Tauri）
 client/src-tauri/target/
-client/src-tauri/gen/
+# ── client/src-tauri/gen/ ─────────────────────────────────────────────
+#
+# 这是 Tauri 生成的 Android 工程目录（3.1 GB：build 中间物 + st.zip 343 MB）。
+# 整个入库显然不行。
+#
+# ★ 但里面**有我们自己写的 Kotlin 业务代码**（2026-11-09 发现）：
+#   stengine/StBridge.kt、StLauncher.kt、StService.kt、StUnpacker.kt、
+#   TestCardCleaner.kt、MainActivity.kt —— 约 2000 行。
+#   在此之前**一行都不在版本控制里**：
+#   `git ls-files "*.kt"` 返回 0。换机器、重新 `tauri android init`、
+#   或者别人 clone 这个仓库，这些代码全都没有。
+#
+# 所以：**只放行 `.kt`，其余照旧忽略**。
+#
+# 写法说明（差一个字就不生效）：
+#
+# ```text
+#   client/src-tauri/gen/**/*      忽略目录下的一切
+#   !client/src-tauri/gen/**/      把**目录**放行 ← 必须！git 不会进入
+#                                  被忽略的目录，不先放行目录，后面那条
+#                                  `!*.kt` 永远不会被求值
+#   !client/src-tauri/gen/**/*.kt  放行 Kotlin 源码
+# ```
+client/src-tauri/gen/**/*
+!client/src-tauri/gen/**/
+!client/src-tauri/gen/**/*.kt
+# 安卓端**用户文档**也放行（2026-11-09）。它和 Kotlin 源码一样属于"我们写的东西"，
+# 不是 Tauri 生成的 —— 用户手册就放在安卓工程自己的 docs/ 下。
+#
+# ★ 注意 `gen/` 重跑 `tauri android init` 会被整个重建。已提交的文档不会丢
+#   （git 里有备份），但会从工作区消失，需要 `git checkout -- <路径>` 找回来。
+!client/src-tauri/gen/android/docs/
+!client/src-tauri/gen/android/docs/**
+# ↑ 但 `generated/` 除外：那是 Tauri 每次 init 重新生成的模板
+# （RustWebChromeClient / WryActivity / PermissionHelper… 约 1400 行），
+# 入库只会让人分不清哪些是我们写的。规则放最后 → 优先级最高。
+client/src-tauri/gen/android/app/src/main/java/**/generated/
 # 注意：Cargo.lock 必须入库（应用类项目的可复现构建），不要忽略
 # 注意：client/src-tauri/icons/ 必须入库（bundler 构建期读取）
 # 注意：vendor/winsw/WinSW.NET4.exe 必须入库（服务宿主，构建期需要；
@@ -76,6 +112,20 @@ docs/*
 !docs/server-cmd.md
 !docs/server-developer.md
 !docs/Cloud Deployment Manual.md
+# v0.1.7 安卓端：适配器契约（施工图，含 ST 源码行号）与夜航设计 token。
+# 二者都不含本机路径/内网地址/密钥，且是后续开发与契约测试的依据，必须版本化。
+!docs/adapter-contract-st-v1.19.md
+# v0.1.7 / T15.3：APK 链设计（前台服务 / Doze / 孤儿清理 / W^X 落地）
+!docs/t15.3-apk-design.md
+# v0.1.7 / T15.6：语音 BYO 需求固化（补丁 F4，含隐私红线与判据级要求）
+!docs/t15.6-asr-byo.md
+# v0.1.7：升 Node 的实测成本（下次升版要照这个看）
+!docs/node-upgrade-cost.md
+# spike ① 的正式产物：Node for Android 的四个构建缺陷与实测判据。
+# 它不是"过程记录"—— 下次升 Node 要照它重趟一遍，不入库等于让人从零再踩。
+!docs/spike-01-node-android.md
+!docs/design-language-nebula.md
+!docs/wireframe-nebula-tabs.html
 PLAN.md
 
 # 记忆全文卷（2026-10-26 用户要求）：与 PLAN.md 同类 —— 含本机路径、真实卡数据与排障记录，
@@ -86,3 +136,41 @@ PLAN.md
 # G7 取证截图：画面上就是用户真实的世界书正文（成人向角色设定）。
 # 留着本地看即可，**不进版本历史** —— 一旦推上去就再也删不干净。
 assets/g7-*.png
+
+# Node for Android 的编译产物（2026-10-30）：两份共 168 MB，是不入库的构建中间物。
+#
+# 不提交的理由不是"文件太大"，而是**git 历史不可撤销** —— 提交一次就永久变大，
+# 日后删掉也只是新提交里没有，.git 里的对象还在。而它们是可重建的（脚本已固化，
+# 代价 17.6 小时），不是源码。sha256 与验证结论记在
+# vendor/node-android/bin/MANIFEST.md（那份受版本控制）。
+#
+# 要改成入库，先决定是否上 Git LFS —— 不要顺手 git add 一个 95 MB 的文件。
+vendor/node-android/bin/*.so
+
+# ── Release 签名密钥（v0.1.7 / T15.3）─────────────────────────────
+#
+# **绝不入库**：keystore 一旦提交，等于把签名私钥公开，而 git 历史不可撤销。
+# 丢了或泄露都会让已发布的 App 无法安全更新（Android 只认同一把密钥）。
+#
+# 密钥实际位置：D:/tcs-release-keys/（仓库外）
+# 仓库里只留指纹：vendor/android-env/RELEASE-KEY-FINGERPRINT.md
+*.jks
+*.keystore
+keystore.properties
+# APK 构建产物
+android/probe/**/build/
+android/probe/.gradle/
+
+# jniLibs 里的 .so 也不入库 —— 与 vendor/node-android/bin/ 同一个理由：
+#   · libnode.so 94.9 MB、libc++_shared.so 1.7 MB，都是**可重建/可再取**的二进制；
+#   · git 历史不可撤销，提交一次就永久变大；
+#   · sha256 与取法记在 vendor/node-android/bin/MANIFEST.md 与 android/probe/README.md。
+# 需要它们时：libnode 从 vendor/node-android/bin/ 拷，
+# libc++_shared 从 NDK 的 sysroot/usr/lib/aarch64-linux-android/ 拷。
+android/probe/app/src/main/jniLibs/**/*.so
+
+# ── 备份与临时文件 ────────────────────────────────────────────
+# `*.bak` 是手工改文件前留的副本（例如 reports/PROGRESS-v0.1.7-20261030.md.bak）。
+# 它们不是源码，也不该进版本库 —— 需要追溯历史时用 git log，不靠散落的副本。
+*.bak
+*.orig

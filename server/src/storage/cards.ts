@@ -17,7 +17,9 @@ import type { AuditService } from '../audit/service.js';
 import { analyzeCardBytes } from '../audit/service.js';
 import { AppError } from '../errors.js';
 import type { Logger } from '../log.js';
-import type { BlobStore } from './blobs.js';
+// 值导入（不只是类型）：`setFace` 里要用 `BlobStore.sha256` 算摘要 ——
+// 与版本上传共用同一个算法，避免两处各算一套
+import { BlobStore } from './blobs.js';
 import { ALL_CARDS, rowInScope, type CardScope } from './card-scope.js';
 import type { CardIdSource, CardRow, Db, NewVersionRow, VersionKind, VersionRow } from './db.js';
 import { compareBytes, diffJson, diffLines, sha256Of, type ByteComparison, type JsonDiff, type LineDiff } from './diff.js';
@@ -99,6 +101,28 @@ export interface CardSummaryDto {
     exportable: boolean;
   } | null;
   auditError: string | null;
+  /**
+   * 卡面资产（v0.1.7 修订二）。`null` = 这张卡没有卡面。
+   *
+   * ## 为什么是嵌套对象而不是四个平铺字段
+   *
+   * 平铺的话"有没有卡面"要靠 `faceSha256 !== null` 判断，而另外三个字段
+   * 各自也可能为 null —— 于是每个调用方都要自己决定"以哪个为准"。
+   * 嵌套之后只有一个判据：`face === null`。缺字段这种事在类型上就不成立。
+   *
+   * ## 为什么卡面不进版本历史
+   *
+   * 换卡面不改内容。把它做成版本会让"回滚到第 3 版"变成"连封面也回滚"，
+   * 而用户换封面往往只是为了好看，不希望它跟设定绑定。
+   * 服务端体积账也算得清：50 个版本的 JSON 是 MB 级，卡面只有一份 ~300KB。
+   */
+  face: {
+    sha256: string;
+    size: number;
+    /** `image/png` / `image/jpeg` / `image/webp` */
+    mime: string;
+    updatedAt: string;
+  } | null;
 }
 
 export interface CardDetailDto extends CardSummaryDto {
@@ -198,6 +222,51 @@ export const CARD_ID_MAX_LENGTH = 64;
  * 任何绕过界面的调用（curl、旧版客户端、脚本）都能造出无法寻址的卡 ——
  * 而那张卡之后**永远打不开**，因为它的 ID 里可能有 `/` 或空格。
  */
+/**
+ * 卡面大小上限（v0.1.7 增补二，从 8 MB 收紧到 250 KB）。
+ *
+ * ## 为什么是 250KB
+ *
+ * 这个数字来自需求里唯一的硬红线：**仓库卡面资产**（内部存储格式）不得超过 250KB。
+ * 它和另外两个产物的关系必须分清，否则很容易"顺手放宽"：
+ *
+ *   · 仓库资产 250KB —— 硬限，由这里兜底；
+ *   · ST 头像 500KB —— **软**上限，不经过这个端点（客户端本地生成）；
+ *   · PNG 卡 / 导出 —— **不受这条约束**，卡面按原尺寸组装，不占仓库。
+ *
+ * ## 为什么服务端还要校验一次（客户端已经压过了）
+ *
+ * 客户端管线只是"正常路径"，不是安全边界：旧版本客户端、改过的客户端、
+ * 手工 curl 都可能送进来一张 5MB 的原图。而 blob **只增不删**，
+ * 一次误传就永久占着仓库空间。所以这里是**兜底**，返回 413。
+ *
+ * 错误信息用 KB 而不是 MB：上限 250KB 说成 "0.24 MB" 会让用户以为是笔误。
+ */
+export const FACE_MAX_BYTES = 250 * 1024;
+
+/**
+ * 允许的卡面 MIME。
+ *
+ * 只收这三种：它们是浏览器 `<img>` 与 ST 都能直接吃的格式。
+ * 不收 SVG 是安全考虑（SVG 能带脚本），不收 BMP/TIFF 是没人用。
+ */
+export const FACE_MIME_ALLOWED = ['image/png', 'image/jpeg', 'image/webp'] as const;
+
+/**
+ * 把客户端给的 MIME 规范化；不在白名单里返回 null。
+ *
+ * 为什么不做"嗅探文件头"来代替：客户端的 MIME 来自 `File.type`，
+ * 浏览器已经看过内容了；服务端再嗅一遍要引入图片解析依赖，
+ * 而收益只是防止"故意标错 MIME"—— 那种情况下把 webp 标成 png
+ * 也不会造成安全问题，只是客户端渲染失败。
+ */
+export function normalizeFaceMime(mime: string): string | null {
+  const base = mime.trim().toLowerCase().split(';')[0]?.trim() ?? '';
+  // jpg 是常见的历史写法，统一成 image/jpeg
+  const alias = base === 'image/jpg' ? 'image/jpeg' : base;
+  return (FACE_MIME_ALLOWED as readonly string[]).includes(alias) ? alias : null;
+}
+
 export function isValidCardId(id: string): boolean {
   if (id.length === 0 || id.length > CARD_ID_MAX_LENGTH) return false;
   if (!/^[A-Za-z0-9-]+$/.test(id)) return false;
@@ -251,6 +320,17 @@ export class CardService {
   constructor(
     private readonly db: Db,
     private readonly blobs: BlobStore,
+    /**
+     * 卡面资产的 blob 库（v0.1.7 修订二）。**与版本 blob 分开一个目录**。
+     *
+     * 为什么不复用 `blobs`：两者生命周期不同 —— 版本 blob 只增（回滚要能取到
+     * 任意历史），卡面可替换（换卡面不产生版本）。混在一个目录里，将来做
+     * blob 回收就必须靠数据库反查"这个摘要属于哪一类"，而分目录本身就能防错。
+     *
+     * 实现仍是同一个 `BlobStore`（内容寻址 + 原子写 + 读后校验），
+     * 所以同一张图被多张卡用只存一份。
+     */
+    private readonly faceBlobs: BlobStore,
     private readonly git: GitStore,
     private readonly audit: AuditService,
     private readonly defaults: { platformId: string; presetId: string },
@@ -290,6 +370,15 @@ export class CardService {
             },
       audit: summaryFromRow(row),
       auditError: row.audit_error,
+      face:
+        row.face_sha256 === null || row.face_sha256 === undefined
+          ? null
+          : {
+              sha256: row.face_sha256,
+              size: row.face_size ?? 0,
+              mime: row.face_mime ?? 'image/png',
+              updatedAt: row.face_updated_at ?? row.updated_at,
+            },
     };
   }
 
@@ -718,6 +807,13 @@ export class CardService {
       audit_warning_count: version.row.auditSummary?.warning ?? null,
       audit_info_count: version.row.auditSummary?.info ?? null,
       audit_exportable: version.row.auditSummary ? (version.row.auditSummary.exportable ? 1 : 0) : null,
+      // 新建的卡没有卡面（v0.1.7 修订二）。卡面是**独立资产**，不随内容上传带进来 ——
+      // 上传接口只收 JSON，封面走 PUT /api/cards/:id/face。这样"卡面没变就不传"
+      // 才有意义（否则每次上传都要判断图片是否变化）。
+      face_sha256: null,
+      face_size: null,
+      face_mime: null,
+      face_updated_at: null,
     };
 
     const tx = this.db.handle.transaction(() => {
@@ -1220,6 +1316,148 @@ export class CardService {
       identical: bytes.identical,
       contentCleared: false,
     };
+  }
+
+  // ────────────────────────── 卡面资产（v0.1.7 修订二） ──────────────────────────
+
+  /**
+   * 设置/替换卡面。**不产生版本**。
+   *
+   * ## 判据：sha256 未变就什么都不做
+   *
+   * 客户端每次上传都会带上当前卡面。而绝大多数上传时卡面根本没变 ——
+   * 如果每次都重写 blob + 改数据库 + 记一条审计，审计日志会被
+   * "换了卡面"淹没，真正需要追溯的那次反而找不出来。
+   * 所以先比摘要，一样就直接返回 `changed: false`，**连事件都不记**。
+   *
+   * ## 为什么换卡面要记审计
+   *
+   * 它改的是仓库里的资产，而"这张卡的封面什么时候被换过"在多账户下是
+   * 需要追溯的事（谁换的、换成什么）。但它**不进版本历史** —— 用户明确要求
+   * "换卡面 ≠ 新版本"：回滚到第 3 版不该把封面一起带走。
+   */
+  async setFace(
+    cardId: string,
+    bytes: Buffer,
+    mime: string,
+    options: { scope?: CardScope; actor?: string | null; ip?: string | null } = {},
+  ): Promise<{ changed: boolean; face: CardSummaryDto['face'] }> {
+    const scope = options.scope ?? ALL_CARDS;
+    if (this.faceBlobs === null) {
+      throw new AppError(500, 'INTERNAL', '卡面存储未初始化');
+    }
+    const row = this.db.getCard(cardId, { scope });
+    if (!row) throw new AppError(404, 'NOT_FOUND', `没有这张卡：${cardId}`);
+
+    if (bytes.byteLength === 0) {
+      throw new AppError(400, 'FACE_EMPTY', '卡面内容为空');
+    }
+    if (bytes.byteLength > FACE_MAX_BYTES) {
+      /*
+       * 单位用 KB：上限是 250KB，写成 "0.24 MB" 会被当成笔误。
+       * 同时把 `size` / `limit` 一起放进去，客户端能直接显示"你的图多大、上限多大"，
+       * 不必再解析文案里的数字。
+       */
+      throw new AppError(413, 'FACE_TOO_LARGE', `卡面太大（上限 ${String(Math.round(FACE_MAX_BYTES / 1024))} KB）`, {
+        size: bytes.byteLength,
+        limit: FACE_MAX_BYTES,
+      });
+    }
+    const normalized = normalizeFaceMime(mime);
+    if (normalized === null) {
+      throw new AppError(415, 'FACE_MIME_UNSUPPORTED', `不支持的图片类型：${mime}`, {
+        allowed: [...FACE_MIME_ALLOWED],
+      });
+    }
+
+    const sha256 = BlobStore.sha256(bytes);
+    if (row.face_sha256 === sha256) {
+      // 内容一模一样：不写盘、不改行、不记事件
+      return {
+        changed: false,
+        face: {
+          sha256,
+          size: row.face_size ?? bytes.byteLength,
+          mime: row.face_mime ?? normalized,
+          updatedAt: row.face_updated_at ?? row.updated_at,
+        },
+      };
+    }
+
+    this.faceBlobs.put(bytes);
+    const now = toIso(Date.now());
+    this.db.setCardFace(cardId, { sha256, size: bytes.byteLength, mime: normalized, at: now });
+    this.db.appendEvent({
+      at: now,
+      level: 'info',
+      action: row.face_sha256 === null ? 'card.face.add' : 'card.face.replace',
+      cardId,
+      detail: { sha256, size: bytes.byteLength, mime: normalized, previous: row.face_sha256 },
+      actor: options.actor ?? null,
+      ip: options.ip ?? null,
+      ownerId: row.owner_id === '' ? null : row.owner_id,
+    });
+    this.logger.info('card.face.set', { cardId, sha256, size: bytes.byteLength, mime: normalized });
+
+    return { changed: true, face: { sha256, size: bytes.byteLength, mime: normalized, updatedAt: now } };
+  }
+
+  /**
+   * 读卡面字节。
+   *
+   * 没有卡面时抛 404 而不是返回空 Buffer：**"没有卡面"是一条正常路径**
+   * （客户端据此走默认卡面兜底链），而空 Buffer 会被当成"图片损坏"，
+   * 两件事在客户端的处理完全不同。
+   */
+  getFace(
+    cardId: string,
+    options: { scope?: CardScope } = {},
+  ): { bytes: Buffer; mime: string; sha256: string; size: number } {
+    const row = this.db.getCard(cardId, { scope: options.scope ?? ALL_CARDS });
+    if (!row) throw new AppError(404, 'NOT_FOUND', `没有这张卡：${cardId}`);
+    if (row.face_sha256 === null || row.face_sha256 === undefined) {
+      throw new AppError(404, 'FACE_NOT_FOUND', `这张卡没有卡面：${cardId}`);
+    }
+    const bytes = this.faceBlobs.read(row.face_sha256, { verify: true });
+    return {
+      bytes,
+      mime: row.face_mime ?? 'image/png',
+      sha256: row.face_sha256,
+      size: bytes.byteLength,
+    };
+  }
+
+  /**
+   * 删除卡面（回落到"无卡面"状态）。
+   *
+   * **不删 blob**：内容寻址的 blob 可能被别的卡（或同一个卡的历史版本）
+   * 共用，删文件会让那些引用变成坏引用。行上的摘要清掉就够了 ——
+   * blob 是内容池，不是这张卡的私有物。
+   */
+  deleteFace(
+    cardId: string,
+    options: { scope?: CardScope; actor?: string | null; ip?: string | null } = {},
+  ): { deleted: boolean } {
+    const row = this.db.getCard(cardId, { scope: options.scope ?? ALL_CARDS });
+    if (!row) throw new AppError(404, 'NOT_FOUND', `没有这张卡：${cardId}`);
+    if (row.face_sha256 === null || row.face_sha256 === undefined) {
+      // 本来就没有：幂等成功，不记事件（"又删了一次不存在的东西"不是审计事件）
+      return { deleted: false };
+    }
+    const now = toIso(Date.now());
+    this.db.setCardFace(cardId, { sha256: null, size: null, mime: null, at: now });
+    this.db.appendEvent({
+      at: now,
+      level: 'info',
+      action: 'card.face.delete',
+      cardId,
+      detail: { previous: row.face_sha256 },
+      actor: options.actor ?? null,
+      ip: options.ip ?? null,
+      ownerId: row.owner_id === '' ? null : row.owner_id,
+    });
+    this.logger.info('card.face.delete', { cardId, previous: row.face_sha256 });
+    return { deleted: true };
   }
 
   // ────────────────────────────── 内部 ──────────────────────────────

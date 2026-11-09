@@ -41,7 +41,30 @@ const SIGNATURE = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a
 
 /** 卡数据用的两个 keyword。顺序即**读取**优先级（决策 D2） */
 export const PNG_CARD_KEYWORDS = ['ccv3', 'chara'] as const;
+
 export type PngCardKeyword = (typeof PNG_CARD_KEYWORDS)[number];
+
+/**
+ * 这段字节是不是 PNG 容器（只看 8 字节签名，不做 chunk 校验）。
+ *
+ * ## 为什么需要它（v0.1.7 增补二之后）
+ *
+ * 仓库卡面资产现在是 **WebP**（250KB 红线逼出来的），而 `pngSource` 的下游
+ * —— `buildPngCard`、导出、推 ST —— **全都要求 PNG 容器**。
+ * 取回时如果把服务端那份 WebP 直接塞进 `pngSource`，推 ST 会抛
+ * `PngCardError: 不是 PNG 文件（文件签名不匹配）`，而那条链路上没人 catch，
+ * 表现是"点推送没反应"（2026-10-29 生产反馈）。
+ *
+ * 所以取回一侧必须先问一句"这是 PNG 吗"，不是就转码。
+ * 用签名而不是 MIME：MIME 是 HTTP 头给的，可能是错的；签名是内容本身。
+ */
+export function isPngBytes(bytes: Uint8Array): boolean {
+  if (bytes.length < SIGNATURE.length) return false;
+  for (let index = 0; index < SIGNATURE.length; index += 1) {
+    if (bytes[index] !== SIGNATURE[index]) return false;
+  }
+  return true;
+}
 
 /** 写块时 spec → keyword */
 export type PngCardSpec = 'v2' | 'v3';

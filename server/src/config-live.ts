@@ -20,12 +20,21 @@
 import { readFileSync } from 'node:fs';
 
 import type { RegisterMode } from './config.js';
+// 本文件内部也要用 isRegisterMode，所以除了下面的再导出，还需要实际 import
+import { isRegisterMode } from './config.js';
 
-export const REGISTER_MODES = ['closed', 'open', 'admin-only'] as const;
-
-export function isRegisterMode(value: unknown): value is RegisterMode {
-  return typeof value === 'string' && (REGISTER_MODES as readonly string[]).includes(value);
-}
+/**
+ * 注册模式的合法值与校验**不在这里定义**，从 `config.ts` 复用。
+ *
+ * 这里曾经自己维护一份 `REGISTER_MODES`，而 `config.ts` 的 `normalizeConfig`
+ * 又维护了另一份（三元素数组）。v0.1.7 加 `invite` 时只改了这里，
+ * `normalizeConfig` 把 `invite` 判成非法值、静默回落 `closed` ——
+ * 于是 `PUT /control/config` 返回 200 但配置被改成了 `closed`。
+ * 详见 `config.ts` 里 `REGISTER_MODES` 的注释。
+ *
+ * 保留这两个再导出（`export { ... }`）是为了不破坏已有 import 路径。
+ */
+export { REGISTER_MODES, isRegisterMode } from './config.js';
 
 export class LiveRegisterMode {
   /** 上一次成功解析**或**解析失败时看到的原文；null 表示还没读过 */

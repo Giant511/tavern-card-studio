@@ -45,6 +45,8 @@ export default defineConfig({
       // 两个入口：主界面 + 性能粗测页（后者不进 MSI 的业务路径，只用于测量）
       input: {
         main: 'index.html',
+        // 移动端入口：四 Tab + 夜航聊天页（T15.5 的 UI，2026-10-31 才接上）
+        mobile: 'mobile.html',
         perf: 'perf.html',
       },
     },

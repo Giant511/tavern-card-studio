@@ -231,9 +231,8 @@ export class CardInfoDialog {
     this.overlay.append(panel);
 
     // 点遮罩关闭（点面板内部不关）
-    this.overlay.addEventListener('click', (event) => {
-      if (event.target === this.overlay) this.close();
-    });
+    // 点遮罩**不关闭**（2026-10-29 用户要求）：子窗口只能由它自己的按钮或 × 关闭。
+    // 去掉这条监听是有意的，不是漏了 —— 误触空白处关掉正在填的表单比多点一次 × 更烦。
     /*
      * 自己挂到 body 上，与 `NewCardDialog` 一致 —— 不让调用方再记一句 mount()。
      * 少一个"必须记得调"的步骤，就少一类"对话框永远不出现"的故障。

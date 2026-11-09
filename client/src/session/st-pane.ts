@@ -40,6 +40,8 @@ import {
   PROXY_RESTARTED_NOTE,
   type ProxyHandle,
 } from './st-pane-lifecycle.ts';
+// 推送结果文案与四状态对话框共用一份（别在面板里再硬编码一条）
+import { stStatusText } from './st-install.ts';
 
 /**
  * 把抛出物压成一行可读文本（**给日志用**）。
@@ -96,7 +98,14 @@ export interface StPaneCallbacks {
   /** 记宽度 */
   saveWidth: (width: number) => Promise<void>;
   /** 推当前卡；返回 null = 被闸门拦下 */
-  push: () => Promise<{ fileName: string } | { error: string }>;
+  /**
+   * 推送当前卡。
+   *
+   * `isUpdate` 是 v0.1.7 修订一带出来的：同名再推现在是**覆盖**而不是新建，
+   * 所以文案要说「已更新」而不是「已推送」—— 否则用户看到一模一样的文件名，
+   * 会怀疑是不是又建了一个。
+   */
+  push: () => Promise<{ fileName: string; isUpdate?: boolean } | { error: string }>;
   /** 底部状态栏（与编辑器共用一条状态栏） */
   notify: (message: string, kind?: 'info' | 'ok' | 'warn' | 'bad') => void;
   /** 判断当前有没有打开的卡（没卡时推送按钮置灰） */
@@ -576,7 +585,15 @@ export class StPane {
         this.callbacks.notify(result.error, 'bad');
         return;
       }
-      this.callbacks.notify('已推送为 PNG · 在 ST 中 F5 刷新可见', 'ok');
+      /*
+       * 文案与四状态对话框**共用** `stStatusText`，不在这里硬编码一条。
+       * 两处各写一份的代价：改了「已更新」那句，面板这边还是老话 —— 而
+       * 用户往往两个入口都用过，看到两套说法只会更困惑。
+       */
+      this.callbacks.notify(
+        stStatusText('pushed', { fileName: result.fileName, updated: result.isUpdate === true }),
+        'ok',
+      );
       // 刷新信号（T14.4）：推完立刻重载，用户在同一个窗口里就能看到新卡
       // fire-and-forget：推送本身已经成功，刷新失败不该把成功改判成失败
       void this.reload();

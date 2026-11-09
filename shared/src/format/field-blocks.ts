@@ -26,6 +26,11 @@ import {
   renderGreetings,
   type GreetingFormatParams,
 } from './greeting-preset.js';
+import {
+  parseCompositeScene,
+  renderCompositeScene,
+  type SceneSections,
+} from './composite-scene.js';
 
 /**
  * 该板块是否由残余字段驱动。
@@ -33,21 +38,51 @@ import {
  * 按 `kind` 派生，不写死 id：v0.1.3 之后如果再加一个"独占某字段"的板块，
  * 只要在 BLOCK_DEFINITIONS 里标成 `field-backed`，这里与所有调用点自动跟随。
  */
+/**
+ * 字段板块读写所需的 residual 切片。
+ *
+ * 集中一处而不是每个函数各写一遍 `Pick<...>`：加一个被板块承载的字段时，
+ * 只改这里。分散写的话，漏掉的那个函数会在运行时拿到 `undefined`
+ * （TypeScript 只在**都改了类型**时才报错，漏改类型的地方反而静默）。
+ */
+type FieldResidualSlice = Pick<
+  StResidual,
+  'firstMes' | 'mesExample' | 'alternateGreetings' | 'scenario'
+>;
+
+/** 从 residual 取四段（复合板块用） */
+function sceneSectionsFrom(residual: FieldResidualSlice): SceneSections {
+  return {
+    firstMes: residual.firstMes,
+    alternateGreetings: residual.alternateGreetings,
+    scenario: residual.scenario,
+  };
+}
+
 export function isFieldBlock(id: BlockId): boolean {
   return BLOCK_DEFINITION_MAP[id]?.kind === 'field-backed';
 }
 
 /** 从残余字段渲染出板块文本 */
 export function fieldBlockTextFrom(
-  residual: Pick<StResidual, 'firstMes' | 'mesExample' | 'alternateGreetings'>,
+  residual: FieldResidualSlice,
   id: BlockId,
   format: GreetingFormatParams = DEFAULT_GREETING_FORMAT,
 ): string {
-  if (id === 'initial-scene') {
-    return renderGreetings(residual.firstMes, residual.alternateGreetings, format);
-  }
-  if (id === 'chat-examples') return residual.mesExample;
-  return '';
+  /*
+   * 现在有**两个**字段板块：
+   *   · `initial-scene`（复合）—— 一个板块文本里含 `@@开场白` / `@@情景` 两段
+   *   · `chat-examples`（单一）—— 就是 mes_example 原文
+   *
+   * 用查表而不是 `if (id === ...)` 链：写死的 if 链在"合并/新增板块"时
+   * 会漏 —— 2026-11-08 加 scenario 时正是踩了这个（掉进 else 拿到别人的内容，
+   * 而且所有断言都是绿的）。
+   */
+  const renderers: Partial<Record<BlockId, () => string>> = {
+    'initial-scene': () => renderCompositeScene(sceneSectionsFrom(residual), format),
+    'chat-examples': () => residual.mesExample,
+  };
+  return renderers[id]?.() ?? '';
 }
 
 export function fieldBlockText(
@@ -80,7 +115,7 @@ function fieldBlock(id: BlockId, text: string, missing = false): CardBlock {
  */
 export function blocksWithFieldBlocks(
   blocks: readonly CardBlock[],
-  residual: Pick<StResidual, 'firstMes' | 'mesExample' | 'alternateGreetings'>,
+  residual: FieldResidualSlice,
   format: GreetingFormatParams = DEFAULT_GREETING_FORMAT,
 ): CardBlock[] {
   const byId = new Map<BlockId, CardBlock>(blocks.map((block) => [block.id, block]));
@@ -98,7 +133,7 @@ export function blocksWithFieldBlocks(
 
 export interface FieldBlockReflection {
   /** 需要覆盖的残余字段（只含真的被改过的） */
-  override: Partial<Pick<StResidual, 'firstMes' | 'mesExample' | 'alternateGreetings'>>;
+  override: Partial<FieldResidualSlice>;
   /** 被回写的板块（诊断/测试用） */
   written: BlockId[];
 }
@@ -114,17 +149,31 @@ export function reflectFieldBlocks(
   const override: FieldBlockReflection['override'] = {};
   const written: BlockId[] = [];
 
+  /*
+   * 对话示例（单一字段）：直接覆盖 mes_example。
+   */
   const examples = card.blocks.find((block) => block.id === 'chat-examples');
   if (examples && examples.dirty) {
     override.mesExample = examples.text;
     written.push('chat-examples');
   }
 
+  /*
+   * 初始场景（复合）：一块脏了要回写三个字段。
+   *
+   * ★ 三个字段**必须一起写**，不能"只写改过的那一段"：
+   * 板块文本是单一真相（用户可能把开场白和情景一起改了），
+   * 若只按某个子段判断"这段没变就不写"，那用户把情景清空时
+   * 旧值会留在 residual 里 —— 界面上没了、prompt 里还在。
+   *
+   * `parseCompositeScene` 对空段返回空串，正是想要的语义。
+   */
   const scene = card.blocks.find((block) => block.id === 'initial-scene');
   if (scene && scene.dirty) {
-    const parsed = parseGreetings(scene.text, format);
+    const parsed = parseCompositeScene(scene.text, format);
     override.firstMes = parsed.firstMes;
     override.alternateGreetings = parsed.alternateGreetings;
+    override.scenario = parsed.scenario;
     written.push('initial-scene');
   }
 

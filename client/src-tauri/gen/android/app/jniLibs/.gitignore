@@ -1,0 +1,4 @@
+# 这两个是构建输入，从 vendor/node-android/bin/ 拷过来（可重建、95MB，不入 git）。
+# 见 docs/t15.3-apk-design.md 与 vendor/node-android/bin/MANIFEST.md
+*
+!.gitignore

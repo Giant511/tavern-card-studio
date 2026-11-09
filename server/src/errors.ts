@@ -42,6 +42,15 @@ export type ErrorCode =
   //   REGISTRATION_REJECTED —— 注册失败（用户名占用/格式不合规/密码不合规，共用）
   //   ACCOUNT_DISABLED      —— 密码正确但账户被禁用（走到这里说明密码已对，不构成枚举面）
   //   INVALID_REFRESH_TOKEN —— refresh 失效（不存在/已吊销/已过期，共用一句）
+  //
+  //   INVITE_REQUIRED / INVITE_INVALID（v0.1.7，邀请码注册）——
+  //   与 REGISTRATION_REJECTED 分开的理由：那句共用的"注册失败"是为了不泄露
+  //   **账户存在性**；而邀请码的问题是"你手里的凭证不对"，用户必须知道该去
+  //   找管理员要新码。混进共用文案会导致用户反复试同一个已过期的码。
+  //   为什么不担心枚举：码是 8 位、31 个字符，约 8.5e11 种，
+  //   而且只有 `invite` 模式才有这条路径。
+  | 'INVITE_REQUIRED'
+  | 'INVITE_INVALID'
   | 'INVALID_CREDENTIALS'
   | 'REGISTRATION_CLOSED'
   | 'REGISTRATION_REJECTED'
@@ -60,6 +69,20 @@ export type ErrorCode =
   | 'VERSION_CONTENT_CLEARED'
   | 'NOT_EMPTY'
   | 'ADMIN_ONLY'
+  // v0.1.7 修订二：卡面资产。
+  //
+  //   FACE_NOT_FOUND         —— 这张卡**没有**卡面（正常状态，客户端据此走默认兜底链）
+  //   FACE_EMPTY             —— 上传了 0 字节（不是"没有卡面"，是请求有问题）
+  //   FACE_TOO_LARGE         —— 超过 8 MB 上限
+  //   FACE_MIME_UNSUPPORTED  —— 不是 png/jpeg/webp
+  //
+  // FACE_NOT_FOUND 与 FACE_EMPTY 必须分开：前者是**正常路径**（用户就是没设封面），
+  // 后者是**请求错误**。合并成一个码会让客户端把"没设封面"当成"上传失败"，
+  // 于是每次同步都弹一次错。
+  | 'FACE_NOT_FOUND'
+  | 'FACE_EMPTY'
+  | 'FACE_TOO_LARGE'
+  | 'FACE_MIME_UNSUPPORTED'
   // v0.1.3 / F5 后半：仓库令牌连接入口（POST /api/auth/repo-token）的四个码。
   //
   //   TOKEN_FORMAT_INVALID —— 形态不对（不查库就能判，无泄露面）

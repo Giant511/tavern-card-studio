@@ -557,7 +557,7 @@ export function parseWorldbookJson(text: string): ParseWorldbookJsonResult {
       issues.push({
         severity: 'warning',
         code: 'no-character-book',
-        message: '文件里的 character_book 是 null，将导入一个空世界书',
+        message: '文件里的世界书为空，将导入一个空世界书',
       });
       return { entries: [], meta: {}, issues, ok: true };
     }
@@ -570,7 +570,7 @@ export function parseWorldbookJson(text: string): ParseWorldbookJsonResult {
         severity: 'error',
         code: 'no-entries-key',
         message: 'JSON 里没有 entries 字段，无法识别为世界书',
-        hint: '支持三种形态：条目数组、{ "entries": [...] }、或整卡里的 character_book',
+        hint: '支持三种形态：条目列表、带条目列表的对象、或整张角色卡里的世界书',
       });
       return { entries: [], meta, issues, ok: false };
     }
@@ -784,7 +784,7 @@ export function exportWorldbook(input: WorldbookExportInput): WorldbookExportRes
     // 用户点「导出世界书」时目标是 ST，所以要开字段对齐（默认关闭以保无损）
     text: renderWorldbookJson(input.entries, meta, { entryTitleToComment: true }),
     verbatim: false,
-    reason: source ? '条目或周边字段有改动，已按规范重新序列化' : '没有导入来源，按规范序列化',
+    reason: source ? '条目或周边字段有改动，已按规范重新生成' : '没有导入来源，按规范生成',
   };
 }
 

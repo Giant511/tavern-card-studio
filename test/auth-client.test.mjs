@@ -175,6 +175,22 @@ test('T10.7 策略：未知 registerMode 一律回落 closed；authRequired 缺�
   assert.equal(policy.authRequired, true);
 });
 
+test('★ v0.1.7 策略：invite 必须被**原样解析**，不许回落 closed', async () => {
+  /*
+   * `fetchPolicy` 里那份判断曾经是
+   * `mode === 'open' || mode === 'admin-only' ? mode : 'closed'` ——
+   * 加 invite 不漏改这里，客户端会把 `invite` 当成未知值回落 `closed`，
+   * 于是**入口被藏起来**，而服务端明明是支持的。
+   *
+   * 这与服务端 `normalizeConfig` 那个静默回落是同一类错：
+   * 未知值回落到"更安全"的一侧，安全但看不出问题。
+   * 所以判据是"能解析出来"，不是"没崩"。
+   */
+  const { impl } = fetchOnce(200, { registerMode: 'invite', accessTtlSeconds: 60 });
+  const policy = await fetchPolicy(BASE, { fetchImpl: impl });
+  assert.equal(policy.registerMode, 'invite');
+});
+
 test('T10.7 注册入口显隐：closed 不显示；admin-only 仅管理员可见；策略缺失不显示', () => {
   const admin = { userId: 'u', username: 'root', role: 'admin' };
   const user = { userId: 'u2', username: 'alice', role: 'user' };
@@ -193,6 +209,35 @@ test('T10.7 注册策略说明文案随模式变化，且不预测成败', () =>
   assert.match(registerHint('open'), /开放自助注册/);
   assert.match(registerHint('admin-only'), /仅管理员/);
   assert.equal(/一定|必然|肯定/.test(registerHint('open')), false);
+});
+
+/* ───────────── v0.1.7：邀请码注册 ───────────── */
+
+test('★ v0.1.7 invite 模式：注册入口**照常显示**（入口可见、进来要码）', () => {
+  /*
+   * 这条是整个功能在客户端侧的成败点。
+   *
+   * 若 `shouldShowRegister` 对 invite 返回 false，用户看不到注册入口，
+   * 也就不会想到去问邀请码 —— 功能等于没做，而且**不报错**：
+   * 表现只是"没有注册按钮"，没有任何线索指向配置。
+   */
+  const policy = { registerMode: 'invite', accessTtlSeconds: 1, authRequired: true };
+  // 未登录也要显示（这是自助注册入口）
+  assert.equal(shouldShowRegister(policy, null), true);
+  assert.equal(shouldShowRegister(policy, { userId: 'u2', username: 'alice', role: 'user' }), true);
+  assert.equal(shouldShowRegister(policy, { userId: 'u', username: 'root', role: 'admin' }), true);
+});
+
+test('★ v0.1.7 invite 模式的说明文案必须**说出需要邀请码**', () => {
+  /*
+   * 只说"可以注册"是不够的：用户看到注册框却不知道该填什么，
+   * 会去反复换用户名重试。这句话就是他下一步动作的依据。
+   */
+  const hint = registerHint('invite');
+  assert.match(hint, /邀请码/, '文案必须出现「邀请码」三个字');
+  assert.match(hint, /管理员|索取/, '文案要指出从哪里拿');
+  // 同样不许预测成败
+  assert.equal(/一定|必然|肯定/.test(hint), false);
 });
 
 test('T10.7 顶栏账户文案：三种状态', () => {

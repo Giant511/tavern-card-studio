@@ -1,7 +1,9 @@
 # 服务端运维命令（PowerShell）
 
 Tavern Card Studio Server 的全部运维操作都在命令行完成：建账户、看/换令牌、
+  
 注册 Windows 服务、离线自检。**管理面板只做查看与配置，不提供这些操作** ——
+  
 所以面板进不去时（忘了密码、服务没起、端口被改），这条路仍然能用。
 
 > 适用版本：0.1.2 及以后。命令面一旦变化，本文件必须同步（见文末「维护约定」）。
@@ -29,27 +31,33 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 `$tcs` 只在**当前这个 PowerShell 窗口**有效。关掉重开要重新定义一次。
 
 **为什么用这个形态**：`node.exe` 和 `app\` 目录是任何安装包都会铺的；而
+  
 `tcs-server.cmd` / `start-server.cmd` 是后来才加进包里的脚本，**同一个版本号
+  
 再装一次不会替换已有文件**（Windows Installer 对相同版本只做维护），所以
+  
 老安装上可能没有它们。
 
 ### 1.1 两个脚本形态（新装才有）
 
 如果你的安装目录里能看到这两个文件，可以更短：
 
-| 形态 | 命令 | 前提 |
-|---|---|---|
-| A（推荐） | `& $tcs user list` | 任何 0.1.2 安装 |
-| B | `.\tcs-server.cmd user list` | 较新的安装包才有；自带 `--config` |
-| C | `.\start-server.cmd user list` | 较新的安装包才有；无参数时启动服务 |
+| 形态    | 命令                             | 前提                     |
+| ----- | ------------------------------ | ---------------------- |
+| A（推荐） | `& $tcs user list`             | 任何 0.1.2 安装            |
+| B     | `.\tcs-server.cmd user list`   | 较新的安装包才有；自带 `--config` |
+| C     | `.\start-server.cmd user list` | 较新的安装包才有；无参数时启动服务      |
 
 **别敲裸 `tcs-server`** —— 安装目录里没有这个 exe，只会得到
+  
 「无法将"tcs-server"项识别为 cmdlet」。要么带 `.cmd`，要么用形态 A。
 
 ### 1.2 `--config` 为什么必须写
 
 它指向**服务正在用的那份配置**。省掉的话，CLI 会按当前目录另算一个数据目录
+  
 （`<当前目录>\data\`），**等于在旁边新建一个空库** —— 症状是
+  
 「账户明明建好了，服务却说不存在」，而两处都不会报错。
 
 配置文件的解析顺序（`.cmd` 脚本内部也是这个顺序）：
@@ -59,38 +67,48 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 3. 否则按绿色包处理 → `%HERE%\data\config.json`
 
 `install-layout.ini` 只有 MSI 才会装。用它而不是"猜 `data\config.json` 存不存在"，
+  
 是因为那个文件绿色包跑过一次就会有、安装版被误跑一次也会生成，猜错就写进另一个库。
 
 ---
 
 ## 2. 命令总表
 
-| 命令 | 用途 |
-|---|---|
-| `serve` | 启动服务（控制面 + 数据面）。默认命令 |
-| `worker` | 只启动数据面 API |
-| `config show` | 打印配置（token 打码）与配置路径 |
-| `config path` | 只打印配置路径 |
-| `token show` | 打印完整访问令牌 |
-| `token rotate` | 重新生成访问令牌 |
-| `service install` / `uninstall` | 注册 / 卸载 Windows 服务 |
-| `service start` / `stop` / `restart` / `status` | 服务的启停与状态 |
-| `user list` | 列出账户 |
-| `user add` | 新建账户 |
-| `user passwd` | 重设密码 |
-| `user enable` / `disable` | 启用 / 禁用账户 |
-| `user adopt` | 把无归属的历史卡片划给某个账户 |
-| `user migrate` | 建首账户并接管历史卡片（升级必经） |
-| `user repos` | 列出账户的仓库 |
-| `user repos add` | 给账户新建仓库 |
-| `version` | 版本信息 |
-| `selfcheck` | 离线自检：真跑一遍运行时依赖 |
-| `cleanup` | 卸载清理：按白名单删安装目录里的运行期残留（日志留痕） |
-| `help` | 打印内置帮助（也可写 `--help`） |
+| 命令                                              | 用途                          |
+| ----------------------------------------------- | --------------------------- |
+| `serve`                                         | 启动服务（控制面 + 数据面）。默认命令        |
+| `worker`                                        | 只启动数据面 API                  |
+| `config show`                                   | 打印配置（token 打码）与配置路径         |
+| `config path`                                   | 只打印配置路径                     |
+| `token show`                                    | 打印完整访问令牌                    |
+| `token rotate`                                  | 重新生成访问令牌                    |
+| `service install` / `uninstall`                 | 注册 / 卸载 Windows 服务          |
+| `service start` / `stop` / `restart` / `status` | 服务的启停与状态                    |
+| `user list`                                     | 列出账户                        |
+| `user add`                                      | 新建账户                        |
+| `user passwd`                                   | 重设密码                        |
+| `user enable` / `disable`                       | 启用 / 禁用账户                   |
+| `user adopt`                                    | 把无归属的历史卡片划给某个账户             |
+| `user migrate`                                  | 建首账户并接管历史卡片（升级必经）           |
+| `user repos`                                    | 列出账户的仓库                     |
+| `user repos add`                                | 给账户新建仓库                     |
+| `version`                                       | 版本信息                        |
+| `selfcheck`                                     | 离线自检：真跑一遍运行时依赖              |
+| `cleanup`                                       | 卸载清理：按白名单删安装目录里的运行期残留（日志留痕） |
+| `help`                                          | 打印内置帮助（也可写 `--help`）        |
+
+> **邀请码没有命令行子命令**（v0.1.7）。它在管理面板「注册策略」里生成与作废，
+>   
+> 或直接调 `POST/DELETE /control/invites`（见 §3.8）。这是刻意的：生成后要立刻
+>   
+> 复制发给对方，面板比命令行合适；命令行的位置留给必须脚本化的运维动作。
 
 > `--version` 与 `version` 等价。**拼错的选项会被拒绝**（退出码 2）并提示
+>   
 > `tcs-server help` —— 不会被当成"没有子命令，启动服务"。
+>   
 > 这条不是洁癖：以前 `--verison` 会静默起一个真服务，还在当前目录写出
+>   
 > `data/config.json`（含明文令牌）。
 
 ---
@@ -100,6 +118,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 ### 3.1 `user migrate` —— 从旧版升级、或全新安装时建第一个账户
 
 **这是 v0.1.1 升上来的必经一步。** v0.1.2 起卡片按账户隔离，没有账户时
+  
 客户端登录不了（自助注册默认关闭），全局令牌也看不到已归属的卡片。
 
 ```powershell
@@ -107,6 +126,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 ```
 
 提示 `首账户密码` 时输入（至少 8 个字符，不回显）。**密码只从标准输入读，
+  
 不接受命令行参数** —— 参数会进 shell 历史，也会出现在进程列表里。
 
 它做的事：
@@ -114,6 +134,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 1. 建账户（首账户自动是管理员）；
 2. 把历史卡片接管进这个账户的默认仓库；
 3. **动库之前先备份**（`VACUUM INTO`，含最新事务），备份在原库旁边，
+     
    文件名形如 `state.db.pre-accounts-<时间戳>.bak`。
 
 典型输出：
@@ -138,6 +159,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 ```
 
 提示 `设置密码` 时输入。**第一个账户无论 `--role` 写什么都会被设为管理员**
+  
 （否则建完没人能管理服务端），此时会额外打印一行说明。
 
 ### 3.3 `user list` —— 看账户现状
@@ -155,6 +177,7 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 ```
 
 - 一个账户都没有时，它会直接提示「还没有任何账户。用 `tcs-server user add <用户名>`
+    
   创建第一个（管理员）」——看到这句就说明库是空的（或路径选错了，见 §1.2）。
 - 库里有无归属的历史卡片时，末尾会多一行 `注意：有 N 张卡片没有归属账户`。
 
@@ -165,6 +188,7 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 ```
 
 提示 `新密码`。改完该账户**已签发的会话全部失效**（密码变了就不再接受旧令牌），
+  
 这是忘了密码、或怀疑泄露时的标准处置。
 
 ### 3.5 `user enable` / `user disable` —— 停用而不删除
@@ -183,7 +207,9 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 ```
 
 把 `owner_id` 为空的历史卡片划给该账户，**同时入它的默认仓库**
+  
 （否则会出现「账户能看到、仓库令牌看不到」的中间态）。适合"当初没跑 migrate / 又
+  
 从旧备份里导回几张卡"的情况。
 
 ### 3.7 `user repos` / `user repos add` —— 看与建仓库
@@ -206,17 +232,78 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 
 ---
 
+### 3.8 邀请码 —— 只能通过面板或 API 管理（v0.1.7）
+
+**没有对应的命令行子命令**，这是刻意的：邀请码是
+  
+"把注册入口临时开放给指定的人"的一次性动作，用面板点两下比敲命令合适，
+  
+而且生成后要立刻复制发给对方。命令行的位置留给"必须脚本化"的运维动作
+  
+（建账户、换令牌、注册服务）。
+
+#### 首选：管理面板
+
+「参数配置 → 注册策略」选 **邀请码注册** → 保存 → 下方出现邀请码管理区。
+  
+选有效期（1 小时 / 6 小时 / 1 天 / 3 天 / 7 天 / 15 天）→ 点「生成邀请码」→
+  
+码会自动复制到剪贴板。列表里能看作废。
+
+#### 备选：直接调 API（脚本化时用）
+
+**注意端口与凭证**：这三条走**控制端口**（默认 **8731**，不是 API 的 8730），
+  
+凭证是**全局访问令牌**（就是面板登录用的那个，`tcs-server token show` 可看）。
+
+```bash
+# 0. 取全局令牌
+& $tcs token show
+
+# 1. 生成一张 1 天有效的码
+curl -s -X POST http://127.0.0.1:8731/control/invites \
+  -H "Authorization: Bearer <全局令牌>" \
+  -H "Content-Type: application/json" \
+  -d '{"validityMs":86400000,"note":"给张三"}'
+
+# 2. 看全部码与剩余次数
+curl -s http://127.0.0.1:8731/control/invites -H "Authorization: Bearer <全局令牌>"
+
+# 3. 作废
+curl -s -X DELETE http://127.0.0.1:8731/control/invites/<id> \
+  -H "Authorization: Bearer <全局令牌>"
+```
+
+> 数据面（8730）**没有** `/api/invites`，调了会 404。这是刻意的：
+>   
+> 两条路径意味着两套凭证模型，而"哪套生效取决于端口"最难排查。
+
+`validityMs` 是**毫秒**，上限 15 天（`1296000000`）。超了返回 `400 BAD_REQUEST` ——
+  
+这个校验在服务端，不在界面里。
+
+#### 三个容易踩的点
+
+1. **码不能被"编辑"**，只能作废重发。次数上限与有效期一旦签发就不该改 ——
+     
+   否则"已经说出去的承诺"和系统里的记录会分叉。
+2. **作废不影响已注册的账户**：它只是让这张码不再能用来建新号。
+3. **每张码最多 3 个账户**，这是产品口径，不是可调参数。
+
+---
+
 ## 4. 令牌相关
 
 ### 4.1 三种令牌，先分清
 
-| 令牌 | 怎么来 | 范围 | 用在哪 |
-|---|---|---|---|
-| **账户令牌** | 客户端登录换取，2 小时、自动续期 | 该账户的全部仓库 | 客户端正常使用 |
-| **仓库令牌**（`tcr_…`） | 客户端「仓库与令牌」里申请 | 单个仓库，读/写/回滚可分别授权 | 给别人或别的工具用 |
-| **全局令牌**（legacy） | 服务端首次启动自动生成 | **只有未归属账户的卡片** | 仅运维、或 ≤v0.1.1 的旧服务端 |
+| 令牌                | 怎么来               | 范围               | 用在哪                 |
+| ----------------- | ----------------- | ---------------- | ------------------- |
+| **账户令牌**          | 客户端登录换取，2 小时、自动续期 | 该账户的全部仓库         | 客户端正常使用             |
+| **仓库令牌**（`tcr_…`） | 客户端「仓库与令牌」里申请     | 单个仓库，读/写/回滚可分别授权 | 给别人或别的工具用           |
+| **全局令牌**（legacy）  | 服务端首次启动自动生成       | **只有未归属账户的卡片**   | 仅运维、或 ≤v0.1.1 的旧服务端 |
 
 **迁移到账户之后，全局令牌看不到任何卡片** —— 卡都已归属账户。这是 0.1.2 的
+  
 有意降权，不是故障。
 
 ### 4.2 `token show` —— 取全局令牌原文
@@ -228,6 +315,7 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 只打印令牌本身，方便管道或复制。配置里还没有令牌时会提示用 `token rotate` 生成。
 
 也可以从这三处拿到：面板「API 与令牌」页、配置文件 `auth.token` 字段、
+  
 或 `config show`（打码显示前后各 4 位）。
 
 ### 4.3 `token rotate` —— 换一个新的全局令牌
@@ -264,7 +352,9 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 ```
 
 输出 JSON：`configPath`、`port`、`controlPort`、`host`、`controlHost`、`dataDir`、
+  
 `rulesDir`、`maxUploadBytes`、`logLevel`、`installDirWriteCheck`、`auth.token`（形如 `tcs_…a1b2`）、
+  
 `service`、以及拼好的 `panel` / `api` 地址。
 
 需要明文令牌时用 `token show`。
@@ -278,6 +368,7 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 3. 运行期每 60 秒比对一次安装目录快照，发现新增或改写就告警。
 
 告警落在启动日志（`server.log` 里 `installDir.writeDetected`）与应用程序事件日志
+  
 （来源 `TavernCardStudio`）。查证据：
 
 ```powershell
@@ -286,6 +377,7 @@ Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCard
 ```
 
 `dataDir` 故意放在安装目录里（不推荐）时，把那个相对路径加进 `installDirWriteAllow`
+  
 就不再按文件刷屏 —— 但配置检查那一条仍会告警一次：
 
 ```json
@@ -293,6 +385,7 @@ Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCard
 ```
 
 测试环境想彻底关掉：`"installDirWriteCheck": false`。注意它**默认开**，
+  
 所以"没有告警"有两种可能 —— 真的没问题，或者被关了。`config show` 会直接显示这个值。
 
 ---
@@ -312,9 +405,13 @@ Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCard
 ```
 
 **注册服务需要宿主程序。** `install` 会检查同目录下的
+  
 `tcs-service-host.exe` + `tcs-service-host.xml`（WinSW 宿主），找不到就拒绝并说明原因。
+  
 为什么不直接挂 `node.exe`：node 从不调用 `StartServiceCtrlDispatcher`，
+  
 服务会永久卡在 `Start Pending`，而进程其实活着、端口也在听 —— 看起来完全正常，
+  
 但安装程序会一直等它。
 
 **用 MSI 装的机器上服务已经注册好了**，一般不需要碰这一组命令。
@@ -324,6 +421,7 @@ Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCard
 ## 6b. 卸载与数据清理
 
 MSI 的卸载流程会弹一页「Uninstall options」，问要不要**连数据一起删**。
+  
 复选框默认**不勾**（数据保留），勾了才删整个 `C:\ProgramData\TavernCardStudio`。
 
 图形界面卸载（开始菜单 / 设置 → 应用）：按提示走，注意那一页的复选框。
@@ -339,6 +437,7 @@ msiexec /x .\release\TavernCardStudioServer-0.1.2.msi /qn DELETEDATA=1
 ```
 
 两条命令都需要**管理员**终端（`/qn` 不会弹 UAC；权限不够会直接失败，
+  
 日志里是 `MSI_LUA: Elevation prompt disabled for silent installs`）。
 
 只想清数据、不想动程序时，手工删目录即可（先停服务，否则文件被占）：
@@ -349,16 +448,21 @@ Remove-Item -LiteralPath 'C:\ProgramData\TavernCardStudio' -Recurse -Force
 ```
 
 **顺序很重要**：`stop` → 删数据 → 再 `Remove-Item` 安装目录残留。反过来会在服务
+  
 还握着日志/数据库句柄时删失败，而且失败得很难看（部分文件已删、部分没删）。
 
 > 卸载动作本身返回 `ignore`：删不掉（例如某个日志文件仍被占用）**不会**让卸载失败
+>   
 > 回滚 —— 回滚会留下一个"卸不掉"的安装，比"留下一个目录"糟糕得多。
+>   
 > 真删不掉时手工执行上面两条命令即可。
 
 ### 6c. `cleanup` —— 安装目录残留清理（卸载时自动跑，也可手工）
 
 Windows Installer 只删它自己装的文件，运行期生成的东西（`data\`、`logs\`、
+  
 `cache\`、顶层 `*.log`）会让安装目录"删不干净"。卸载流程里已经有一步自动清理，
+  
 也可以手工跑（先停服务）：
 
 ```powershell
@@ -368,6 +472,7 @@ Windows Installer 只删它自己装的文件，运行期生成的东西（`data
 # 真删（--event-log 会往「事件查看器 → Windows 日志 → 应用程序」写一行摘要）
 & $tcs cleanup --event-log --config "C:\ProgramData\TavernCardStudio\config.json"
 ```
+
 
 **只删白名单，且只认安装目录顶层**：
 
@@ -479,7 +584,7 @@ Tavern Card Studio Server 0.1.2 自检（node v22.22.2，win32/x64）
 | `--control-port <端口>` | 管理面板端口（默认 `port + 1`） |
 | `--host <地址>` | API 监听地址（默认 `127.0.0.1`；开给局域网填 `0.0.0.0`） |
 | `--control-host <地址>` | 面板监听地址（默认 `127.0.0.1`，独立于 `--host`） |
-| `--data-dir <路径>` | 数据目录（`blobs` / `repos` / `state.db`） |
+| `--data-dir <路径>` | 数据目录（`blobs` / `repos` / `faces` / `state.db`，清单见 §8b） |
 | `--rules-dir <路径>` | 规则目录 |
 | `--token <令牌>` | 指定访问令牌 |
 | `--trust-proxy <列表>` | 可信反向代理，逗号分隔的 IP 或 CIDR（默认空＝不信任任何代理头） |
@@ -516,6 +621,65 @@ Tavern Card Studio Server 0.1.2 自检（node v22.22.2，win32/x64）
 
 ---
 
+## 8b. 数据目录里有什么（备份与迁移必读）
+
+默认位置是 **`C://ProgramData//TavernCardStudio//store`**（注意是 `store` 子目录，
+不是 `TavernCardStudio` 本身 —— 后者还放着 `config.json` 与安装期日志）。
+
+```text
+C://ProgramData//TavernCardStudio//
+├── config.json          ← 配置文件（含明文全局令牌，权限已收紧）
+├── logs\                ← 安装/卸载期日志
+└── store\               ← ★ 这才是「数据目录」（--data-dir 指向它）
+    ├── state.db         ← 账户、卡片元数据、版本索引、审计、邀请码
+    ├── repos\           ← 每张卡一个 git 仓库（版本历史）
+    ├── blobs\           ← 版本内容块（内容寻址，只增不改）
+    ├── faces\           ← 卡面资产（v0.1.7 新增，内容寻址，可替换）
+    ├── certs-backup\    ← 轮换下来的旧证书与私钥（带时间戳）
+    ├── logs\            ← 运行日志
+    └── tmp\             ← 临时文件
+```
+
+### 每个目录能不能删
+
+| 目录 | 装什么 | 删了会怎样 | 备份 |
+|---|---|---|---|
+| `state.db` | 账户、卡片元数据、版本索引、审计、邀请码 | **全站瘫痪**：账户没了、卡片列表空、历史找不到 | **必须** |
+| `repos/` | 每张卡的 git 仓库 | 版本历史全丢（卡片当前内容在 blob 里，但没法定位） | **必须** |
+| `blobs/` | 版本内容块（只增不改） | 历史版本内容丢失、回滚失败 | **必须** |
+| `faces/` | 卡面（每卡 0..1 张） | **封面全丢**，卡片内容不受影响 | **必须**（v0.1.7 起） |
+| `certs-backup/` | 旧证书与私钥 | 出事时没法回退到旧证书 | 建议 |
+| `logs/` | 运行日志 | 丢排障依据 | 可选 |
+| `tmp/` | 临时文件 | 无害（会自己重建） | 不需要 |
+
+### 三条操作纪律
+
+**① 备份/迁移必须整目录拷 `store`。**
+
+只拷 `state.db` 会得到"账户都在、历史全丢"的半死状态；
+只拷 `repos/` 与 `blobs/` 会得到"历史都在、不知道属于谁"。
+
+**② 迁移前先停服务。**
+
+`state.db` 是 SQLite，热拷可能拿到未提交的事务。停服务是：
+`net stop "Tavern Card Studio Server"`（或 `sc stop`），拷完再 `net start`。
+
+**③ v0.1.7 之前的备份里没有 `faces/`。**
+
+从旧版本恢复备份时 `faces` 会是空的 —— 这是**正常现象**（那时还没有卡面功能），
+不是恢复失败。恢复后卡片内容完好，只是封面需要重新上传。
+
+### 邀请码存在哪、怎么清
+
+邀请码在 `state.db` 里，**没有对应的命令行子命令**（见 §3.8）。
+要清只能走管理面板「注册策略 → 邀请码」逐张作废，或直接调
+`DELETE /control/invites/:id`。
+
+> 直接改数据库删邀请码行**不推荐**：审计事件是分表记的，
+> 单删主表会留下指不到目标的孤儿事件。
+
+---
+
 ## 9. 常见故障对照
 
 | 现象 | 原因 | 处置 |
@@ -524,6 +688,11 @@ Tavern Card Studio Server 0.1.2 自检（node v22.22.2，win32/x64）
 | `无法将"start-server.cmd"…识别` | 老安装上没有这个文件 | 见 §1；或强制重装（§10） |
 | 账户建好了，服务说「用户不存在」 | `--config` 没写，写进了另一个库 | `& $tcs config path` 对一下；用 `user list` 确认账户在哪个库 |
 | 登录被拒「未开放自助注册」 | `registerMode` 是 `closed` / `admin-only` | 用 `user add` 建账户，别走注册 |
+| 注册被拒「需要邀请码」（v0.1.7） | `registerMode` 是 `invite` 但没带码 | 面板「注册策略」下生成一张码给对方，或改回其它模式 |
+| 邀请码提示已用完 / 已过期 | 每张码上限 3 个账户、最长 15 天 | 生成新码；**已注册的账户不受影响** |
+| 面板改了「邀请码注册」，保存成功却变回关闭 | 服务端版本 < 0.1.7，不认识 `invite`，静默回落 `closed` | 确认面板底部版本号；升级服务端 |
+| `POST /control/invites` 返回 400 | `validityMs` 超过 15 天或 ≤ 0 | 有效期上限是服务端强校验，不是界面限制 |
+| `/api/invites` 返回 404 | 邀请码在**控制端口**（8731），不在数据面 | 换端口 + 用全局令牌，见 §3.8 |
 | 迁移后客户端看不到卡 | 还在用全局令牌 | 换账户登录（§4.1） |
 | `user migrate` 说「已有 N 个账户」 | 库已经迁移过了 | 正常；它只补默认仓库与未归仓库的卡片 |
 | 服务起不来，事件日志 1067 | 产物缺运行时依赖 | `selfcheck`（§7.4） |

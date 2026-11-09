@@ -143,9 +143,8 @@ export class NewCardDialog {
     panel.append(head, body, foot);
     this.overlay.append(panel);
 
-    this.overlay.addEventListener('click', (event) => {
-      if (event.target === this.overlay) this.finish(null);
-    });
+    // 点遮罩**不关闭**（2026-10-29 用户要求）：子窗口只能由它自己的按钮或 × 关闭。
+    // 去掉这条监听是有意的，不是漏了 —— 误触空白处关掉正在填的表单比多点一次 × 更烦。
     document.addEventListener('keydown', (event) => {
       if (this.overlay.hidden) return;
       if (event.key === 'Escape') {

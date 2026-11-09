@@ -25,6 +25,15 @@ export function shouldShowRegister(
   switch (policy.registerMode) {
     case 'open':
       return true;
+    /*
+     * `invite`（v0.1.7）：入口**照常显示**。
+     *
+     * 这正是邀请码模式存在的意义 —— 入口对所有人可见，但进来要有码。
+     * 若在这里返回 false，用户看不到注册入口，也就不会想到去问邀请码，
+     * 功能等于没做。区别只在于提交时必须填一个码。
+     */
+    case 'invite':
+      return true;
     case 'admin-only':
       return user !== null && user.role === 'admin';
     default:
@@ -43,6 +52,15 @@ export function registerHint(mode: RegisterMode | null): string {
   switch (mode) {
     case 'open':
       return '本服务端开放自助注册：填好用户名与密码后可直接创建账户。';
+    /*
+     * `invite`（v0.1.7）。
+     *
+     * 文案里必须**明确说出"需要邀请码"**：否则用户看到注册框却不知道
+     * 该填什么，会来问"注册为什么失败"。这句话就是他下一步该去做什么的依据 ——
+     * 去找管理员要码，而不是反复换用户名重试。
+     */
+    case 'invite':
+      return '本服务端需要邀请码才能注册：请向管理员索取邀请码，连同用户名、密码一起填入。';
     case 'admin-only':
       return '本服务端仅管理员可创建账户。请让管理员在「账户」里为你建号。';
     case 'closed':

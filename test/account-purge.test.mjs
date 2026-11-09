@@ -106,7 +106,10 @@ async function count(table, where = '', params = []) {
 before(async () => {
   workDir = mkdtempSync(join(tmpdir(), 'tcs-account-purge-'));
   configPath = join(workDir, 'config.json');
-  port = 27400 + Math.floor(Math.random() * 300);
+  // 端口段要和别的测试文件**不重叠**（含 port+1 的控制端口）。
+// 原先 27400–27700 与 repo-transfer 的 27500–27800 相交，并行跑时偶发
+// EADDRINUSE —— 表现为「这次全绿、下次红」，是最难查的一类噪音。
+port = 29100 + Math.floor(Math.random() * 300);
 
   const config = createDefaultConfig({
     token: 'G'.repeat(43),

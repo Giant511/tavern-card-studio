@@ -483,7 +483,18 @@ test('T5.1 删除：软删后默认不可见，includeDeleted 可见；hard=true
   assert.equal((await request(`/api/cards/${id}?includeDeleted=true`)).status, 404);
 });
 
-test('T5.4 服务控制：停止后面板仍在线、API 返回 503，启动与重启可用', async () => {
+/*
+ * `{ concurrency: false }` 是**显式声明前提**，不是复述默认值。
+ *
+ * 这条测试在同一个服务实例上 stop / start / restart worker —— 改的是**共享状态**。
+ * 与别的测试并行时会互相看到对方的中间态：典型症状是另一个测试正好在 worker
+ * 停着的那几十毫秒里发请求，拿到 503 而误判成「接口坏了」。
+ *
+ * 顶层 test 默认顺序执行，但那是**运行器的默认值**，不是这条测试对自己前提的声明。
+ * 写出来之后：有人给本文件加 concurrency:true、或把它挪进 describe 时，
+ * 会先看到这条注释，而不是先收到一堆随机失败。
+ */
+test('T5.4 服务控制：停止后面板仍在线、API 返回 503，启动与重启可用', { concurrency: false }, async () => {
   const statusBefore = await request('/control/status', { base: PANEL });
   assert.equal(statusBefore.status, 200);
   assert.equal(statusBefore.json.worker.state, 'running');

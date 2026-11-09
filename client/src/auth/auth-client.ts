@@ -12,7 +12,18 @@
  *   · 不读配置、不写配置 —— 持久化在 `session.ts`，这里只做 HTTP。
  */
 
-export type RegisterMode = 'closed' | 'open' | 'admin-only';
+/**
+ * 注册模式（客户端视角）。
+ *
+ * `invite`（v0.1.7）：入口可见，但注册必须填邀请码。
+ *
+ * ⚠ 这个联合类型在仓库里出现过**三份**（这里、服务端 `config.ts`、
+ * 服务端 `config-live.ts`），加 `invite` 时漏改任何一份都会表现为
+ * "服务端明明支持、客户端却把入口藏了"或反向的静默回落。
+ * 客户端这份之所以没能直接复用服务端的，是因为 client 不依赖 server 包；
+ * 但**它自己的解析处（下方 `parseAuthPolicy`）必须与联合类型同步**。
+ */
+export type RegisterMode = 'closed' | 'open' | 'admin-only' | 'invite';
 
 export interface AuthPolicy {
   registerMode: RegisterMode;
@@ -121,10 +132,29 @@ async function send(
     });
   } catch (error) {
     const aborted = error instanceof Error && error.name === 'AbortError';
-    throw new AuthClientError(
+    /*
+     * ★ `{ cause: error }` 不可省（2026-11-04）。
+     *
+     * 原来这里把任何底层失败都压成一句「无法连接服务端」，
+     * **丢掉了可操作的信息**。真机实测的后果：
+     *
+     * ```text
+     *   自签证书失败 → 原生侧说"证书校验失败，确认风险后可继续"
+     *                → 这里改写成"无法连接服务端"
+     *                → 上层认不出是证书问题 ⇒ 那个确认框永远不弹
+     *                → 用户只看到"连不上"，不知道有出路
+     * ```
+     *
+     * 加 `cause` 保留原始错误链（标准 Error cause 机制），
+     * **对外文案与错误码完全不变** —— 只是让上层能"看穿"这一层。
+     */
+    const wrapped = new AuthClientError(
       aborted ? 'TIMEOUT' : 'NETWORK',
       aborted ? `请求超时（${timeoutMs} ms）` : '无法连接服务端',
     );
+    /* 保留原始错误链（构造函数第三个参数是 status，不能塞 cause） */
+    (wrapped as Error & { cause?: unknown }).cause = error;
+    throw wrapped;
   } finally {
     clearTimeout(timer);
   }
@@ -200,11 +230,18 @@ export async function fetchPolicy(
 
   const mode = response.body?.['registerMode'];
   return {
-    // 不认识的值一律当 closed：宁可少显示一个入口，也不要让用户点了才发现不能用
-    registerMode: mode === 'open' || mode === 'admin-only' ? mode : 'closed',
+    // 不认识的值一律当 closed：宁可少显示一个入口，也不要让用户点了才发现不能用。
+    // ⚠ 加模式时必须同步改这里 —— 漏了 `invite` 的后果是服务端支持、
+    // 客户端却把注册入口藏起来，用户看不到任何线索（不是报错，是**什么都没发生**）。
+    registerMode: isRegisterMode(mode) ? mode : 'closed',
     accessTtlSeconds: num(response.body?.['accessTtlSeconds'], 7200),
     authRequired: response.body?.['authRequired'] !== false,
   };
+}
+
+/** 与服务端 `REGISTER_MODES` 对齐的运行时校验 */
+function isRegisterMode(value: unknown): value is RegisterMode {
+  return value === 'closed' || value === 'open' || value === 'admin-only' || value === 'invite';
 }
 
 function toBundle(body: Record<string, unknown>): TokenBundle {
@@ -271,7 +308,18 @@ export interface RegisterOutcome {
 
 export async function register(
   serverUrl: string,
-  input: { username: string; password: string },
+  input: {
+    username: string;
+    password: string;
+    /**
+     * 邀请码（v0.1.7，`registerMode === 'invite'` 时必填）。
+     *
+     * **无条件透传**：服务端只在 invite 模式下读这个字段，
+     * 其它模式下多传一个字段没有任何影响。这样客户端不必先判断模式再决定
+     * 要不要带 —— 少一处两端可能判断不一致的地方。
+     */
+    inviteCode?: string;
+  },
   options: AuthRequestOptions = {},
 ): Promise<RegisterOutcome> {
   const response = await send(

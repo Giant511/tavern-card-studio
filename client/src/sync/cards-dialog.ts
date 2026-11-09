@@ -16,6 +16,7 @@
 import { askConfirm } from '../contract';
 import {
   deleteCard,
+  deleteFace,
   listCards,
   moveCard,
   SyncError,
@@ -26,6 +27,12 @@ import { type RepoSummary } from './repo-client.ts';
 import { emptyCardsText, isolationNote, toCardRow, type CardRowView } from './card-row.ts';
 import type { RepoTokenContext } from './repo-select.ts';
 import { describeCapabilities } from '../auth/repo-token.ts';
+// 换封面（v0.1.7 修订二）：选图 → 压成仓库资产 → PUT /api/cards/:id/face
+import { pickImageFile, readBinaryFile } from '../contract/shell.ts';
+import { decodeBinaryFile } from '../session/png-source.ts';
+import { uploadFace } from './server-sync.ts';
+// 增补二：压缩管线（WebP ≤250KB / 平涂 PNG），决策纯函数在 face-pipeline.ts
+import { buildStoreFace, decodeImage } from '../export/face-encode.ts';
 
 export { isolationNote };
 
@@ -83,6 +90,18 @@ export class CardsDialog {
   private readonly overlay: HTMLDivElement;
   private readonly listEl: HTMLElement;
   private readonly noteEl: HTMLElement;
+  /**
+   * 操作反馈条（v0.1.7 生产反馈：「换封面后没有任何提示」）。
+   *
+   * 为什么不能复用上面的 `noteEl`：那个是**静态说明**（账户隔离 / 令牌范围），
+   * 在 `open()` 里按模式写一次，语义是"这个列表怎么来的"。
+   * 操作反馈是"你刚才那次点击的结果"，两者生命周期不同，混用会让说明被覆盖掉。
+   *
+   * 为什么不能只调 `notify`：它写的是主窗口状态栏，而这个对话框是模态的，
+   * 状态栏被遮在下面 —— 用户看到的等价于"什么都没发生"。反馈必须出现在
+   * **用户此刻正在看的这个窗口里**。
+   */
+  private readonly actionNoteEl: HTMLElement;
   private readonly countEl: HTMLElement;
   private readonly searchInput: HTMLInputElement;
   private readonly refreshButton: HTMLButtonElement;
@@ -135,10 +154,14 @@ export class CardsDialog {
     this.countEl.dataset['role'] = 'cards-count';
     this.countEl.textContent = '尚未加载';
 
+    this.actionNoteEl = el('p', 'cards-action-note');
+    this.actionNoteEl.dataset['role'] = 'cards-action-note';
+    this.actionNoteEl.hidden = true;
+
     this.listEl = el('div', 'cards-list');
     this.listEl.dataset['role'] = 'cards-list';
 
-    body.append(tools, this.noteEl, this.countEl, this.listEl);
+    body.append(tools, this.noteEl, this.countEl, this.actionNoteEl, this.listEl);
 
     const foot = el('div', 'modal-foot');
     // 登出放在这个面板：它是"账户"这一面唯一常驻的地方，
@@ -155,9 +178,8 @@ export class CardsDialog {
 
     panel.append(head, body, foot);
     this.overlay.append(panel);
-    this.overlay.addEventListener('click', (event) => {
-      if (event.target === this.overlay) this.close();
-    });
+    // 点遮罩**不关闭**（2026-10-29 用户要求）：子窗口只能由它自己的按钮或 × 关闭。
+    // 去掉这条监听是有意的，不是漏了 —— 误触空白处关掉正在填的表单比多点一次 × 更烦。
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && !this.overlay.hidden) this.close();
     });
@@ -325,6 +347,123 @@ export class CardsDialog {
   }
 
   /** 移动：列出现有仓库让用户选（不弹输入框 —— 仓库 id 没人记得住） */
+  /**
+   * 设置/更换卡片封面（v0.1.7 修订二；增补二改成走压缩管线）。
+   *
+   * 四步：选图 → **压成仓库资产**（WebP ≤250KB 或平涂 PNG）→ PUT → 重载列表。
+   * **不产生版本**：服务端只改卡面资产并记一条审计事件。
+   *
+   * ## 为什么这里必须把原图压完再传（增补二的核心）
+   *
+   * 上一版直接把用户选的原始字节传上去，服务端上限 8MB —— 于是仓库里躺着
+   * 一堆 1–3MB 的封面，而它们的作用只是"列表里那张缩略图"。
+   * 现在的规矩是：**进仓库的那一份必须是压过的**，250KB 是硬线。
+   * 服务端也收紧了同样的线（413 兜底），两边一起守。
+   *
+   * ## 为什么压缩结论要 notify 出来
+   *
+   * 用户选了一张 4MB 的照片、最后存进去 180KB，这个事实**必须让他看见** ——
+   * 否则下次他会怀疑"我明明选了高清图，为什么显示得有点糊"。
+   * 提示里同时给"压缩后"和"原图"，这是需求指定的格式。
+   */
+  /**
+   * 在当前窗口里显示一条操作结果（v0.1.7 生产反馈）。
+   *
+   * 这是**必须**的：`notify` 写主窗口状态栏，而本对话框是模态的，
+   * 状态栏被遮住 ⇒ 用户点完"换封面"什么都看不到，以为没生效。
+   * 所有会改状态的按钮（换封面 / 移除封面）都必须把结果送到这里。
+   */
+  private showAction(message: string, kind: 'ok' | 'warn' | 'bad' | 'info'): void {
+    this.actionNoteEl.hidden = false;
+    this.actionNoteEl.textContent = message;
+    this.actionNoteEl.className = `cards-action-note ${kind}`;
+  }
+
+  private async changeFace(view: CardRowView): Promise<void> {
+    const config = this.deps.getConfig();
+    if (config === null) {
+      this.deps.notify('请先连接服务端再设置封面', 'warn');
+      return;
+    }
+    const path = await pickImageFile();
+    if (path === null) return;
+
+    try {
+      const file = await readBinaryFile(path);
+      const decoded = await decodeBinaryFile(file);
+      const originalBytes = decoded.bytes.byteLength;
+      const fileName = path.split(/[\\/]/).pop() ?? path;
+
+      const image = await decodeImage(decoded.bytes, fileName);
+      let built;
+      try {
+        built = await buildStoreFace(
+          image,
+          decoded.bytes,
+          fileName.toLowerCase().endsWith('.png'),
+        );
+      } finally {
+        image.bitmap.close();
+      }
+
+      if (!built.ok || built.bytes === null || built.mime === null) {
+        // 压不下去：文案已经是"换一张更简洁的"，不要在这里再包一层技术名词
+        this.showAction(built.note, 'bad');
+        return;
+      }
+
+      const result = await uploadFace(config, view.cardId, built.bytes, built.mime);
+      this.showAction(
+        result.changed ? `已更新「${view.name}」的封面 · ${built.note}` : '封面没有变化，未重新上传',
+        result.changed ? 'ok' : 'info',
+      );
+      await this.reload();
+    } catch (error) {
+      this.showAction(
+        `设置封面失败：${error instanceof Error ? error.message : String(error)}`,
+        'bad',
+      );
+    }
+  }
+
+  /**
+   * 移除卡面（v0.1.7 增补一）。
+   *
+   * 与"换封面"同一条规则：**不产生版本、写一条审计日志**（服务端 deleteFace 负责）。
+   * 移除后这张卡回到"无卡面"态 —— 列表里显示占位，推 ST 时走默认卡面兜底链。
+   *
+   * 要确认一次：卡面是用户挑过的，删了就得重挑。但它又不是版本，
+   * 回滚救不回来，所以这个确认不能省。
+   */
+  private async removeFace(view: CardRowView): Promise<void> {
+    const config = this.deps.getConfig();
+    if (config === null) {
+      this.showAction('请先连接服务端再移除封面', 'warn');
+      return;
+    }
+    const ok = await askConfirm(
+      `移除「${view.name}」的封面？\n\n` +
+        '移除后这张卡会变成「无卡面」，推送到 SillyTavern 时会用默认卡面。\n' +
+        '封面不属于版本历史，这一步不能靠回滚恢复。',
+      '移除封面',
+    );
+    if (!ok) return;
+
+    try {
+      const result = await deleteFace(config, view.cardId);
+      this.showAction(
+        result.deleted ? `已移除「${view.name}」的封面` : '这张卡本来就没有封面',
+        result.deleted ? 'ok' : 'info',
+      );
+      await this.reload();
+    } catch (error) {
+      this.showAction(
+        `移除封面失败：${error instanceof Error ? error.message : String(error)}`,
+        'bad',
+      );
+    }
+  }
+
   private async openMove(view: CardRowView): Promise<void> {
     const config = this.deps.getConfig();
     if (!config || !this.deps.getRepos) {
@@ -428,6 +567,24 @@ export class CardsDialog {
       const repoEl = el('span', 'cards-row-repo', view.repo);
       const verEl = el('span', 'cards-row-version', view.version);
       main.append(nameEl, idEl, repoEl, verEl);
+
+      /*
+       * 「无卡面」占位（v0.1.7 增补一）。
+       *
+       * 只在**没有卡面**时插入。有卡面时 `facePlaceholder` 是 null，
+       * 这里什么都不加 —— 不能加一个空 `<span>`，那会占掉一格的宽度，
+       * 列表里就出现一排对不齐的缝隙。
+       *
+       * 用 `dataset.role` 而不是纯样式类：验收脚本要能直接查
+       * "这张卡是不是显示成无卡面"，而不要去猜样式名。
+       */
+      if (view.facePlaceholder !== null) {
+        const faceEl = el('span', 'cards-row-face-none', view.facePlaceholder);
+        faceEl.dataset['role'] = 'card-face-none';
+        faceEl.title = '这张卡还没有封面。推送时用默认卡面，也可以在这里补一张。';
+        main.append(faceEl);
+      }
+
       main.addEventListener('click', () => {
         this.deps.onPick?.(view.cardId);
         this.close();
@@ -443,6 +600,48 @@ export class CardsDialog {
       const caps = this.tokenContext?.caps ?? null;
       const noWrite = caps !== null && !caps.canMove;
       const writeReason = this.tokenContext?.reason.move ?? '';
+
+      /*
+       * 「设置封面… / 换封面…」（v0.1.7 修订二）。
+       *
+       * 文案随"有没有卡面"变：选中图之后传的是**卡面资产**，不产生版本 ——
+       * 所以这个按钮与「移动…」「删除…」并排，而不是藏在版本历史里。
+       * 已删除的卡不给入口（服务端会对已删除卡拒绝写操作）。
+       */
+      if (!view.deleted) {
+        const faceButton = el('button', 'btn small', view.hasFace ? '换封面…' : '设置封面…');
+        faceButton.type = 'button';
+        faceButton.dataset['role'] = 'card-face';
+        faceButton.dataset['cardId'] = view.cardId;
+        faceButton.disabled = noWrite;
+        if (noWrite) faceButton.title = writeReason;
+        faceButton.addEventListener('click', (event) => {
+          event.stopPropagation();
+          void this.changeFace(view);
+        });
+        actions.append(faceButton);
+
+        /*
+         * 「移除封面」只在**已有卡面**时出现（v0.1.7 增补一）。
+         *
+         * 不给无卡面的卡渲染一个禁用的"移除"按钮：那是在告诉用户
+         * "这里有个功能你用不了"，而实际上是这个功能对这张卡没有意义。
+         * 不渲染 = 它本来就不存在。
+         */
+        if (view.hasFace) {
+          const removeButton = el('button', 'btn small', '移除封面…');
+          removeButton.type = 'button';
+          removeButton.dataset['role'] = 'card-face-remove';
+          removeButton.dataset['cardId'] = view.cardId;
+          removeButton.disabled = noWrite;
+          if (noWrite) removeButton.title = writeReason;
+          removeButton.addEventListener('click', (event) => {
+            event.stopPropagation();
+            void this.removeFace(view);
+          });
+          actions.append(removeButton);
+        }
+      }
 
       if (this.deps.getRepos) {
         const moveButton = el('button', 'btn small', '移动…');

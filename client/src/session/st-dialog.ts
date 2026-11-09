@@ -66,6 +66,7 @@ import {
   type StState,
 } from './st-install.ts';
 import { pushCardToSt } from './st-push.ts';
+import { configNameDeps } from './st-push-registry.ts';
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -86,6 +87,13 @@ export interface StDialogCallbacks {
   notify: (message: string, kind?: 'ok' | 'warn' | 'bad' | 'info') => void;
   /** 当前卡的角色名（决定推送文件名） */
   getCardName: () => string;
+  /**
+   * 当前卡的稳定 ID（F11 的 cardId）；还没上传过服务端时为 null。
+   *
+   * 推送用它做「更新式」判定（v0.1.7 修订一）：映射跟 cardId 走，
+   * 于是**改角色名不会换 ST 里的文件名**，聊天记录自然保留。
+   */
+  getCardId: () => string | null;
   /**
    * 生成要推过去的**PNG 角色卡** + 摘要 + 卡面来源。
    *
@@ -205,9 +213,8 @@ export class StDialog {
     panel.append(head, body);
     overlay.append(panel);
     document.body.append(overlay);
-    overlay.addEventListener('click', (event) => {
-      if (event.target === overlay) this.close();
-    });
+    // 点遮罩**不关闭**（2026-10-29 用户要求）：子窗口只能由它自己的按钮或 × 关闭。
+    // 去掉这条监听是有意的，不是漏了 —— 误触空白处关掉正在填的表单比多点一次 × 更烦。
     document.addEventListener(
       'keydown',
       (event) => {
@@ -498,11 +505,13 @@ export class StDialog {
       const outcome = await pushCardToSt({
         charactersDir: verdict.charactersDir,
         cardName: this.callbacks.getCardName(),
+        cardId: this.callbacks.getCardId(),
         build: () => this.callbacks.buildStPush(),
         deps: {
           probeDir: (dir, options) => probeCardsDir(dir, options),
           scanDir: (dir, limit, extensions) => scanCardsDir(dir, limit, extensions),
           writeBinary: (path, base64, sha256) => writeBinaryFileAtomic(path, base64, sha256),
+          ...configNameDeps,
         },
       });
 
@@ -514,7 +523,12 @@ export class StDialog {
       this.pushedFile = outcome.fileName;
       this.pushedFaceNote = outcome.faceNote;
       this.staleJsonNote = outcome.staleNote;
-      this.callbacks.notify(stStatusText('pushed', { fileName: outcome.fileName }), 'ok');
+      // 更新已有角色与首次推送分开说 —— 用户改完设定最担心的是「丢了聊天记录」
+      this.callbacks.notify(
+        stStatusText('pushed', { fileName: outcome.fileName, updated: outcome.isUpdate }),
+        'ok',
+      );
+      if (outcome.nameNote !== '') this.callbacks.notify(outcome.nameNote, 'warn');
 
       // 打开 ST 让用户直接看角色列表；打不开不影响"已经推好了"这个事实
       try {
@@ -681,7 +695,14 @@ export class StDialog {
       this.locationText.textContent = `${root}${suffix}`;
     }
     if (this.footerNote !== null) {
-      this.footerNote.textContent = `Verdict 依据：package.json 存在，且 scripts.start 非空或 server.js 存在。本功能只读写 ST 的 characters 目录与启动进程，不碰其它配置。`;
+      /*
+       * 这里原来写的是「Verdict 依据：package.json 存在，且 scripts.start 非空…」。
+       * 2026-10-29 用户要求删除：那是**判据的实现细节**，属开发阶段文案——
+       * 用户不需要知道我们是靠什么认定 ST 装好了的，只需要知道结论（装没装、能不能推）。
+       * 判据本身仍在 `st-install.ts` 里并被单测覆盖，只是不再摊到界面上。
+       */
+      this.footerNote.textContent = '';
+      this.footerNote.hidden = true;
     }
 
     this.body.replaceChildren();
@@ -843,17 +864,14 @@ export class StDialog {
   /** 状态 3：运行中 → 推送 */
   private buildPushPanel(): HTMLElement {
     const wrap = el('div', 'st-push');
-    const charactersDir = this.verdict === null ? '' : stCharactersDir(this.verdict.root);
     wrap.append(
       el('h3', 'st-h3', 'SillyTavern 正在运行'),
-      el(
-        'p',
-        'st-text',
-        `推送会把当前卡写成 PNG 角色卡（卡数据在图片里），落到 ${charactersDir}。` +
-          '同名文件不覆盖，自动加序号。',
-      ),
-      el('p', 'st-text', '封面用这张卡自己的图（原图 → 记住的图库封面 → 内置默认），不在这里再弹选择。'),
-      el('p', 'st-text', '世界书会随角色卡一起写入，不需要单独准备文件。'),
+      /*
+       * 只说"这一下会发生什么"（2026-10-29 用户要求）：
+       * 不写落地路径、不写封面兜底链、不写"不需要单独准备文件"——
+       * 那些是开发者关心的事，用户按下按钮只需要知道卡会进 ST、世界书跟着进去。
+       */
+      el('p', 'st-text', '点「推送当前卡」会把这张卡写成 PNG 角色卡放进 SillyTavern，世界书会一起写入。'),
     );
     const actions = el('div', 'st-actions');
     const push = el('button', 'btn primary', '推送当前卡');

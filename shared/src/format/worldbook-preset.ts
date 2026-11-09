@@ -121,9 +121,9 @@ export const DEFAULT_WORLDBOOK_FORMAT: WorldbookFormatParams = {
 export const DEFAULT_WORLDBOOK_PRESET: WorldbookPreset = {
   schemaVersion: 1,
   id: 'default',
-  name: '标准世界书（v1.0 冻结）',
+  name: '标准世界书',
   version: '1.0.0',
-  description: 'docs/04 冻结的 @@ENTRY / @@CONTENT / @@END 格式，字段标签即字段名。',
+  description: 'docs/04 定义的 @@ENTRY / @@CONTENT / @@END 格式，字段标签即字段名。',
   builtin: true,
   format: DEFAULT_WORLDBOOK_FORMAT,
 };
@@ -243,7 +243,7 @@ export function parseWorldbookPreset(input: unknown): WorldbookPresetParseResult
       return DEFAULT_WORLDBOOK_FORMAT[key];
     }
     if (!value.includes(ID_TOKEN)) {
-      errors.push(`format.${key} 必须含 ${ID_TOKEN} 占位符（否则条目 id 无处可写，round-trip 会丢 id）`);
+      errors.push(`format.${key} 必须含 ${ID_TOKEN} 占位符（否则条目 id 无处可写，存回去时会丢 id）`);
       return DEFAULT_WORLDBOOK_FORMAT[key];
     }
     if (value.includes('\n') || value.includes('\r')) {
