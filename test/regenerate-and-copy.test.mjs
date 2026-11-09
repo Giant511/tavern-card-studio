@@ -179,3 +179,99 @@ test('★★★ 删掉底部回复后，界面要给出正确的下一步提示'
   assert.match(body, /popped\.target === null/, '要判 target 为空');
   assert.match(body, /onNotify/, '要告诉用户为什么不行');
 });
+
+/* ═══════════════════════════════════════════════════════════
+  ③ 世界书导入：必须走 /edit，不能走 /import
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★★ 世界书导入不许再走 /api/worldinfo/import', () => {
+  /*
+   * ## 用户报的
+   *
+   * > 这个卡里面的世界书导入不了……但是在原生 ST 上可以正常使用
+   *
+   * 他判断"可能是有些世界书少了东西" —— **不是**。卡是完整的，
+   * `convertEmbeddedWorldbook` 能正常转出 22 条。
+   *
+   * ## 真因（读 ST 1.19.0 源码 + 真机实跑确认）
+   *
+   * `/api/worldinfo/import` 是**给浏览器上传文件用的**，第一行：
+   *
+   * ```js
+   *   router.post('/import', (request, response) => {
+   *       if (!request.file) return response.sendStatus(400);
+   * ```
+   *
+   * `request.file` 由 multer 在 multipart 上传时填。我们用 JSON body 调它，
+   * 它永远是 undefined ⇒ **每次都 400，一次也没成功过**。
+   *
+   * 真机实跑（红米，活引擎）：
+   *
+   * ```text
+   *   /import + JSON body → 400 Bad Request
+   *   /edit   + JSON body → 200 {"ok":true}，/get 读回 22 条
+   * ```
+   *
+   * ## 为什么潜伏这么久
+   *
+   * 400 被 `persistEmbeddedWorldbook` 的空 catch 吞掉（只 return null），
+   * 界面上一个字都没有。用户只能猜"是不是卡有问题"。
+   */
+  const rs = read('client/src-tauri/src/st_chat.rs');
+
+  /* 取 st_chat_worldinfo_import 的函数体（到下一个 tauri::command 或文件尾） */
+  const at = rs.indexOf('pub async fn st_chat_worldinfo_import');
+  assert.ok(at > 0, '找不到 st_chat_worldinfo_import');
+  const rest = rs.slice(at);
+  const nextCmd = rest.indexOf('#[tauri::command]', 10);
+  const body = nextCmd > 0 ? rest.slice(0, nextCmd) : rest;
+
+  /* ① 不许再调 /import（那是 multipart 通道） */
+  assert.ok(
+    !body.includes('"/api/worldinfo/import"'),
+    '不许用 /api/worldinfo/import —— 它要求 multipart 文件，JSON body 永远 400',
+  );
+
+  /* ② 必须调 /edit */
+  assert.ok(body.includes('"/api/worldinfo/edit"'), '必须走 /api/worldinfo/edit（JSON 通道）');
+
+  /* ③ data 要包一层 entries（ST 的世界书文件顶层是 { entries }） */
+  assert.ok(
+    body.includes('"entries"'),
+    'data 必须包成 { entries: ... }，否则 /edit 也会 400（它校验 entries in data）',
+  );
+});
+
+test('★★★ 世界书条目转换：22 条一条不少，字段映射正确', async () => {
+  /*
+   * 顺带钉住转换本身 —— 用户怀疑"少了东西"，实测 22 条全在。
+   * 这条用真实卡文件（红米备份里的西奥.png）跑，不是造的数据。
+   */
+  const { existsSync } = await import('node:fs');
+  const cardPath = join(ROOT, '.verify/redmi-backup/restore/西奥.png');
+  if (!existsSync(cardPath)) {
+    /* 备份是本地取证产物，别人 clone 没有 —— 跳过而不是失败 */
+    return;
+  }
+
+  const { parsePngCard } = await import('../shared/dist/png-card.js');
+  const { readEmbeddedWorldbook, convertEmbeddedWorldbook } = await import(
+    '../shared/dist/repo/embedded-worldbook.js'
+  );
+  const png = new Uint8Array(readFileSync(cardPath));
+  const card = JSON.parse(parsePngCard(png).jsonText);
+
+  assert.notEqual(readEmbeddedWorldbook(card), null, '卡里必须有 character_book');
+  const plan = convertEmbeddedWorldbook(card, { cardName: '西奥' });
+  assert.notEqual(plan, null, '必须能转出计划');
+  assert.equal(Object.keys(plan.entries).length, 22, '22 条一条不少');
+
+  /* 字段映射：卡里用 keys/secondary_keys/enabled，ST 用 key/keysecondary/disable */
+  const first = plan.entries['0'];
+  assert.ok(Array.isArray(first.key), 'keys → key');
+  assert.ok(Array.isArray(first.keysecondary), 'secondary_keys → keysecondary');
+  assert.equal(typeof first.disable, 'boolean', 'enabled → disable（取反）');
+
+  const rawFirst = card.data.character_book.entries[0];
+  assert.equal(first.disable, rawFirst.enabled !== true, 'disable 必须是 enabled 的取反');
+});
