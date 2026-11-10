@@ -48,7 +48,8 @@
 管理员权限运行 MSI（非管理员会话里 `msiexec /qn` 必定失败，这是设计如此）：
 
 ```powershell
-msiexec /i TavernCardStudioServer-0.1.7.msi /qb
+rem 文件名换成本次下载的那一版
+msiexec /i TavernCardStudioServer-<版本>.msi /qb
 sc.exe query TavernCardStudioServer     # STATE 应为 RUNNING
 ```
 
