@@ -430,10 +430,11 @@ MSI 的卸载流程会弹一页「Uninstall options」，问要不要**连数据
 
 ```powershell
 # 保留数据（默认）。程序没了，ProgramData 里的版本链、审计、账号都还在
-msiexec /x .\release\TavernCardStudioServer-0.1.2.msi /qn
+REM 文件名换成本机装的那一版，别照抄（旧版本号会找不到文件）
+msiexec /x .\release\TavernCardStudioServer-<版本>.msi /qn
 
 # 连数据一起删（不可逆）
-msiexec /x .\release\TavernCardStudioServer-0.1.2.msi /qn DELETEDATA=1
+msiexec /x .\release\TavernCardStudioServer-<版本>.msi /qn DELETEDATA=1
 ```
 
 两条命令都需要**管理员**终端（`/qn` 不会弹 UAC；权限不够会直接失败，
@@ -711,7 +712,7 @@ Windows Installer 对**相同版本号**的安装只做维护：校验、修复�
 强制重装（管理员 PowerShell）：
 
 ```
-msiexec /i "C:\path\to\TavernCardStudioServer-0.1.2.msi" REINSTALL=ALL REINSTALLMODE=amus
+msiexec /i "C:\path\to\TavernCardStudioServer-<版本>.msi" REINSTALL=ALL REINSTALLMODE=amus
 ```
 
 - `REINSTALL=ALL` 要求重装所有功能；
