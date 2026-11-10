@@ -97,9 +97,31 @@ object StLauncher {
     var ready: Boolean = false
         private set
 
-    /** 由服务调用，把最新探测结果写进缓存 */
-    fun refreshReady() {
-        ready = probe(activePort).state == ProbeState.ST
+    /*
+     * `refreshReady()` 已删除（2026-11-10）。
+     *
+     * 它内部 `probe()` —— 真 HTTP 请求。而唯一还在调它的地方是 RSS 刷新，
+     * 那个跑在**主线程**（`Handler(Looper.getMainLooper())`），于是每 10 秒
+     * 抛一次 `NetworkOnMainThreadException`，被 probe 的 catch 咽掉后返回 FREE，
+     * 把 `ready` 静默踩回 false —— 引擎在服务、App 却永远不就绪。
+     *
+     * 删掉而不是留着：**没有任何调用点了**，留着只会让下一个人以为
+     * "可以随便在主线程调它刷新状态"。就绪只有两个来源：
+     *
+     * ```text
+     *   markReady()   awaitListening / 看守**刚刚探到** ST 应答
+     *   markStopped() 进程真的没了
+     * ```
+     */
+
+    /**
+     * 直接标记为就绪，**不做网络探测**（2026-11-10）。
+     *
+     * 用在"刚刚已经探到 ST"的地方 —— 再探一次不只浪费，还会因为在
+     * 主线程上而被 `NetworkOnMainThreadException` 打回 false。
+     */
+    fun markReady() {
+        ready = true
     }
 
     /** 进程退出后清掉缓存（否则前端会一直以为还活着） */

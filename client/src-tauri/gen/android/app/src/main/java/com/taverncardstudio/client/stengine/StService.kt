@@ -279,6 +279,13 @@ class StService : Service() {
         }
 
         lastError = null
+        /*
+         * 先置 ready 再刷通知（2026-11-10）。
+         *
+         * `awaitListening` 刚刚才探到 ST 应答，这里**不需要**再探一次；
+         * 再探一次如果落在主线程上会被 NetworkOnMainThreadException 打回 false。
+         */
+        StLauncher.markReady()
         publishReady(result.message)
 
         // ③ RSS 周期刷新（通知里的数字必须真实）
@@ -320,6 +327,8 @@ class StService : Service() {
                 if (StLauncher.probe(StLauncher.activePort).state == StLauncher.ProbeState.ST) {
                     Log.i(TAG, "引擎后来就绪了（超出探活上限，由看守补上）")
                     lastError = null
+                    /* 同上：看守刚探到 ST，不必再探 */
+                    StLauncher.markReady()
                     publishReady("引擎后来就绪了")
                     return@Thread
                 }
@@ -329,9 +338,49 @@ class StService : Service() {
         }, "st-watch-ready").apply { isDaemon = true }.start()
     }
 
-    /** 引擎就绪后把通知换成"已就绪 + 实时 RSS" */
+    /**
+     * 把通知换成"已就绪 + 实时 RSS"。
+     *
+     * ★★★ 这里**不再探测**（2026-11-10 修）。
+     *
+     * ## 原来为什么错
+     *
+     * ```kotlin
+     *   private fun publishReady(message: String) {
+     *       StLauncher.refreshReady()        // ← 内部 probe()，是网络请求
+     *       ...
+     *   }
+     * ```
+     *
+     * 而它的两个调用方里，**RSS 刷新跑在主线程**：
+     *
+     * ```kotlin
+     *   private val handler = Handler(Looper.getMainLooper())
+     *   private fun startRssRefresh() {
+     *       ... publishReady("引擎正在运行"); handler.postDelayed(this, RSS_REFRESH_MS)
+     *   }
+     * ```
+     *
+     * 主线程上的 `HttpURLConnection` 会抛 `NetworkOnMainThreadException`，
+     * 而 `probe` 的 catch 把它咽下并返回 `FREE` ⇒ **`ready` 每 10 秒被踩成 false**。
+     *
+     * 红米真机日志（间隔正好 10 秒）：
+     *
+     * ```text
+     *   E StProbe : probe 失败 port=8000：NetworkOnMainThreadException
+     * ```
+     *
+     * 这是"引擎在服务、App 却永远不就绪"的第二层原因（第一层是明文 HTTP 被拦）。
+     *
+     * ## 现在的分工
+     *
+     * ```text
+     *   markReadyAfterStart()  启动成功时置 true（刚探到过，不必再探）
+     *   publishReady()         只更新通知文案与 RSS —— 主线程安全
+     *   markStopped()          真停了才置 false
+     * ```
+     */
     private fun publishReady(message: String) {
-        StLauncher.refreshReady()
         val mb = StLauncher.readResidentMb()
         Log.i(TAG, "就绪：$message，RSS=${mb}MB，端口=${StLauncher.activePort}")
         updateNotification(readyText(mb), null)
@@ -347,7 +396,11 @@ class StService : Service() {
      */
     private fun readyText(mb: Int): String {
         val size = if (mb > 0) "约 $mb MB 内存" else "资源占用正常"
-        return "SillyTavern 在后台待命 · $size"
+        /*
+         * 用户可见文案（通知栏），按红线不许出现 SillyTavern / ST。
+         * 同一条标准见 shared/src/chat/bridge-error.ts 的注释。
+         */
+        return "聊天服务在后台待命 · $size"
     }
 
     private fun startRssRefresh() {

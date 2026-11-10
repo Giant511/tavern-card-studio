@@ -397,6 +397,119 @@ def patch_min_sdk_for_v1(check_only: bool) -> list[str]:
     return [msg]
 
 
+def patch_cleartext_loopback(check_only: bool) -> list[str]:
+    """
+    允许 **回环地址** 的明文 HTTP —— 否则 release 包里连不上引擎。
+
+    ## 真机取证（2026-11-10，两台并排）
+
+    ```text
+      iQOO V2507A (Android 16)   正常进聊天
+      红米 Note 8 Pro (Android 11 + MIUI 12.5)
+        E StProbe: probe 失败 port=8000：
+          IOException Cleartext HTTP traffic to 127.0.0.1 not permitted
+    ```
+
+    ## 为什么只有 release 坏
+
+    `app/build.gradle.kts` 里写的是：
+
+    ```kotlin
+      defaultConfig { manifestPlaceholders["usesCleartextTraffic"] = "false" }
+      buildTypes { debug { manifestPlaceholders["usesCleartextTraffic"] = "true" } }
+    ```
+
+    也就是 **debug 放行、release 禁止**。而我们的引擎就是
+    `http://127.0.0.1:8000` —— 明文 HTTP。
+
+    这完美解释了用户那句「之前 debug 版本都没有问题」：
+    他之前装的确实是 debug 包，换 release 之后才坏。
+
+    ## 为什么不能直接把 release 也设成 true
+
+    `usesCleartextTraffic=true` 是**全局**放行明文 —— 那会让 App 对
+    **任何**域名都接受 HTTP，包括用户填的非 HTTPS 中转站地址。
+    那是真实的安全降级，不该为了一个回环连接付这个代价。
+
+    ## 正确做法：network_security_config
+
+    只对 `127.0.0.1` / `localhost` 放行，其它域名仍按默认（禁止）：
+
+    ```xml
+      <network-security-config>
+          <domain-config cleartextTrafficPermitted="true">
+              <domain includeSubdomains="false">127.0.0.1</domain>
+              <domain includeSubdomains="false">localhost</domain>
+          </domain-config>
+      </network-security-config>
+    ```
+
+    ★ `networkSecurityConfig` 与 `usesCleartextTraffic` 同时存在时**前者优先**，
+      所以 `defaultConfig` 里那个 `false` 可以保持不动 —— 对外仍是禁止明文。
+
+    ## 为什么在 gen/ 里而不是源码树
+
+    `gen/android` 在 `.gitignore` 里，`tauri android init` 会重建它。
+    所以这段配置必须由本脚本幂等补上，否则下一个人 init 完就又坏了。
+    """
+    app = GEN / "app"
+    manifest = app / "src" / "main" / "AndroidManifest.xml"
+    xml_dir = app / "src" / "main" / "res" / "xml"
+    xml_file = xml_dir / "network_security_config.xml"
+
+    if not manifest.is_file():
+        return [f"[跳过] 没有 {manifest}"]
+
+    config = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<!--\n'
+        '  只对回环放行明文 HTTP（2026-11-10）。\n'
+        '\n'
+        '  引擎是 http://127.0.0.1:8000，而 targetSdk>=28 默认禁止明文，\n'
+        '  release 包的 usesCleartextTraffic=false 会把 probe 卡死：\n'
+        '    IOException Cleartext HTTP traffic to 127.0.0.1 not permitted\n'
+        '\n'
+        '  这里只放开 127.0.0.1 / localhost，其它域名仍按系统默认（禁止明文）。\n'
+        '  不要改成全局 <base-config cleartextTrafficPermitted="true"> —— 那会让\n'
+        '  用户填的非 HTTPS 中转站地址也被接受，是真实的安全降级。\n'
+        '-->\n'
+        '<network-security-config>\n'
+        '    <domain-config cleartextTrafficPermitted="true">\n'
+        '        <domain includeSubdomains="false">127.0.0.1</domain>\n'
+        '        <domain includeSubdomains="false">localhost</domain>\n'
+        '    </domain-config>\n'
+        '</network-security-config>\n'
+    )
+
+    text = manifest.read_text(encoding="utf-8")
+    needs_ref = "android:networkSecurityConfig=" not in text
+    needs_file = (not xml_file.is_file()) or (
+        xml_file.read_text(encoding="utf-8") != config
+    )
+
+    if not needs_ref and not needs_file:
+        return ["[OK] 回环明文已放行（network_security_config 就位）"]
+
+    msg = "[修] 放行回环明文（network_security_config.xml + Manifest 引用）"
+    if check_only:
+        return [msg]
+
+    xml_dir.mkdir(parents=True, exist_ok=True)
+    xml_file.write_text(config, encoding="utf-8", newline="\n")
+
+    if needs_ref:
+        # 挂在 <application> 上，紧挨 usesCleartextTraffic 那一行
+        text = text.replace(
+            'android:usesCleartextTraffic="${usesCleartextTraffic}">',
+            'android:usesCleartextTraffic="${usesCleartextTraffic}"\n'
+            '        android:networkSecurityConfig="@xml/network_security_config">',
+            1,
+        )
+        manifest.write_text(text, encoding="utf-8", newline="\n")
+
+    return [msg]
+
+
 def main() -> int:
     check_only = "--check" in sys.argv
 
@@ -410,6 +523,7 @@ def main() -> int:
     lines += patch_build_task(check_only)
     lines += patch_signing_config(check_only)
     lines += patch_min_sdk_for_v1(check_only)
+    lines += patch_cleartext_loopback(check_only)
 
     for line in lines:
         print(line)
