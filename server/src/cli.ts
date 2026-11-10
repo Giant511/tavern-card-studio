@@ -182,6 +182,8 @@ function printHelp(): void {
       `  config show|path      打印配置 / 配置路径\n` +
       `  token show|rotate     查看 / 轮换访问令牌\n` +
       `  service install|uninstall|start|stop|status [--dry-run]\n` +
+      `  user list|add|passwd|enable|disable|migrate|adopt|repos\n` +
+      `                        账户与仓库管理（migrate 是升级必经的第一步）\n` +
       `  version               版本信息\n` +
       `  selfcheck             离线自检：真跑一遍运行时依赖（argon2/x509/sqlite/git）\n` +
       `  cleanup [--dry-run]   卸载清理：按白名单删安装目录里的运行期残留（日志留痕）\n\n` +
