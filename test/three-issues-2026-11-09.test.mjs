@@ -21,7 +21,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -679,4 +679,149 @@ test('★★★★ probe 的 IO 超时不能低于 3 秒（低端机 webpack 编
 
   assert.ok(connect >= 3_000, `connectTimeout 不能低于 3 秒，实际 ${String(connect)}`);
   assert.ok(readMs >= 3_000, `readTimeout 不能低于 3 秒，实际 ${String(readMs)}`);
+});
+
+/* ═══════════════════════════════════════════════════════════
+   ⑨ 双机排查（2026-11-10）：明文 HTTP + 主线程探测
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★★ 必须放行回环明文，否则 release 包连不上引擎', () => {
+  /*
+   * 双机并排取证：
+   *
+   * ```text
+   *   红米 release  E StProbe: probe 失败 port=8000：
+   *                 IOException Cleartext HTTP traffic to 127.0.0.1 not permitted
+   * ```
+   *
+   * 原因：`build.gradle.kts` 里 debug 设 `usesCleartextTraffic=true`、
+   * defaultConfig（release 继承）设 `false`。而引擎就是 `http://127.0.0.1:8000`。
+   *
+   * ★ 这完美解释了用户那句「之前 debug 版本都没有问题」——
+   *   他之前装的确实是 debug 包。
+   *
+   * ## 为什么不能直接把 release 也设 true
+   *
+   * 那是**全局**放行明文（对任何域名），包括用户填的非 HTTPS 中转站地址。
+   * 为了一个回环连接付这个代价不值得。
+   *
+   * 正确做法：`network_security_config.xml` 只对 127.0.0.1 / localhost 放行。
+   * 它由 `scripts/fix-android-gen.py` 幂等补上（gen/ 在 gitignore 里）。
+   */
+  const gen = join(ROOT, 'client/src-tauri/gen/android/app');
+  const xmlPath = join(gen, 'src/main/res/xml/network_security_config.xml');
+  const manifestPath = join(gen, 'src/main/AndroidManifest.xml');
+
+  assert.ok(existsSync(xmlPath), '缺 network_security_config.xml（跑 fix-android-gen.py）');
+  const xmlRaw = readFileSync(xmlPath, 'utf8');
+  /*
+   * ★ 必须剥注释再判。
+   *
+   * XML 的注释里**刻意**写着 `<base-config cleartextTrafficPermitted="true">`
+   * 来解释"不要这么做" —— 不剥的话反判据会被自己的说明文字命中。
+   * 这个项目已经踩过五六次"注释骗判据"。
+   */
+  const xml = xmlRaw.replace(/<!--[\s\S]*?-->/g, '');
+
+  /* ① 只对两个回环域名放行 */
+  assert.match(xml, /127\.0\.0\.1/, '要放行 127.0.0.1');
+  assert.match(xml, /localhost/, '要放行 localhost');
+  assert.match(xml, /cleartextTrafficPermitted="true"/, '要有 cleartextTrafficPermitted=true');
+
+  /* ② 反判据：不许全局放行 */
+  assert.doesNotMatch(
+    xml,
+    /<base-config[^>]*cleartextTrafficPermitted="true"/,
+    '不许全局放行明文 —— 那会让非 HTTPS 的中转站地址也被接受',
+  );
+
+  /* ③ Manifest 要引用它 */
+  const manifest = readFileSync(manifestPath, 'utf8');
+  assert.match(manifest, /android:networkSecurityConfig="@xml\/network_security_config"/, 'Manifest 要引用');
+
+  /* ④ 补丁脚本必须能重建它（gen/ 被 gitignore，别人 clone 后要靠它） */
+  const fixer = readFileSync(join(ROOT, 'scripts/fix-android-gen.py'), 'utf8');
+  assert.match(fixer, /def patch_cleartext_loopback/, '补丁脚本里要有这个函数');
+  assert.match(fixer, /patch_cleartext_loopback\(check_only\)/, '补丁脚本 main 里要调用它');
+});
+
+test('★★★★★ 就绪状态不许在主线程靠探测来刷（会被 NetworkOnMainThreadException 踩回 false）', () => {
+  /*
+   * 明文放行之后暴露的第二层（红米真机，间隔正好 10 秒 = RSS_REFRESH_MS）：
+   *
+   * ```text
+   *   E StProbe : probe 失败 port=8000：NetworkOnMainThreadException
+   * ```
+   *
+   * 链路：
+   *
+   * ```text
+   *   Handler(Looper.getMainLooper()).postDelayed(rssTask, 10s)
+   *     → publishReady() → StLauncher.refreshReady() → probe()  ← 网络！
+   *     → 主线程抛 NetworkOnMainThreadException
+   *     → probe 的 catch 咽掉并返回 FREE ⇒ ready = false
+   * ```
+   *
+   * ⇒ **每 10 秒把 ready 踩回 false**，开屏永远等不到就绪。
+   *
+   * 修法：就绪只有两个来源（`markReady` / `markStopped`），不再"顺手探一次"。
+   */
+  const svc = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StService.kt',
+  );
+
+  /* ① handler 确实绑主线程（这是问题的前提，钉住免得将来被改掉后判据失去意义） */
+  assert.match(svc, /Handler\(Looper\.getMainLooper\(\)\)/, 'RSS 循环在主线程');
+
+  /* ② publishReady 里不许再有探测 */
+  /*
+   * ★ 剥注释：publishReady 上方的文档注释里**刻意**引用了旧代码
+   * （`StLauncher.refreshReady()`）来解释为什么删掉它。
+   */
+  const svcCode = stripComments(svc);
+  const pubAt = svcCode.indexOf('private fun publishReady');
+  assert.ok(pubAt > 0, '找不到 publishReady');
+  const pubBody = svcCode.slice(pubAt, pubAt + 1600);
+  assert.doesNotMatch(
+    pubBody,
+    /refreshReady\(\)/,
+    'publishReady 不许调 refreshReady —— 它内部 probe()，主线程会抛异常并踩掉 ready',
+  );
+  assert.doesNotMatch(
+    pubBody,
+    /probe\(/,
+    'publishReady 不许自己 probe',
+  );
+
+  /* ③ 就绪由 markReady 显式置位，且启动成功与看守两处都要调 */
+  const launcher = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StLauncher.kt',
+  );
+  assert.match(launcher, /fun markReady\(\)/, '要有不探测的 markReady');
+  const markCalls = (svc.match(/StLauncher\.markReady\(\)/g) ?? []).length;
+  assert.ok(markCalls >= 2, `启动成功与看守都要 markReady，实际 ${String(markCalls)} 处`);
+
+  /* ④ refreshReady 必须已被删掉（零调用点的死代码会骗人） */
+  assert.doesNotMatch(
+    launcher,
+    /fun refreshReady\(\)/,
+    'refreshReady 已无调用点，应删除而不是留着让人误用',
+  );
+});
+
+test('★★ 通知栏文案也不许出现 SillyTavern', () => {
+  /*
+   * 通知栏是用户可见文案，同一条红线。
+   * 原来写的是「SillyTavern 在后台待命 · 约 150 MB 内存」。
+   */
+  const svc = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StService.kt',
+  );
+  /* 这个测试是独立作用域，要自己再剥一次注释 */
+  const svcCode = stripComments(svc);
+  const at = svcCode.indexOf('private fun readyText');
+  assert.ok(at > 0, '找不到 readyText');
+  const body = svcCode.slice(at, at + 600);
+  assert.doesNotMatch(body, /SillyTavern/i, '通知文案不许出现 SillyTavern');
+  assert.match(body, /聊天服务/, '要说"聊天服务"');
 });
