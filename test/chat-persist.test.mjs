@@ -210,11 +210,18 @@ test('★★★ 外壳必须真的接上，并且真的调用 saveChat', () => {
    * 快照必须跟着更新 —— 那是"切 Tab 回来还在"的唯一依据。
    * 之前 `setChatSnapshot` 只在 `?sample=1` 时被调用。
    */
-  assert.match(
-    shell,
-    /private handleChatChanged[\s\S]{0,2000}?this\.chatSnapshot = \{/,
-    'handleChatChanged 里要更新 chatSnapshot',
-  );
+  /*
+   * ★ 截出函数体再断言，不用固定字符窗口（2026-11-15）。
+   *
+   * 原来写的是 `{0,2000}?` —— 只要函数开头加了注释就会把它顶出去，
+   * 判据**假红**。而"窗口长度"和"这条判据要守的性质"毫无关系：
+   * 它要守的是"快照会被更新"，不是"更新语句在 2000 字符以内"。
+   */
+  const at = shell.indexOf('private handleChatChanged');
+  assert.ok(at > 0, '找不到 handleChatChanged');
+  const end = shell.indexOf('\n  private ', at + 10);
+  const body = shell.slice(at, end < 0 ? shell.length : end);
+  assert.match(body, /this\.chatSnapshot = \{/, 'handleChatChanged 里要更新 chatSnapshot');
 });
 
 test('★★★ 保存并发时不许丢掉后一次（要排队，不是丢弃）', () => {
@@ -263,17 +270,58 @@ test('★ 保存失败不许打断对话（只提示，不抛）', () => {
   assert.doesNotMatch(fn, /throw error/, '不许把异常抛给调用方（会打断聊天）');
 });
 
-test('★ 文件名只在没有时生成一次（复用，不是每次新造）', () => {
+test('★★★★★ 文件名只在没有时生成一次，且必须真的"该建"才建', () => {
   /*
-   * 如果每次保存都重新生成名字，一次对话会在 ST 里留下十几个文件 ——
-   * 用户打开聊天列表会看到一堆"角色名 - 时间"，每条只有一两句。
+   * ## 第一层（原有意图）：不能每次保存都重新生成名字
+   *
+   * 否则一次对话会在 ST 里留下十几个文件，用户打开列表看到一堆
+   * "角色名 - 时间"，每条只有一两句。
+   *
+   * ## 第二层（2026-11-14 补）：光"只在 null 时生成"**远远不够**
+   *
+   * 这条判据原来只钉了内联写法，于是下面这段**完全合法地**通过了它：
+   *
+   * ```ts
+   *   if (this.chatFileName === null && avatar !== null) {
+   *     this.chatFileName = makeChatFileName(name);   // 无条件建
+   *   }
+   * ```
+   *
+   * 而 `chatFileName` 在**切角色时必然被清成 null**，`applyOpening()`
+   * 注入开场白后又会调 `handleChatChanged` ⇒ 每切一次角色就多一个
+   * 只有开场白的空壳文件。用户截图里同一角色 8 个文件全是空壳。
+   *
+   * ⇒ 判据要钉"建之前过两道闸"，而不只是"null 才建"：
+   *
+   * ```text
+   *   ① restoringAvatar === avatar  ⇒ 恢复中，不建
+   *   ② !shouldStartNewChatFile()  ⇒ 没有用户消息，不建
+   * ```
    */
   const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
-  assert.match(
-    shell,
-    /if \(this\.chatFileName === null && avatar !== null\) \{\s*this\.chatFileName = makeChatFileName\(name\);/,
-    '只在 null 时生成',
-  );
+
+  /* 只有 null 时才可能建（这条保证"复用而非每次新造"） */
+  assert.match(shell, /if \(this\.chatFileName === null && avatar !== null\) \{/, '只在 null 时考虑生成');
+  assert.match(shell, /this\.chatFileName = makeChatFileName\(name\);/, '要有生成');
+
+  /*
+   * 生成必须在两道闸**之后**。
+   * 取 `handleChatChanged` 里那段，检查顺序。
+   */
+  const at = shell.indexOf('private handleChatChanged');
+  assert.ok(at > 0, '找不到 handleChatChanged');
+  const end = shell.indexOf('\n  private ', at + 10);
+  const body = shell.slice(at, end < 0 ? shell.length : end);
+
+  const restoreGate = body.indexOf('this.restoringAvatar === avatar');
+  const contentGate = body.indexOf('shouldStartNewChatFile(messages)');
+  const makeAt = body.indexOf('makeChatFileName(name)');
+
+  assert.ok(restoreGate > 0, '要有"恢复中不建"的闸');
+  assert.ok(contentGate > 0, '要有"没有用户消息就不建"的闸');
+  assert.ok(makeAt > 0, '要有生成');
+  assert.ok(restoreGate < makeAt, '"恢复中"的闸必须在生成之前');
+  assert.ok(contentGate < makeAt, '"内容闸"必须在生成之前');
 });
 
 /* ═══════════════════════════════════════════════════════════
@@ -316,9 +364,21 @@ test('★★★ `onPickChat` 不许再硬编码返回 null（否则永远读不�
    * 我先把读历史的逻辑加在 `onPickChat` 上，装了三轮包、查了两小时运行时，
    * 才发现"改的位置根本没被执行过"。判据必须钉住**真正被执行的那个位置**。
    */
+  /*
+   * ★ 去掉 2000 字符上限（2026-11-11）。
+   *
+   * 这条判据上面那段注释自己就写着教训：「判据依赖代码布局，重构就会误报；
+   * 钉"谁调用谁"才稳」。而我这次在 `selectedCharacter = …` 与
+   * `restoreLatestChat(...)` 之间加了"带重试读卡 + 卡到了先重绘"，
+   * 距离超过 2000 ⇒ 它红了，但**调用关系一点没坏**。
+   *
+   * 所以用 `[\s\S]*?`（非贪婪，找最近的那个）而不是固定窗口。
+   * `restoreLatestChat(character.avatar)` 这个实参形态只在 onPick 里出现，
+   * 所以不会跨到别处。
+   */
   assert.match(
     shell,
-    /this\.selectedCharacter = \{ avatar: character\.avatar[\s\S]{0,2000}?restoreLatestChat\(character\.avatar\)/,
+    /this\.selectedCharacter = \{ avatar: character\.avatar[\s\S]*?restoreLatestChat\(character\.avatar\)/,
     'onPick 里要调 restoreLatestChat（那才是真被执行的位置）',
   );
   assert.match(shell, /restoreLatestChat/, '要有 restoreLatestChat 实现');

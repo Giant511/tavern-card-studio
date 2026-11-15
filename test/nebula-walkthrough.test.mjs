@@ -24,6 +24,7 @@ import { test } from 'node:test';
 
 const ROOT = join(import.meta.dirname, '..');
 const CHAT_DIR = join(ROOT, 'client', 'src', 'chat');
+const DIAG_DIR = join(ROOT, 'client', 'src', 'diagnostics');
 const TOKENS = 'nebula-tokens.css';
 
 function cssFiles() {
@@ -32,10 +33,23 @@ function cssFiles() {
     .map((name) => ({ name, text: readFileSync(join(CHAT_DIR, name), 'utf8') }));
 }
 
+/*
+ * 文案不只在 `client/src/chat` 里。
+ *
+ * 2026-11-13：用户会把「诊断日志」面板里的整段文本复制给我们，
+ * 那些字符串产自 `client/src/diagnostics/mobile-diag.ts` ——
+ * 它里面的 `上次会话**非正常结束**` 同样会被用户看到字面的星号。
+ * 所以要把这个目录一起扫。
+ */
 function tsFiles() {
-  return readdirSync(CHAT_DIR)
-    .filter((name) => name.endsWith('.ts'))
-    .map((name) => ({ name, text: readFileSync(join(CHAT_DIR, name), 'utf8') }));
+  const out = [];
+  for (const dir of [CHAT_DIR, DIAG_DIR]) {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.ts')) continue;
+      out.push({ name, text: readFileSync(join(dir, name), 'utf8') });
+    }
+  }
+  return out;
 }
 
 /* ── 走查 1：不许有裸色值 ── */
@@ -198,7 +212,23 @@ test('★ 走查 10：新增界面文案里没有内部术语', () => {
 
   const offenders = [];
   for (const { name, text } of tsFiles()) {
-    for (const literal of stringLiterals(text)) {
+    /*
+     * ★ 排除诊断日志（2026-11-15）。
+     *
+     * `diagNote('note', \`[会话] fileName=${x ?? 'null'}\`)` 里的 `null`
+     * 是**给排障看的事实**，不是界面文案 —— 那行日志正是为了让
+     * "指针当时指向谁"能事后查清才加的。
+     *
+     * 判据原来的近似是"这个文件里的所有字符串都是文案"，粒度太粗：
+     * 它会把日志、错误信息、内部常量一起算进去。
+     *
+     * 这一条与 §131「判据看错对象」同源：**先问"这段文本给谁看"，
+     * 再决定用哪套规则**，而不是拿一套规则套所有字符串。
+     */
+    const diagRanges = diagNoteRanges(text);
+    for (const { text: literal, offset } of stringLiterals(text)) {
+      if (inRanges(diagRanges, offset)) continue;
+
       /* 整体就是语言关键字 ⇒ 跳过 */
       if (JS_KEYWORDS.has(literal.trim())) continue;
       for (const word of banned) {
@@ -239,6 +269,27 @@ function stringLiterals(text) {
   /** 是否身处 `/* … *\/` 块注释之中（跨行状态） */
   let inBlock = false;
 
+  /*
+   * ★ 返回 `{ text, offset }` 而不是裸字符串（2026-11-15）。
+   *
+   * ## 为什么需要位置
+   *
+   * 有的判据要问"这个字面量是**给谁看的**"：
+   *
+   * ```text
+   *   diagNote('note', `[会话] fileName=${x ?? 'null'}`)   ← 诊断日志，写 null 是对的
+   *   textContent = '暂无数据'                              ← 界面文案，不许出现内部术语
+   * ```
+   *
+   * 两者在词法上都是字符串，靠内容分不开（都要允许 `null` 这个词出现在
+   * 某个场合）。只能靠**在源码里的位置**判断它属于哪类调用。
+   *
+   * ## 顺带修掉一处脆弱写法
+   *
+   * 走查里有 `text.indexOf(literal)` 去找位置 —— 同一段文本出现两次时会
+   * 找错那个。现在有 offset 了，直接用。
+   */
+  let offset = 0;
   for (const line of text.split('\n')) {
     let i = 0;
     while (i < line.length) {
@@ -283,14 +334,63 @@ function stringLiterals(text) {
           buf += line[j];
           j += 1;
         }
-        out.push(buf);
+        out.push({ text: buf, offset: offset + i });
         i = j + 1;
         continue;
       }
       i += 1;
     }
+    offset += line.length + 1; // +1 是换行符
   }
   return out;
+}
+
+/**
+ * 找出所有 `diagNote(...)` 调用的**源码区间**。
+ *
+ * ## 为什么要这个
+ *
+ * 诊断日志是给排障看的，允许出现 `null` / `findLatest` 这类内部术语；
+ * 界面文案不允许。谓词不同，判据必须分开 —— 否则要么漏（日志混进界面），
+ * 要么假红（日志里的 null 被当成界面术语）。
+ *
+ * ## 括号配对要跳过字符串
+ *
+ * `diagNote('note', \`a) b\`)` 里那个 `)` 是文案，不是括号。
+ * 所以扫的时候要吃掉字符串（单双引号 + 反引号），否则区间会提前闭合。
+ */
+function diagNoteRanges(text) {
+  const ranges = [];
+  let from = 0;
+  for (;;) {
+    const at = text.indexOf('diagNote(', from);
+    if (at < 0) break;
+    let depth = 0;
+    let i = at + 'diagNote'.length;
+    let quote = '';
+    for (; i < text.length; i += 1) {
+      const ch = text[i];
+      if (quote !== '') {
+        if (ch === '\\') { i += 1; continue; }
+        if (ch === quote) quote = '';
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === '`') { quote = ch; continue; }
+      if (ch === '(') depth += 1;
+      else if (ch === ')') {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    ranges.push([at, i]);
+    from = i + 1;
+  }
+  return ranges;
+}
+
+/** 某个偏移是否落在诊断调用里 */
+function inRanges(ranges, offset) {
+  return ranges.some(([a, b]) => offset >= a && offset <= b);
 }
 
 /* ── 走查 7：空状态不许是"暂无数据" ── */
@@ -621,3 +721,258 @@ function stripAtBlocks(text, atName) {
   }
   return out;
 }
+
+/* ═══════════════════════════════════════════════════════════
+   走查 11：用户看得见的字符都得有意义
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★★ 界面文案里不许有 markdown 强调语法残留', () => {
+  /*
+   * ## 真机现场（2026-11-13，用户截图）
+   *
+   * 「诊断日志」副标题原样显示：
+   *
+   * ```text
+   *   上次**异常结束** · 共 0 条 · 0.0/18MB
+   * ```
+   *
+   * 那四个星号是我在**注释里**习惯写 `**重点**` 的写法，直接漏进了
+   * 用户可见的模板字符串。`textContent` 不做 markdown 渲染 ——
+   * 星号就是四个字符。
+   *
+   * ## ★★★ 为什么不能"扫所有字符串"
+   *
+   * 我第一版就是全局扫的，结果抓到两处**都不该改**：
+   *
+   * ```text
+   *   demo.ts   「**好啊。**」              ← 演示对话，气泡走 innerHTML
+   *                                           渲染 markdown，星号是合法的
+   *   shell.ts  请**不要**替代角色说话      ← 发给 AI 的指令，星号是强调
+   * ```
+   *
+   * 项目的渲染分两条路：
+   *
+   * ```text
+   *   聊天气泡  innerHTML + renderMessageHtml ⇒ 支持 markdown ⇒ ** 合法
+   *   其余文案  textContent                   ⇒ 纯文本      ⇒ ** 是字面量
+   * ```
+   *
+   * 所以判据必须**按位置**判，不能按内容判。
+   *
+   * ## 判据：只看"这条文案最终进的是纯文本槽位"
+   *
+   * 两种形态都算命中：
+   *
+   * ```text
+   *   ① 字面量紧跟在槽位后面     x.textContent = '…'      { subtitle: '…' }
+   *   ② 所在语句的变量名是槽位   const subtitle = 条件 ? A : '…'
+   * ```
+   *
+   * ② 是这次真 bug 的形态（`const subtitle = 条件 ? A : B`，星号在 B 里）。
+   * 光看"字面量前面是什么"抓不到 —— 它前面是 `:`，再往前是条件变量。
+   *
+   * ## 为什么不用"附近有槽位就算"
+   *
+   * 我试过（往前看 240 字符），结果把 `runDirective('请**不要**…')` 也抓了
+   * —— 因为同一个箭头函数体里上一行刚写过一个 `detail: '…'`。
+   * **同一个函数里有别的槽位**不等于**这条字符串是文案**。
+   */
+  const SLOTS = new Set(['textContent', 'subtitle', 'title', 'detail', 'label', 'hint', 'alt']);
+  const offenders = [];
+
+  for (const { name, text } of tsFiles()) {
+    for (const { text: literal, offset: literalAt } of stringLiterals(text)) {
+      /* 成对星号，中间是短内容（强调用法），不是幂运算 */
+      const pairs = literal.match(/\*\*[^*\n]{1,40}\*\*/g);
+      if (pairs === null) continue;
+
+      /*
+       * 用字形自己的 offset，不再 `text.indexOf(literal)`（2026-11-15）。
+       *
+       * 同一段文本在文件里出现两次时 indexOf 恒返回**第一个**位置，
+       * 于是判据检查的是"第一次出现的那个上下文" —— 而真正违规的
+       * 可能是第二处。这类错在本项目已经出现过（§131 取错对象）。
+       */
+      const at = literalAt;
+      if (at < 0) continue;
+
+      /* ① 紧邻槽位：跳过引号与空白，应见到 `=` / `:`，再往前是槽位名 */
+      let i = at - 1;
+      while (i >= 0 && '"\'`'.includes(text[i])) i -= 1;
+      while (i >= 0 && /\s/.test(text[i])) i -= 1;
+      let directly = false;
+      if (text[i] === '=' || text[i] === ':') {
+        i -= 1;
+        while (i >= 0 && /\s/.test(text[i])) i -= 1;
+        const end = i + 1;
+        while (i >= 0 && /[\w.]/.test(text[i])) i -= 1;
+        const owner = text.slice(i + 1, end).split('.').pop();
+        directly = owner !== undefined && SLOTS.has(owner);
+      }
+      if (directly) {
+        for (const hit of pairs) offenders.push(`${name}: ${hit}（直接赋给纯文本槽位）`);
+        continue;
+      }
+
+      /*
+       * ② 所在语句的变量名是槽位：往回 600 字符找最近的 `const X =`。
+       *
+       * 600 足够覆盖一个多行三元表达式（这次那个约 200 字符），
+       * 又不会翻到上一个函数里去。
+       */
+      const back = text.slice(Math.max(0, at - 600), at);
+      const decls = [...back.matchAll(/\b(?:const|let|var)\s+([\w$]+)\s*(?::[^=\n]*)?=/g)];
+      const owner = decls.length > 0 ? decls[decls.length - 1][1] : undefined;
+      if (owner !== undefined && SLOTS.has(owner)) {
+        for (const hit of pairs) offenders.push(`${name}: ${hit}（赋给纯文本变量 ${owner}）`);
+        continue;
+      }
+
+      /*
+       * ③ 直接 push 进一个纯文本数组（诊断报告就是这么拼的）。
+       *
+       * `lines.push('上次会话：**非正常结束**…')` —— 两个 `**` 之间是中文，
+       * 没有 `=` / `:` 让形态 ①② 命中，但它们最终会被 `join('\n')`
+       * 成一份给用户复制的文本。所以 `push(` / `unshift(` / `log(` 也算。
+       */
+      const pushAt = back.lastIndexOf('push(');
+      const unshiftAt = back.lastIndexOf('unshift(');
+      const near = Math.max(pushAt, unshiftAt);
+      /*
+       * 窗口 200 而不是 40：真实的诊断报告是**多行三元**，
+       * `lines.push(` 到那个字面量隔了 60 多个字符（分行 + 缩进 + 条件）。
+       *
+       * 但放宽窗口会更容易串到上一条语句 ⇒ 要求中间**没有 `;`**
+       * （有就说明已经跨过了一条语句）。
+       */
+      const between = near >= 0 ? back.slice(near) : '';
+      if (near >= 0 && between.length < 200 && !between.includes(';')) {
+        for (const hit of pairs) offenders.push(`${name}: ${hit}（进入纯文本数组）`);
+      }
+    }
+  }
+  /*
+   * ★ 还要扫 Kotlin 里的**用户可见字符串**（2026-11-13）。
+   *
+   * 诊断日志的正文有一部分是原生写的（`BOOT` / `MEM` / `CRASH` 那些），
+   * 而用户会把它**原样复制发给我们**。所以 Kotlin 字符串里的 `**`
+   * 同样会出现在他眼前。
+   */
+  for (const { name, text } of ktUserStrings()) {
+    const pairs = text.match(/\*\*[^*\n]{1,40}\*\*/g);
+    if (pairs === null) continue;
+    for (const hit of pairs) offenders.push(`${name}: ${hit}（Kotlin 里会写进日志）`);
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `纯文本界面文案里有 markdown 星号（用户会看到字面的 **）：\n  ${offenders.join('\n  ')}`,
+  );
+});
+
+/**
+ * 取 Kotlin 源码里"可能写进用户可见日志"的字符串字面量。
+ *
+ * ## 只挑 StLog / Log 的调用
+ *
+ * 全扫会把注释、资源名、logcat tag 都卷进来。这些字符串的特点是
+ * **必然经过 `StLog.x(` / `Log.x(`** —— 那是日志的唯一出口。
+ *
+ * ## 为什么要去掉注释
+ *
+ * 判据自己被坑过一次：注释里写了被搜的字符串，于是变异删掉真代码
+ * 也不变红（见 §93 与本文件 CSS 那条的注释）。
+ */
+function ktUserStrings() {
+  const dir = join(ROOT, 'client', 'src-tauri', 'gen', 'android', 'app', 'src', 'main', 'java', 'com', 'taverncardstudio', 'client');
+  const out = [];
+  const walk = (path) => {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const full = join(path, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.name.endsWith('.kt')) continue;
+      const raw = readFileSync(full, 'utf8');
+      /* 去掉块注释与行注释，再找 StLog/Log 调用里的字符串 */
+      const code = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      for (const match of code.matchAll(/\bSt?Log\.[iwed]\(([\s\S]{0,300}?)\)/g)) {
+        out.push({ name: entry.name, text: match[1] });
+      }
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+test('★★★★★ 说明类文本必须能断长串（路径/URL 不许顶破容器）', () => {
+  /*
+   * ## 真机现场（2026-11-13，用户截图）
+   *
+   * ```text
+   *   日志文件：/storage/emulated/0/Android/data/com.taven…
+   *            ↑ 被卡片右边缘切掉，后面全看不见
+   * ```
+   *
+   * ## 为什么这不是"个别地方忘了写"
+   *
+   * 「中文 + 一条没有空格的绝对路径」是最坏的组合：中文每字可断，
+   * 而 CSS 默认只在空格处断行 ⇒ 整条路径被当成一个不可分的块。
+   *
+   * 而**这条路径是我们自己拼进文案的**（`日志文件：${status.dir}`），
+   * 也就是说：只要一个说明段落里会插入路径/URL，就必须有换行策略。
+   *
+   * ## 判据
+   *
+   * ```text
+   *   .nb-note 必须有 overflow-wrap   ← 说明类文本的通用容器
+   *   .nb-diag-pre 必须有 word-break   ← 等宽日志（逐字符断才对）
+   * ```
+   *
+   * 钉的是**性质**（能不能断）而不是具体写法，两套等价写法都放行。
+   */
+  const css = cssFiles();
+  const cssAt = (file) => css.find((one) => one.name === file);
+  const chat = cssAt('chat.css');
+  assert.ok(chat !== undefined, '找不到 chat.css');
+
+  /*
+   * ★★★ 必须先剥掉 CSS 注释再匹配（2026-11-13，这条判据自己踩的坑）。
+   *
+   * 我给 `.nb-note` 写的说明注释里就有这一句：
+   *
+   * ```text
+   *   ## 为什么 `overflow-wrap: anywhere` 而不是 `word-break: break-all`
+   * ```
+   *
+   * 于是"删掉真正的声明"之后判据**照样绿** —— 它匹配到的是注释里那串字。
+   * 变异因此没变红，等于这条判据在保护一句注释。
+   *
+   * 这与 §93「判据两次看错对象」是同一类错：注释里写被搜字符串。
+   */
+  const stripCssComments = (text) => text.replace(/\/\*[\s\S]*?\*\//g, '');
+  const code = stripCssComments(chat.text);
+
+  const blockOf = (selector) => {
+    const at = code.indexOf(`\n${selector} {`);
+    assert.ok(at > 0, `找不到 ${selector}`);
+    const end = code.indexOf('\n}', at);
+    return code.slice(at, end < 0 ? at + 1200 : end);
+  };
+
+  const note = blockOf('.nb-note');
+  assert.match(
+    note,
+    /overflow-wrap:\s*(anywhere|break-word)/,
+    '.nb-note 要能断长串 —— 它正是"日志文件：<一条绝对路径>"那个容器',
+  );
+
+  const pre = blockOf('.nb-diag-pre');
+  assert.match(
+    pre,
+    /word-break:\s*(break-all|break-word)/,
+    '.nb-diag-pre 要能断长串（堆栈里的路径没有空格）',
+  );
+});

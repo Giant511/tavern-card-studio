@@ -141,3 +141,28 @@ export async function loadThumbnail(avatar: string): Promise<string | null> {
 export function clearThumbnailCache(): void {
   cache.clear();
 }
+
+/**
+ * 只清某一个头像的缓存（2026-11-11）。
+ *
+ * ## 为什么需要单条清理
+ *
+ * 用户在仓库里下载/覆盖了一张卡，**只有这一张**的图变了。全清会让
+ * 列表里其他几十张白白重拉一遍；不清则这一张永远显示旧图。
+ *
+ * 配合 `st_chat_invalidate_thumbnail`（删掉 ST 磁盘上的缩略图缓存）：
+ *
+ * ```text
+ *   App 侧 cache   ← 本函数清
+ *   ST  侧 缩略图   ← invalidate_thumbnail 删
+ *   两层都清，重新渲染时才会真的取到新图
+ * ```
+ *
+ * 只清一层不够：ST 那层不清，App 重新请求拿到的还是旧缩略图字节。
+ */
+export function clearThumbnailCacheFor(avatar: string): void {
+  const key = avatar.trim();
+  if (key === '') return;
+  cache.delete(key);
+  inflight.delete(key);
+}

@@ -138,7 +138,30 @@ test('★★★ 掩码串绝不能被当成 key 保存', () => {
 
 test('★★ 聚焦掩码框会清空并切到编辑态', () => {
   assert.equal(keyStateOnFocus('masked'), 'editing');
-  assert.equal(keyStateOnFocus('empty'), 'empty');
+  /*
+   * ★★★★ 2026-11-12 改判据：`empty` 聚焦也必须进 `editing`。
+   *
+   * 原判据钉的是 `keyStateOnFocus('empty') === 'empty'`，而**那正是 bug**：
+   *
+   * ```text
+   *   用户的源从来没配过 key ⇒ initialKeyState = 'empty'
+   *   点进输入框 → 仍是 'empty'
+   *   粘好 key（内容在框里，状态却还是 empty）
+   *   点保存（输入框先 blur）
+   *     → keyStateOnBlur('empty', 'sk-xxx') 直接返回 'empty'
+   *     → 不认为"填了内容"
+   *     → paintKeyField() → value = ''
+   *     → **刚粘的 key 被抹掉**
+   *     → 发消息 401
+   * ```
+   *
+   * 真机日志（Redmi Note 8 Pro）：
+   * `[save] source=openai input=yes len=0 mask=no write=no`
+   *
+   * 语义上：聚焦 = 用户打算输入 ⇒ 就是 editing。只有 `masked` 是"假状态"
+   * （展示一排圆点），`empty` 只是"当前没有值"，不是一种状态。
+   */
+  assert.equal(keyStateOnFocus('empty'), 'editing', 'empty 也要进编辑态，否则填了值也会被当没填');
   assert.equal(keyStateOnFocus('editing'), 'editing');
 });
 

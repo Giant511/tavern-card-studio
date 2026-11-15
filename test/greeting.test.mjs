@@ -398,10 +398,17 @@ test('★★★ 选角色后要真的把卡读进 loadedCard（否则开场白�
    * `buildOpeningMessages` 永远返回空数组，开场白插了个寂寞。
    */
   assert.match(shellSrc, /private async loadCharacterCard\(/, '要有读卡的方法');
+  /*
+   * ★ 守性质：选角色后要读卡。不守写法（2026-11-11）。
+   *
+   * 原来这条钉的是 `loadCharacterCard(...)`。为了修"首次切角色没开场白"，
+   * 它换成了带重试的 `loadCharacterCardWithRetry(...)` —— 性质没变，
+   * 写法变了。钉写法会让好改动被拦在门外。
+   */
   assert.match(
     shellSrc,
-    /await this\.loadCharacterCard\(character\.avatar\)/,
-    '选角色时要调用它',
+    /await this\.loadCharacterCard(?:WithRetry)?\(character\.avatar\)/,
+    '选角色时要调用它（单次或带重试都行）',
   );
   assert.match(
     shellSrc,

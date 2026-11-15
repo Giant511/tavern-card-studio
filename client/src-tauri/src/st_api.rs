@@ -117,8 +117,40 @@ pub struct StApi {
     ///
     /// 那种情况下"重连后重试"可能仍然 403，看起来像恢复逻辑没生效。
     /// 重建 client 从根上消除这个可能：旧 jar 直接丢弃。
-    client: tokio::sync::RwLock<reqwest::Client>,
-    csrf: tokio::sync::RwLock<Csrf>,
+    /// ★★★ `client` 与 `csrf` 必须**同一代**，所以放在同一个锁里（2026-11-11 修）。
+    ///
+    /// 之前是两个独立 RwLock，于是 `send_post` 里这两行之间可以被别人插进来：
+    ///
+    /// ```text
+    ///   let csrf = self.csrf_or_connect().await?;        // 读到 session A 的 token
+    ///   let client = self.client.read().await.clone();   // ← 这里已经是 session B 了
+    /// ```
+    ///
+    /// 结果：**拿 A 的 token 配 B 的 cookie jar ⇒ 永久 403**。
+    ///
+    /// 这不是理论风险。安卓上报的正是它：
+    ///
+    /// ```text
+    ///   /api/backends/chat-completions/generate 返回 403（已重试：true）
+    ///   同一 API、同一密钥，原生 ST 能聊
+    /// ```
+    ///
+    /// `已重试：true` 是关键线索 —— 重试本身就又触发了一次并发错位，
+    /// 所以越重试越坏。安卓端请求更密（生成 + token 计数 + 审计并发），
+    /// 桌面上串行得多，所以手机上才明显。
+    session: tokio::sync::RwLock<Session>,
+    /// 重连的单飞锁（同一时刻只有一次 `connect` 真正在跑）
+    connect_lock: tokio::sync::Mutex<()>,
+}
+
+/// 一次 ST 会话 = 一只带 jar 的 client + 与它配套的 CSRF 状态。
+///
+/// 把两者绑在一起，任何时刻读到的都一定是**同一代**。
+struct Session {
+    client: reqwest::Client,
+    csrf: Csrf,
+    /// 每次真正重连 +1。403 恢复用它判断"别人是不是已经替我重连过"
+    epoch: u64,
 }
 
 impl StApi {
@@ -133,8 +165,12 @@ impl StApi {
         }
         Ok(Self {
             base,
-            client: tokio::sync::RwLock::new(build_client()?),
-            csrf: tokio::sync::RwLock::new(Csrf::Unknown),
+            session: tokio::sync::RwLock::new(Session {
+                client: build_client()?,
+                csrf: Csrf::Unknown,
+                epoch: 0,
+            }),
+            connect_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -150,7 +186,21 @@ impl StApi {
     ///
     /// 这是"建会话"的那一步：ST 的 cookieSession 会在响应里下发 session cookie，
     /// 由 cookie jar 收下；令牌与会话绑定，所以**每次重建会话都必须重取**。
+    /// 强制重建会话：丢掉旧 jar、重新取 token。
+    ///
+    /// 适用于"我确定现在这份会话不可用"的场合（登录之后、用户点重试）。
+    /// 403 恢复**不要**直接用它 —— 用 [reconnect_if_epoch]，它能在并发时
+    /// 避免 N 个请求各重建一次。
     pub async fn connect(&self) -> Result<(), ShellError> {
+        let _guard = self.connect_lock.lock().await;
+        self.rebuild_locked().await.map(|_| ())
+    }
+
+    /// 拿锁之后真正重建。返回新的 epoch。
+    ///
+    /// ★ 调用方**必须**已持有 `connect_lock`。拆出来是为了让"强制重建"
+    /// 与"条件重建"共用同一段逻辑，而不是各写一遍（那种重复必然分叉）。
+    async fn rebuild_locked(&self) -> Result<u64, ShellError> {
         /*
          * 先换一只**全新的 client**（= 丢掉旧 cookie jar），再取 token。
          *
@@ -160,14 +210,16 @@ impl StApi {
          * 为什么整只换而不是"清 cookie"：reqwest 在 `cookie_store(true)` 时
          * 不暴露清空 jar 的 API。而且"新会话"的正确语义本来就是一份干净 jar。
          */
-        {
-            let mut client = self.client.write().await;
-            *client = build_client()?;
-        }
-        *self.csrf.write().await = Csrf::Unknown;
+        let fresh = build_client()?;
+        let epoch = {
+            let mut session = self.session.write().await;
+            session.client = fresh.clone();
+            session.csrf = Csrf::Unknown;
+            session.epoch += 1;
+            session.epoch
+        };
 
-        let client = self.client.read().await.clone();
-        let response = client
+        let response = fresh
             .get(self.url("/csrf-token"))
             .send()
             .await
@@ -196,20 +248,203 @@ impl StApi {
         } else {
             Csrf::Token(body.token)
         };
-        *self.csrf.write().await = next;
-        Ok(())
+
+        let mut session = self.session.write().await;
+        if session.epoch == epoch {
+            session.csrf = next;
+        }
+        Ok(epoch)
     }
 
-    /// 取当前 CSRF 状态；`Unknown` 时先 `connect()`。
-    async fn csrf_or_connect(&self) -> Result<Csrf, ShellError> {
+    /// 条件重建：只有 epoch 仍是 `seen` 时才真重建。
+    ///
+    /// ## 这是"并发 403 只重建一次"的关键（2026-11-11）
+    ///
+    /// 十个请求同时 403，它们都记着同一个 `seen`。第一个拿到锁的重建了，
+    /// epoch 变成 `seen+1`；后九个进来一看 epoch 变了 —— **说明别人已经
+    /// 替我连好了**，直接返回、用那份新会话去重试。
+    ///
+    /// 不加这个判断，十个请求会重建十次，每次都把前一次的 jar 丢掉；
+    /// 而 403 恢复的重试会拿着"自己那代的 token"去配"最新那代的 jar"，
+    /// 于是 403 永不消失 —— 用户看到的就是「已重试：true」仍然失败。
+    async fn reconnect_if_epoch(&self, seen: u64) -> Result<(), ShellError> {
+        let _guard = self.connect_lock.lock().await;
+        if self.session.read().await.epoch != seen {
+            log::debug!(target: "st_api", "并发 403：别人已重连，复用其会话（epoch {seen}）");
+            return Ok(());
+        }
+        self.rebuild_locked().await.map(|_| ())
+    }
+
+    /// 取**同一代**的 client 与 CSRF 状态；`Unknown` 时先 `connect()`。
+    ///
+    /// ★ 必须一次读出两者（2026-11-11）。分成两次读会拿到"这一代的 token +
+    /// 下一代的 jar"，那正是 403 反复出现的根因 —— 见 `Session` 的注释。
+    async fn session_or_connect(&self) -> Result<(reqwest::Client, Csrf), ShellError> {
         {
-            let current = self.csrf.read().await;
-            if *current != Csrf::Unknown {
-                return Ok(current.clone());
+            let session = self.session.read().await;
+            if session.csrf != Csrf::Unknown {
+                return Ok((session.client.clone(), session.csrf.clone()));
             }
         }
-        self.connect().await?;
-        Ok(self.csrf.read().await.clone())
+        /*
+         * 记下 epoch 再条件重建：排队期间别人连好了就复用，
+         * 不重复重建（首屏三个请求同时到，不该建三次会话）。
+         */
+        let seen = self.session.read().await.epoch;
+        self.reconnect_if_epoch(seen).await?;
+        let session = self.session.read().await;
+        Ok((session.client.clone(), session.csrf.clone()))
+    }
+
+    /// 403 恢复：条件重连，**并发时只重建一次**。
+    ///
+    /// 与 `connect()` 的区别就是那条 epoch 判断。为什么 403 恢复必须用它：
+    ///
+    /// ```text
+    ///   十个请求同时 403
+    ///     → 各自调 connect()  ⇒ 重建十次，每次都丢掉前一次的 jar
+    ///     → 而重试时"自己那代的 token"配"最新那代的 jar" ⇒ 仍然 403
+    ///   用户看到的就是「已重试：true」还是失败。
+    /// ```
+    ///
+    /// 用这个：第一个重建，其余九个一看 epoch 变了就复用 —— 只重建一次，
+    /// 且所有请求都用同一份新会话去重试。
+    /// 判断一个 403 到底是**谁**给的。
+    ///
+    /// ## 为什么必须分清（2026-11-11 真机取证）
+    ///
+    /// 403 有两个完全不同的来源，处置相反：
+    ///
+    /// ```text
+    ///   ST 自己的 CSRF/session 校验失败
+    ///     → 重连 + 重试**有用**（换一份新会话就好了）
+    ///
+    ///   上游 API 服务商拒绝（额度不足 / key 无效 / 无权用该模型）
+    ///     → 重连**没用**，重试**白花钱**（按次计费时这一下也算一次）
+    /// ```
+    ///
+    /// 判据看 **body 形状**，不看状态码：
+    ///
+    /// ```text
+    ///   ST 的 CSRF 失败  →  纯文本 "Invalid CSRF token. Please refresh the page and try again."
+    ///   上游拒绝        →  JSON：{"error":{"message":"…","code":"…"}}
+    /// ```
+    ///
+    /// ★ 判据不能只看"body 是不是 JSON"：ST 的 404/500 也可能回 JSON。
+    ///   必须看 `error` 这一层里有没有 `message` 或 `code` —— 那是上游
+    ///   （OpenAI 兼容格式）与 new-api 系中转站共有的形状。
+    ///
+    /// 返回 `None` = 判不出来（空 body、非 JSON、JSON 但不是错误形状），
+    /// 此时按 **CSRF** 处理 —— 那是既有行为，保住旧路径不乱。
+    fn classify_forbidden_body(body: &str) -> Option<(String, String)> {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let Ok(json) = serde_json::from_str::<Value>(trimmed) else {
+            return None;
+        };
+        let error = json.get("error")?;
+
+        /*
+         * 两种常见形状都收：
+         *
+         * ```json
+         *   {"error": {"message": "账户额度不足。…", "code": "pre_consume_token_quota_failed"}}
+         *   {"error": "invalid_api_key"}          ← OpenAI 老格式，直接是字符串
+         * ```
+         */
+        if let Some(text) = error.as_str() {
+            return Some((text.to_string(), String::new()));
+        }
+        let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let code = error.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        if message.is_empty() && code.is_empty() {
+            return None;
+        }
+        Some((message.to_string(), code.to_string()))
+    }
+
+    /// 发 POST；403 时**先判来源**，只有真 CSRF 失效才重连重试。
+    ///
+    /// ## 为什么不重试上游 403
+    ///
+    /// 用户的 API 是**按次计费**的（5 元 ≈ 200 次）。额度不足时上游回 403，
+    /// 若我们按老逻辑"重连 + 重试一次"，那次重试**照样计费** ——
+    /// 等于在用户已经欠费的情况下又刷了他一次。这不是性能问题，是钱。
+    async fn send_post_with_recovery(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response, ShellError> {
+        let response = self.send_post(path, body).await?;
+        if response.status() != reqwest::StatusCode::FORBIDDEN {
+            return Ok(response);
+        }
+
+        /* 403：先读 body 判来源。读掉之后这个 response 就废了，所以要重发。 */
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+
+        if let Some((message, code)) = Self::classify_forbidden_body(&text) {
+            /*
+             * 上游拒绝：**立刻返回，不重连、不重试**。
+             *
+             * 带上 code 是为了让用户能拿去搜 / 问客服；
+             * 服务商原话保留不改写 —— "账户额度不足。请检查额度或购买。"
+             * 这句话比我们编的任何提示都准。
+             */
+            let detail = if code.is_empty() {
+                message
+            } else {
+                format!("{message}（{code}）")
+            };
+            log::warn!(target: "st_api", "上游拒绝 {path}：{status} {detail}");
+            return Err(ShellError::UpstreamRejected {
+                path: path.to_string(),
+                detail,
+                status,
+            });
+        }
+
+        /*
+         * 判不出来 ⇒ 按 CSRF 失效处理（既有行为）。
+         *
+         * 这里刻意**不用**刚读掉的 response 去判断重试结果 ——
+         * 它已经废了，必须重新发一次请求。
+         */
+        log::info!(target: "st_api", "403 判为会话失效（body 非上游错误形状），重连重试：{path}");
+        self.recover_forbidden().await?;
+        let retry = self.send_post(path, body).await?;
+        if retry.status() != reqwest::StatusCode::FORBIDDEN {
+            return Ok(retry);
+        }
+
+        /* 重试后仍 403：再判一次，别把上游错误报成"会话过期" */
+        let retry_status = retry.status().as_u16();
+        let retry_text = retry.text().await.unwrap_or_default();
+        if let Some((message, code)) = Self::classify_forbidden_body(&retry_text) {
+            let detail = if code.is_empty() {
+                message
+            } else {
+                format!("{message}（{code}）")
+            };
+            return Err(ShellError::UpstreamRejected {
+                path: path.to_string(),
+                detail,
+                status: retry_status,
+            });
+        }
+        Err(ShellError::StForbidden {
+            path: path.to_string(),
+            retried: true,
+        })
+    }
+
+    async fn recover_forbidden(&self) -> Result<(), ShellError> {
+        let seen = self.session.read().await.epoch;
+        self.reconnect_if_epoch(seen).await
     }
 
     /// 发一个 POST，并在需要时附上 CSRF 头。
@@ -217,8 +452,7 @@ impl StApi {
     /// 不含 403 恢复逻辑 —— 那在 `post_json` 里。分开是为了让"怎么发"
     /// 与"失败了怎么办"各自可读。
     async fn send_post(&self, path: &str, body: &Value) -> Result<reqwest::Response, ShellError> {
-        let csrf = self.csrf_or_connect().await?;
-        let client = self.client.read().await.clone();
+        let (client, csrf) = self.session_or_connect().await?;
         let mut request = client.post(self.url(path)).json(body);
         // 关闭 CSRF 的部署：**不发这个头**（发了反而被拒）
         if let Csrf::Token(token) = csrf {
@@ -242,26 +476,19 @@ impl StApi {
             detail: format!("请求体序列化失败：{error}"),
         })?;
 
-        let mut response = self.send_post(path, &body).await?;
-        let mut recovered = false;
-
-        if response.status() == reqwest::StatusCode::FORBIDDEN {
-            // ★ 陷阱 #8：cookie 过期后所有 POST 403。
-            //
-            // 判据是 403（而不是 401）：ST 在 cookie 失效时仍然认为请求"有身份"，
-            // 只是 CSRF/会话对不上，所以给 403 而不是 401。
-            recovered = true;
-            self.connect().await?;
-            response = self.send_post(path, &body).await?;
-        }
+        /*
+         * 403 的两种来源在这里分流（2026-11-11）：
+         *
+         * ```text
+         *   上游服务商拒绝  → UpstreamRejected，不重试（重试要花钱）
+         *   ST 会话失效     → 重连 + 重试一次
+         * ```
+         *
+         * 分流逻辑在 `send_post_with_recovery` 里，四个调用点共用。
+         */
+        let response = self.send_post_with_recovery(path, &body).await?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::FORBIDDEN {
-            return Err(ShellError::StForbidden {
-                path: path.to_string(),
-                retried: recovered,
-            });
-        }
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
             return Err(ShellError::StHttpStatus {
@@ -286,20 +513,8 @@ impl StApi {
             detail: format!("请求体序列化失败：{error}"),
         })?;
 
-        let mut response = self.send_post(path, &body).await?;
-        let mut recovered = false;
-        if response.status() == reqwest::StatusCode::FORBIDDEN {
-            recovered = true;
-            self.connect().await?;
-            response = self.send_post(path, &body).await?;
-        }
+        let response = self.send_post_with_recovery(path, &body).await?;
         let status = response.status();
-        if status == reqwest::StatusCode::FORBIDDEN {
-            return Err(ShellError::StForbidden {
-                path: path.to_string(),
-                retried: recovered,
-            });
-        }
         if !status.is_success() {
             return Err(ShellError::StHttpStatus {
                 path: path.to_string(),
@@ -324,20 +539,8 @@ impl StApi {
             detail: format!("请求体序列化失败：{error}"),
         })?;
 
-        let mut response = self.send_post(path, &body).await?;
-        let mut recovered = false;
-        if response.status() == reqwest::StatusCode::FORBIDDEN {
-            recovered = true;
-            self.connect().await?;
-            response = self.send_post(path, &body).await?;
-        }
+        let response = self.send_post_with_recovery(path, &body).await?;
         let status = response.status();
-        if status == reqwest::StatusCode::FORBIDDEN {
-            return Err(ShellError::StForbidden {
-                path: path.to_string(),
-                retried: recovered,
-            });
-        }
         if !status.is_success() {
             return Err(ShellError::StHttpStatus {
                 path: path.to_string(),
@@ -390,24 +593,18 @@ impl StApi {
             detail: format!("请求体序列化失败：{error}"),
         })?;
 
-        let mut response = self.send_post(path, &body).await?;
-
-        if response.status() == reqwest::StatusCode::FORBIDDEN {
-            // 与 post_json 同一套恢复：cookie 过期 → 重连 → 重试一次
-            self.connect().await?;
-            response = self.send_post(path, &body).await?;
-        }
+        /*
+         * 与其它三个调用点共用同一套 403 分流（2026-11-11）。
+         *
+         * ★ 流式这条尤其要注意：上游 403 时**绝不能重试** ——
+         *   那是一次真实的模型调用，按次计费时重试就是重复扣费。
+         */
+        let response = self.send_post_with_recovery(path, &body).await?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::FORBIDDEN {
-            return Err(ShellError::StForbidden {
-                path: path.to_string(),
-                retried: true,
-            });
-        }
         if !status.is_success() {
             // 出错时响应体是 JSON/HTML（不是流），读全文便于给出有意义的报错。
-            // 403 的响应体是 **HTML**（契约 §9.3），所以只截断、不当 JSON 解析。
+            // 403 已经在 `send_post_with_recovery` 里分流并读掉了，走不到这里。
             let text = response.text().await.unwrap_or_default();
             return Err(ShellError::StHttpStatus {
                 path: path.to_string(),
@@ -478,7 +675,7 @@ impl StApi {
     /// 一张静态页（200），而 `/csrf-token` 是真正的接口 —— 它 200 才说明
     /// HTTP 服务确实起来了。
     pub async fn probe(&self) -> bool {
-        let client = self.client.read().await.clone();
+        let client = self.session.read().await.client.clone();
         match client.get(self.url("/csrf-token")).send().await {
             Ok(response) => response.status().is_success(),
             Err(_) => false,

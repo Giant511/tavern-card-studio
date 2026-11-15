@@ -856,7 +856,14 @@ class EditorApp {
    */
   async buildExportForTest(format: 'json' = 'json'): Promise<string> {
     const preset = this.rules?.preset ?? null;
-    const artifact = await buildExportAsync(this.card, preset, format, this.greetingFormat().format);
+    const artifact = await buildExportAsync(
+      this.card,
+      preset,
+      format,
+      this.greetingFormat().format,
+      undefined,
+      this.chatExamplesFormat(),
+    );
     if (artifact.format === 'png') throw new Error('内部错误：这里只要文本产物');
     return artifact.text;
   }
@@ -1027,7 +1034,14 @@ class EditorApp {
       // 上传内容与「导出 JSON」同一份，保证服务端字节与本地可复现
       getPayload: () => {
         const preset = this.rules?.preset ?? null;
-        return buildExportAsync(this.card, preset, 'json', this.greetingFormat().format).then(
+        return buildExportAsync(
+          this.card,
+          preset,
+          'json',
+          this.greetingFormat().format,
+          undefined,
+          this.chatExamplesFormat(),
+        ).then(
           (artifact) => {
             // 'json' 一定是文本产物；判别联合在这里收窄，避免 `artifact.text` 在 PNG 上读到 undefined
             if (artifact.format === 'png') throw new Error('内部错误：JSON 上传拿到了 PNG 产物');
@@ -1671,6 +1685,8 @@ class EditorApp {
     try {
       const parsed = parseStCard(JSON.parse(text) as unknown, {
         greetingFormat: this.greetingFormat().format,
+        /* 对话示例的说话人写法也按当前预设渲染（2026-11-11） */
+        chatExamplesFormat: this.chatExamplesFormat(),
         /*
          * 世界书必须按**当前激活预设**渲染（v0.1.6 缺陷一）。
          * 不传的话这里会用内置默认格式渲染文本，而审计用当前预设解析 ——
@@ -2165,6 +2181,36 @@ class EditorApp {
    */
   private greetingFormat(): { format: GreetingFormatParams; source: 'greeting-preset' | 'txt-preset' | 'frozen' } {
     return effectiveGreetingFormat(this.greetingPreset, this.rules?.preset?.greeting);
+  }
+
+  /**
+   * 「对话示例」板块的格式参数（2026-11-11）。
+   *
+   * ## 与 `greetingFormat()` 是两个东西
+   *
+   * ```text
+   *   greetingFormat()      初始场景：段标题、多条开场白分隔、标签行
+   *   chatExamplesFormat()  对话示例：说话人写法（用户：/角色：）、轮次称呼
+   * ```
+   *
+   * ## 为什么必须传下去
+   *
+   * `mes_example` 存的是 ST 标准写法（`{{user}}:`）。用户在预设里声明了
+   * "我的平台用 `用户：`" 之后，**导入时要按它渲染进板块**，否则：
+   *
+   * ```text
+   *   板块里看到   {{user}}:    （ST 写法）
+   *   他的规则判   「缺说话人行」（按平台规范判）
+   *   ⇒ 卡永远红着，而他找不到原因
+   * ```
+   *
+   * 导出时还要按它反解回 `{{user}}:` —— 否则 `mes_example` 里留下 `用户：`，
+   * 而 ST 不认那种写法，整段示例在 ST 里读不到（不报错、只是没有）。
+   *
+   * 成对使用这条铁律见 `chat-examples-format.ts` 开头。
+   */
+  private chatExamplesFormat(): GreetingFormatParams {
+    return this.chatExamplePreset.format;
   }
 
   /**
@@ -2911,9 +2957,11 @@ class EditorApp {
         kind === 'before'
           ? /* no-worldbook */ parseStCard(raw as unknown, {
               greetingFormat: this.greetingFormat().format,
+              chatExamplesFormat: this.chatExamplesFormat(),
             })
           : parseStCard(raw as unknown, {
               greetingFormat: this.greetingFormat().format,
+              chatExamplesFormat: this.chatExamplesFormat(),
               worldbookFormat: this.worldbookPreset.format,
             });
 
@@ -4397,6 +4445,7 @@ class EditorApp {
 
       const parsed = parseStCard(file.text, {
         greetingFormat: this.greetingFormat().format,
+        chatExamplesFormat: this.chatExamplesFormat(),
         worldbookFormat: this.worldbookPreset.format,
       });
       this.replaceCard(parsed.card);
@@ -4468,6 +4517,7 @@ class EditorApp {
 
     const parsed = parseStCard(inspected.jsonText, {
       greetingFormat: this.greetingFormat().format,
+      chatExamplesFormat: this.chatExamplesFormat(),
       worldbookFormat: this.worldbookPreset.format,
     });
     const created = this.hasSession ? null : this.createSessionFromFile(path);

@@ -59,7 +59,16 @@ import {
 import { pickFetch, setInsecureOrigins } from './native-fetch.ts';
 import { askCertTrust, isCertificateError } from './cert-trust.ts';
 import { readDefaultFaceBytes } from './default-face.ts';
-import { loadThumbnail } from './thumbnail.ts';
+import { clearThumbnailCacheFor, loadThumbnail } from './thumbnail.ts';
+/* 引擎/崩溃取证：见 diagnostics/mobile-diag.ts 的文件头 */
+import {
+  buildDiagReport,
+  clearDiagLog,
+  diagNote,
+  exportNativeLog,
+  nativeStatus,
+  readDiagEntries,
+} from '../diagnostics/mobile-diag.ts';
 import { shareCardPng, type ShareOutcome } from './share-card.ts';
 import { pickAvatarDataUrl } from './avatar-upload.ts';
 import { renderWorldbookPage, type WorldbookSummary } from './worldbook-page.ts';
@@ -87,6 +96,7 @@ import {
   CLOUD_REPO_HOST,
   buildOpeningMessages,
   buildPngCard,
+  isPngBytes,
   parsePngCard,
   parseStCardText,
   planCardImport,
@@ -154,8 +164,11 @@ import {
   resolveAuthorNoteConfig,
   buildStConnectionPatch,
   secretKeyOf,
+  /* 本地地址（可能不需要 key）与公网地址要区别对待，见 writeApiConnectionToSt */
+  isLocalEndpoint,
   verifyConnectionPersisted,
   activePersona,
+  syncPersonaToCharacter,
   activeUserName,
   emptyPersonaState,
   relabelUserMessages,
@@ -177,6 +190,13 @@ import {
   type EngineStatus,
   parseChatResponse,
   makeChatFileName,
+  /* last_mes 是 ISO 字符串还是数字取决于文件空不空 —— 解析收在 shared */
+  chatFileLastAt,
+  chatFileCount,
+  shouldStartNewChatFile,
+  /* 聊天记录导出 TXT（v0.1.9） */
+  chatToText,
+  chatExportFileName,
   shouldSaveChat,
   type StChatMessage,
   type StSettings,
@@ -186,6 +206,12 @@ import {
   type ParamFamily,
   type ThinkingIntent,
 } from '@tcs/shared';
+
+/*
+ * 仓库卡面可能是 webp，而 `buildPngCard` 只认 PNG 容器 ⇒ 下载导入前先转码。
+ * 桌面端导出早就用这个函数了，这里是把同一条路接上（2026-11-11）。
+ */
+import { convertToPng } from '../export/face-convert.ts';
 
 export type TabId = 'chat' | 'cards' | 'repo' | 'me';
 
@@ -512,6 +538,13 @@ export class AppShell {
    * （那种情况下旧连接已经确定不可用了，重连是合理的）。
    */
   private connected = false;
+  /**
+   * 上一次引擎连接状态（`null` = 还没试过）。
+   *
+   * 只用来决定"要不要往诊断日志里写一条" —— 每 2 秒一次的重试如果每次都记，
+   * 环形日志（100 条）会被它一个人占满，真正有用的崩溃记录反而被挤掉。
+   */
+  private lastEngineState: 'ok' | 'fail' | null = null;
 
   /** 正在进行的 connect 尝试（并发调用共享同一次，避免连出四次） */
   private connecting: Promise<{ ok: boolean; error?: unknown }> | null = null;
@@ -604,6 +637,8 @@ export class AppShell {
    * 存在页面里一切 Tab 就丢。
    */
   private voiceExpanded = false;
+  /** 「诊断日志」展开状态（与 voice 同理：记在外壳，页面每次切 Tab 会重建） */
+  private diagExpanded = false;
   /**
    * API 连接收纳项是否展开。
    *
@@ -936,7 +971,29 @@ export class AppShell {
    *
    * 存在外壳而不是面板里：面板随 Tab 切换重建，快照要跨重建存活。
    */
-  private chatSnapshot: { fileName: string; messages: StChatMessage[]; scrollTop?: number } | null = null;
+  /**
+   * 会话快照。
+   *
+   * ## `fileName` 为什么是 `string | null`（2026-11-15）
+   *
+   * 昨天为了避免类型报错，把"还没有文件名"写成了 **空串 `''`**。
+   * 而空串在比较里等于"谁都不是"：
+   *
+   * ```ts
+   *   if (snapshot.fileName === someId)   // 空串永远 false
+   * ```
+   *
+   * 于是改名时"这段是不是当前打开的"判不出来 —— 而这个判断正是
+   * 决定"要不要把指针改成新名字"的唯一依据。
+   *
+   * 用 `null` 表达"没有"，比较语义就干净了：`null === id` 也是 false，
+   * 但读代码的人不会以为它是一个真实存在的名字。
+   */
+  private chatSnapshot: {
+    fileName: string | null;
+    messages: StChatMessage[];
+    scrollTop?: number;
+  } | null = null;
 
   /**
    * 当前聊天在 ST 里的文件名（**不带扩展名**）。
@@ -950,6 +1007,17 @@ export class AppShell {
    * `null` 表示这次会话还没落过盘（新建聊天）。
    */
   private chatFileName: string | null = null;
+  /**
+   * 正在为哪个角色恢复历史（`null` = 没在恢复）。
+   *
+   * `restoreLatestChat()` 是异步的，最长重试 60 秒。这段时间里
+   * `chatFileName` 是 null，如果有人碰 `handleChatChanged`，就会
+   * **新建一个空文件**并把历史挤掉（2026-11-14 用户报的那个）。
+   *
+   * 用一个字段而不是 await 等待：`handleChatChanged` 是面板的同步回调，
+   * 改成异步会把整条消息路径搅乱。
+   */
+  private restoringAvatar: string | null = null;
 
   /**
    * 上一次成功保存时的内容指纹（`chatFingerprint()`）。
@@ -1064,6 +1132,12 @@ export class AppShell {
     if (saved !== null) {
       this.selectedCharacter = { avatar: saved.avatar, name: saved.name };
       this.chatFileName = saved.fileName;
+      /*
+       * 冷启动也要对齐（2026-11-11）：上次退出时的人设可能是另一个角色绑的，
+       * 而当前恢复出来的角色有自己的人设。不对齐的话，用户重进 App
+       * 看到的就是"上一个人设"。
+       */
+      this.applyPersonaForCharacter(saved.avatar);
     }
   }
 
@@ -1152,7 +1226,22 @@ export class AppShell {
        */
       void (async () => {
         try {
-          await this.loadCharacterCard(avatar);
+          /*
+           * ★ 用带重试版（2026-11-11）：冷启动这一刻引擎几乎肯定还没起。
+           * 原来读一次失败就置空 ⇒ 开场白永久缺失，只有"进去保存一下"
+           * 才会被 `refreshOpeningAfterEdit` 救回来。
+           */
+          const gotCard = await this.loadCharacterCardWithRetry(avatar);
+          /*
+           * 卡一到就重绘 —— **不等历史**。
+           *
+           * `restoreLatestChat` 找不到历史时会重试到 60 秒超时；把重绘
+           * 排在它后面，用户要对着没有开场白的空屏等一分钟。
+           * 而这个词条的开场白只需要卡，不需要历史。
+           *
+           * 判一次"用户还在这个角色上"：这期间他可能切走了。
+           */
+          if (gotCard && this.selectedCharacter?.avatar === avatar) this.renderPage();
           await this.restoreLatestChat(avatar, this.chatFileName);
         } finally {
           this.options.onSessionSettled?.();
@@ -2516,6 +2605,8 @@ export class AppShell {
         versionCount: one.versionCount,
         updatedAt: one.updatedAt,
         hasFace: one.face !== null,
+        /* 卡面内容指纹：缩略图缓存靠它判断"图换了没有"（2026-11-11） */
+        faceSha256: one.face?.sha256 ?? null,
       }));
   }
 
@@ -2807,23 +2898,142 @@ export class AppShell {
    * v0.1.8 起落盘那段抽成 `resolveCardPlacement` + `writeCardToLibrary`，
    * 给本地卡导入共用；这里只剩"取原文 + 给底图"。
    */
+  /**
+   * 拉仓库里某张卡的**卡面字节**（下载导入时当 PNG 底图用）。
+   *
+   * 与 `loadCardFace` 的区别：
+   *
+   * ```text
+   *   loadCardFace         → data URL，给 <img> 画缩略图（列表装饰）
+   *   fetchRepoFaceForImport → 原始字节，给 buildPngCard 当容器
+   * ```
+   *
+   * 两者都要原始响应，但消费方式不同，所以分开放 —— 让一个函数同时
+   * 服务"画图"和"嵌卡"会导致其中一方拿到多余的格式转换。
+   *
+   * 失败/没有卡面一律返回 `null`：**没有背景是正常状态**（不是所有卡都配了图），
+   * 不该抛错让下载整体失败。
+   */
+  private async fetchRepoFaceForImport(
+    cardId: string,
+  ): Promise<{ bytes: Uint8Array; mime: string } | null> {
+    try {
+      const fetched = await this.runRepoRequest((config) =>
+        repoFetchFace(config, cardId, { fetchImpl: pickFetch() }),
+      );
+      if (fetched === null) return null;
+      return { bytes: fetched.bytes, mime: fetched.mime };
+    } catch {
+      return null;
+    }
+  }
+
   private async importRepoVersion(cardId: string, seq: number): Promise<void> {
     const jsonText = await this.runRepoRequest((config) =>
       repoFetchVersionText(config, cardId, seq, { fetchImpl: pickFetch() }),
     );
 
-    /*
-     * 仓库有卡面资产，但那是 **webp**，而 `buildPngCard` 只认 PNG 容器。
-     * 转码要 canvas，而这条路径的目标是"内容能进来"。
-     *
-     * v0.1.8 起不再塞那张统一的默认卡面 —— 传 `null` 让
-     * `writeCardToLibrary` 按卡名生成首字封面。理由：所有下载的卡
-     * 长得一模一样的话，选角色列表里根本认不出哪张是哪张。
-     */
     /* 仓库是权威版本，覆盖本地同名卡是预期行为，不弹确认 */
     const plan = await this.resolveCardPlacement({ jsonText, cardId, confirmOverwrite: false });
     if (plan === null) return;
-    const written = await this.writeCardToLibrary({ plan, jsonText, base: null });
+
+    /*
+     * ★★★ 用**仓库里的卡面**当底图（2026-11-11，用户报的）
+     *
+     * > 仓库有背景的时候下载没有把仓库的背景下载下来并合并成一张 PNG
+     *
+     * ## 原来为什么是一张首字封面
+     *
+     * v0.1.8 时传的是 `base: null`，理由是"仓库卡面是 webp，而
+     * `buildPngCard` 只认 PNG —— 转码要 canvas，这条路径只想让内容进来"。
+     *
+     * 那个理由在当时成立，但**同一个仓库里已经有 `convertToPng` 了**
+     * （桌面端导出用的就是它），只是没接到这条路上。于是：
+     *
+     * ```text
+     *   仓库里明明有精心画的卡面
+     *   下载下来却是一张"西"字封面
+     *   ⇒ 选角色列表里认不出哪张是哪张（正是 v0.1.8 当初想解决的）
+     * ```
+     *
+     * 转念一想，`base: null` 解决的正是它自己想避免的问题：所有卡长得一样。
+     *
+     * ## 三种情况
+     *
+     * ```text
+     *   ① 仓库有卡面且已是 PNG   → 直接当底图
+     *   ② 仓库有卡面但是 webp    → convertToPng 转一张再当底图
+     *   ③ 仓库没有卡面           → 首字封面 + 提示用户去配背景
+     * ```
+     *
+     * ③ 按用户要求："如果无背景提示用户选背景或者生成背景"。
+     */
+    const face = await this.fetchRepoFaceForImport(cardId);
+    let base: Uint8Array | null = null;
+    /* 背景没合并进去的**真实原因**，下载完要说给用户听 */
+    let faceProblem: string | null = null;
+    if (face !== null) {
+      if (isPngBytes(face.bytes)) {
+        base = face.bytes;
+      } else {
+        try {
+          /*
+           * 长边限 1024：卡面只用于列表/顶栏，几百 px 就够。
+           * 4096 的 canvas 在手机 WebView 上是 64MB —— 那正是它失败的地方。
+           */
+          base = (
+            await convertToPng(
+              face.bytes,
+              `face.${face.mime.includes('webp') ? 'webp' : 'jpg'}`,
+              1024,
+            )
+          ).bytes;
+        } catch (error) {
+          /*
+           * ★★★ 转码失败**不许静默**（2026-11-11）。
+           *
+           * 原来这里是 `catch { base = null }` —— 静默退回首字封面。
+           * 真机后果：仓库卡面下载花了 13 秒（说明图确实拉下来了），
+           * 最终却仍是一个字，而**用户看不到任何解释**，只能报"问题未解决"。
+           *
+           * 吞掉失败比失败本身更坏：失败还能查，静默只能猜。
+           */
+          faceProblem =
+            error instanceof Error ? error.message : String(error);
+          console.warn('[repo-import] 卡面转 PNG 失败', faceProblem);
+          base = null;
+        }
+      }
+    }
+
+    const written = await this.writeCardToLibrary({ plan, jsonText, base });
+    /*
+     * 没有背景图 ⇒ 说清楚"这张卡现在只有首字封面，可以去配一张"。
+     *
+     * 为什么值得单独提示：用户以为下载下来的卡就是仓库里看到的那张，
+     * 结果头像是个字 —— 会当成"下载坏了"。而实际上仓库里那张卡本来
+     * 就没有配图，需要有人补一张。
+     */
+    if (face === null) {
+      this.options.onNotify?.(
+        '这张卡在仓库里没有背景图，已用首字封面代替。想要头像的话，可以在同步页给它上传一张背景。',
+        'warn',
+      );
+    } else if (faceProblem !== null) {
+      /*
+       * 有背景但没转成 PNG —— 与"没有背景"是两件事，提示必须分开：
+       *
+       * ```text
+       *   没有背景      → 用户去配一张就好
+       *   有背景但转不了 → 是我们的问题，得说清是哪一步失败的
+       * ```
+       */
+      this.options.onNotify?.(
+        `这张卡有背景，但没能合并进卡里（${faceProblem}），暂时用首字封面。`,
+        'warn',
+      );
+    }
+
     /* 书没落地要说一声（角色可用了，所以是 warn 不是 danger） */
     if (written.worldbook === 'failed') {
       this.options.onNotify?.(
@@ -2966,6 +3176,49 @@ export class AppShell {
     const status = this.readEngineStatus();
     const charactersDir = status?.charactersDir ?? '';
     if (charactersDir === '') throw new Error('拿不到角色库目录，无法保存');
+
+    /*
+     * ★★★ 写卡之后必须让**头像缩略图**失效（2026-11-11）。
+     *
+     * ## 用户两次报同一件事
+     *
+     * ```text
+     *   ① 下载后威廉的角色头像还是原来的那个兜底的
+     *   ② 现在连直接导入 PNG 卡，缩略图还是会显示兜底
+     * ```
+     *
+     * 第 ② 次说明第一版只修了仓库下载那条路 —— 而本地导入走的是同一个
+     * `writeCardToLibrary`。**修在调用方就是会漏，修在这里才对。**
+     *
+     * ## 真因（直连 ST 读字节取证）
+     *
+     * ```text
+     *   原图   /characters/威廉.png      PNG  683×1024（691 KB） ← 已经是新卡面
+     *   缩略图 /thumbnail?type=avatar    JPEG  96×144（5 KB）    ← 还是绿「威」字
+     * ```
+     *
+     * ST 靠 `originalStat.mtimeMs > cachedStat.ctimeMs` 判断原图变没变
+     * （`thumbnails.js`）。而我们是**直接写文件**（tmp + rename），绕过了
+     * 它的 API —— 那条路上它没有机会知道"图换了"，于是永远回旧缩略图。
+     *
+     * ## 两层都要清
+     *
+     * ```text
+     *   ST  磁盘缩略图  ← invalidateThumbnail（删文件，下次请求自动重建）
+     *   App 内存 cache  ← clearThumbnailCacheFor
+     * ```
+     *
+     * 只清一层不够：ST 那层不清，App 重新请求拿到的还是旧字节；
+     * App 那层不清，这一会话里根本不会重新请求。
+     *
+     * 失败**不阻断导入**：卡的内容已经落地了，头像只是观感。
+     */
+    try {
+      await this.withConnection(() => this.bridge.invalidateThumbnail(plan.avatar, charactersDir));
+    } catch {
+      /* 清不掉就让 ST 继续用旧缩略图 —— 不影响卡内容 */
+    }
+    clearThumbnailCacheFor(plan.avatar);
 
     /*
      * `allowCreate` 跟着 `overwrite` 走 —— 两个语义**必须成对**：
@@ -3903,18 +4156,18 @@ export class AppShell {
    * 读不到卡不能让聊天用不了 —— 用户还能打字、还能拿到回复，
    * 只是模型不知道在扮演谁。报错中断整页比"降级"更糟。
    */
-  private async loadCharacterCard(avatar: string): Promise<void> {
+  private async loadCharacterCard(avatar: string): Promise<boolean> {
     try {
       const pngBytes = await this.withConnection(() => this.bridge.characterPng(avatar));
       const parsed = parsePngCard(new Uint8Array(pngBytes));
       if (parsed.kind !== 'card') {
         this.loadedCard = {};
-        return;
+        return false;
       }
       const json = JSON.parse(parsed.jsonText) as unknown;
       if (json === null || typeof json !== 'object') {
         this.loadedCard = {};
-        return;
+        return false;
       }
       const root = json as Record<string, unknown>;
       const data = root['data'];
@@ -3922,8 +4175,58 @@ export class AppShell {
         data !== null && typeof data === 'object'
           ? (data as Record<string, unknown>)
           : root;
+      return true;
     } catch {
       this.loadedCard = {};
+      return false;
+    }
+  }
+
+  /**
+   * 读角色卡，**读不到就重试**。
+   *
+   * ## ★★★ 为什么必须重试（2026-11-11，用户报的）
+   *
+   * > 安装后的第一次切换聊天角色不会自动加载开场白，需要进去保存一下才行
+   *
+   * "安装后的第一次"是关键字 —— 那是**引擎最慢**的时候（真机首启实测 7–57 秒）。
+   *
+   * 原来的时序：
+   *
+   * ```text
+   *   切角色 → renderPage()（空卡，面板没有开场白）
+   *          → loadCharacterCard()   ← 引擎没起，catch 里静默置空，**不重试**
+   *          → restoreLatestChat()   ← 有重试，但救不了已经空掉的卡
+   *          → renderPage()          ← 空卡再渲染一次，还是没开场白
+   * ```
+   *
+   * 而 `restoreLatestChat` 每轮重试前都会 `ensureConnected()` —— 也就是说
+   * **等引擎就绪的那套机制是有的，只是没用在读卡上**。
+   *
+   * 结果：开场白永久为空，直到用户进「开场与示例」点保存
+   * （`refreshOpeningAfterEdit` 会重读一次卡，那时引擎早就起来了）。
+   * 这完全对得上"需要进去保存一下才行"。
+   *
+   * ## 为什么返回 boolean 而不是抛错
+   *
+   * 调用方要区分"读到了（可以重绘了）"和"放弃了（别再等）"。
+   * 抛错会让每个调用点都写 try/catch，而这里失败**不是异常情况** ——
+   * 引擎还没起是正常时序。
+   */
+  private async loadCharacterCardWithRetry(avatar: string): Promise<boolean> {
+    const deadline = Date.now() + CARD_LOAD_TIMEOUT_MS;
+    for (;;) {
+      /*
+       * 用户可能在这期间换了角色 —— 立刻放弃，别把别人的卡读到这个槽里。
+       * 与 `restoreLatestChat` 里那条判断同源。
+       */
+      if (this.selectedCharacter !== null && this.selectedCharacter.avatar !== avatar) return false;
+
+      await this.ensureConnected();
+      if (await this.loadCharacterCard(avatar)) return true;
+
+      if (Date.now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
   }
 
@@ -3971,6 +4274,24 @@ export class AppShell {
     this.handleChatChanged(opening);
   }
 
+  /** 当前该用的用户名：选中的人设优先，否则用外部传入的默认名 */
+  private currentUserName(): string {
+    return activePersona(this.personaState)?.name ?? this.options.userName;
+  }
+
+  /**
+   * 把当前人设对齐到"这个角色该用的那套"并落盘。
+   *
+   * 抽成一个方法而不是在两处各写一遍：切角色与冷启动恢复必须走同一套规则，
+   * 各写一遍必然分叉（而分叉的表现就是"切角色生效、重进 App 不生效"这种）。
+   */
+  private applyPersonaForCharacter(avatar: string): void {
+    const next = syncPersonaToCharacter(this.personaState, avatar);
+    if (next === this.personaState) return;
+    this.personaState = next;
+    void this.options.onPersistPersona?.(next);
+  }
+
   /**
    * 把人设的当前状态推给聊天面板。
    *
@@ -3979,10 +4300,6 @@ export class AppShell {
    * - `persona.description` → 上下文里"你是谁"那段
    * - `persona.position` → 那段插到哪
    */
-  /** 当前该用的用户名：选中的人设优先，否则用外部传入的默认名 */
-  private currentUserName(): string {
-    return activePersona(this.personaState)?.name ?? this.options.userName;
-  }
 
   /**
    * 人设对应的 ctx 片段。
@@ -4162,6 +4479,26 @@ export class AppShell {
           this.selectedCharacter.avatar === character.avatar;
 
         this.selectedCharacter = { avatar: character.avatar, name: character.name };
+        /*
+         * ★★★ 换角色 ⇒ 人设跟着换（2026-11-11）。
+         *
+         * 用户报的三条其实是一件事：
+         *
+         * ```text
+         *   · 角色绑定了人设，聊天里不自动用它
+         *   · 切角色后显示的还是上一个角色绑的人设
+         *   · 想手动选又提示"还没有人设"（因为当前那套明确绑了别人）
+         *   · 只能去人设页点「使用」，而那一按全局生效、影响所有角色
+         * ```
+         *
+         * 根因：`personaState.selectedId` 是**全局唯一**的，切角色时没人动它，
+         * 于是新角色继续用旧人设；而 `personasForCharacter` 又因为
+         * "当前这套绑的是别人"把它筛掉了 ⇒ 界面显示"还没有人设"。
+         *
+         * `syncPersonaToCharacter` 按"绑定优先、默认兜底"重新对齐 ——
+         * 用户不用再每次手动点「使用」。
+         */
+        this.applyPersonaForCharacter(character.avatar);
 
         /*
          * ★★★ 跳转必须**立刻**发生，不能等读完历史（2026-11-06）。
@@ -4224,6 +4561,41 @@ export class AppShell {
         this.chatFileName = null;
         this.chatSnapshot = null;
         this.lastSavedFingerprint = null;
+        /*
+         * ★★★ 旧角色的卡也必须丢掉（2026-11-11，用户报"两个角色开场白一样"）。
+         *
+         * ## 不清会怎样
+         *
+         * 紧接着的 `renderPage()` 是**同步**的，此刻 `loadedCard` 里还是
+         * 上一个角色的卡。而面板在没有快照时走 `newChat()`：
+         *
+         * ```ts
+         *   this.messages = buildOpeningMessages(this.ctx.card);   // ← 旧卡！
+         *   if (this.messages.length > 0) onChatChanged(messages);
+         * ```
+         *
+         * 于是**旧角色的开场白被建了出来**，并通过 `onChatChanged` →
+         * `handleChatChanged` 把 `chatSnapshot` 又填上了。
+         *
+         * 等新卡加载完、第二次 `renderPage()` 时：
+         *
+         * ```text
+         *   chatSnapshot !== null  ⇒ 走快照分支
+         *   ⇒ 显示的是**上一个角色的开场白**
+         * ```
+         *
+         * 用户看到的正是这个：切两个不同角色，聊天页的开场白一模一样。
+         *
+         * ## 为什么清空是安全的
+         *
+         * ```text
+         *   ① 移动端 options.card 是 {}，退回空卡 ⇒ 开场白为空 ⇒ 不触发
+         *      onChatChanged ⇒ chatSnapshot 保持 null ⇒ 第二次渲染会重建
+         *   ② 清空后到新卡到位之间的窗口，若用户发消息会用空卡 ——
+         *      但那比"用上一个角色的设定发消息"安全得多（现状就是后者）
+         * ```
+         */
+        this.loadedCard = {};
 
         /* ① 立即跳（不 await） */
         this.renderPage();
@@ -4232,7 +4604,17 @@ export class AppShell {
         /* ② 后台补内容 */
         void (async () => {
           try {
-            await this.loadCharacterCard(character.avatar);
+            /*
+             * ★ 带重试 + 读到就重绘（2026-11-11）。
+             *
+             * 用户报的正是这条路：**安装后第一次切角色没开场白**。
+             * 首启时引擎要 7–57 秒才就绪，而原来读卡只试一次、失败即空，
+             * 再也没人重读 —— 直到用户进「开场与示例」保存了一次。
+             */
+            const gotCard = await this.loadCharacterCardWithRetry(character.avatar);
+            if (gotCard && this.selectedCharacter?.avatar === character.avatar) {
+              this.renderPage();
+            }
             await this.restoreLatestChat(character.avatar);
             /*
              * 读完再刷一次把消息填进去。
@@ -4677,10 +5059,31 @@ export class AppShell {
       try {
         await this.bridge.connect(baseUrl);
         this.connected = true;
+        /* 状态**变了**才记 —— 每 2 秒调一次，每次都记会把日志刷爆 */
+        if (this.lastEngineState !== 'ok') {
+          this.lastEngineState = 'ok';
+          diagNote('engine', `引擎已连上：${baseUrl}`);
+        }
         return { ok: true };
       } catch (error) {
         // 见取舍 2：失败不置标记，下次还能重试
         this.connected = false;
+        /*
+         * ★ 引擎连不上要留痕（2026-11-12）。
+         *
+         * 用户报「过一段时间自动闪退」时，我完全不知道引擎当时是死是活 ——
+         * 而这恰恰是最可能的变量。只在**状态变化**时记一条：
+         *
+         * ```text
+         *   ok → fail     记（引擎掉了）
+         *   fail → fail   不记（每 2 秒一次会刷爆环形日志）
+         * ```
+         */
+        if (this.lastEngineState !== 'fail') {
+          this.lastEngineState = 'fail';
+          const detail = describeBridgeError(error).message;
+          diagNote('engine', `引擎连不上（${baseUrl}）：${detail}`);
+        }
         return { ok: false, error };
       } finally {
         this.connecting = null;
@@ -4772,9 +5175,44 @@ export class AppShell {
   ): Promise<string[] | null> {
     const problems: string[] = [];
 
-    /* ── ① 秘钥：写 ST 的 secrets（`api_key_<源>`）── */
+    /*
+     * ── ① 秘钥：核对引擎里这个源**到底有没有**可用 key ──
+     *
+     * ★★★ 这里原来有个致命的条件：只有"这次填了新 key"才核对。
+     *
+     * ```ts
+     *   if (apiKey !== null && apiKey.trim() !== '') { …核对… }
+     * ```
+     *
+     * ## 它造成的完整事故链（2026-11-12 真机取证）
+     *
+     * 用户报「填了秘钥，还是 401」并说"点保存后提示已保存"。
+     * 直连他手机的 ST 读 `/api/secrets/read`：**52 个槽位全是 null**。
+     * 也就是说 key 一个字节都没进去，而界面一路说成功。
+     *
+     * ```text
+     *   ① api-page 拿到的 rawKey 是 null（原因待查，见下面的日志）
+     *   ② 这一步因为 apiKey === null 直接跳过核对
+     *   ③ problems 为空 ⇒ stOk = true
+     *   ④ 界面显示「已保存（已同步到服务）」
+     *   ⑤ 发消息 → Bearer 为空 → 上游 401
+     * ```
+     *
+     * ## 修法：不管这次填没填，都问引擎"有没有"
+     *
+     * 「不改 key」不等于「不需要 key」。用户点了保存，就该知道
+     * 这个接口现在到底能不能用。
+     *
+     * ## 为什么是 warn 而不是 error
+     *
+     * 有些源**本来就不需要 key**（本地跑的 ollama / koboldcpp / vLLM，
+     * 地址是回环或局域网）。对它们硬报错会让用户没法保存。
+     *
+     * 所以：`custom` 源 + 回环地址 ⇒ 不要求 key（它就是本地服务）；
+     * 其余情况没有 key ⇒ 明确提示"发消息会失败"，但不阻断保存。
+     */
     let keyWritten = false;
-    if (apiKey !== null && apiKey.trim() !== '') {
+    {
       const secretKey = secretKeyOf(state.source);
       try {
         /*
@@ -4808,14 +5246,29 @@ export class AppShell {
          * 那个函数已改成与 `readSecret` 完全一致（只认 active:true）。
          */
         const present = await this.withConnection(() => this.bridge.secretPresent());
-        if (!present.includes(secretKey)) {
+        if (present.includes(secretKey)) {
+          keyWritten = true;
+        } else if (apiKey !== null && apiKey.trim() !== '') {
+          /* 这次填了，引擎里却没有 ⇒ 写入本身失败了，这是硬错误 */
           problems.push(
             `秘钥没在引擎里生效（${secretKey} 找不到 active 记录）。` +
               '再点一次保存；还不行就说明引擎没连上。',
           );
-        } else {
-          keyWritten = true;
+        } else if (!isLocalEndpoint(state.baseUrl)) {
+          /*
+           * 这次没填、引擎里也没有 ⇒ 用户以为配好了，实际必然失败。
+           *
+           * 这是本次修复的核心：原来这种情况**什么都不说**，界面还显示
+           * "已保存（已同步到服务）"。用户只能等到发消息看到 401 才知道。
+           *
+           * 文案要说清两件事：现在什么状态、下一步做什么。
+           */
+          problems.push(
+            `这个接口还没有可用的秘钥 —— 现在发消息会失败。` +
+              '把 key 粘贴到上面的输入框，再点一次保存。',
+          );
         }
+        /* 没填 + 本地服务 ⇒ 不需要 key，不报 */
       } catch (error) {
         /*
          * 写不进去**必须报**：只改源和模型而不写 key，等于把用户
@@ -6203,11 +6656,39 @@ export class AppShell {
    * 那条路里已经处理了三态判定（`missing`/`empty`/`malformed` 都不自动建聊天），
    * 另写一遍必然漏掉其中一种，而 `malformed` 漏掉的后果是
    * "用空历史覆盖真实文件"（save 是全量覆盖），不可逆。
+   *
+   * ## ★★★ 只在**真的读到了**才记文件名（2026-11-14）
+   *
+   * 原来这里无条件 `this.chatFileName = fileName`。而 `loadChat` 失败时
+   * 面板内部已经把 `fileName` 置 null —— 于是**面板说没文件、外壳说有文件**。
+   *
+   * 真机上抓到的样子（vivo，`engine-8000.log`）：
+   *
+   * ```text
+   *   File not found: …/威廉/新聊天 - 2026-11-14@19h57m46s.jsonl.
+   *     The chat does not exist or is empty.
+   * ```
+   *
+   * 那是「开始新聊天」先 write 一个空文件、再 load 它自己写的东西 ——
+   * ST 把"空"和"不存在"报成同一句，于是刷一条看起来很吓人的 W。
+   *
+   * 现在失败就不记名字（保持 null），让用户的下一条消息按"新对话"处理，
+   * 由 `shouldStartNewChatFile` 那道闸决定什么时候真的建档。
    */
-  private async openChatFile(avatar: string, fileName: string): Promise<void> {
-    await this.chatPanel?.loadChat(avatar, fileName);
-    this.chatFileName = fileName;
-    this.persistSession();
+  private async openChatFile(avatar: string, fileName: string): Promise<boolean> {
+    const loaded = (await this.chatPanel?.loadChat(avatar, fileName)) ?? false;
+    if (loaded) {
+      this.chatFileName = fileName;
+      this.persistSession();
+    } else {
+      /*
+       * 读不到 ⇒ 指针保持"没有文件"。**不要**在这里把 selectedCharacter 清掉：
+       * 用户还在这个角色的上下文里，只是这一段读不出来。
+       */
+      this.chatFileName = null;
+      this.persistSession();
+    }
+    return loaded;
   }
 
   /** 当前是否已打开一段对话（"聊天操作"里依赖它的项要禁用） */
@@ -6246,6 +6727,25 @@ export class AppShell {
     ): Promise<ChatActionOutcome & { fileName?: string }> => {
       const avatar = this.selectedCharacter?.avatar ?? null;
       if (avatar === null) return { ok: false, detail: '先选一个角色。' };
+      /*
+       * ★★★ 空内容一律不建文件（2026-11-14）。
+       *
+       * `saveAs` 是唯一一个"用新文件名写盘"的入口，而新名字不覆盖任何东西
+       * —— 所以它**不会**造成数据丢失，只会造成垃圾：
+       *
+       * ```text
+       *   每调一次 ⇒ 角色目录里多一个 chat_items: 0 的空壳 jsonl
+       * ```
+       *
+       * 用户视频里那 8 个「2027 条」的同类就是这么攒出来的
+       * （另一个来源是 `onNewChat`，已改成完全不写）。
+       *
+       * 上游「保存检查点」本来也判了空，这里再判一次是因为
+       * **判据要钉在最靠近副作用的地方** —— 上游多一个调用点就漏一次。
+       */
+      if (messages.length === 0) {
+        return { ok: false, detail: '当前对话是空的，没有可保存的内容。' };
+      }
       try {
         /*
          * 文件名必须**独一无二**：ST 的 `chats/save` 是整份覆盖，
@@ -6291,21 +6791,61 @@ export class AppShell {
         return saveAs(name, messages);
       },
 
+      /*
+       * 「开始新聊天」= **只清前端状态，不写文件**（2026-11-14 修）。
+       *
+       * ## 原来的做法与它的三个后果
+       *
+       * 原来调 `saveAs('新聊天', [])`，也就是立刻往 ST 写一个**空 jsonl**，
+       * 再 `openChatFile()` 把它读回来。真机日志（vivo）里留下的痕迹：
+       *
+       * ```text
+       *   File not found: …/威廉/新聊天 - 2026-11-14@19h57m46s.jsonl.
+       *     The chat does not exist or is empty.
+       *   Deleted file: …/威廉/新聊天 - 2026-11-14@19h57m46s.jsonl
+       * ```
+       *
+       * ```text
+       *   ① 每点一次「开始新聊天」就多一个空壳文件
+       *      —— 正是前两天用户截图里那 8 个「2027 条」垃圾的同类
+       *   ② 写完之后立刻读它，ST 把"空"报成"不存在" ⇒ 一条 W 级错误
+       *      用户看日志会以为记录丢了，实际是我们自己刚造的空文件
+       *   ③ 读完失败还会把 chatFileName 指过去（已在上游修掉）
+       * ```
+       *
+       * ## 现在：什么都不写，等第一句话
+       *
+       * `chatPanel.newChat()` 会清空消息、注入开场白、回调 `onChatChanged`；
+       * 而 `handleChatChanged` 里那道 `shouldStartNewChatFile` 闸
+       * 明确"只有开场白不建档"。⇒ **用户真的发出第一句话时才建文件**。
+       *
+       * 这也正是 ST 自己的行为（它的「Start new chat」只清 DOM）。
+       *
+       * ## 没说话就退出会怎样
+       *
+       * `chatFileName` 是 null，localStorage 里也是 null ⇒ 下次进 App
+       * `restoreLatestChat` 会找回上一段。**什么都没说，等于没开新段** ——
+       * 这比"留一个空文件等他回来发现是空的"合理得多。
+       */
       onNewChat: async () => {
         const avatar = this.selectedCharacter?.avatar ?? null;
         if (avatar === null) return { ok: false, detail: '先选一个角色。' };
+
         /*
-         * 建一个**空聊天文件**而不是"只清前端状态"。
+         * 先清指针，再让面板清消息 —— 顺序不能反。
          *
-         * 只清前端的话，用户下次说话时会存回**原来那个文件名** ——
-         * 于是"新聊天"把旧聊天覆盖了。用户以为开了新的一段，
-         * 实际上把上一段冲掉了，这是不可逆的。
+         * `newChat()` 会回调 `onChatChanged`，如果那一刻 `chatFileName`
+         * 还是旧值，保存就会写进**上一段**（把旧聊天覆盖成开场白）。
          */
-        const outcome = await saveAs('新聊天', []);
-        if (!outcome.ok) return outcome;
-        const fileName = outcome.fileName ?? null;
-        if (fileName !== null) await this.openChatFile(avatar, fileName);
-        return { ok: true, detail: `已开一段新对话（${fileName ?? '新聊天'}）。` };
+        this.chatFileName = null;
+        this.chatSnapshot = null;
+        this.lastSavedFingerprint = null;
+
+        this.chatPanel?.newChat(avatar, this.selectedCharacter?.name);
+        this.persistSession();
+        this.renderPage();
+
+        return { ok: true, detail: '已开一段新对话，说第一句话就会保存成新文件。' };
       },
 
       onCloseChat: () => {
@@ -6398,21 +6938,181 @@ export class AppShell {
       onOpen: async (id) => {
         const avatar = this.selectedCharacter?.avatar ?? null;
         if (avatar === null) return;
-        await this.openChatFile(avatar, id);
+        const loaded = await this.openChatFile(avatar, id);
+        /*
+         * 读不到就**留在文件列表页**（2026-11-14）。
+         *
+         * 原来不管成没成都跳回聊天页，于是用户看到一段空对话 +
+         * 一条顶部提示，而"哪一条没读出来"这个信息已经丢了 ——
+         * 他还得重新进列表才知道。
+         */
+        if (!loaded) return;
         this.chatSettingsRoute = null;
         this.renderPage();
       },
       onRename: async (id, newName) => {
         const avatar = this.selectedCharacter?.avatar ?? null;
         if (avatar === null) return { ok: false, detail: '先选一个角色。' };
+
+        /*
+         * 空名字直接拦掉（2026-11-15）。
+         *
+         * 空格子点保存 → `renamed_file = ".jsonl"` → ST 那边
+         * `path.parse('.jsonl').name = '.jsonl'`（点开头的隐藏文件）
+         * ⇒ 一个看不见的聊天文件。用户此后既找不到也删不掉。
+         */
+        const trimmed = newName.trim();
+        if (trimmed === '') return { ok: false, detail: '名字不能是空的。' };
+
+        /*
+         * ★★★ 先在本地查重，别让 ST 用 400 回我们（2026-11-15）。
+         *
+         * ST 的 `/rename` 在目标文件已存在时返回 **400**，而那个 400 与
+         * "源文件不存在"的 400 **是同一个状态码**（它只回 `{error:true}`）。
+         *
+         * ```js
+         *   if (!fs.existsSync(pathToOriginalFile) || fs.existsSync(pathToRenamedFile)) {
+         *       return response.status(400).send({ error: true });
+         *   }
+         * ```
+         *
+         * 用户看到的是「改名失败：/api/chats/rename 返回 HTTP 400」，
+         * 而他唯一能做的动作就是"再点一次"或"换个名字瞎试"。
+         *
+         * 列表就在手上，所以这里自己判：
+         *
+         * ```text
+         *   重名（且不是自己）⇒ "已经有同名的，换一个"     精准、可行动
+         *   其余 400        ⇒ 保留原始错误 + 提示可能是文件已被删
+         * ```
+         *
+         * 判重必须排除**自己**：把「A」改成「A」是不该报错的（用户可能只改了
+         * 首尾空格，trim 之后与原 id 相同）。
+         */
         try {
-          await this.withConnection(() => this.bridge.renameChat(avatar, id, newName));
-          /* 改的是当前这条 ⇒ 会话指针的名字也要跟着改，否则下次打开找不到 */
-          if (this.chatFileName === id) {
-            this.chatFileName = newName;
-            this.persistSession();
+          const listRaw = await this.withConnection(() => this.bridge.listChatsRaw(avatar));
+          const rows = parseChatFileRows(listRaw, this.chatFileName ?? null);
+          const clash = rows.some((row) => row.id === trimmed && row.id !== id);
+          if (clash) {
+            return { ok: false, detail: `已经有叫「${trimmed}」的聊天文件了，换一个名字。` };
           }
-          return { ok: true, detail: `已改名为「${newName}」。` };
+        } catch {
+          /*
+           * 列表读不到就**不阻断改名** —— 它只是"提前给个好提示"的优化，
+           * 不是正确性的一部分。真重名时 ST 那边还会用 400 兜住。
+           */
+        }
+
+        try {
+          const raw = await this.withConnection(() => this.bridge.renameChat(avatar, id, trimmed));
+
+          /*
+           * ★★★ 用 ST 返回的名字，不是用户输入的名字（2026-11-15）。
+           *
+           * ST 那侧过了一遍 `sanitize()`（`sanitize-filename` 包）：
+           * 非法字符会被删掉、结尾的点和空格会被去掉、超长会截断。
+           * 然后它回一个 `sanitizedFileName`（**不带扩展名**）。
+           *
+           * ```text
+           *   用户输入  a/b:c   → 实际文件  abc.jsonl
+           *   记成 a/b:c 的话，下次按这个名字读 ⇒ 404 ⇒ 又"记录没了"
+           * ```
+           *
+           * 所以指针必须记**磁盘上真实的名字**。拿不到回退值时才用输入名，
+           * 并把这件事说给用户（`detail` 里带上实际名字，他就能对上）。
+           */
+          let sanitized = '';
+          try {
+            const parsed = JSON.parse(raw === '' ? '{}' : raw) as { sanitizedFileName?: unknown };
+            sanitized = typeof parsed.sanitizedFileName === 'string' ? parsed.sanitizedFileName.trim() : '';
+          } catch {
+            /* 返回不是 JSON ⇒ 当没有回传值，走下面的回退 */
+          }
+          const finalName = sanitized === '' ? trimmed : sanitized;
+
+          diagNote(
+            'note',
+            `[会话] 改名 ${id} → ${finalName}` +
+              `${sanitized === '' ? '（ST 未回传，用输入名）' : ''}` +
+              ` 指针原值=${this.chatFileName ?? 'null'}`,
+          );
+
+          /*
+           * ★★★★★ 改的是"当前这段"⇒ 必须按新名字**重新打开一次**（2026-11-15）。
+           *
+           * ## 为什么只是"把指针改成 finalName"不够
+           *
+           * 昨天的版本就只改了指针。用户操作是「改名 → 回聊天页 → 发一句话 →
+           * 杀进程重进」，结果记录没了。日志里的证据：
+           *
+           * ```text
+           *   engine：Successfully renamed chat file.        ← 改名确实成功
+           *   16:22 重进后的请求里第 4 条是**开场白**       ← 打开的是新的一段
+           *   15:45→16:22 之间没有任何 save / 删除错误
+           * ```
+           *
+           * 也就是说：改名成功了，但**重进时按某个名字读不到**，于是走了
+           * "空聊天 → 发一句话 → 建档"那条路，那段历史就被"新的 2 条"顶掉了。
+           *
+           * ## 改指针解决不了的那种情况
+           *
+           * ```text
+           *   改名时 this.chatFileName 是 null（上一次恢复就没成功）
+           *   ⇒ `chatFileName === id` 不成立 ⇒ 指针不更新 ⇒ localStorage 里
+           *      还是旧名字/空 ⇒ 重进按旧名字读 ⇒ 那个文件已被改名删掉 ⇒ 读不到
+           * ```
+           *
+           * 所以判断条件要放宽到"快照指向它"也算当前；而且改完之后
+           * **真的去读一次** —— 读成功才算这件事办完了。
+           *
+           * 这一步同时是**验证**：如果新名字读不回内容，说明 ST 的 sanitize
+           * 结果与回传值不一致（或文件没落地），必须当场告诉用户，
+           * 而不是等他第二天来报"记录没了"。
+           */
+          const wasCurrent = this.chatFileName === id || this.chatSnapshot?.fileName === id;
+
+          if (wasCurrent) {
+            this.chatFileName = finalName;
+            if (this.chatSnapshot !== null) {
+              this.chatSnapshot = { ...this.chatSnapshot, fileName: finalName };
+            }
+            this.persistSession();
+
+            const reopened = await this.openChatFile(avatar, finalName);
+            diagNote(
+              'note',
+              `[会话] 改名后重开 finalName=${finalName} 结果=${reopened ? 'ok' : 'miss'}`,
+            );
+            if (!reopened) {
+              /*
+               * 改名成功但读不回来 —— 这是**必须出声**的状态：
+               * 用户以为"改完了继续聊"，而下一句话会写进一个新文件、
+               * 把这段历史的连续性断掉。
+               */
+              return {
+                ok: true,
+                detail:
+                  `已改名为「${finalName}」，但按新名字读不回内容。` +
+                  '请在列表里点「打开」确认一下——如果打不开，说明这个名字没落地。',
+              };
+            }
+          }
+
+          /*
+           * 改的不是当前这段 ⇒ 只同步快照（如果它恰好指向它），不动指针。
+           * 面板不用管：用户切回去时会按快照重建。
+           */
+          if (!wasCurrent && this.chatSnapshot !== null && this.chatSnapshot.fileName === id) {
+            this.chatSnapshot = { ...this.chatSnapshot, fileName: finalName };
+          }
+
+          return {
+            ok: true,
+            detail:
+              finalName === trimmed
+                ? `已改名为「${finalName}」。`
+                : `已改名为「${finalName}」（原名字里有不能用的字符，已自动调整）。`,
+          };
         } catch (error) {
           return { ok: false, detail: `改名失败：${describeBridgeError(error).message}` };
         }
@@ -6433,6 +7133,95 @@ export class AppShell {
         } catch (error) {
           return { ok: false, detail: `删除失败：${describeBridgeError(error).message}` };
         }
+      },
+      /*
+       * 导出这段聊天为 TXT 并起分享面板（2026-11-14，v0.1.9）。
+       *
+       * ## 三步：读 → 转 → 分享
+       *
+       * 转那一步是纯函数（`shared/src/chat/chat-export.ts`），
+       * 五条容易做错的细节都在它的判据里（不是在这里）。
+       *
+       * ## 为什么不用 `panel.getMessages()`
+       *
+       * 面板手上的只是**当前打开的那一段**。用户在这一页可以导出任何一条
+       * 历史聊天，所以必须按 `id` 现读 —— 用面板的消息会把 A 段的内容
+       * 存成 B 段的文件名。
+       *
+       * ## 失败不抛，返回 `{ ok, detail }`
+       *
+       * 界面把 `detail` 直接显示在状态条上。抛异常会让每个调用点各写一遍捕获。
+       */
+      onExport: async (id, name) => {
+        const avatar = this.selectedCharacter?.avatar ?? null;
+        if (avatar === null) return { ok: false, detail: '先选一个角色。' };
+
+        let raw = '';
+        try {
+          raw = await this.withConnection(() => this.bridge.loadChatRaw(avatar, id));
+        } catch (error) {
+          return { ok: false, detail: `读不到这段聊天：${describeBridgeError(error).message}` };
+        }
+
+        let messages: StChatMessage[] = [];
+        try {
+          const parsed = parseChatResponse(JSON.parse(raw === '' ? '{}' : raw) as unknown);
+          if (parsed.kind !== 'chat') {
+            /*
+             * `missing` / `empty` / `malformed` 三种都不是"可以导出"的状态。
+             * 尤其是 `malformed`：导出一个空文件让用户以为记录丢了，
+             * 而实际是读取环节出了问题 —— 两者必须分开说。
+             */
+            return {
+              ok: false,
+              detail:
+                parsed.kind === 'missing'
+                  ? '这个聊天文件不在了（可能刚被删掉）。'
+                  : '这段聊天的内容读不出来，没法导出。',
+            };
+          }
+          messages = parsed.messages;
+        } catch {
+          return { ok: false, detail: '这段聊天的内容读不出来，没法导出。' };
+        }
+
+        const characterName = this.selectedCharacter?.name ?? '';
+        const exported = chatToText(messages, {
+          characterName,
+          userName: this.currentUserName(),
+        });
+
+        /*
+         * `shareText` 是原生方法，**必须直接调不能解引用**（§125）：
+         * `const f = bridge.shareText; f(...)` 会报 "non-injected object"。
+         */
+        const bridge = (globalThis as { __ST_ENGINE__?: { shareText?: (t: string, n: string) => string } })
+          .__ST_ENGINE__;
+        if (typeof bridge?.shareText !== 'function') {
+          return { ok: false, detail: '这台设备不支持导出。' };
+        }
+
+        let reply: { ok?: boolean; error?: string; bytes?: number } = {};
+        try {
+          reply = JSON.parse(
+            bridge.shareText(exported.text, chatExportFileName(characterName)),
+          ) as typeof reply;
+        } catch {
+          return { ok: false, detail: '导出失败（返回的不是有效数据）。' };
+        }
+
+        if (reply.ok !== true) return { ok: false, detail: reply.error ?? '导出失败。' };
+
+        /*
+         * 说清"导出了几条"而不是"已导出" ——
+         * 后者在空聊天时会骗人（那种情况也"导出成功"了，但一条都没有）。
+         */
+        return {
+          ok: true,
+          detail: exported.empty
+            ? '这段聊天还没有记录，已导出说明文本。'
+            : `已导出 ${String(exported.count)} 条，选择应用打开即可。`,
+        };
       },
     };
   }
@@ -6999,7 +7788,7 @@ export class AppShell {
        */
       panel.setMessages(
         this.chatSnapshot.messages,
-        this.chatSnapshot.fileName,
+        this.chatSnapshot.fileName ?? undefined,
         this.selectedCharacter?.avatar,
       );
       /*
@@ -7145,8 +7934,32 @@ export class AppShell {
      *
      * 一成功就停；**"确实没有历史"也停**（那不是网络问题，重试没意义）。
      */
+    /*
+     * ★★★★★ 标记"这个角色的历史还在读"（2026-11-14）。
+     *
+     * ## 不标记会怎样
+     *
+     * ```
+     * 点角色 → chatFileName = null
+     *        → 本函数开始异步读历史（可能重试到 60 秒）
+     *        → 期间 applyOpening() 注入开场白 ⇒ handleChatChanged
+     *        → 见 chatFileName 是 null ⇒ **新建一个空文件并落盘**
+     *        → 新文件 mtime 最新 ⇒ 下次 findLatestChat 挑中它
+     *        → 真正的历史从此打不开
+     * ```
+     *
+     * 用户看到的正是"上午的记录没了"，而磁盘上那份 jsonl 还在。
+     *
+     * 标记期间 `handleChatChanged` 只更新快照、不建档不落盘。
+     * 恢复成功后 `tryLoadInto` 会设好 `chatFileName`，之后再聊就正常写。
+     *
+     * `finally` 清标记：中途 return（换了角色、超时）也必须清，
+     * 否则这个角色从此永远"恢复中"，新聊天再也存不下来。
+     */
+    this.restoringAvatar = avatar;
     const deadline = Date.now() + 60_000;
-    for (let attempt = 0; ; attempt += 1) {
+    try {
+      for (let attempt = 0; ; attempt += 1) {
       /*
        * 用户可能在这期间换了角色 —— 立刻放弃，不要让旧角色的历史
        * 覆盖到他新选的角色上（表现为"选 B 结果出来 A 的对话"）。
@@ -7176,8 +7989,66 @@ export class AppShell {
        */
       await this.ensureConnected();
 
-      const latest = preferred ?? (await this.findLatestChat(avatar));
-      if (latest !== null && (await this.tryLoadInto(avatar, latest))) return;
+      /*
+       * ★★★ 两轮：先用首选名，失败再自己找（2026-11-15）。
+       *
+       * ## 原来只有一轮，而且首选名失败会**一直重试那个坏名字**
+       *
+       * ```ts
+       *   const latest = preferred ?? (await this.findLatestChat(avatar));
+       *   if (latest !== null && (await this.tryLoadInto(avatar, latest))) return;
+       *   // ↑ 失败就等 2 秒再来，`preferred` 还是那个不存在的名字
+       * ```
+       *
+       * 后果：只要 localStorage 里的首选名失效（文件被改名/删除），
+       * 就会**空转 60 秒**，然后放弃 ⇒ 界面空白 ⇒ 用户发一句话 ⇒
+       * 建档成新文件 ⇒ 看起来"记录全没了"。
+       *
+       * 改名场景下这个坑必然触发：改名把旧名字的文件删了，而
+       * localStorage 里还留着旧名字。
+       *
+       * ## 现在
+       *
+       * ```text
+       *   首选名读成功      → 用它
+       *   首选名读不到      → 立刻改成"从列表里找最新的"（不再空转）
+       * ```
+       *
+       * 只在 `preferred` 与 `findLatestChat` 结果不同时才多一次尝试，
+       * 所以正常情况下开销没变。
+       */
+      const tried: string[] = [];
+      const first = preferred ?? (await this.findLatestChat(avatar));
+      if (first !== null) {
+        tried.push(first);
+        const ok = await this.tryLoadInto(avatar, first);
+        diagNote(
+          'note',
+          `[会话] 恢复首选 fileName=${first} 结果=${ok ? 'ok' : 'miss'} ` +
+            `来源=${preferred === null ? 'findLatest' : 'preferred'}`,
+        );
+        if (ok) return;
+      } else {
+        diagNote('note', '[会话] 恢复：列表里没有可用的聊天文件');
+      }
+
+      /*
+       * 首选名失效 ⇒ 换"列表里最新的那条"再试一次。
+       *
+       * 不重试同一个名字（那样只会空转到超时），但也不放弃 ——
+       * 磁盘上很可能有一段完好的历史，只是名字对不上。
+       */
+      if (preferred !== null && preferred !== undefined) {
+        const fallback = await this.findLatestChat(avatar);
+        if (fallback !== null && !tried.includes(fallback)) {
+          const ok = await this.tryLoadInto(avatar, fallback);
+          diagNote(
+            'note',
+            `[会话] 恢复回退 fileName=${fallback} 结果=${ok ? 'ok' : 'miss'}`,
+          );
+          if (ok) return;
+        }
+      }
 
       /*
        * `findLatestChat` 返回 null 有两种含义：**真的没有历史**，
@@ -7185,8 +8056,19 @@ export class AppShell {
        * 这里无法区分，所以统一按"可能是引擎没起"重试到超时 ——
        * 代价只是没有历史的用户多轮询几次（每次一个 HTTP 请求，无副作用）。
        */
-      if (Date.now() >= deadline) return;
+      if (Date.now() >= deadline) {
+        diagNote('note', `[会话] 恢复放弃（超时）已试=${tried.join('|')}`);
+        return;
+      }
       await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    } finally {
+      /*
+       * 只清自己设的标记：用户中途换了角色时，另一个
+       * `restoreLatestChat` 可能已经把标记改成了新角色 ——
+       * 无条件清空会放行旧角色的保存。
+       */
+      if (this.restoringAvatar === avatar) this.restoringAvatar = null;
     }
   }
 
@@ -7219,6 +8101,11 @@ export class AppShell {
       }
       this.chatFileName = latest;
       this.chatSnapshot = { fileName: latest, messages: parsed.messages.slice() };
+      diagNote(
+        'note',
+        `[会话] 读回 ${latest} 条数=${String(parsed.messages.length)}` +
+          ` 有user=${String(parsed.messages.some((one) => one.is_user === true))}`,
+      );
       // 已经存过的内容，指纹要对上，否则首次发消息会重复存一遍
       this.lastSavedFingerprint = chatFingerprint(parsed.messages);
       /*
@@ -7257,7 +8144,45 @@ export class AppShell {
    * `persistChat()` 里，有重试与提示。
    */
   private persistSession(): void {
-    if (this.selectedCharacter === null) return;
+    if (this.selectedCharacter === null) {
+      /*
+       * ★ 记一条（2026-11-15）。
+       *
+       * "没存上"和"存上了但没被用"在用户眼里一样，在我们眼里必须分开。
+       * 用户报过两次"记录没了"，两次都因为**没有任何指针日志**而无法定案。
+       */
+      diagNote('note', '[会话] 未写入会话：还没选角色');
+      return;
+    }
+    /*
+     * ★★★ 每次落盘都记一行（2026-11-15）。
+     *
+     * ## 为什么要记
+     *
+     * 用户报「改名后记录没了」，我们能拿到的证据只有：
+     *
+     * ```text
+     *   engine-8000.log  → 改名成功、之后没有任何报错
+     *   app-001-.log     → 只有启动/退出，**没有一行提到指针指向谁**
+     * ```
+     *
+     * 于是"重进时首选了哪个文件"这个**唯一关键事实**无从得知 ——
+     * 只能靠推理（而推理已经错过一次）。
+     *
+     * 现在一行说清三件事：
+     *
+     * ```text
+     *   avatar   哪个角色
+     *   fileName 指针现在指向谁（null = 没有）
+     *   hasSnap  快照在不在（区分"有指针没内容"与"两者都没有"）
+     * ```
+     */
+    diagNote(
+      'note',
+      `[会话] 写入会话 avatar=${this.selectedCharacter.avatar} ` +
+        `fileName=${this.chatFileName ?? 'null'} ` +
+        `hasSnap=${this.chatSnapshot === null ? 'no' : 'yes'}`,
+    );
     this.options.onPersistSession?.({
       avatar: this.selectedCharacter.avatar,
       name: this.selectedCharacter.name,
@@ -7291,16 +8216,86 @@ export class AppShell {
       const parsed = JSON.parse(raw === '' ? '[]' : raw) as unknown;
       if (!Array.isArray(parsed)) return null;
 
-      let best: { id: string; at: number } | null = null;
+      /*
+       * ★★★★ 空壳文件不该被当成"最近的历史"（2026-11-14）。
+       *
+       * 修好时间解析之后还剩一个问题：**空壳文件的 mtime 确实更新**。
+       *
+       * ```text
+       *   上午：真历史   last_mes = 08:00（ISO），chat_items = 88
+       *   下午：空壳文件 mtimeMs   = 18:47（数字，刚被创建）
+       *   ⇒ 按时间排，空壳仍然赢
+       * ```
+       *
+       * 而"打开最近一次聊天"的用户期待是**接着上次聊**，不是打开一个空壳。
+       * 所以分两轮：
+       *
+       * ```text
+       *   第一轮  只在"有内容"的文件里选最新的
+       *   第二轮  一个都没有（这个角色确实没聊过）才回退到全部
+       * ```
+       *
+       * ## 为什么用 `hasCount` 而不是直接判 count === 0
+       *
+       * `chat_items` 是 ST 才给的字段。如果某个版本没给，`chatFileCount`
+       * 返回 0 —— 直接跳过会导致**所有文件都被跳过**，用户看到空白。
+       * 所以只有"确实读到了条数字段"的条目才参与"是否为空"的判断。
+       */
+      const rows: { id: string; at: number; count: number; hasCount: boolean }[] = [];
       for (const one of parsed) {
         if (one === null || typeof one !== 'object') continue;
         const info = one as Record<string, unknown>;
         const id = info['file_id'];
         if (typeof id !== 'string' || id === '') continue;
-        const at = typeof info['last_mes'] === 'number' ? info['last_mes'] : 0;
-        if (best === null || at > best.at) best = { id, at };
+        /*
+         * ★★★★★ 取时间必须用 shared 的 `chatFileLastAt()`（2026-11-14 修）。
+         *
+         * ## 原来这行是"记录打不开"的直接原因
+         *
+         * ```ts
+         *   const at = typeof info['last_mes'] === 'number' ? info['last_mes'] : 0;
+         * ```
+         *
+         * 而 ST 给 `last_mes` 的**类型取决于文件是否为空**：
+         *
+         * ```text
+         *   非空文件  = "2026-11-11T19:30:00.000Z"   ISO 字符串 → at = 0
+         *   空文件    = 1763107200000                number    → at = 1.7e12
+         * ```
+         *
+         * 于是：
+         *
+         * ```text
+         *   只要存在一个空文件  ⇒ 空文件恒赢 ⇒ 用户打开的是空的
+         *   一个空文件都没有    ⇒ 全部 at=0 ⇒ `at > best.at` 永远假
+         *                        ⇒ **恒返回列表第一个**，不管它多旧
+         * ```
+         *
+         * 用户说的"打开都是同一个聊天记录"就是这个：不是每次都新建，
+         * 而是**每次都挑中同一个**。而它多半是那个空壳文件 ——
+         * 所以看着像"上午的记录没了"。
+         */
+        const at = chatFileLastAt(info);
+        const count = chatFileCount(info);
+        const hasCount = info['chat_items'] !== undefined || info['message_count'] !== undefined;
+        rows.push({ id, at, count, hasCount });
       }
-      return best === null ? null : best.id;
+
+      const pick = (pool: typeof rows): string | null => {
+        let best: { id: string; at: number } | null = null;
+        for (const row of pool) {
+          if (best === null || row.at > best.at) best = { id: row.id, at: row.at };
+        }
+        return best === null ? null : best.id;
+      };
+
+      /* 第一轮：只挑有内容的（`hasCount && count === 0` 明确是空文件） */
+      const withContent = rows.filter((row) => !(row.hasCount && row.count === 0));
+      const fromContent = pick(withContent);
+      if (fromContent !== null) return fromContent;
+
+      /* 第二轮：这个角色的文件全是空的（或都没有条数字段）—— 回退到全部 */
+      return pick(rows);
     } catch {
       // 读不到列表 = 当作"没有历史"，让用户从空聊天开始
       return null;
@@ -7318,8 +8313,184 @@ export class AppShell {
     const avatar = this.selectedCharacter?.avatar ?? null;
     const name = this.selectedCharacter?.name ?? '';
 
-    // 文件名：已有就复用；没有就现造一个（新建聊天首次保存）
+    /*
+     * ★★★★★ 恢复期间**一律不许写盘**（2026-11-15 第三修，这条才是真根因）。
+     *
+     * ## 冷启动的真实时序（每一句都有日志为证）
+     *
+     * ```text
+     *   ① mount()：从 localStorage 恢复 selectedCharacter **和 chatFileName**
+     *      ⇒ 此刻 chatFileName 已经有值（上次那个名字）
+     *
+     *   ② restoreLatestChat(avatar, preferred) 开始 —— 异步，设 restoringAvatar
+     *
+     *   ③ renderChat() 立刻执行：chatSnapshot 是 null（新进程）⇒ 走 newChat()
+     *      ⇒ messages = 只有开场白 ⇒ onChatChanged
+     *
+     *   ④ handleChatChanged：
+     *      chatFileName **不是 null** ⇒ 跳过全部闸门
+     *      ⇒ persistChat(只有开场白) ⇒ ST 的 save 是**整份覆盖**
+     *      ⇒ **真实历史被"开场白"冲掉**
+     *
+     *   ⑤ restoreLatestChat 读到文件 ⇒ 里面就剩开场白 ⇒ 报 "结果=ok"
+     *      ⇒ 日志看起来一切正常，而记录已经没了
+     * ```
+     *
+     * **每启动一次覆盖一次。** 这就是"记录没了"却"恢复 ok"的原因。
+     *
+     * ## 为什么原来那道闸挡不住
+     *
+     * 昨天的闸写在"还没有文件名"的分支里：
+     *
+     * ```ts
+     *   if (this.chatFileName === null && avatar !== null) {
+     *     const restoring = this.restoringAvatar === avatar;   // ← 只在这个分支判
+     *     ...
+     *   }
+     *   if (this.chatFileName !== null) { …保存… }              // ← 有名字就直通
+     * ```
+     *
+     * 它防的是"恢复期间建新文件"，**没防"恢复期间覆盖旧文件"** ——
+     * 而后者才是丢数据的动作。判据当时也只盯了建档那一句。
+     *
+     * ## 现在：闸提到函数级
+     *
+     * ```text
+     *   恢复中 ⇒ 只更新快照，**不建文件、不写盘、不改指针**
+     * ```
+     *
+     * 快照仍要更新：否则这期间切 Tab 回来，开场白就没了（当场可见的退步）。
+     * 但"屏幕上先显示开场白"和"磁盘上把历史覆盖成开场白"是两件完全不同的事。
+     */
+    const restoring = this.restoringAvatar === avatar;
+    if (restoring && avatar !== null) {
+      /*
+       * ★ 恢复期间用户开口了 ⇒ 记一条（2026-11-15）。
+       *
+       * 这种情况下他刚打的那句话会被这次 `return` 丢掉（恢复成功后
+       * 快照会被真实内容覆盖）。窗口通常只有 1–3 秒，概率很低，
+       * 但**丢了就是丢了** —— 至少要留下痕迹，别让它无声无息。
+       *
+       * 不改成"打断恢复去保存"是因为：`chatFileName` 此刻可能指向
+       * 一个还没读到的真实文件，贸然保存就是整份覆盖 —— 正是要防的事。
+       */
+      if (messages.some((one) => one.is_user === true)) {
+        diagNote(
+          'note',
+          `[会话] 恢复期间收到用户消息，暂不写入：条数=${String(messages.length)}` +
+            ` fileName=${this.chatFileName ?? 'null'}`,
+        );
+      }
+      /*
+       * ★ 指针只在它本来就为空时保持为空。
+       *
+       * 有值时**不许动** —— 它指向的那段历史正等着被读回来。
+       * 这里不清空，是因为清空后 `persistSession` 会把 null 写进
+       * localStorage，等于把"上次聊到哪"这件事也一起丢了。
+       */
+      this.chatSnapshot = {
+        fileName: this.chatFileName,
+        messages: messages.slice(),
+        scrollTop: this.chatSnapshot?.scrollTop,
+      };
+      return;
+    }
+
+    /*
+     * ★★★★★ 冷启动保护：**还没从磁盘读过这段，就别拿内容去覆盖它**（2026-11-15）。
+     *
+     * ## 为什么光有时序标记不够
+     *
+     * `mount()` 里的顺序是：
+     *
+     * ```text
+     *   loadCharacterCardWithRetry() → 卡一到就 renderPage()   ← 先发生
+     *   await restoreLatestChat()                               ← 后发生
+     * ```
+     *
+     * 重绘**故意排在恢复前面**（否则用户要对着没有开场白的空屏等一分钟）。
+     * 而 `renderPage()` → `renderChat()` → 快照为 null → `panel.newChat()`
+     * → 注入开场白 → 本函数 —— **这一整串都发生在 `restoringAvatar` 被设上之前**。
+     *
+     * 所以那道时序闸对"启动窗口内"的这一次调用是无效的。
+     *
+     * ## 用"读没读过"来判断，不依赖时序
+     *
+     * ```text
+     *   lastSavedFingerprint === null  ⇒ 本次进程还没成功读过/写过这段
+     *   messages 里没有 user 消息      ⇒ 手里只有开场白
+     *   chatFileName 非 null           ⇒ 它指向一个**可能有历史**的真实文件
+     * ```
+     *
+     * 三条同时成立 ⇒ 这是"临时显示用的开场白"，写下去就是**用开场白
+     * 覆盖掉整段历史**（ST 的 save 是整份覆盖）。必须跳过。
+     *
+     * ## 为什么不误伤正常保存
+     *
+     * ```text
+     *   用户发第一句   hasUser = true          ⇒ 不跳过
+     *   恢复成功之后   lastSavedFingerprint 有值 ⇒ 不跳过
+     *   新建对话        chatFileName 由本函数生成
+     *                  且 messages 必有 user    ⇒ 不跳过
+     * ```
+     *
+     * 唯一被跳过的是"手里只有开场白、又没读过文件"这一种 —— 那本来就
+     * 不该写盘。
+     */
+    const hasUserMessage = messages.some((one) => one.is_user === true);
+    if (
+      this.lastSavedFingerprint === null &&
+      !hasUserMessage &&
+      this.chatFileName !== null
+    ) {
+      diagNote(
+        'note',
+        `[会话] 跳过保存（开场白未覆盖）：fileName=${this.chatFileName} 条数=${String(messages.length)}`,
+      );
+      this.chatSnapshot = {
+        fileName: this.chatFileName,
+        messages: messages.slice(),
+        scrollTop: this.chatSnapshot?.scrollTop,
+      };
+      return;
+    }
+
+    /*
+     * 文件名：已有就复用；没有**看情况**才造（2026-11-14 修）。
+     *
+     * ## 原来"没有就造"的后果
+     *
+     * 切角色必须把 `chatFileName` 清空（否则会写进上一个角色的目录），
+     * 于是每次切角色都走这条分支 —— 而 `applyOpening()` 注入开场白后
+     * 也会调本函数，于是**每切一次角色就多一个只有开场白的文件**。
+     * 用户截图里同一角色 8 个文件全是空壳，就是这个。
+     *
+     * ## 现在的闸
+     *
+     * ```text
+     *   内容里没有用户消息 ⇒ 不造
+     *   只有开场白不算"开始了一段对话"，那只是"他还没开口"
+     * ```
+     *
+     * 过了才建档 —— 也就是用户**真的发了第一句话**时。
+     * （"恢复期间不建"那道闸已经提到函数开头，不再在这里判。）
+     */
     if (this.chatFileName === null && avatar !== null) {
+      if (!shouldStartNewChatFile(messages)) {
+        /*
+         * 不建档，但**快照仍要更新** —— 否则切 Tab 回来开场白就没了
+         * （那是"当场可见"的问题，比"没落盘"更难受）。
+         *
+         * `fileName` 用 `null`：这个字段在本类里**只写不读**
+         * （渲染用的是 `this.chatFileName`），而 `null` 明确表示"没有"。
+         */
+        this.chatSnapshot = {
+          fileName: null,
+          messages: messages.slice(),
+          scrollTop: this.chatSnapshot?.scrollTop,
+        };
+        return;
+      }
       this.chatFileName = makeChatFileName(name);
     }
 
@@ -7391,6 +8562,20 @@ export class AppShell {
             current.messages,
           );
           this.lastSavedFingerprint = fingerprint;
+          /*
+           * ★★ 记下"真的写了多少条"（2026-11-15）。
+           *
+           * 这条日志是被两次"定不了案"逼出来的：用户报"气泡出来了但
+           * 记录没进去"，而日志只能证明"persistSession 被调过" ——
+           * **调过不等于写过**（指纹相同会跳过、并发会排队）。
+           *
+           * 现在每成功写一次就有一行条数，和恢复时的读回条数对得上，
+           * "写没写进去"当场可判。
+           */
+          diagNote(
+            'note',
+            `[会话] 保存成功 ${this.chatFileName} 条数=${String(current.messages.length)}`,
+          );
         } catch (error) {
           /*
            * 保存失败**不打断聊天**：用户正在对话，弹一个红条阻断体验更糟。
@@ -7454,7 +8639,18 @@ export class AppShell {
      * 不各写一份 —— 各写一份必然在 padding / chevron / aria 上慢慢分叉，
      * 而这类分叉只在截图里看得出来（`chat.css` 那边已有过同类教训）。
      */
-    scroller.append(this.renderApiSection(), this.renderVoiceSection());
+    scroller.append(
+      this.renderApiSection(),
+      this.renderVoiceSection(),
+      /*
+       * 诊断日志（2026-11-12）。
+       *
+       * 加这一项的直接原因：用户报「过一段时间自动闪退」，而我们
+       * **拿不到任何日志** —— logcat 要数据线，用户做不到。
+       * 有了这个入口，他闪退后重进 App 点一下就能把原因发回来。
+       */
+      this.renderDiagSection(),
+    );
   }
 
   /* ═══════════════════════════════════════════════════════════
@@ -7606,7 +8802,59 @@ export class AppShell {
          */
         const writer = {
           writeSecret: (key: string, value: string) =>
-            this.withConnection(() => this.bridge.writeSecret(key, value)),
+            /*
+             * ★★★ 写入 + **自证成功**（2026-11-11）。
+             *
+             * ## 为什么必须在这里自证
+             *
+             * 用户报：
+             *
+             * > 我现在尝试了多次，无法更新秘钥
+             *
+             * 而界面每次都显示「已保存」。真机取证（直读 ST 的
+             * `/api/secrets/read`）：`api_key_custom` 里只有一条
+             * `label: "cli-test"` —— 那是**旧探针脚本**写的，
+             * `App 一次都没写进去过`。
+             *
+             * ## 为什么以前的校验看不出来
+             *
+             * 外壳的 `writeApiConnectionToSt()` 只核「`api_key_custom`
+             * 这个名字在不在」。旧的那条一直在 ⇒ **永远通过** ⇒ 显示"已保存"。
+             *
+             * ```text
+             *   写入失败（或压根没调用）
+             *     → secretPresent() 返回 ['api_key_custom']（旧值）
+             *     → 校验通过 → "已保存"
+             * ```
+             *
+             * ## 判据：写入前后比对 active 那条的 id
+             *
+             * key 的值读不回来（掩码），但 id 会变：
+             *
+             * ```text
+             *   ST.writeSecret → 旧的 active=false，push 新 uuid active=true
+             *   ⇒ id 不变 == 没写进去
+             * ```
+             *
+             * 这是唯一可靠的证据。失败就直接抛错 —— 抛了 api-page 才会
+             * 显示红条而不是"已保存"。
+             */
+            this.withConnection(async () => {
+              const before = await this.bridge.secretActiveId(key);
+              const written = await this.bridge.writeSecret(key, value);
+              const after = await this.bridge.secretActiveId(key);
+              if (after === null || after === before) {
+                /*
+                 * ★ 用户可见文案里不出现 "ST" 这种内部术语（项目文案红线）。
+                 * 说"聊天服务"就够了 —— 用户知道那指的是引擎。
+                 */
+                throw new Error(
+                  '新密钥没写进聊天服务：写入前后指向同一条记录。' +
+                    '先确认服务在运行，然后重新保存一次。',
+                );
+              }
+              return written;
+            }),
         };
 
         const page = renderApiPage(this.doc, writer, this.apiState, {
@@ -7835,6 +9083,268 @@ export class AppShell {
     return { ...createRecorder(), transcribe: transcriber };
   }
 
+  /**
+   * 「诊断日志」收纳项 —— 让用户自己把崩溃现场取出来（2026-11-12）。
+   *
+   * ## 为什么值得单独做一个界面
+   *
+   * 用户报「进入 APP 后过一段时间自动闪退」，而我为了查它连续猜了三次：
+   *
+   * ```text
+   *   猜内存泄漏  → 实测 263MB 稳定不动，错
+   *   猜 ANR      → 主线程无阻塞迹象，错
+   *   猜前台服务  → 声明完整，无从判断
+   * ```
+   *
+   * 根子在于**没有任何一条现场记录**。修这个比继续猜有用：
+   * 用户闪退后重进 App，点开这一项、复制、发给我，就有真因了。
+   *
+   * ## 副标题就是结论
+   *
+   * 不展开也能看到"上次是正常退出还是异常结束" —— 那是最关键的一条信息，
+   * 藏进面板里等于没有（用户不会为了看结论先展开）。
+   */
+  private renderDiagSection(): ElLike {
+    const boot = this.diagBoot();
+    const entries = readDiagEntries();
+    const errorCount = entries.filter(
+      (one) => one.kind === 'error' || one.kind === 'unhandledrejection',
+    ).length;
+    const status = nativeStatus();
+
+    /*
+     * 副标题只说**能被用户理解**的事：
+     *
+     * ```text
+     *   "上次异常结束"  → 他心里"对，就是它崩了"
+     *   "0x00000008"   → 无意义
+     * ```
+     */
+    /*
+     * 副标题要一眼回答两件事：**上次崩没崩**、**日志有多大**。
+     *
+     * 后者是用户要求的直接来源：
+     *
+     * > 日志需要能够让用户方便快速的找到并可以传输的方式
+     *
+     * 只说"已记录"没用 —— 他要知道该不该先导出（快满了就得先导）。
+     */
+    const sizeText =
+      status === null
+        ? ''
+        : ` · ${(status.totalBytes / 1024 / 1024).toFixed(1)}/${String(Math.round(status.limitBytes / 1024 / 1024))}MB`;
+    /*
+     * ★★★ 这里不许出现 markdown 强调语法（2026-11-13，用户截图报的）。
+     *
+     * 原来写的是 `上次**异常结束**` —— 那四个星号是我在**注释里**习惯用
+     * `**重点**` 的写法，直接漏进了用户可见文案。真机上副标题显示成：
+     *
+     * ```text
+     *   上次**异常结束** · 共 0 条 · 0.0/18MB
+     * ```
+     *
+     * `textContent` 不做 markdown 渲染，星号就是四个字符。
+     *
+     * 判断标准很简单：**用户看到的每一个字符都得是有意义的**。
+     * 要强调就靠措辞和位置，不靠星号 —— 这里本来也没有富文本能力。
+     */
+    const subtitle = boot.lastExitClean
+      ? `上次正常退出 · 共 ${String(entries.length)} 条${sizeText}`
+      : `上次异常结束${errorCount > 0 ? `（有 ${String(errorCount)} 条报错）` : ''} · 共 ${String(entries.length)} 条${sizeText}`;
+
+    return this.renderAccordion({
+      entryRole: 'diag-entry',
+      panelRole: 'diag-panel',
+      title: '诊断日志',
+      subtitle,
+      expanded: this.diagExpanded,
+      onToggle: () => {
+        this.diagExpanded = !this.diagExpanded;
+        return true;
+      },
+      buildBody: () => {
+        const body = el(this.doc, 'div', 'nb-diag-body');
+        body.setAttribute('data-role', 'diag-body');
+
+        const note = el(this.doc, 'p', 'nb-note');
+        note.textContent =
+          '闪退后重新打开 App，这里会显示上次是怎么结束的。把下面的内容复制出来发给开发者，就能定位问题。';
+        body.append(note);
+
+        /*
+         * 日志文件在哪 + 多大（2026-11-12 用户要求）。
+         *
+         * 用户原话：
+         *
+         * > 最好是放在用户无 root 时可以访问的目录，这样在应用反复崩溃时
+         * > 也可以拿到 APP 日志
+         *
+         * 所以这里要把路径明写出来 —— 他能照着去电脑上找。同时说明
+         * "导出到 Download"更省事（Android 11+ 文件管理器进不去 Android/data）。
+         */
+        if (status !== null) {
+          /*
+           * ★★★ 路径**单独成块**，不混在说明文字里（2026-11-13 第二次修）。
+           *
+           * ## 为什么
+           *
+           * 原来是一句话：`日志文件：${status.dir}（N 个文件，…）`。
+           * 而「中文 + 一条 80 字符、没有空格的绝对路径」在真机上会断错位置：
+           * 红米那台把**标题**拆成了「日志文 / 件：/storage/…」。
+           *
+           * 试过两轮 CSS（`overflow-wrap: anywhere` → `break-word`），
+           * 都没解决 —— 断行落点取决于 WebView 版本，**不可预测**。
+           *
+           * ⇒ 改结构：说明是说明，路径是路径。
+           *
+           * ```text
+           *   日志文件（1 个文件，0.0 MB，上限 18 MB）
+           *   ┌──────────────────────────────────────┐
+           *   │ /storage/emulated/0/Android/data/…   │  ← 等宽、可选中复制
+           *   └──────────────────────────────────────┘
+           * ```
+           *
+           * 顺带修好了另一个体验问题：路径现在**能长按复制**，
+           * 用户不必照着手打。
+           *
+           * ★ 文案里也不许出现 "Android 11+" 之外的内部细节 ——
+           *   "自带文件管理器进不去"是用户能理解的事实，保留。
+           */
+          const where = el(this.doc, 'p', 'nb-note');
+          where.setAttribute('data-role', 'diag-where');
+          where.textContent =
+            `日志文件（${String(status.fileCount)} 个文件，` +
+            `${(status.totalBytes / 1024 / 1024).toFixed(1)} MB，上限 ` +
+            `${String(Math.round(status.limitBytes / 1024 / 1024))} MB）：` +
+            '用数据线连电脑即可取。Android 11+ 的手机自带文件管理器进不去这个目录，' +
+            '请用下面的「导出到下载目录」。';
+
+          /*
+           * 路径块挂在同一个段落**后面**（不是段落里面）——
+           * 放进段落里会被段落的文字排版规则管住，又回到断错行的老问题。
+           */
+          const pathEl = el(this.doc, 'div', 'nb-diag-path');
+          pathEl.setAttribute('data-role', 'diag-path');
+          pathEl.textContent = status.dir;
+
+          body.append(where, pathEl);
+        } else {
+          const where = el(this.doc, 'p', 'nb-note');
+          where.setAttribute('data-role', 'diag-where');
+          where.textContent =
+            '当前拿不到原生日志（可能不在安卓上）。下面的内容只存在于本次会话，重启会丢。';
+          body.append(where);
+        }
+
+        const pre = el(this.doc, 'pre', 'nb-diag-pre');
+        pre.setAttribute('data-role', 'diag-text');
+        /*
+         * 只在展开时才拼整份报告：`buildDiagReport()` 要读 localStorage
+         * 并格式化上百行，每次重绘都算一遍是白花钱。
+         */
+        pre.textContent = buildDiagReport();
+        body.append(pre);
+
+        const row = el(this.doc, 'div', 'nb-tag-row');
+
+        /*
+         * 「导出到下载目录」放第一位（2026-11-12）。
+         *
+         * 理由：这是用户**真正用得上**的那一步 —— 复制文本适合一两条报错，
+         * 而闪退要的是完整日志。导出后是 `Download/tcs-log-<时间>.txt`，
+         * 任何文件管理器能开、能长按分享到微信/QQ。
+         */
+        if (status !== null) {
+          const exportBtn = el(this.doc, 'button', 'nb-btn');
+          exportBtn.setAttribute('type', 'button');
+          exportBtn.setAttribute('data-role', 'diag-export');
+          exportBtn.textContent = '导出到下载目录';
+          exportBtn.addEventListener('click', () => {
+            const name = exportNativeLog();
+            if (name === '') {
+              this.options.onNotify?.('导出失败，日志可能还是空的', 'warn');
+              return;
+            }
+            this.options.onNotify?.(`已导出：下载目录 / ${name}`, 'ok');
+          });
+          row.append(exportBtn);
+        }
+
+        const copy = el(this.doc, 'button', 'nb-btn');
+        copy.setAttribute('type', 'button');
+        copy.setAttribute('data-role', 'diag-copy');
+        copy.textContent = '复制全部';
+        copy.addEventListener('click', () => {
+          /*
+           * `navigator.clipboard` 在 WebView 里可能没有（或需要 https）。
+           * 失败不装作成功 —— 改成全选文本，用户手动长按复制，
+           * 并明说这一步（不能让他以为复制好了）。
+           */
+          const text = buildDiagReport();
+          const clipboard = (globalThis as { navigator?: { clipboard?: { writeText?: (t: string) => Promise<void> } } })
+            .navigator?.clipboard;
+          if (clipboard?.writeText !== undefined) {
+            void clipboard.writeText(text).then(
+              () => this.options.onNotify?.('已复制到剪贴板', 'ok'),
+              () => this.selectDiagText(pre),
+            );
+            return;
+          }
+          this.selectDiagText(pre);
+        });
+        row.append(copy);
+
+        const clear = el(this.doc, 'button', 'nb-btn');
+        clear.setAttribute('type', 'button');
+        clear.setAttribute('data-role', 'diag-clear');
+        clear.textContent = '清空日志';
+        clear.addEventListener('click', () => {
+          clearDiagLog();
+          this.options.onNotify?.('诊断日志已清空', 'ok');
+          this.renderPage();
+        });
+        row.append(clear);
+
+        body.append(row);
+        return body;
+      },
+    });
+  }
+
+  /** 读"上次怎么退的" —— 读不到就当正常，别让诊断功能自己成为错误源 */
+  private diagBoot(): { lastExitClean: boolean } {
+    const holder = globalThis as {
+      __TCS_DIAG__?: { boot?: { lastExitClean?: boolean } };
+    };
+    return { lastExitClean: holder.__TCS_DIAG__?.boot?.lastExitClean !== false };
+  }
+
+  /**
+   * 选中预格式化文本（复制失败时的兜底路径，用户长按即可复制）。
+   *
+   * ★ 用 `globalThis.document` 而不是 `this.doc`：`this.doc` 的类型是
+   *   `DocLike`（测试桩的最小接口），上面没有 `createRange`。
+   *   而这条路径只在真 WebView 里走 —— 桩环境里 `document` 不存在，
+   *   直接跳过即可，不需要为它扩展 `DocLike`（那会让所有桩都变重）。
+   */
+  private selectDiagText(pre: ElLike): void {
+    const doc = (globalThis as { document?: { createRange?: () => Range } }).document;
+    const selection = (globalThis as { getSelection?: () => Selection | null }).getSelection?.();
+    if (doc?.createRange === undefined || selection === null || selection === undefined) {
+      this.options.onNotify?.('复制失败，请长按文本手动选择', 'warn');
+      return;
+    }
+    try {
+      const range = doc.createRange();
+      range.selectNodeContents(pre as unknown as Node);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      this.options.onNotify?.('已选中全部文本，长按复制', 'warn');
+    } catch {
+      this.options.onNotify?.('复制失败，请长按文本手动选择', 'warn');
+    }
+  }
+
   private renderVoiceSection(): ElLike {
     return this.renderAccordion({
       entryRole: 'voice-entry',
@@ -7951,6 +9461,18 @@ function readNumberField(source: Record<string, unknown>, key: string): number |
  */
 const NAV_FALLBACK_MS = 600;
 const NAV_EXTRA_MS = 200;
+
+/**
+ * 读角色卡的重试预算（2026-11-11）。
+ *
+ * 为什么是 70 秒：真机首启实测引擎就绪要 **7–57 秒**（见
+ * `restoreLatestChat` 里那段实测记录）。取 57 秒之上留一点余量。
+ *
+ * 为什么读卡要跟读历史一样能等：这两件事开头是同一个阻塞点 ——
+ * 引擎没起。只给历史重试、不给卡重试，就会出现"历史等到了、卡却是空的"
+ * ⇒ 有对话没开场白，而且再也不会自动纠正。
+ */
+const CARD_LOAD_TIMEOUT_MS = 70_000;
 
 function animationBudgetMs(node: ElLike): number {
   const host = globalThis as {

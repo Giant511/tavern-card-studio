@@ -112,8 +112,46 @@ pub enum ShellError {
     #[error("连不上聊天服务：{detail}")]
     StUnavailable { detail: String },
 
-    #[error("{path} 返回 403（已重试：{retried}）—— 通常是会话过期了")]
+    /*
+     * ★★★ `StForbidden` 只留给「ST 自己的 CSRF/会话校验失败」（2026-11-11）。
+     *
+     * 原来它把**所有** 403 都吞进来，文案还写着"通常是会话过期了"。
+     * 真机取证推翻了这句话：
+     *
+     * ```text
+     *   StNode: Streaming request failed with status 403 Forbidden:
+     *   {"error":{"message":"账户额度不足。请检查额度或购买。",
+     *    "type":"new_api_error","code":"pre_consume_token_quota_failed"}}
+     * ```
+     *
+     * 那是**上游中转站**的 403，跟会话一点关系都没有。用户被判成
+     * "会话过期"，去重连、去重登，全都治不好 —— 因为要充钱。
+     *
+     * 而且更糟：原来的逻辑对 403 一律"重连 + 重试一次"。上游按次计费时
+     * **这一次重试也是花钱的**，等于在用户额度已经不足时又刷了他一次。
+     *
+     * 现在按 body 分流：上游错误走 `UpstreamRejected`，**不重试**。
+     */
+    #[error("{path} 返回 403（已重试：{retried}）—— 会话可能过期了")]
     StForbidden { path: String, retried: bool },
+
+    /// 上游 API 服务商拒绝了这次请求（额度、权限、key 状态）。
+    ///
+    /// 与 `StForbidden` 分开是为了三件事：
+    ///
+    /// ```text
+    /// ① 文案：让用户知道"这是服务商那边的事"，不是本机配置错
+    /// ② 动作：不要重连（重连治不好），也不要点重试（白花钱）
+    /// ③ 透传：把服务商原话带出来（"额度不足"这种话只有它说得准）
+    /// ```
+    #[error("接口服务商拒绝了这次请求：{detail}")]
+    UpstreamRejected {
+        path: String,
+        /// 服务商给的原话（尽量原样，别改写 —— 用户要拿去问客服）
+        detail: String,
+        /// 服务商的状态码
+        status: u16,
+    },
 
     #[error("{path} 返回 HTTP {status}：{detail}")]
     StHttpStatus {
@@ -148,6 +186,7 @@ impl ShellError {
             Self::Invalid { .. } => "INVALID_INPUT",
             Self::StUnavailable { .. } => "ST_UNAVAILABLE",
             Self::StForbidden { .. } => "ST_FORBIDDEN",
+            Self::UpstreamRejected { .. } => "UPSTREAM_REJECTED",
             Self::StHttpStatus { .. } => "ST_HTTP_STATUS",
             Self::StBadResponse { .. } => "ST_BAD_RESPONSE",
         }
@@ -211,6 +250,17 @@ impl ShellError {
             Self::StForbidden { path, retried } => {
                 map.insert("path".to_string(), path.clone().into());
                 map.insert("retried".to_string(), (*retried).into());
+            }
+            /*
+             * 上游拒绝：把 `status` 与 `detail` 一起交出去。
+             *
+             * 前端要靠 `detail` 里那句服务商原话（"账户额度不足。"）
+             * 才能告诉用户该干什么 —— 自己编一句"请求失败"等于没说。
+             */
+            Self::UpstreamRejected { path, detail, status } => {
+                map.insert("path".to_string(), path.clone().into());
+                map.insert("detail".to_string(), detail.clone().into());
+                map.insert("status".to_string(), (*status).into());
             }
             Self::StHttpStatus { path, status, .. } => {
                 map.insert("path".to_string(), path.clone().into());

@@ -387,14 +387,66 @@ class StBridge(
              * 所以图片必须走这条：Kotlin 侧读原始字节 → base64 → 前端解码。
              * 缩略图只有 2 KB，base64 约 2.7 KB，完全可接受。
              */
+            /*
+             * ★★★ 响应体**必须限量读**，并在每次读完后记下真实大小
+             * （2026-11-13，荣耀90 的 OOM 之后加的）。
+             *
+             * ## 原来为什么危险
+             *
+             * ```kotlin
+             *   stream.use { it.readBytes() }                    // 有多少读多少
+             *   stream.bufferedReader().use { it.readText() }    // 同上
+             * ```
+             *
+             * 读进来之后还要变形：
+             *
+             * ```text
+             *   二进制  → base64 字符串（×1.34，且 Java 字符是 UTF-16 → ×2 字节）
+             *   文本    → 直接变成 JS 侧的 String（同样 ×2）
+             * ```
+             *
+             * 也就是**一个 76MB 的响应，在 Java 堆里要占约 200MB**。
+             * 那台机的堆上限 384MB、崩溃前已用 206MB ⇒ 正好炸在这里。
+             *
+             * ## 现在的行为
+             *
+             * ```text
+             *   ≤ 上限  正常读，并记一行实际字节数
+             *   > 上限  读都不读，直接 ok=false 报错（JS 侧抛 TypeError）
+             * ```
+             *
+             * 报错而不是静默截断：截断的 JSON 会在别处以更莫名其妙的方式失败。
+             */
+            val bytes = readCapped(stream)
+            if (bytes == null) {
+                Log.w(TAG, "httpRequest 响应超过上限：$urlText")
+                StLog.w("BRIDGE", "响应超过 ${MAX_RESPONSE_MB}MB 上限，已中止：$urlText")
+                result.put("ok", false)
+                result.put("status", status)
+                result.put(
+                    "error",
+                    "这个地址返回的内容超过 ${MAX_RESPONSE_MB}MB，" +
+                        "为了避免把应用撑爆已中止。检查地址是否指向了大文件。",
+                )
+                return result.toString()
+            }
+
+            /*
+             * 每次请求都记大小（2026-11-13）。
+             *
+             * 这一行是本次排查**最缺的东西**：崩溃日志里只有
+             * "一次要 202MB"，没有任何一条能对上"是哪个请求"。
+             * 有了它，下次直接看崩溃前最后那条 size= 即可。
+             */
+            StLog.i("BRIDGE", "响应 ${bytes.size} 字节：$urlText")
+
             val wantBinary = spec.optBoolean("binary", false)
             val text: String
             if (wantBinary) {
-                val bytes = stream?.use { it.readBytes() } ?: ByteArray(0)
                 result.put("bytes", bytes.size)
                 text = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
             } else {
-                text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+                text = String(bytes, Charsets.UTF_8)
             }
 
             val headerArray = org.json.JSONArray()
@@ -565,7 +617,126 @@ class StBridge(
         }
     }
 
+    /**
+     * 把一段**纯文本**分享出去（2026-11-14，v0.1.9 聊天记录导出）。
+     *
+     * ## 为什么不复用 `sharePng`
+     *
+     * 两者的 `Intent` 类型不同：PNG 是 `image/png`，而聊天记录是 `text/plain`。
+     * 用错类型的后果很具体 —— 微信收到 `image/png` 会当图片解析，
+     * 一张打不开的图；而 `text/plain` 才能被当成文档转发、也才能被
+     * 文件管理器/记事本接住。
+     *
+     * ## 为什么收字符串而不是 base64
+     *
+     * 文本本来就从 JS 来（`chatToText` 的产物），过一趟 base64 只是
+     * 白白多做两次编解码、多占一倍内存 —— 而这条链路的文件通常只有几十 KB，
+     * 危险的是 **PNG 那种几百 KB 的二进制**，那才需要 base64。
+     *
+     * ## 编码
+     *
+     * 显式写 UTF-8。用平台默认编码会在少数设备上产出 GBK，
+     * 用户拿到的 TXT 就是一堆乱码（而且是"我的中文聊天记录"乱码，很难不炸）。
+     *
+     * ## 返回
+     *
+     * 与 `sharePng` 同形状：`{ ok, uri, bytes }` / `{ ok:false, error }`。
+     */
+    @JavascriptInterface
+    fun shareText(text: String, fileName: String): String {
+        val result = JSONObject()
+        try {
+            if (text.isEmpty()) return fail(result, "要分享的内容是空的")
+
+            /* 文件名规则与 sharePng 一致：保留中文，只滤掉路径分隔符与控制字符 */
+            val safe = fileName.trim().mapNotNull { ch ->
+                when {
+                    ch.code < 0x20 || ch.code == 0x7f -> null
+                    ch in "/\\:*?\"<>|" -> '_'
+                    else -> ch
+                }
+            }.joinToString("").ifEmpty { "chat" }.take(60)
+
+            val dir = java.io.File(context.cacheDir, "share")
+            if (!dir.exists() && !dir.mkdirs()) return fail(result, "建不了临时目录")
+            val file = java.io.File(dir, if (safe.endsWith(".txt")) safe else "$safe.txt")
+            file.writeBytes(text.toByteArray(Charsets.UTF_8))
+
+            val authority = context.packageName + ".fileprovider"
+            val uri = androidx.core.content.FileProvider.getUriForFile(context, authority, file)
+
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            /* NEW_TASK 的理由同 sharePng：WebView 线程没有 Activity 上下文 */
+            val chooser = android.content.Intent.createChooser(send, "导出聊天记录").apply {
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(chooser)
+
+            result.put("ok", true)
+            result.put("uri", uri.toString())
+            result.put("bytes", file.length())
+            return result.toString()
+        } catch (error: Throwable) {
+            Log.w(TAG, "shareText 失败：${error.javaClass.simpleName} ${error.message}")
+            val message = when (error) {
+                is java.lang.IllegalArgumentException -> "文件分享配置不对：${error.message ?: ""}"
+                is android.content.ActivityNotFoundException -> "这台设备没有可分享的应用"
+                else -> "${error.javaClass.simpleName}: ${error.message ?: ""}"
+            }
+            return fail(result, message)
+        }
+    }
+
     /** 构造一个"什么都不校验"的 SocketFactory（仅用于用户已确认的自签证书） */
+    /**
+     * 单次 HTTP 响应体的上限（MB）。
+     *
+     * 24 的依据不是"刚好够用"，而是**在 384MB 堆里留够余量**：
+     *
+     * ```text
+     *   24MB 原始字节
+     * + 32MB base64 字符串（×1.34）
+     * = 56MB 峰值
+     * ```
+     *
+     * 真实用途里最大的是"下载一张角色卡 PNG"（实测几 MB 到十几 MB），
+     * 24MB 已经足够；再大基本就是地址拿错了（比如指向整包文件）。
+     */
+    /*
+     * ★ 不能写 `const val`：`StBridge` 是普通 class 而不是 object，
+     * const 只允许在顶层 / object / companion object 里（Kotlin 规则）。
+     */
+    private val MAX_RESPONSE_MB = 24
+
+    private val MAX_RESPONSE_BYTES = MAX_RESPONSE_MB * 1024 * 1024
+
+    /**
+     * 读响应体，**超过 [MAX_RESPONSE_BYTES] 就返回 null**（不读进内存）。
+     *
+     * 用固定缓冲区自己拼，不用 `readBytes()`：后者内部是
+     * `ByteArrayOutputStream` 一路翻倍，撞上限时已经复制出好几份，
+     * 内存峰值比数据本身还大 —— 那正是我们要避免的形态。
+     */
+    private fun readCapped(stream: java.io.InputStream?): ByteArray? {
+        if (stream == null) return ByteArray(0)
+        return stream.use { input ->
+            val out = java.io.ByteArrayOutputStream(64 * 1024)
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                /* 先判再写：超了立刻收手，不把超出的部分留在内存里 */
+                if (out.size() + read > MAX_RESPONSE_BYTES) return null
+                out.write(buffer, 0, read)
+            }
+            out.toByteArray()
+        }
+    }
+
     private fun insecureSocketFactory(): javax.net.ssl.SSLSocketFactory {
         val trustAll = object : javax.net.ssl.X509TrustManager {
             override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) = Unit
@@ -612,5 +783,86 @@ class StBridge(
          */
         json.put("charactersDir", charactersDir().absolutePath)
         return json.toString()
+    }
+
+    /* ═══════════════════════════════════════════════════════════
+       应用日志（2026-11-12）
+       ═══════════════════════════════════════════════════════════ */
+
+    /**
+     * 页面写一条日志。
+     *
+     * ## 为什么这个接口必须是**同步**的
+     *
+     * 与本项目其它桥方法（一律异步回传）相反，这里刻意同步 ——
+     * 因为**崩溃前的最后一条必须已经落盘**。异步排队的结果是：
+     * 队列还没跑到，进程已经死了，最关键的那条永远看不到。
+     *
+     * 代价可控：单次写入是几 KB 的 append，耗时在微秒级；
+     * 而且只在异常/关键节点调用，不在热路径上。
+     */
+    @JavascriptInterface
+    fun log(level: String, tag: String, message: String) {
+        StLog.write(level, tag, message)
+    }
+
+    /**
+     * 日志状态（目录、占用、条数、上限）。
+     *
+     * 给界面显示"日志在哪、有多大" —— 用户要知道该去哪儿找文件。
+     */
+    @JavascriptInterface
+    fun logStatus(): String = StLog.statusJson()
+
+    /**
+     * 读最近的日志文本。
+     *
+     * `maxBytes` 有上限（512KB）：整份日志可能 16MB，
+     * 一次性塞进 JS 字符串会直接把 WebView 顶爆 ——
+     * 那是"为了看日志而制造新的崩溃"。
+     */
+    @JavascriptInterface
+    fun logRead(maxBytes: Int): String {
+        val capped = maxBytes.coerceIn(1024, 512 * 1024)
+        return StLog.readTail(capped)
+    }
+
+    /**
+     * 把最近日志导出到 `Download/`，返回文件名（失败返回空串）。
+     *
+     * ## 为什么需要这一步（用户要求"方便快速找到并可传输"）
+     *
+     * 日志本身写在 `Android/data/<包名>/files/logs`，但 Android 11+
+     * 的手机自带文件管理器**进不去那个目录**。而 `Download/` 谁都能打开、
+     * 也能长按直接分享到微信/QQ。
+     */
+    @JavascriptInterface
+    fun logExport(): String = StLog.exportToDownloads(context) ?: ""
+
+    /** 清空日志（用户主动操作） */
+    @JavascriptInterface
+    fun logClear() {
+        StLog.clear()
+    }
+
+    /**
+     * 记录**渲染进程崩溃**（WebView 的 renderer 被杀）。
+     *
+     * 由 `MainActivity` 在 `onRenderProcessGone` 里调用 —— 那时代码还在
+     * 主进程里跑（死的是渲染进程），是唯一能留下线索的时刻。
+     *
+     * 这一类特别重要：安卓上 WebView 被 OOM killer 干掉时，
+     * **JS 侧不会触发任何 error 事件**，用户看到的就是"突然闪退"。
+     */
+    @JavascriptInterface
+    fun logRendererGone(didCrash: Boolean) {
+        StLog.e(
+            "RENDERER",
+            if (didCrash) {
+                "WebView 渲染进程崩溃（didCrash=true）。常见原因：渲染进程 OOM 或内核崩溃。"
+            } else {
+                "WebView 渲染进程被系统回收（didCrash=false）。说明当时内存紧张。"
+            }
+        )
     }
 }

@@ -227,6 +227,14 @@ export function buildJsonExport(
   card: UnifiedCard,
   preset: TxtPreset | null,
   greetingFormat?: GreetingFormatParams,
+  /**
+   * 「对话示例」的说话人写法（2026-11-11）。
+   *
+   * 板块里是用户平台的写法（`用户：`），而 `mes_example` 必须是 ST 的
+   * `{{user}}:`。不给这个参数，`用户：` 会原样写进字段 ——
+   * ST 不认它，那段对话示例在 ST 里整段读不到（不报错、只是没有）。
+   */
+  chatExamplesFormat?: GreetingFormatParams,
 ): ExportArtifactText {
   const options = preset ? presetAssembleOptions(preset) : {};
   /*
@@ -241,6 +249,7 @@ export function buildJsonExport(
   const payload = serializeStCard(card, {
     ...options,
     ...(greetingFormat ? { greetingFormat } : {}),
+    ...(chatExamplesFormat ? { chatExamplesFormat } : {}),
     entryTitleToComment: true,
   });
   // 有多少条是"靠 name 补出来"的（原本没有 comment）——只用于说明，不影响产物
@@ -385,8 +394,9 @@ export function buildExport(
   preset: TxtPreset | null,
   format: ExportFormat,
   greetingFormat?: GreetingFormatParams,
+  chatExamplesFormat?: GreetingFormatParams,
 ): ExportArtifactText {
-  if (format === 'json') return buildJsonExport(card, preset, greetingFormat);
+  if (format === 'json') return buildJsonExport(card, preset, greetingFormat, chatExamplesFormat);
   if (format === 'png') {
     throw new Error('PNG 产物需要卡面字节：请走 buildPngExport');
   }
@@ -417,12 +427,15 @@ export function buildPngExport(
   preset: TxtPreset | null,
   faceBytes: Uint8Array,
   greetingFormat?: GreetingFormatParams,
+  /** 与 `buildJsonExport` 同义：PNG 里嵌的是同一份卡 JSON，漏了就等于漏一半 */
+  chatExamplesFormat?: GreetingFormatParams,
 ): ExportArtifactPng {
   const options = preset ? presetAssembleOptions(preset) : {};
   // 与 JSON 导出同一套对齐：PNG 里嵌的是同一份卡 JSON，漏了就等于漏一半
   const payload = serializeStCard(card, {
     ...options,
     ...(greetingFormat ? { greetingFormat } : {}),
+    ...(chatExamplesFormat ? { chatExamplesFormat } : {}),
     entryTitleToComment: true,
   });
   const jsonText = `${JSON.stringify(payload, null, 2)}\n`;
@@ -519,14 +532,15 @@ export async function buildExportAsync(
   format: ExportFormat,
   greetingFormat?: GreetingFormatParams,
   faceBytes?: Uint8Array,
+  chatExamplesFormat?: GreetingFormatParams,
 ): Promise<ExportArtifactReady> {
   if (format === 'png') {
     if (faceBytes === undefined) {
       throw new Error('PNG 导出缺少卡面：请先在"卡面"步骤里选一张图');
     }
-    const artifact = buildPngExport(card, preset, faceBytes, greetingFormat);
+    const artifact = buildPngExport(card, preset, faceBytes, greetingFormat, chatExamplesFormat);
     return { ...artifact, sha256: await sha256Bytes(artifact.png) };
   }
-  const artifact = buildExport(card, preset, format, greetingFormat);
+  const artifact = buildExport(card, preset, format, greetingFormat, chatExamplesFormat);
   return { ...artifact, sha256: await sha256Hex(artifact.text) };
 }

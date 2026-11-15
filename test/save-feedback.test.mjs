@@ -154,9 +154,21 @@ test('★★★ 外壳调 setMessages 时必须传 avatar', () => {
    * 判据钉**完整调用形态**，不是"某处出现 selectedCharacter" ——
    * 后者在上下文中到处都是，缺陷能溜过去（这个错本轮已经犯过一次）。
    */
+  /*
+   * ★ 第二个参数允许带 `?? undefined`（2026-11-15）。
+   *
+   * `chatSnapshot.fileName` 的类型从 `string` 改成了 `string | null`
+   * （用 null 表达"还没有文件名"，见 `onRename` 里的说明），而
+   * `setMessages` 的可选参数接 `undefined` 不接 `null` —— 所以调用处
+   * 多了一个 `?? undefined`。
+   *
+   * 判据本来钉的是"完整调用形态"，这次要跟着放宽一处，但**守的性质不变**：
+   * 第三个参数必须是 `avatar`。放宽的只是"第二个参数怎么书写"，
+   * 那一项与这条判据要防的缺陷（历史回来但身份没设）无关。
+   */
   assert.match(
     shell,
-    /panel\.setMessages\(\s*this\.chatSnapshot\.messages,\s*this\.chatSnapshot\.fileName,\s*this\.selectedCharacter\?\.avatar,\s*\)/,
+    /panel\.setMessages\(\s*this\.chatSnapshot\.messages,\s*this\.chatSnapshot\.fileName(\s*\?\?\s*undefined)?,\s*this\.selectedCharacter\?\.avatar,\s*\)/,
     'setMessages 要传第三个参数 avatar',
   );
 });

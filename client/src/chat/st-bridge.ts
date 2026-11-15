@@ -300,6 +300,32 @@ export class StChatBridge {
   }
 
   /**
+   * 让某张卡的头像缩略图失效（删掉 ST 磁盘上的缓存文件）。
+   *
+   * 返回值 = 有没有真的删掉（false 表示本来就没有缓存，也正常）。
+   *
+   * 为什么在下载卡之后必须调：卡是**直接写文件**覆盖的，ST 没机会知道
+   * "图换了"，于是它的缩略图缓存会一直是旧图 —— 而列表画的正是缩略图。
+   * 用户看到的就是"下载了新卡，头像还是原来的"。
+   */
+  invalidateThumbnail(avatar: string, charactersDir: string): Promise<boolean> {
+    return invoke<boolean>('st_chat_invalidate_thumbnail', { avatar, charactersDir });
+  }
+
+  /**
+   * 当前**生效那条** secret 的 id（2026-11-11）。
+   *
+   * 值读不回来，但 id 会变：ST 的 `writeSecret` 每次先把旧的全置
+   * `active: false`，再 push 一条新 uuid。所以"写入前后 id 不同"
+   * 是**唯一能证明新值真的进去了**的判据。
+   *
+   * 见 `writeSecret` 的调用点（shell 的 writer）—— 它用这个做前后对比。
+   */
+  secretActiveId(key: string): Promise<string | null> {
+    return invoke<string | null>('st_chat_secret_active_id', { key });
+  }
+
+  /**
    * 问 ST「哪些 secret 真的配了」（2026-11-07）。
    *
    * 返回的是 key 名数组（如 `['api_key_custom']`），**不含任何 key 内容** ——

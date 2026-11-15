@@ -284,14 +284,31 @@ test('★★★★ 等会话恢复要有**上限**（否则引擎起不来会卡
   );
 });
 
+/**
+ * 取某个方法的**完整函数体**（到下一个同缩进 `private ` 或文件尾）。
+ *
+ * 为什么不用 `slice(at, at + N)`：魔法数字窗口会随代码增长而被撑破，
+ * 于是"顺序对不对"的判据在代码变长后无端变红（2026-11-11 踩过）。
+ */
+function methodBody(source, signature) {
+  const at = source.indexOf(signature);
+  if (at < 0) return '';
+  const next = source.indexOf('\n  private ', at + signature.length);
+  return source.slice(at, next < 0 ? source.length : next);
+}
+
 test('★★★ 会话信号要用 finally 放行（失败也必须淡出）', () => {
   /*
    * 若只在成功路径调 `onSessionSettled`，引擎起不来时开屏会等满上限
    * （虽然最终也能出去，但白等 3 秒）。用 `finally` 更准确。
    */
-  const at = shellSrc.indexOf('await this.loadCharacterCard(avatar);');
+  /*
+   * 定位改成"冷启动那个恢复块"，用 `onSessionSettled` 反查更稳 ——
+   * 原来钉的是 `loadCharacterCard(avatar)`，它现在换成了带重试版。
+   */
+  const at = shellSrc.indexOf('const gotCard = await this.loadCharacterCardWithRetry(avatar)');
   assert.ok(at > 0, '找不到冷启动恢复块');
-  const body = shellSrc.slice(at, at + 700);
+  const body = shellSrc.slice(at, at + 900);
   assert.match(body, /finally \{/, '要用 finally 放行');
   assert.match(body, /onSessionSettled/, '要在 finally 里调回调');
 });
@@ -395,9 +412,26 @@ test('★★★★ 世界书要在**写卡之前**落地（书名要先定下来
    * 反过来（先写卡）中途失败会留下"卡指向一本不存在的书"，
    * 表现为"世界书是空的" —— 比没有更难查。
    */
-  const at = shellSrc.indexOf('private async importRepoVersion');
-  assert.ok(at > 0, '找不到 importRepoVersion');
-  const body = shellSrc.slice(at, at + 3200);
+  /*
+   * ★ 不用固定字符窗口（2026-11-11 修）。
+   *
+   * 原来写 `slice(at, at + 3200)`，而我在 `importRepoVersion` 里加了
+   * 几十行"拉仓库卡面当底图"的逻辑，窗口就被撑破了 ⇒ 判据红，
+   * 但**顺序一点没坏**。
+   *
+   * 魔法数字窗口必然随代码增长而失效。改成"到本函数结束"：
+   * 下一个同缩进的 `private ` / 文件尾。
+   */
+  /*
+   * ★ 定位要落在**顺序真正发生的地方**（2026-11-11 修）。
+   *
+   * 这三步（落地世界书 / 把书名写进卡 / 写 PNG）全在 `writeCardToLibrary` 里。
+   * 老判据定位的是 `importRepoVersion`，靠 3200 字符窗口**溢出到下一个函数**
+   * 才碰巧通过 —— 那是判据的缺陷，不是代码的结构。
+   * 一改成严格函数体就露馅了，顺手改对。
+   */
+  const body = methodBody(shellSrc, 'private async writeCardToLibrary');
+  assert.ok(body !== '', '找不到 writeCardToLibrary');
 
   const worldAt = body.indexOf('this.persistEmbeddedWorldbook');
   const attachAt = body.indexOf('attachWorldToCard');

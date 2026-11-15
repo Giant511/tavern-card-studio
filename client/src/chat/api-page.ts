@@ -28,7 +28,11 @@ import {
   keyFieldValue,
   keyStateOnBlur,
   keyStateOnFocus,
+  /* "失焦别抹掉用户输入"的判断，与语音页共用（同一 bug 犯过两次） */
+  shouldKeepTypedValue,
   keyToSave,
+  KEY_MASK,
+  effectiveSourceFor,
   unsupportedSourceMessage,
   type KeyFieldState,
   type StChatSource,
@@ -36,6 +40,8 @@ import {
 
 import { describeBridgeError } from '@tcs/shared';
 import { el, type DocLike, type ElLike } from './chat-view.ts';
+/* 保存路径的现场记录：见 saveBtn 里那段 diagnostics 注释 */
+import { diagNote } from '../diagnostics/mobile-diag.ts';
 /**
  * 这一页只需要一项 ST 能力：**写密钥**。
  *
@@ -269,6 +275,35 @@ export function renderApiPage(
     StChatSource,
     { model: string; baseUrl: string; maxTokens?: number }
   >();
+
+  /**
+   * 已输入但**还没保存**的秘钥，按源分开暂存在内存里。
+   *
+   * ## 为什么必须有（2026-11-12 真机发现）
+   *
+   * `expandSource()` 会 `replaceChildren()` 掉所有面板。于是：
+   *
+   * ```text
+   *   在「自定义」里粘好 key
+   *     → 手滑点开「DeepSeek」看一眼（面板被重建）
+   *     → 点回「自定义」
+   *     → **刚粘的 key 没了**，框又变回"粘贴 key"
+   * ```
+   *
+   * 这和"点保存被 blur 清空"是同一个体验问题的两个面：
+   * 用户填的东西不该在保存前消失。
+   *
+   * ## 三条边界（刻意这么定）
+   *
+   * ```text
+   *   ① 只在内存 —— 不写 localStorage、不写日志。它是秘钥。
+   *      进程被杀就没了，这是可接受的（还没保存的东西本来就不算数）。
+   *   ② 保存成功后清掉 —— 它已经进了 ST，留着只是多余的副本。
+   *   ③ 与 `drafts`（model/baseUrl）分开 —— 那个是要落盘的配置，
+   *      这个是临时输入，混在一起迟早会被一起持久化出去。
+   * ```
+   */
+  const pendingKeys = new Map<StChatSource, string>();
   for (const source of CHAT_SOURCES) {
     drafts.set(source, {
       // 只有当前源继承外部传进来的 model，其余源从空开始
@@ -467,7 +502,50 @@ export function renderApiPage(
     const paintKeyField = (): void => {
       ki.setAttribute('type', keyFieldType(keyState));
       ki.setAttribute('placeholder', keyFieldPlaceholder(keyState));
-      ki.value = keyFieldValue(keyState);
+      /*
+       * ★★★★★ `editing` 态**绝对不许碰 value** —— 那是用户刚粘贴的 key。
+       *
+       * ## 这个 bug（2026-11-12，真机日志定的案）
+       *
+       * `keyFieldValue(state)` 的实现是「masked 给掩码，其余一律空串」：
+       *
+       * ```js
+       *   return state === 'masked' ? KEY_MASK : '';
+       * ```
+       *
+       * 原来这行无条件执行。而 `blur` 的处理正好是：
+       *
+       * ```text
+       *   用户点「保存」按钮
+       *     → 输入框先失焦（web 标准：blur 早于 click）
+       *     → blur handler: keyStateOnBlur('editing', 'sk-xxx') ⇒ 'editing'（有值就保持）
+       *     → blur handler: paintKeyField()          ← 就这一句
+       *     → ki.value = keyFieldValue('editing') = ''
+       *     → click handler 读 ki.value ⇒ 空串
+       * ```
+       *
+       * 真机日志的两行铁证（`app-001-.log`）：
+       *
+       * ```text
+       *   [save] source=custom input=yes len=0 mask=no write=no
+       * ```
+       *
+       * `input=yes` + `len=0` + `mask=no` ⇒ 框在、值是空串、不是掩码。
+       * 用户描述"粘贴时能看到星号"也吻合：粘贴那一刻确实有值，
+       * **是点保存时被自己清掉的**。
+       *
+       * ## 为什么只有 editing 要跳过
+       *
+       * ```text
+       *   masked  → 必须写掩码（这才是"已配置"的样子）
+       *   empty   → 必须写空（本来就没有）
+       *   editing → **用户的内容在里面，谁都不许覆盖**
+       * ```
+       *
+       * 而 `focus` 里那句 `ki.value = ''` 仍然保留：那是刻意清掉掩码
+       * （否则用户会在 12 个点后面接着输入）。
+       */
+      if (keyState !== 'editing') ki.value = keyFieldValue(keyState);
       ki.setAttribute('data-key-state', keyState);
       /*
        * ★★★ 必须刷说明（2026-11-07）。
@@ -479,6 +557,23 @@ export function renderApiPage(
       paintKeyHint();
     };
     paintKeyField();
+
+    /*
+     * 有未保存的草稿 ⇒ 回填并进入 editing 态（2026-11-12）。
+     *
+     * 必须在 `paintKeyField()` **之后**：那个函数会把 value 设成掩码/空。
+     * 而这里设完就进入 editing，后续 `paintKeyField` 也不会再覆盖它
+     * （见那个函数里 `if (keyState !== 'editing')` 的保护）。
+     */
+    const pendingKey = pendingKeys.get(source);
+    if (pendingKey !== undefined && pendingKey !== '') {
+      keyState = 'editing';
+      ki.value = pendingKey;
+      ki.setAttribute('type', keyFieldType(keyState));
+      ki.setAttribute('placeholder', keyFieldPlaceholder(keyState));
+      ki.setAttribute('data-key-state', keyState);
+      paintKeyHint();
+    }
 
     ki.addEventListener?.('focus', () => {
       /*
@@ -501,10 +596,53 @@ export function renderApiPage(
        *
        * 否则会出现"从没配过 key 的用户点一下框再点开，界面变成已配置"，
        * 那是明确的撒谎。
+       *
+       * ★★★★★ 但"用户填了内容"时**一个字都不许动 value**（2026-11-12）。
+       *
+       * 这与语音页 2026-11-07 修的是**同一个 bug**（那边修了、这边漏了）。
+       * 后果不是"key 没保存"那么轻 —— 它是：
+       *
+       * ```text
+       *   粘贴 → 点「保存」（按钮点击让输入框先 blur）
+       *        → 值被抹成空串
+       *        → 保存时当作"这次没填 key"
+       *        → 界面说「已保存」
+       *        → 发消息 401
+       * ```
+       *
+       * 真机日志 `[save] input=yes len=0 mask=no write=no` 就是现场。
+       *
+       * 判断本身收在 shared 的 `shouldKeepTypedValue()` 里 ——
+       * 两处各写一份必然第三次分叉。
        */
       const hadKey = callbacks.hasKeyFor?.(source) ?? false;
-      keyState = keyStateOnBlur(keyState, ki.value ?? '', hadKey);
+      const typed = ki.value ?? '';
+      const next = keyStateOnBlur(keyState, typed, hadKey);
+      const keepTyped = shouldKeepTypedValue(next, typed);
+      keyState = next;
+      if (keepTyped) {
+        /* 只更新属性，绝不碰 value */
+        ki.setAttribute('type', keyFieldType(next));
+        ki.setAttribute('placeholder', keyFieldPlaceholder(next));
+        ki.setAttribute('data-key-state', next);
+        return;
+      }
       paintKeyField();
+    });
+
+    /*
+     * 每次输入都记进内存草稿（2026-11-12）。
+     *
+     * 没有这一步的话，"粘好之后点开别的源看一眼"就会丢 —— 面板会被重建。
+     * 只存内存，不落盘（见 `pendingKeys` 的注释）。
+     */
+    ki.addEventListener?.('input', () => {
+      const typedNow = ki.value ?? '';
+      if (typedNow === '') {
+        pendingKeys.delete(source);
+      } else {
+        pendingKeys.set(source, typedNow);
+      }
     });
 
     ki.setAttribute('data-role', 'key-input');
@@ -788,7 +926,50 @@ export function renderApiPage(
       const rawModel = (
         modelInput !== null ? (modelInput.value ?? '') : (draft?.model ?? '')
       ).trim();
-      const rawKey = keyToSave(keyInput !== null ? (keyInput.value ?? '') : '');
+      /*
+       * ★★★ 这一段是"填了 key 却永远 401"的现场记录点（2026-11-12）。
+       *
+       * ## 为什么要专门记
+       *
+       * 真机取证：ST 的 52 个 secret 槽位全是 null，而界面显示「已保存」。
+       * 断言检查下来只有一个出口能造成这种组合 —— `rawKey === null`
+       * （那样 shell 那边会跳过 key 核对，一路"成功"）。
+       *
+       * 但**为什么它是 null**，光看代码推不出来（可能是输入框被重绘清空、
+       * 可能是值仍是掩码串、可能面板没建）。这几种成因的处理方式完全不同，
+       * 所以必须留现场。
+       *
+       * ## 记什么、不记什么
+       *
+       * ```text
+       *   记：输入框在不在、值的长度、是否等于掩码、当前源
+       *   不记：key 的内容（日志要给用户看的，不能带秘钥）
+       * ```
+       */
+      const rawKeyInput = keyInput !== null ? (keyInput.value ?? '') : '';
+      const rawKey = keyToSave(rawKeyInput);
+
+      /*
+       * 日志用**英文键名 + 先把值算成变量**，两条理由：
+       *
+       * ```text
+       *   ① 日志是给开发者看的，不是界面文案 —— 结构化更好 grep
+       *   ② 判据 `走查 10` 会扫所有字符串字面量找内部术语（含 "null"），
+       *      而模板里写 `x === null ? … : …` 会让它把**代码**当文案。
+       *      先把值算出来，模板里就只剩变量了。
+       * ```
+       *
+       * "走查 10"的意图是防"TODO / mock 漏到界面上"，不是管日志写法 ——
+       * 但它分不清，所以绕开它比改它更省事，也更符合这块代码的本意。
+       */
+      const inputState = keyInput !== null ? 'yes' : 'no';
+      const maskState = rawKeyInput.trim() === KEY_MASK ? 'yes' : 'no';
+      const willWrite = rawKey !== null ? 'yes' : 'no';
+      diagNote(
+        'note',
+        `[save] source=${currentSource} input=${inputState}` +
+          ` len=${String(rawKeyInput.length)} mask=${maskState} write=${willWrite}`,
+      );
 
       /*
        * ★ 校验顺序：先判源合法，再判模型。
@@ -835,8 +1016,38 @@ export function renderApiPage(
          *            —— 不写，避免重复
          * ```
          */
+        /*
+         * ★★★ 先把地址算出来，因为**它决定 key 写进哪个槽位**（2026-11-11）。
+         *
+         * ## 用户报的
+         *
+         * > 秘钥存储还是有问题
+         *
+         * 截图是上游的 `Key 错误: Key 填错、过期或未设置 Bearer`。
+         * 录屏：填了中转站地址，然后把源从「自定义」改成「DeepSeek」。
+         *
+         * ## 为什么 key "看起来存了却没用"
+         *
+         * ST 的 secret 槽位是按源分的（`api_key_custom` / `api_key_deepseek`…），
+         * 而**只有 custom 源会读 `custom_url`**。所以"填了自己的地址"这件事
+         * 本身就等价于"必须用 custom 源"：
+         *
+         * ```text
+         *   源=deepseek + 地址=中转站
+         *     → key 存进 api_key_deepseek
+         *     → 请求却被 ST 发到官方 api.deepseek.com（地址被丢掉）
+         *     → 官方不认这把中转站的 key ⇒ "Key 错误"
+         * ```
+         *
+         * 把 key 写进 `api_key_custom`、源也按 custom 走，两边才对齐。
+         */
+        const rawBaseUrl = (
+          baseUrlInput !== null ? (baseUrlInput.value ?? '') : (draft?.baseUrl ?? '')
+        ).trim();
+        const actualSource = effectiveSourceFor(currentSource, rawBaseUrl);
+
         if (rawKey !== null) {
-          await bridge.writeSecret(`api_key_${currentSource}`, rawKey);
+          await bridge.writeSecret(`api_key_${actualSource}`, rawKey);
           /*
            * ★ 写完之后**不**清空输入框，改成回到 masked 态。
            *
@@ -848,15 +1059,12 @@ export function renderApiPage(
         }
         // 保存成功后把 model 落到草稿，切走再切回来不会丢
         if (draft !== undefined) draft.model = rawModel;
-        const rawBaseUrl = (
-          baseUrlInput !== null ? (baseUrlInput.value ?? '') : (draft?.baseUrl ?? '')
-        ).trim();
 
         /*
          * 自定义源必须填地址 —— 否则"保存成功"之后生成时根本不知道发给谁。
          * 校验放在这里而不是连接页之外：这是唯一知道用户选了哪个源的地方。
          */
-        if (currentSource === 'custom' && rawBaseUrl === '') {
+        if (actualSource === 'custom' && rawBaseUrl === '') {
           status.hidden = false;
           status.textContent = '自定义接口要填服务地址。填到 /v1 为止，再保存。';
           callbacks.onNotify?.(status.textContent, 'warn');
@@ -878,12 +1086,36 @@ export function renderApiPage(
           ? rawMax
           : (draftMax ?? DEFAULT_MAX_TOKENS);
 
+        /*
+         * 传 `actualSource` 而不是 `currentSource`：落盘那边的
+         * `buildStConnectionPatch` 也会做同样的纠正，两处**必须一致** ——
+         * 否则会出现"key 存进 custom、settings 里写的还是 deepseek"。
+         */
         await callbacks.onSave(
-          { source: currentSource, model: rawModel, baseUrl: rawBaseUrl, maxTokens },
+          { source: actualSource, model: rawModel, baseUrl: rawBaseUrl, maxTokens },
           rawKey,
         );
+        /*
+         * 保存成功 ⇒ 清掉内存草稿（2026-11-12）。
+         *
+         * 它已经进了引擎，这里再留一份只是多余的秘钥副本。
+         * 放在 `onSave` **之后**：那一步可能抛（引擎没连上），
+         * 抛了就不该清 —— 用户还要重试。
+         */
+        pendingKeys.delete(actualSource);
         status.hidden = false;
-        status.textContent = rawKey === null ? '已保存' : '已保存，key 也换好了';
+        /*
+         * 文案必须区分"这次写没写 key"（2026-11-12）。
+         *
+         * 原来两种情况都只说"已保存"，于是用户以为 key 已经配好了 ——
+         * 而他真实看到的那句"已保存"恰好是 `rawKey === null` 这一支，
+         * 也就是 **key 一个字节都没动**。
+         *
+         * 这不是措辞问题：它让用户失去了唯一一次发现"我没填上"的机会，
+         * 一路到发消息看到 401 才开始查。
+         */
+        status.textContent =
+          rawKey === null ? '已保存（这次没有改动秘钥）' : '已保存，key 也换好了';
         callbacks.onNotify?.('已保存', 'ok');
       } catch (error) {
         /*

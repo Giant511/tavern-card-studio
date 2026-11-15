@@ -131,11 +131,40 @@ test('★ 问题五：「我的」页的内容必须装进能滚的容器', () =
    * 判据改成"这一次 append 里两个条目都在"，比原来的两条更强：
    * 原来允许"只挂了一个"，现在要求**两个都挂上**。
    */
-  assert.match(
-    src,
-    /scroller\.append\(\s*this\.renderApiSection\(\),\s*this\.renderVoiceSection\(\),?\s*\)/s,
-    '两个收纳项都必须 append 进 .nb-scroll（挂到 pageHost 就不会滚）',
-  );
+  /*
+   * ★ 2026-11-12：加了第三个收纳项「诊断日志」。
+   *
+   * 守的性质没变（**每一个都要进 .nb-scroll**），判据跟着加严：
+   * 从"两个都在"变成"三个都在"。
+   *
+   * 这条判据历史上已经因为"条目数量变了"红过两次（见上面那段注释），
+   * 每次都是判据写死了条目数而不是写"这些条目都要在"。
+   * 现在仍然写死三个 —— 但这是刻意的：新增条目时就该来这里加一项，
+   * 那一步能提醒作者"别忘了让它可滚"。
+   */
+  /*
+   * ★ 用"取这一次 append 调用"而不是"逐字匹配参数列表"。
+   *
+   * 逐字匹配会被**夹在参数之间的注释**打断（本次就因为给诊断项写了段
+   * 注释而误红）。而参数之间写注释是完全正常的代码风格，
+   * 判据不该逼人为了迁就它而不写注释。
+   */
+  /*
+   * ★ 定位必须从 `renderApiSection` **反查**到那个 `scroller.append(`。
+   *
+   * 文件里有多个 `scroller.append(`（角色页第 1507 行那个是另一处），
+   * 直接 indexOf 拿到的是第一个 —— 又一种"前缀撞车"。
+   */
+  const apiAt = src.indexOf('this.renderApiSection(),');
+  assert.ok(apiAt > 0, '找不到 renderApiSection 的挂载');
+  const callAt = src.lastIndexOf('scroller.append(', apiAt);
+  assert.ok(callAt > 0, 'renderApiSection 前面没有 scroller.append');
+  const callEnd = src.indexOf('\n    );', callAt);
+  const call = src.slice(callAt, callEnd < 0 ? callAt + 1200 : callEnd);
+
+  for (const item of ['this.renderApiSection()', 'this.renderVoiceSection()', 'this.renderDiagSection()']) {
+    assert.ok(call.includes(item), `${item} 必须 append 进 .nb-scroll（挂到 pageHost 就不会滚）`);
+  }
 });
 
 test('★ 问题五：.nb-scroll 的三个属性缺一不可', () => {

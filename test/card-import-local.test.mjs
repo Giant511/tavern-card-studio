@@ -432,15 +432,44 @@ test('★★★ 仓库下载也走同一条封面逻辑（它也曾经全是同�
   assert.ok(body !== '', '找不到 private async importRepoVersion');
 
   /*
-   * 传 `base: null` ⇒ 让 writeCardToLibrary 按卡名生成。
-   * 如果这里还自己调 readDefaultFaceBytes，仓库下载的卡就仍是统一默认图，
-   * 与本地导入的卡长得不一样 —— 同一件事两套行为。
+   * ★★★ 这条判据在 2026-11-11 改过方向 —— 用户推翻了 `base: null`。
+   *
+   * ## 原来守什么
+   *
+   * 「`base: null` ⇒ 按卡名生成首字封面」。理由是 v0.1.8 时发现：
+   * 所有下载的卡都塞同一张内置卡面，选角色列表里分不出谁是谁。
+   *
+   * ## 用户为什么推翻它
+   *
+   * > 仓库有背景的时候下载没有把仓库的背景下载下来并合并成一张 PNG
+   *
+   * 仓库里每张卡**本来就有自己的卡面**（`face.sha256`），只是下载时没取。
+   * 用首字封面反而把"每张卡该有的样子"抹掉了 —— 那个权宜之计解决的是它
+   * 自己制造的问题。
+   *
+   * ## 现在守什么
+   *
+   * ```text
+   *   仓库有卡面  → 转成 PNG 当底图（webp 要 convertToPng）
+   *   仓库没卡面  → 才退回按卡名生成 + 提示用户
+   * ```
+   *
+   * 仍然不许自己调 `readDefaultFaceBytes` —— 那张统一的内置图谁都不该再用。
    */
-  assert.match(body, /base: null/, '仓库下载也要走按卡名生成');
+  assert.match(body, /fetchRepoFaceForImport\(cardId\)/, '要拉仓库卡面当底图');
+  /*
+   * 写成完整调用而不是 `/base,/` —— 实际是 `{ plan, jsonText, base }`，
+   * 简写属性后面跟的是 ` }` 不是逗号。（今天第 4 次定位不准。）
+   */
+  assert.match(
+    body,
+    /writeCardToLibrary\(\{\s*plan,\s*jsonText,\s*base\s*\}\)/,
+    '要把拿到的字节传下去（不是固定 null）',
+  );
   assert.doesNotMatch(
     body,
     /readDefaultFaceBytes\(\)/,
-    '仓库下载不该再自己取内置卡面（会与本地导入分叉）',
+    '仓库下载不该自己取那张统一的内置卡面',
   );
 });
 

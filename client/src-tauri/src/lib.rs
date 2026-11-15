@@ -132,6 +132,8 @@ pub fn run() {
             st_chat::st_chat_secret_write,
             /* 问 ST「哪些 secret 真的配了」（2026-11-07） */
             st_chat::st_chat_secret_present,
+            st_chat::st_chat_secret_active_id,
+            st_chat::st_chat_invalidate_thumbnail,
             st_chat::st_chat_generate,
             st_chat::st_chat_group_create,
             st_chat::st_chat_preset_save,

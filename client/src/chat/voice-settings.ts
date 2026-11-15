@@ -40,6 +40,7 @@ import {
   keyFieldPlaceholder,
   keyFieldType,
   keyFieldValue,
+  shouldKeepTypedValue,
   keyStateOnBlur,
   keyStateOnFocus,
   keyToSave,
@@ -405,7 +406,11 @@ export function renderVoiceSettingsPage(
      *   也就不会触发 blur。真实手指点击一定会。**只有真手指能复现的 bug**。
      */
     const next = keyStateOnBlur(keyState, keyInput.value ?? '', callbacks.hasKey?.() ?? false);
-    const keepTyped = next === 'editing' && (keyInput.value ?? '').trim() !== '';
+    /*
+     * 判断收在 shared 里（2026-11-12）：API 页犯过一次同样的错，
+     * 两处各写一份必然第三次分叉。见 `shouldKeepTypedValue` 的注释。
+     */
+    const keepTyped = shouldKeepTypedValue(next, keyInput.value ?? '');
     keyState = next;
     if (keepTyped) {
       /* 只更新属性，不碰 value */

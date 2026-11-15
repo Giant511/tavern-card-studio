@@ -38,6 +38,8 @@
  */
 
 import { AppShell, type SavedChatSession } from '../chat/shell.ts';
+/* 崩溃取证：入口最早处安装，见下方 boot 之前那段注释 */
+import { installMobileDiagnostics } from '../diagnostics/mobile-diag.ts';
 import { DEFAULT_API_STATE, type ApiPageState } from '../chat/api-page.ts';
 import { DEFAULT_VOICE_SETTINGS, type VoiceSettings } from '../chat/voice-settings.ts';
 import type { DocLike, ElLike } from '../chat/chat-view.ts';
@@ -1196,6 +1198,26 @@ async function boot(): Promise<void> {
  * 它自己不会 reject —— 开屏的三种结局都是返回值，不是异常。
  * 加 `.catch` 反而会掩盖"某个 await 意外抛了"这件事。
  */
+/*
+ * ★★★ 先装崩溃取证，再启动（2026-11-12）。
+ *
+ * ## 为什么要抢在 boot() 之前
+ *
+ * 用户报「进入 APP 后过一段时间自动闪退，哪怕没做任何操作」，
+ * 而我们**一条日志都没有**：logcat 要数据线，桌面版的 crash-log 没接移动端。
+ *
+ * 这段必须在最早期执行，理由有两个：
+ *
+ * ```text
+ *   ① 启动期崩溃也要抓到（最难看的那种，往往没有任何线索）
+ *   ② 要读"上次会话怎么结束的"—— 必须在写本次 boot 记录之前读
+ * ```
+ *
+ * 落 localStorage 而不是文件：崩溃那一刻只有**同步写**来得及。
+ */
+const diag = installMobileDiagnostics();
+(globalThis as { __TCS_DIAG__?: unknown }).__TCS_DIAG__ = diag;
+
 if (globalThis.document.readyState === 'loading') {
   globalThis.document.addEventListener('DOMContentLoaded', () => void boot());
 } else {

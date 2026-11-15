@@ -197,9 +197,19 @@ test('★★★ 导入必须走「允许新建」，否则新卡写不进去', a
    *   只是**又跟了一次位置**。这已经是这条判据第二次搬家，
    *   所以这次断言改成不认变量名（见下），下次再抽就不用再改。
    */
+  /*
+   * ★ 2026-11-11：**第三次**因为固定字符窗口而误红。
+   *
+   * 前两次是 3200 / 2000，这次是 3600 —— 我在 `writeCardToLibrary` 里加了
+   * 「写卡后让缩略图失效」那一段，`writeCharacterPng` 就被挤出了窗口。
+   *
+   * 结论：窗口大小一定会随代码增长而失效。改成"取整个函数体"，
+   * 到下一个同缩进的 `private ` 或文件尾为止。
+   */
   const at = shell.indexOf('private async writeCardToLibrary(');
   assert.ok(at > 0, '找不到 writeCardToLibrary 方法');
-  const block = shell.slice(at, at + 3600);
+  const nextPrivate = shell.indexOf('\n  private ', at + 10);
+  const block = shell.slice(at, nextPrivate < 0 ? shell.length : nextPrivate);
 
   /*
    * ★ 2026-11-06 起 `allowCreate` 不是硬编码的 `true` 了 ——

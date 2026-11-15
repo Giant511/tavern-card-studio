@@ -174,10 +174,33 @@ test('★★★★★ 失焦时不许抹掉刚输入的 key', () => {
   const src = stripComments(read('client/src/chat/voice-settings.ts'));
 
   assert.match(src, /keepTyped/, '要区分"填了内容"与"没填"');
+
+  /*
+   * ★ 2026-11-12 改判据：从"内联表达式"改成"必须调共享函数"。
+   *
+   * 原来这条断言的是内联写法：
+   *
+   * ```ts
+   *   const keepTyped = next === 'editing' && (keyInput.value ?? '').trim() !== '';
+   * ```
+   *
+   * 而 API 页那边**也有一份一样的代码** —— 但它漏了这段保护，
+   * 于是同一个 bug 在 11-12 又炸了一次（用户报"填了 key 还是 401"）。
+   *
+   * 说明"两处各写一份"本身就是 bug 土壤。所以把判断收进 shared 的
+   * `shouldKeepTypedValue()`，判据改成钉**调用**：
+   *
+   * ```text
+   *   钉内联表达式  → 换个地方再写一遍照样过（这次的教训）
+   *   钉调用共享函数 → 想分叉就必须先绕过这条断言
+   * ```
+   *
+   * 判断本身的正确性由 `api-source-consistency` 里那条真跑守着。
+   */
   assert.match(
     src,
-    /const keepTyped = next === 'editing' && \(keyInput\.value \?\? ''\)\.trim\(\) !== ''/,
-    '判据是"状态与内容同时满足"',
+    /const keepTyped = shouldKeepTypedValue\(next, keyInput\.value \?\? ''\)/,
+    '必须调 shared 的 shouldKeepTypedValue（不许内联一份）',
   );
 
   /*

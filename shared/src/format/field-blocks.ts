@@ -31,6 +31,7 @@ import {
   renderCompositeScene,
   type SceneSections,
 } from './composite-scene.js';
+import { parseChatExamples, renderChatExamples } from './chat-examples-format.js';
 
 /**
  * 该板块是否由残余字段驱动。
@@ -68,6 +69,17 @@ export function fieldBlockTextFrom(
   residual: FieldResidualSlice,
   id: BlockId,
   format: GreetingFormatParams = DEFAULT_GREETING_FORMAT,
+  /**
+   * 「对话示例」自己的格式参数（2026-11-11）。
+   *
+   * ★ 与 `format` **不是同一个东西**，别混用：
+   *   `format`            = 初始场景预设（管 @@开场白/@@情景/多条分隔）
+   *   `chatExamplesFormat` = 对话示例预设（管 说话人写法/轮次称呼）
+   *
+   * 混用的后果不是崩溃，而是**静默不生效**：初始场景预设的 labelMap 里
+   * 没有 `user`/`char`，于是说话人映射一个都不做，用户以为配了其实没配。
+   */
+  chatExamplesFormat?: GreetingFormatParams,
 ): string {
   /*
    * 现在有**两个**字段板块：
@@ -80,7 +92,16 @@ export function fieldBlockTextFrom(
    */
   const renderers: Partial<Record<BlockId, () => string>> = {
     'initial-scene': () => renderCompositeScene(sceneSectionsFrom(residual), format),
-    'chat-examples': () => residual.mesExample,
+    /*
+     * 对话示例要按预设把说话人写法渲染出来（2026-11-11）。
+     *
+     * `mes_example` 里是 ST 的 `{{user}}:`，而平台规范可能要求 `用户：`。
+     * 不渲染的话：用户在板块里看到的是 ST 写法，审计按他的规则判却是"缺说话人行"，
+     * 两边对不上而他无从下手。
+     *
+     * ★ 反向在 `reflectFieldBlocks` 里，成对才闭合。
+     */
+    'chat-examples': () => renderChatExamples(residual.mesExample, chatExamplesFormat),
   };
   return renderers[id]?.() ?? '';
 }
@@ -89,8 +110,9 @@ export function fieldBlockText(
   card: UnifiedCard,
   id: BlockId,
   format: GreetingFormatParams = DEFAULT_GREETING_FORMAT,
+  chatExamplesFormat?: GreetingFormatParams,
 ): string {
-  return fieldBlockTextFrom(card.residual, id, format);
+  return fieldBlockTextFrom(card.residual, id, format, chatExamplesFormat);
 }
 
 function fieldBlock(id: BlockId, text: string, missing = false): CardBlock {
@@ -117,11 +139,12 @@ export function blocksWithFieldBlocks(
   blocks: readonly CardBlock[],
   residual: FieldResidualSlice,
   format: GreetingFormatParams = DEFAULT_GREETING_FORMAT,
+  chatExamplesFormat?: GreetingFormatParams,
 ): CardBlock[] {
   const byId = new Map<BlockId, CardBlock>(blocks.map((block) => [block.id, block]));
   return BLOCK_IDS.filter((id) => id !== 'worldbook').map((id) => {
     if (isFieldBlock(id)) {
-      const text = fieldBlockTextFrom(residual, id, format);
+      const text = fieldBlockTextFrom(residual, id, format, chatExamplesFormat);
       return fieldBlock(id, text);
     }
     const existing = byId.get(id);
@@ -145,6 +168,8 @@ export interface FieldBlockReflection {
 export function reflectFieldBlocks(
   card: UnifiedCard,
   format: GreetingFormatParams = DEFAULT_GREETING_FORMAT,
+  /** 「对话示例」预设（与 format 分离，见 `fieldBlockTextFrom` 的说明） */
+  chatExamplesFormat?: GreetingFormatParams,
 ): FieldBlockReflection {
   const override: FieldBlockReflection['override'] = {};
   const written: BlockId[] = [];
@@ -177,6 +202,19 @@ export function reflectFieldBlocks(
     written.push('initial-scene');
   }
 
+  /*
+   * 对话示例：把用户写法反解回 ST 写法（2026-11-11）。
+   *
+   * ★ 不写这一步的后果：用户在板块里把 `用户：` 编辑好，导出时原样写进
+   *   `mes_example` —— 而 ST 不认 `用户：` 当说话人标记，那张卡在 ST 里
+   *   整段对话示例都读不到。**它不报错、不崩，只是内容没了。**
+   */
+  const examplesBlock = card.blocks.find((block) => block.id === 'chat-examples');
+  if (examplesBlock && examplesBlock.dirty) {
+    override.mesExample = parseChatExamples(examplesBlock.text, chatExamplesFormat);
+    written.push('chat-examples');
+  }
+
   return { override, written };
 }
 
@@ -184,8 +222,9 @@ export function reflectFieldBlocks(
 export function applyFieldBlockReflection(
   card: UnifiedCard,
   format: GreetingFormatParams = DEFAULT_GREETING_FORMAT,
+  chatExamplesFormat?: GreetingFormatParams,
 ): UnifiedCard {
-  const { override, written } = reflectFieldBlocks(card, format);
+  const { override, written } = reflectFieldBlocks(card, format, chatExamplesFormat);
   if (written.length === 0) return card;
   return { ...card, residual: { ...card.residual, ...override } };
 }

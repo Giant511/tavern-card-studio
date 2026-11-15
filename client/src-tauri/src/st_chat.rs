@@ -567,6 +567,65 @@ pub async fn st_chat_list(
         .await
 }
 
+/// 跨 IPC 回传给 WebView 的单条文本上限（MB）。
+///
+/// ## 为什么这个上限必须存在（2026-11-13，荣耀90 的 OOM）
+///
+/// 用户崩溃日志里的唯一硬信息：
+///
+/// ```text
+///   java.lang.OutOfMemoryError:
+///     Failed to allocate a 211839248 byte allocation
+///     with 186493872 free bytes and 177MB until OOM,
+///     target footprint 402653184, growth limit 402653184
+/// ```
+///
+/// 换算：**一次要 202MB，当时只剩 178MB，上限 384MB ⇒ 已用 206MB**。
+///
+/// 而 Tauri 在 Android 上把命令返回值交给 WebView 的方式是
+/// `evaluateJavascript("…runCallback(…<这个 JSON>…)")` ——
+/// **那一整个字符串是 Java 堆里的一次分配**。
+///
+/// ```text
+///   一条 100MB 的 JSON 文本
+///     → Java String，字符按 UTF-16 存 ⇒ 200MB 单次分配
+///     → 正好撞上那份日志里的 211839248 字节
+/// ```
+///
+/// 所以：**在 Rust 侧、返回之前**就把过大的响应挡掉。
+/// Rust 这边没有 384MB 的堆上限，挡得住；等进了 Java 就晚了。
+///
+/// ## 为什么是 24MB
+///
+/// `24MB 文本 → Java 侧约 48MB`，在 384MB 堆里留足余量，
+/// 又足够装下正常用途里最大的东西（一张角色卡 PNG 的 base64、
+/// 一份几万条消息的聊天记录）。
+const MAX_IPC_TEXT_MB: usize = 24;
+
+/// 返回前检查长度；超了就换成一句能读懂的错误，而不是让 WebView 崩掉。
+///
+/// `what` 是给用户看的名词（"这份聊天记录"），不要写内部命令名 ——
+/// 项目文案红线：界面语言里不出现内部术语。
+fn capped_text(text: String, what: &str) -> Result<String, ShellError> {
+    let limit = MAX_IPC_TEXT_MB * 1024 * 1024;
+    if text.len() > limit {
+        /*
+         * 注意：`text.len()` 是 UTF-8 字节数，而 Java 侧是 UTF-16 字符。
+         * 中文占 3 字节 UTF-8 / 2 字节 UTF-16，所以这里用字节数当闸门
+         * 是**偏保守**的（同样的数字，中文在 Java 侧反而更小）。
+         * 宁可早一点拦，也不要在边界上赌。
+         */
+        return Err(ShellError::StBadResponse {
+            detail: format!(
+                "{what}太大（{}MB，上限 {}MB），继续读会把应用撑爆。                 如果这不对，告诉我它是怎么变成这么大的。",
+                text.len() / 1024 / 1024,
+                MAX_IPC_TEXT_MB
+            ),
+        });
+    }
+    Ok(text)
+}
+
 /// 读聊天。
 ///
 /// `file_name` 是**带 `.jsonl`** 的那个 —— 契约陷阱 #3：get/save 用不带扩展名的
@@ -579,16 +638,19 @@ pub async fn st_chat_load(
     state: State<'_, StChatState>,
 ) -> Result<String, ShellError> {
     let api = state.api()?;
-    api.post_text(
-        "/api/chats/get",
-        serde_json::json!({
-            "avatar_url": avatar,
-            "file_name": file_name,
-            "ch_name": "",
-            "tail_message": serde_json::Value::Null,
-        }),
-    )
-    .await
+    let text = api
+        .post_text(
+            "/api/chats/get",
+            serde_json::json!({
+                "avatar_url": avatar,
+                "file_name": file_name,
+                "ch_name": "",
+                "tail_message": serde_json::Value::Null,
+            }),
+        )
+        .await?;
+    /* 整份聊天一次性回传 —— 是桥接里最大的一条，必须限量 */
+    capped_text(text, "这份聊天记录")
 }
 
 /// 保存聊天。**整份覆盖**（陷阱 #1）—— 调用方必须先把完整历史读出来再改。
@@ -637,12 +699,48 @@ pub async fn st_chat_rename(
     state: State<'_, StChatState>,
 ) -> Result<String, ShellError> {
     let api = state.api()?;
+    /*
+     * ★★★★★ 两个文件名都必须带 `.jsonl`（2026-11-15，用户报「改不了名字」）。
+     *
+     * ## ST 的 `/api/chats/rename` 不补扩展名
+     *
+     * ```js
+     *   const pathToOriginalFile = path.join(pathToFolder, sanitize(request.body.original_file));
+     *   ...
+     *   if (!fs.existsSync(pathToOriginalFile) || fs.existsSync(pathToRenamedFile)) {
+     *       return response.status(400).send({ error: true });
+     *   }
+     * ```
+     *
+     * `file_id` 是**不带扩展名**的（契约 #3），于是 `existsSync` 查的是
+     * `…/威廉/威廉 - 2026-11-14@19h57m46s`（没有 `.jsonl`）⇒ 恒为 false
+     * ⇒ **每一次改名都返回 400**。用户看到的就是「改名失败」。
+     *
+     * ## 三个端点三种行为（这是最容易踩的一组）
+     *
+     * ```text
+     *   /save     const chatFileName = `${file_name}.jsonl`     无条件拼 ⇒ 传【不带】
+     *   /delete   if (!path.extname(chatfile)) chatfile += '.jsonl'  缺才补 ⇒ 都行
+     *   /rename   sanitize(body.original_file)                  不补   ⇒ 必须传【带】
+     * ```
+     *
+     * 按 `/delete` 的直觉写 `/rename`，就会 100% 失败 —— 这次正是如此。
+     * 判据在 `test/chat-file-contract.test.mjs`，三个端点各钉一条。
+     */
+    let with_ext = |name: &str| -> String {
+        if name.to_ascii_lowercase().ends_with(".jsonl") {
+            name.to_string()
+        } else {
+            format!("{name}.jsonl")
+        }
+    };
+
     api.post_text(
         "/api/chats/rename",
         serde_json::json!({
             "avatar_url": avatar,
-            "original_file": file_id,
-            "renamed_file": new_name,
+            "original_file": with_ext(&file_id),
+            "renamed_file": with_ext(&new_name),
         }),
     )
     .await
@@ -782,15 +880,182 @@ pub async fn st_chat_secret_write(
     state: State<'_, StChatState>,
 ) -> Result<String, ShellError> {
     let api = state.api()?;
-    api.post_text(
-        "/api/secrets/write",
-        serde_json::json!({
-            "key": key,
-            "value": value,
-            "label": label.unwrap_or_default(),
-        }),
-    )
-    .await
+
+    /*
+     * ★ `label` 没给时**不带这个字段**，而不是传空串（2026-11-11 修）。
+     *
+     * ST 侧是 `writeSecret(key, value, label = 'Unlabeled')` —— JS 的默认参数
+     * **只在 `undefined` 时生效**。我们原来传 `label.unwrap_or_default()` = `""`，
+     * 于是默认值不触发，secrets.json 里存成 `label: ""`。
+     *
+     * 不传功能上有害处（key 照样写进去），但它让"这条是谁写的"变得不可辨认 ——
+     * 排查时只能靠 id 猜。留个干净的 label 值反而有用。
+     */
+    let mut body = serde_json::json!({
+        "key": key,
+        "value": value,
+    });
+    if let Some(text) = label {
+        if !text.is_empty() {
+            body["label"] = serde_json::Value::String(text);
+        }
+    }
+
+    api.post_text("/api/secrets/write", body).await
+}
+
+/// 取某个 secret key **当前生效那条的 id**（2026-11-11）。
+///
+/// ## 为什么需要它
+///
+/// key 的值写进 ST 后**读不回来**（契约 §3.5 掩码），所以"新 key 到底进没进去"
+/// 无法用值来判。但 ST 的 `writeSecret` 每次都会：
+///
+/// ```text
+///   ① 把旧的全部 active = false
+///   ② push 一条新的（新 uuid，active = true）
+/// ```
+///
+/// ⇒ **写入成功必然导致 active 那条的 id 变化**。这是唯一可靠的判据。
+///
+/// ## 它要抓的那个 bug
+///
+/// 用户报「无法更新秘钥」，而界面每次都显示"已保存"。原因是校验只看
+/// 「`api_key_custom` 这个名字存在吗」—— 旧的那条一直在，所以永远通过。
+///
+/// ```text
+///   写入失败（或压根没被调用）
+///     → secretPresent() 仍返回 ['api_key_custom']（旧值）
+///     → 校验通过 → 显示"已保存"
+/// ```
+///
+/// 有了这个 id，前后一对比就知道有没有真的写进去。
+#[tauri::command]
+pub async fn st_chat_secret_active_id(
+    key: String,
+    state: State<'_, StChatState>,
+) -> Result<Option<String>, ShellError> {
+    let api = state.api()?;
+    let text = api.post_text("/api/secrets/read", serde_json::json!({})).await?;
+    let root: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| ShellError::StBadResponse {
+            detail: format!("secrets/read 返回的不是 JSON（{e}）"),
+        })?;
+
+    let Some(list) = root.get(&key).and_then(|v| v.as_array()) else {
+        return Ok(None);
+    };
+
+    /*
+     * 与 ST 的 `readSecret()` 同口径：**只认 `active: true` 那条**。
+     * 数组里一条都不 active ⇒ 返回 None（等于"ST 读不到 key"）。
+     */
+    for item in list {
+        if item.get("active").and_then(|v| v.as_bool()) == Some(true) {
+            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                return Ok(Some(id.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// 让某张卡的**头像缩略图**失效（删掉磁盘上的缓存文件）。
+///
+/// ## 为什么需要它（2026-11-11，真机取证）
+///
+/// 用户："下载后威廉的角色头像还是原来的那个兜底的"
+///
+/// 取证结果（直连 ST 读字节）：
+///
+/// ```text
+///   原图   /characters/威廉.png      PNG 683×1024（691 KB）  ← 已经是仓库卡面
+///   缩略图 /thumbnail?type=avatar    JPEG 96×144（5 KB）     ← 还是绿「威」字
+/// ```
+///
+/// 也就是说**卡本身已经对了**，是 ST 的**头像缩略图缓存没跟着刷新**，
+/// 而列表画的正是缩略图。用户看到"还是兜底"，指的就是它。
+///
+/// ## 为什么 ST 不自己刷新
+///
+/// 它的判断是（`thumbnails.js`）：
+///
+/// ```js
+///   if (originalStat.mtimeMs > cachedStat.ctimeMs) forceGenerate = true;
+/// ```
+///
+/// 这个判断在桌面正常，而我们是**直接写文件**（`st_chat_character_write_png`，
+/// tmp + rename），绕过了 ST 的 API —— 那条路上 ST 没有任何机会知道"图换了"。
+///
+/// ## 为什么删而不是覆盖成空文件
+///
+/// 覆盖成 0 字节也能触发的它的 catch 分支，但那是**依赖对方的错误处理**；
+/// 而"缓存文件不存在"是 ST 明确支持的正常路径（它会重新生成）。
+/// 少一层猜测。
+///
+/// ## 安全边界（这个命令能删文件，必须收窄）
+///
+/// ```text
+///   ① 目录只能由 characters_dir 推导出来（<user>/thumbnails/avatars），
+///      不接受调用方传任意目录
+///   ② 只删"文件名主干等于 avatar 主干"的文件（`威廉.png` 的缩略图可能叫
+///      `威廉.jpg`，ST 会按输出格式换扩展名，所以按主干比）
+///   ③ avatar 不许含路径分隔符（防 `../../` 穿越）
+/// ```
+#[tauri::command]
+pub async fn st_chat_invalidate_thumbnail(
+    avatar: String,
+    characters_dir: String,
+) -> Result<bool, ShellError> {
+    let name = avatar.trim();
+    if name.is_empty() {
+        return Ok(false);
+    }
+    /* ③ 防穿越：正常情况下 avatar 就是个文件名 */
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(ShellError::PathNotAllowed {
+            path: name.to_string(),
+        });
+    }
+
+    /* ① 由 characters_dir 推导，绝不接受外部传入的缩略图目录 */
+    let user_dir = match std::path::Path::new(&characters_dir).parent() {
+        Some(one) => one.to_path_buf(),
+        None => return Ok(false),
+    };
+    let thumb_dir = user_dir.join("thumbnails").join("avatars");
+    if !thumb_dir.is_dir() {
+        return Ok(false);
+    }
+
+    /* ② 按主干比：`威廉.png` 与 `威廉.jpg` 视为同一张卡的缩略图 */
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .map(|one| one.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_string());
+
+    let mut removed = false;
+    let entries = match std::fs::read_dir(&thumb_dir) {
+        Ok(one) => one,
+        Err(_) => return Ok(false),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let same_stem = path
+            .file_stem()
+            .map(|one| one.to_string_lossy() == stem)
+            .unwrap_or(false);
+        if !same_stem {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed = true;
+        }
+    }
+    Ok(removed)
 }
 
 /// 问 ST「哪些 secret **真的配了**」，返回 key 名列表（2026-11-07）。
