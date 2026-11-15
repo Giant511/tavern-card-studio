@@ -72,8 +72,34 @@ fi
 
 # 版本号从生成的 tauri.properties 读 —— 不在脚本里手写，避免升版后文件名漂移
 TAURI_PROPS="$CLIENT/src-tauri/gen/android/app/tauri.properties"
-VERSION_NAME=$(sed -n 's/^tauri\.android\.versionName=//p' "$TAURI_PROPS" 2>/dev/null | tr -d '\r')
-VERSION_NAME="${VERSION_NAME:-0.0.0}"
+#
+# ★★★ 文件不存在时必须**明确报错**，不能让 set -e 静默带走整条构建
+# （2026-11-15 亲手踩到）。
+#
+# 原来是这样：
+#
+# ```bash
+#   VERSION_NAME=$(sed -n '...' "$TAURI_PROPS" 2>/dev/null | tr -d '\r')
+# ```
+#
+# 文件不存在时 `sed` 返回非零，`set -o pipefail` 让**管道整体**返回非零，
+# 于是 `set -e` 立刻退出 —— 退出码 2、**一行输出都没有**。
+#
+# 表现是"打包 32 秒就结束了，但什么也没生成"，而没有任何线索说明
+# 是版本号文件的问题。`2>/dev/null` 把唯一的那句错误也吞了。
+#
+# 现在：先判存在，缺了就说清缺什么、怎么补。
+if [ ! -f "$TAURI_PROPS" ]; then
+  echo "[FATAL] 缺少 $TAURI_PROPS" >&2
+  echo "        它是 tauri 构建时生成的版本号来源。手写也可以：" >&2
+  echo "        tauri.android.versionName=<版本> / tauri.android.versionCode=<整数>" >&2
+  exit 2
+fi
+VERSION_NAME=$(sed -n 's/^tauri\.android\.versionName=//p' "$TAURI_PROPS" | tr -d '\r')
+if [ -z "$VERSION_NAME" ]; then
+  echo "[FATAL] $TAURI_PROPS 里没有 tauri.android.versionName" >&2
+  exit 2
+fi
 
 VARIANT="debug"
 TAURI_ARGS=(--apk --target aarch64 --debug)
