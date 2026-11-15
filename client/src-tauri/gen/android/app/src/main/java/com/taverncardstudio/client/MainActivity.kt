@@ -7,7 +7,9 @@ import android.view.WindowInsets
 import android.webkit.WebSettings
 import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
+import android.app.Application
 import com.taverncardstudio.client.stengine.StBridge
+import com.taverncardstudio.client.stengine.StLog
 
 /**
  * 安卓端主 Activity。
@@ -31,11 +33,133 @@ class MainActivity : TauriActivity() {
 
   companion object {
     private const val TAG = "MainActivity"
+
+    /** 崩溃取证用的偏好文件（与引擎配置分开：清配置时不该顺手清掉它） */
+    private const val PREFS = "tcs.diag"
+
+    /**
+     * "上次是否正常退出"标记。
+     *
+     * `onCreate` 置 false、`onDestroy` 置 true —— 只有两个都走到，
+     * 才说明这次会话是干净结束的。中间被杀就永远停在 false。
+     */
+    private const val KEY_CLEAN_EXIT = "cleanExit"
   }
 
   override fun onCreate(savedInstanceState: Bundle?) {
+    /*
+     * ★★★ 日志必须在**一切之前**就绪（2026-11-12）。
+     *
+     * 用户报「进入 APP 后过一段时间自动闪退，哪怕没做任何操作」，
+     * 而之前一条现场记录都拿不到：logcat 要数据线，JS 崩了之后页面里什么都不剩。
+     *
+     * 放在 `enableEdgeToEdge()` 之前 —— 那一步在个别机型上会抛
+     * （窗口 inset 异常），放后面就抓不到那种启动期崩溃。
+     */
+    StLog.init(this)
+    StLog.i(
+      "BOOT",
+      "onCreate 开始：SDK ${Build.VERSION.SDK_INT}，" +
+        "${Build.MANUFACTURER} ${Build.MODEL}，Android ${Build.VERSION.RELEASE}"
+    )
+
+    /*
+     * ★ 堆预算（2026-11-13，用户报荣耀90 闪退之后加的）。
+     *
+     * ## 那份崩溃日志里唯一的硬信息
+     *
+     * ```text
+     *   java.lang.OutOfMemoryError:
+     *     Failed to allocate a 211839248 byte allocation
+     *     with 186493872 free bytes and 177MB until OOM,
+     *     target footprint 402653184, growth limit 402653184
+     * ```
+     *
+     * 换算出来是：**一次要 202MB，当时只剩 178MB，上限 384MB
+     * ⇒ 崩溃前已经用掉 206MB。**
+     *
+     * 但"206MB 用在哪""这台机的上限是多少""开机时还剩多少"——
+     * 日志里**一个字都没有**。我们只能反算，不能验证。
+     *
+     * ## 这两行补的就是这个洞
+     *
+     * ```text
+     *   上限 = maxMemory()      每台机不同（dalvik.vm.heapsize）
+     *   已用 = total - free     开机基线；后续任何时刻可再记
+     * ```
+     *
+     * 代价是两次 Runtime 调用（微秒级），只记一次。
+     */
+    run {
+      val runtime = Runtime.getRuntime()
+      StLog.i(
+        "MEM",
+        "堆上限 ${runtime.maxMemory() / 1024 / 1024}MB，" +
+          "开机已用 ${(runtime.totalMemory() - runtime.freeMemory()) / 1024 / 1024}MB"
+      )
+    }
+
+    /*
+     * 记一条"上次是怎么退出的"。
+     *
+     * 依据：上次进程有没有走到 `onDestroy`。
+     *
+     * ```text
+     *   走到过 onDestroy        ⇒ 正常退出
+     *   没走到（标记还是 false） ⇒ 被系统回收 / 被杀 / 崩溃
+     * ```
+     *
+     * 这一条与"同一时段有没有 CRASH 记录"配合，就能把「JS 崩了」
+     * 「渲染进程被回收」「整个进程被系统清掉」三者分开 ——
+     * 它们的修法完全不同，混在一起只能靠猜。
+     */
+    val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+    if (!prefs.getBoolean(KEY_CLEAN_EXIT, true)) {
+      StLog.e(
+        "BOOT",
+        "上次进程没有正常退出（未走到 onDestroy）。" +
+          "若上一条是 CRASH ⇒ 崩溃；若只有心跳中断 ⇒ 多半被系统回收或被杀。"
+      )
+    }
+    /* 先置 false：只有这次真的走到 onDestroy 才会被改回 true */
+    prefs.edit().putBoolean(KEY_CLEAN_EXIT, false).apply()
+
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+
+    /*
+     * 记 Activity 的进/退后台（2026-11-12）。
+     *
+     * ## 为什么这条重要
+     *
+     * 安卓上进程被系统清掉**绝大多数发生在后台**（前台服务也拦不住内存压力
+     * 下的回收）。所以"什么时候进的后台、在里面待了多久"是判断
+     * 「闪退 vs 后台被杀」的关键上下文。
+     *
+     * ## 为什么不用 `setWebViewClient` 的 `onRenderProcessGone`
+     *
+     * 那个回调能直接抓到渲染进程死亡，但 `setWebViewClient` 会**顶掉
+     * Tauri 自己的 client**（本文件后面那条注释记的就是这个坑），
+     * 顶掉后页面加载、资源拦截全部失常。
+     *
+     * 所以放弃那个钩子，改用生命周期 + JS 侧心跳来推断 ——
+     * 损失一点精度，换来不破坏 WebView 本身。
+     */
+    registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+      override fun onActivityStarted(activity: android.app.Activity) {
+        if (activity === this@MainActivity) StLog.i("LIFE", "进入前台")
+      }
+
+      override fun onActivityStopped(activity: android.app.Activity) {
+        if (activity === this@MainActivity) StLog.i("LIFE", "退到后台")
+      }
+
+      override fun onActivityCreated(activity: android.app.Activity, state: Bundle?) = Unit
+      override fun onActivityResumed(activity: android.app.Activity) = Unit
+      override fun onActivityPaused(activity: android.app.Activity) = Unit
+      override fun onActivitySaveInstanceState(activity: android.app.Activity, state: Bundle) = Unit
+      override fun onActivityDestroyed(activity: android.app.Activity) = Unit
+    })
 
     /*
      * 启动时把引擎拉起来（设计文档 §5.4：App 启动拉起）。
@@ -362,4 +486,43 @@ class MainActivity : TauriActivity() {
     val fromRes = resources.getDimensionPixelSize(resId)
     return if (fromRes > 0) fromRes else 0
   }
+  /**
+   * 正常退出标记（2026-11-12）。
+   *
+   * 与 `onCreate` 里那次置 false 配对 —— 只有真的走到这里才算干净结束。
+   * 这是判断"闪退 vs 被系统杀"的唯一依据：没有它，两种情况在日志里
+   * 长得一模一样（都是"上次没有日志结尾"）。
+   *
+   * ## ★★★ 必须用 `commit()` 而不是 `apply()`（2026-11-15）
+   *
+   * 真机日志里这一对**自相矛盾**，相隔 4 秒：
+   *
+   * ```text
+   *   20:05:10.701 I BOOT: onDestroy（正常退出）
+   *   20:05:14.778 E BOOT: 上次进程没有正常退出（未走到 onDestroy）
+   * ```
+   *
+   * 原因就是 `apply()`：它**立刻改内存、异步写磁盘**。而 `onDestroy`
+   * 之后进程马上被回收，那次异步写很可能没落地 —— 下次开机读到的
+   * 还是 `false`，于是"明明正常退出"被报成"没有正常退出"。
+   *
+   * 这是所有"退出时写标记"的通病：**进程死亡与异步落盘在赛跑，
+   * 通常进程先死。** 标记越小越该用同步写 —— 一个 boolean 的
+   * `commit()` 是微秒级，在 `onDestroy` 里阻塞完全可以接受。
+   *
+   * 更严重的后果不是这条日志错，而是**它会污染所有崩溃归因**：
+   * 真的被系统杀掉时，我们会以为"上次是正常退出的"，从而漏掉线索。
+   */
+  override fun onDestroy() {
+    /*
+     * 顺序也要紧：先落标记，再记日志。
+     *
+     * 反过来的话，日志里会出现"onDestroy（正常退出）"而标记没写进去 ——
+     * 正是这次的现场。**先做有副作用的事，再用日志确认它做完了。**
+     */
+    getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_CLEAN_EXIT, true).commit()
+    StLog.i("BOOT", "onDestroy（正常退出）")
+    super.onDestroy()
+  }
+
 }

@@ -135,6 +135,16 @@ class StService : Service() {
                  * 用户看到的是一个不会消失的通知，没有任何原因。
                  */
                 Log.e(TAG, "启动流程崩溃", error)
+                /*
+                 * 同时落进用户可取的日志（2026-11-12）。
+                 *
+                 * `catch Throwable` 这一支抓的是 OOM / UnsatisfiedLinkError
+                 * 这类致命错误 —— 它们最需要现场，而原来只进 logcat。
+                 */
+                StLog.e(
+                    "ENGINE",
+                    "启动流程崩溃：${error.javaClass.name}: ${error.message}\n${error.stackTraceToString()}"
+                )
                 lastError = "启动失败：${error.javaClass.simpleName}"
                 updateNotification("启动失败，点开重试", null)
             }

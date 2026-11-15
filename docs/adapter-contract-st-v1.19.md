@@ -504,7 +504,8 @@ export type StStreamEvent =
 |---|---|---|---|
 | 1 | `/api/chats/save` 是全量覆盖 | 只发改动 → 历史丢失 | 适配器只暴露「整份保存」 |
 | 2 | 聊天目录名 = `avatar` 去 `.png`，不是角色名 | 角色改名后找不到旧聊天 | 始终用 `avatar` 字段，不要用 `name` 拼路径 |
-| 3 | `file_name`（带 `.jsonl`）与 `file_id`（不带）双轨 | 传错 → 400 或建出怪文件 | 按端点分别用：get/save 用不带，rename/delete 用带 |
+| 3 | `file_name`（带 `.jsonl`）与 `file_id`（不带）双轨 | 传错 → 400 或建出怪文件 | 按端点分别用：get/save 用**不带**，rename/delete 用**带** |
+| 3b | **三个写端点的扩展名行为各不相同**（2026-11-15 补，用户报「改不了名字」）：<br>`save` → `` `${file_name}.jsonl` `` **无条件拼**；<br>`rename` → `sanitize(body.original_file)` **不补**；<br>`delete` → `if (!extname) += '.jsonl'` **缺才补** | 按 delete 的直觉写 rename ⇒ `existsSync` 查无扩展名路径 ⇒ **每次改名都 400** | 三条可执行判据：`test/chat-file-contract.test.mjs`。**光在文档里写着没用，必须有判据** —— 这一条文档原本就是对的，代码还是错了 |
 | 4 | **`/api/chats/get` 的「没有聊天」有两种形状**（2026-10-29 实测修正）：目录不存在 → `{}`（顺手 `mkdirSync`）；目录存在但文件读不到 → **`[]`**。两者都不返回 404 | 把 `{}` 或 `[]` 当「空聊天 → 可安全写入」 → **一次保存整份覆盖，真实历史丢失** | 三态判定（`missing` / `empty` / `chat`），`empty` 必须再按「是否出现在聊天列表里」交叉验证才允许保存（`canSaveOverEmpty`） |
 | 5 | `settings` 是字符串 | 直接当对象用 → undefined | parse + 类型断言后再用 |
 | 6 | `/api/settings/save` 无 patch | 只发一个字段 → 其它设置全清 | 只走 `mutateSettings` |

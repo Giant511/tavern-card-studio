@@ -286,8 +286,14 @@ export function renderCharacterPicker(
      * 原来这里写的是"会连聊天记录一起删掉，不能恢复" —— 那是删除专属警告。
      * 现在这个弹窗既是分享入口又是删除入口，把它写死成删除警告会让
      * 只想分享的人以为自己点了删除。
+     *
+     * ★ 必须写明"会打开系统分享面板"（2026-11-14）：
+     * 三个渠道按钮走的都是 `ACTION_SEND`，不是 SDK 直达。
+     * 不写的话用户点「微信」看到系统面板会以为按钮坏了。
      */
-    subtitle.textContent = '可以把它导出成 PNG 发给别人，对方导入后就能用同一张卡。';
+    subtitle.textContent =
+      '导出成 PNG 发给别人，对方导入后就能用同一张卡。' +
+      '三个渠道都会打开系统分享面板，在里面再选一次即可。';
 
     const actions = el(doc, 'div', 'nb-exit-actions');
 
@@ -333,11 +339,25 @@ export function renderCharacterPicker(
       })();
     });
 
-    const share = el(doc, 'button', 'nb-exit-stay');
-    share.setAttribute('type', 'button');
-    share.setAttribute('data-role', 'picker-share');
-    share.textContent = '导出并分享';
-    share.addEventListener('click', () => {
+    /*
+     * 三个分享渠道 + 小程序占位（2026-11-14，v0.1.9）。
+     *
+     * ## 为什么三个按钮其实只调一个系统面板
+     *
+     * 微信开放平台的分享权限要**企业主体 + 已认证应用**才申请得到，
+     * 个人开发者账号拿不到；QQ 互联同理。两个 SDK 还各带一个回调 Activity，
+     * 而 `gen/android` 在 `.gitignore` 里 —— 每次 `tauri android init`
+     * 都要重新打补丁（本项目已有 `fix-android-gen.py` 的教训）。
+     *
+     * ⇒ 三个按钮**都走 `ACTION_SEND` + `createChooser`**，用户在系统面板里
+     * 再选一次。多一步，换来的是今天就能用，而不是等审核。
+     *
+     * ## 所以文案必须诚实（文案红线：用户知道了能做什么）
+     *
+     * 不能让用户以为"点微信就直达微信"。副标题写清"会打开系统分享面板"。
+     * 反过来如果写"分享到微信"而实际弹的是系统面板，用户会以为按钮坏了。
+     */
+    const runShare = (button: ElLike): void => {
       const run = callbacks.onShare;
       if (run === undefined) return;
 
@@ -346,7 +366,7 @@ export function renderCharacterPicker(
        * 先禁用防连点，但不关弹窗 —— 关掉之后失败提示就无处可显示
        * （那是原生分享面板之外唯一的反馈）。
        */
-      share.setAttribute('disabled', 'true');
+      button.setAttribute('disabled', 'true');
       const outcome = run(item);
 
       if (outcome.ok) {
@@ -354,14 +374,58 @@ export function renderCharacterPicker(
         return;
       }
 
-      share.removeAttribute('disabled');
+      button.removeAttribute('disabled');
       pullHint.textContent = `没分享成：${outcome.reason ?? '未知原因'}`;
       pullHint.setAttribute('data-state', 'error');
       pullHint.setAttribute('data-role', 'picker-share-error');
-    });
+    };
 
     /* 有 onShare 才画分享按钮：没接能力就不给一个点了没反应的按钮 */
-    if (callbacks.onShare !== undefined) actions.append(share);
+    if (callbacks.onShare !== undefined) {
+      const shareRow = el(doc, 'div', 'nb-share-row');
+      shareRow.setAttribute('data-role', 'picker-share-row');
+
+      /*
+       * `key` 只用于 `data-role`，三个按钮的行为完全一致 ——
+       * 分开写三套逻辑没有意义，而且将来会漂移成"微信那条忘了加防连点"。
+       */
+      const channels: ReadonlyArray<{ key: string; label: string }> = [
+        { key: 'wechat', label: '微信' },
+        { key: 'qq', label: 'QQ' },
+        { key: 'more', label: '更多' },
+      ];
+
+      for (const channel of channels) {
+        const btn = el(doc, 'button', 'nb-exit-stay nb-share-btn');
+        btn.setAttribute('type', 'button');
+        btn.setAttribute('data-role', `picker-share-${channel.key}`);
+        btn.textContent = channel.label;
+        btn.addEventListener('click', () => {
+          runShare(btn);
+        });
+        shareRow.append(btn);
+      }
+      actions.append(shareRow);
+    }
+
+    /*
+     * 小程序入口：**只做按钮，明确写"暂不支持"**（用户 2026-11-09 明令）。
+     *
+     * 不做半成品：具体实现要等小程序编辑器定形，提前做会把形态绑死。
+     * 文案只说"暂不支持"，**不写原因** —— 用户要的是知道"现在别指望它"，
+     * 而不是听一段技术解释。
+     */
+    const miniApp = el(doc, 'button', 'nb-exit-stay nb-share-miniapp');
+    miniApp.setAttribute('type', 'button');
+    miniApp.setAttribute('data-role', 'picker-share-miniapp');
+    miniApp.textContent = '小程序（暂不支持）';
+    miniApp.addEventListener('click', () => {
+      pullHint.textContent = '小程序分享暂不支持。';
+      pullHint.setAttribute('data-state', 'idle');
+      pullHint.setAttribute('data-role', 'picker-share-miniapp-note');
+    });
+    actions.append(miniApp);
+
     actions.append(confirm, cancel);
     card.append(title, subtitle, actions);
     overlay.append(card);

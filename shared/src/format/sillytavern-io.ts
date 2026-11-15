@@ -133,6 +133,19 @@ export interface ParseStCardOptions {
    */
   greetingFormat?: GreetingFormatParams;
   /**
+   * 「对话示例」板块用什么格式渲染（2026-11-11）。
+   *
+   * `mes_example` 里是 ST 的 `{{user}}:` / `{{char}}:`，而用户平台的规范
+   * 可能是 `用户：` / `角色：`。传这个参数 = **到达时就按用户的写法渲染**，
+   * 板块视图与他的平台规则天然一致，不会出现"视图是 ST 写法、
+   * 审计按平台规则判"这种自相矛盾。
+   *
+   * ★ 必须与 `SerializeStCardOptions.chatExamplesFormat` 成对使用：
+   *   只渲染不反解，导出时 `用户：` 会被写进 `mes_example`，
+   *   而 ST 不认这种说话人写法 —— 那段对话示例在那张卡里读不到。
+   */
+  chatExamplesFormat?: GreetingFormatParams;
+  /**
    * 世界书文本用什么格式渲染（v0.1.6 生产缺陷一 / 决策 #235）。
    *
    * `character_book.entries` 是**结构化的**，文本只是它的视图 —— 视图用哪套
@@ -254,7 +267,19 @@ export function parseStCard(input: unknown, options: ParseStCardOptions = {}): P
     ...createEmptyCard(meta.name),
     schemaVersion: UNIFIED_CARD_SCHEMA_VERSION,
     meta,
-    blocks: blocksWithFieldBlocks(built.blocks, residual, options.greetingFormat),
+    /*
+     * ★ 对话示例的格式必须与初始场景**分开传**（2026-11-11）。
+     *
+     * 两者是不同预设：`greetingFormat` 管 `@@开场白/@@情景/多条分隔`，
+     * `chatExamplesFormat` 管 `说话人写法/轮次称呼`。混成一个会让
+     * 说话人映射静默失效 —— 初始场景预设的 labelMap 里没有 user/char。
+     */
+    blocks: blocksWithFieldBlocks(
+      built.blocks,
+      residual,
+      options.greetingFormat,
+      options.chatExamplesFormat,
+    ),
     description: {
       raw: built.raw,
       separator: built.separator,
@@ -290,6 +315,8 @@ export interface SerializeStCardOptions extends AssembleOptions {
   targetSpec?: StSpecVersion;
   /** 「初始场景」多条开场白的分隔格式；缺省 = 冻结默认值 */
   greetingFormat?: GreetingFormatParams;
+  /** 「对话示例」的说话人写法；与 `ParseStCardOptions` 同名同义，必须成对 */
+  chatExamplesFormat?: GreetingFormatParams;
   /**
    * 把世界书条目的显示名补进 ST 认的 `comment`（缺省 **false**）。
    *
@@ -397,7 +424,11 @@ export function serializeStCard(card: UnifiedCard, options: SerializeStCardOptio
   // 字段板块（对话示例 / 初始场景）被改过时，把改动回写到 residual：
   // 只处理 dirty 的板块，未编辑的板块一律用原字段值 —— 否则 first_mes 里
   // 天然含有的一行 `---` 会被当成分隔符切开（静默改数据）。
-  const effective = applyFieldBlockReflection(card, options.greetingFormat);
+  const effective = applyFieldBlockReflection(
+    card,
+    options.greetingFormat,
+    options.chatExamplesFormat,
+  );
   const description = assembleDescription(card.blocks, card.description, options);
   const data = buildData(effective, description, options);
   const legacyMode = options.legacyTopLevel ?? 'sync';

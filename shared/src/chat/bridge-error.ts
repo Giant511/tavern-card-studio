@@ -84,6 +84,33 @@ function classifyCode(code: string, message: string): DescribedError {
         message: message === '' ? '服务拒绝了这次请求' : message,
         hint: '会话可能过期了。回到聊天页重新连接一次。',
       };
+    /*
+     * ★★★ 上游服务商拒绝（2026-11-11 新增，与 ST_FORBIDDEN 分开）。
+     *
+     * 真机取证前，这种情况被报成「返回 403 —— 通常是会话过期了」，
+     * 而真实原因是：
+     *
+     * ```text
+     *   {"error":{"message":"账户额度不足。请检查额度或购买。",
+     *    "code":"pre_consume_token_quota_failed"}}
+     * ```
+     *
+     * 用户按那句提示去重连、去重登、去重填 key —— 全都治不好，因为要充钱。
+     * **一句错提示能让人白折腾一整天**，所以这条必须独立。
+     *
+     * `message` 优先用服务商原话（Rust 已把它放在 message 里）——
+     * "账户额度不足"这种话只有服务商说得准，我们改写只会变模糊。
+     */
+    case 'UPSTREAM_REJECTED':
+      return {
+        kind: 'upstream',
+        code,
+        message: message === '' ? '接口服务商拒绝了这次请求' : message,
+        hint:
+          '这是接口服务商那边的判断，不是本机配置错。' +
+          '最常见的是**账户额度用完**，其次是这把 key 无权访问该模型。' +
+          '去服务商后台看额度与用量，充上之后直接重发即可 —— 不用改任何设置。',
+      };
     case 'ST_HTTP_STATUS':
       return {
         kind: 'upstream',

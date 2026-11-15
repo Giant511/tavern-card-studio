@@ -28,6 +28,12 @@
 
 import type { StChatSource, StGenerateRequest } from '../st-adapter/types.js';
 import { SUPPORTED_CHAT_SOURCES, isSupportedChatSource } from '../st-adapter/types.js';
+/*
+ * 「填了非官方地址 ⇒ 必须按 custom 源发」这条规则的唯一定义处。
+ * 请求侧与落盘侧必须用同一个判据，否则会出现"存的是 custom、发的是 deepseek"
+ * 这种自相矛盾（那正是用户报「秘钥存储还是有问题」的真因）。
+ */
+import { effectiveSourceFor } from './api-persist.js';
 import {
   buildReasoningInjection,
   manualProfile,
@@ -428,8 +434,43 @@ export function buildGenerateRequest(input: BuildGenerateInput): BuildGenerateRe
     };
   }
 
+  /*
+   * ★★★ 请求体里的源必须与"地址是否自定义"一致（2026-11-11）。
+   *
+   * ## 用户报的
+   *
+   * > 秘钥存储还是有问题
+   *
+   * 截图：`400 {"code":"","message":"Key 错误: Key 填错、过期或未设置 Bearer。"}`
+   *
+   * 录屏里他做了两件事：填了中转站地址 `https://vip4lai.xyz/v1`，
+   * 然后把源从「自定义」改成了「DeepSeek」。
+   *
+   * ## 为什么这就坏了
+   *
+   * ST 的分支（`chat-completions.js`）：
+   *
+   * ```js
+   *   // custom 源
+   *   apiUrl = request.body.custom_url;
+   *   apiKey = readSecret(…, SECRET_KEYS.CUSTOM, …);
+   *
+   *   // deepseek 源
+   *   apiUrl = request.body.reverse_proxy || API_DEEPSEEK;   // ← 官方地址
+   *   apiKey = readSecret(…, SECRET_KEYS.DEEPSEEK, …);
+   * ```
+   *
+   * 源一改成 DeepSeek，`custom_url` 就不被读了 —— 请求打到
+   * `api.deepseek.com`，拿着中转站的 key，上游当然说「Key 错误」。
+   *
+   * **key 一直是存好的，是请求发错了地方。** 用户因此以为"秘钥存储坏了"。
+   *
+   * `effectiveSourceFor` 的规则：填了非官方地址 ⇒ 就用 custom 源。
+   * 这与用户的意图完全一致 —— 他填那个地址就是要打那个地址。
+   */
+  const actualSource = effectiveSourceFor(input.source, input.customUrl ?? '');
   const request: StGenerateRequest = {
-    chat_completion_source: input.source,
+    chat_completion_source: actualSource,
     model,
     messages: input.messages.map((m) => ({ ...m })),
     stream: input.stream !== false,
@@ -487,7 +528,16 @@ export function buildGenerateRequest(input: BuildGenerateInput): BuildGenerateRe
    * 于是请求 15 毫秒就结束，界面上只留一个空气泡，**没有任何可归因的信息**。
    * 现在缺地址直接判失败，把原因说清楚。
    */
-  if (input.source === 'custom') {
+  /*
+   * 地址：按**实际源**决定要不要带。
+   *
+   * `actualSource === 'custom'` 有两种来路：
+   *   ① 用户本来就选了 custom
+   *   ② 用户选了别的源但填了非官方地址（被 `effectiveSourceFor` 纠正过来）
+   *
+   * ① 缺地址要报错（原来那条提示照留）；② 必然有地址，不用报。
+   */
+  if (actualSource === 'custom') {
     const url = typeof input.customUrl === 'string' ? input.customUrl.trim() : '';
     if (url === '') {
       return {

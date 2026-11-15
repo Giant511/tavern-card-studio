@@ -30,6 +30,16 @@
  */
 
 import { el, type DocLike, type ElLike } from './chat-view.ts';
+/*
+ * 条数与时间都从 shared 取 —— 这两个字段的类型坑在一处踩过就够了
+ * （见 `chatFileCount` / `chatFileLastAt` 的注释）。
+ */
+import {
+  chatFileCount,
+  chatFileSaysEmpty,
+  chatFileSizeBytes,
+  isDeletableEmptyChat,
+} from '../../../shared/dist/st-adapter/chat-file.js';
 import { buildTopbar } from './chat-settings.ts';
 
 /**
@@ -292,6 +302,37 @@ export interface ChatFileRow {
   name: string;
   /** 消息条数（拿不到给 0） */
   count: number;
+  /**
+   * 是否**真的**从 ST 读到了条数字段。
+   *
+   * ## 为什么必须区分"0 条"和"不知道"
+   *
+   * ST 的 `chat_items` 缺失时 `chatFileCount()` 返回 0，而那与
+   * "这个文件真的是空的"**不是一回事**。
+   *
+   * ```text
+   *   清空聊天后 0 条     ⇒ 确实是空的，可以删
+   *   ST 没给这个字段      ⇒ 里面可能有 500 条，删了就没了
+   * ```
+   *
+   * 界面上要显示成"条数未知"，清理功能也**必须跳过**它们 ——
+   * 拿不准的东西不许删。
+   */
+  countKnown: boolean;
+  /**
+   * `file_size` 解析出的字节数；`null` = 读不到。
+   *
+   * 「清理空聊天」用它做**独立**校验（见 shared 的 `isDeletableEmptyChat`）。
+   * 光看 `count === 0` 会误删"只有一条消息但末行解析失败"的聊天。
+   */
+  sizeBytes: number | null;
+  /**
+   * ST 是否明确说这个文件是空的（`mes === '[The chat is empty]'`）。
+   *
+   * 与 `count === 0` **不是同一件事**：末行损坏时 ST 也报 0 条，
+   * 但那是"一条消息 + 读不出的末行"，删了就真丢内容。
+   */
+  saysEmpty: boolean;
   /** 是否当前打开的那一条 */
   current: boolean;
 }
@@ -334,14 +375,38 @@ export function parseChatFileRows(raw: string, currentId: string | null): ChatFi
     const name = fileName.replace(/\.jsonl$/i, '');
 
     /*
-     * 条数：`last_mes` 是"最后一条的下标"，所以条数是它 +1。
-     * 拿不到就给 0（比显示 `NaN` 好）。
+     * ★★★ 条数必须取 `chat_items`，不是 `last_mes` 的下标加一（2026-11-14）。
+     *
+     * ## 原来的 bug
+     *
+     * ```ts
+     *   const last = Number.parseInt(String(info['last_mes'] ?? ''), 10);
+     *   const count = last + 1;
+     * ```
+     *
+     * 注释说 `last_mes` 是"最后一条的下标"，但它其实是**时间**。
+     * 而 `parseInt("2026-11-11T19:30:00.000Z")` = **2026**（年份），
+     * 于是每个文件都显示 **2027 条**。
+     *
+     * 用户截图里 8 个文件全是 2027 —— 他说的"数字不是真实数量"完全正确。
+     * 更糟的是这个假数字会让人误判"记录还在不在"。
+     *
+     * 解析收在 shared 的 `chatFileCount()`（认 `chat_items` 与
+     * `message_count`，都没有就返回 0，**不猜**）。
      */
-    const lastRaw = info['last_mes'];
-    const last = typeof lastRaw === 'number' ? lastRaw : Number.parseInt(String(lastRaw ?? ''), 10);
-    const count = Number.isFinite(last) && last >= 0 ? last + 1 : 0;
+    const count = chatFileCount(info);
+    /* 只有真的读到了字段才敢说"这是 0 条"（见 countKnown 的注释） */
+    const countKnown = info['chat_items'] !== undefined || info['message_count'] !== undefined;
 
-    rows.push({ id, name, count, current: currentId !== null && id === currentId });
+    rows.push({
+      id,
+      name,
+      count,
+      countKnown,
+      sizeBytes: chatFileSizeBytes(info),
+      saysEmpty: chatFileSaysEmpty(info),
+      current: currentId !== null && id === currentId,
+    });
   }
 
   /* 当前这条排最前，其余按 ST 给的顺序（它已按最近排序） */
@@ -356,6 +421,15 @@ export interface ChatFilesCallbacks {
   onOpen: (id: string) => Promise<void>;
   onRename: (id: string, newName: string) => Promise<ChatActionOutcome>;
   onDelete: (id: string) => Promise<ChatActionOutcome>;
+  /**
+   * 导出这段聊天为 TXT 并分享（2026-11-14，v0.1.9）。
+   *
+   * 传 `name` 是因为分享出去的文件名要用**用户看到的标题**
+   * （它可能改过名），而不是 `file_id` 那个带时间戳的内部名。
+   *
+   * 可选：没接能力就不画按钮 —— 不给一个点了没反应的按钮。
+   */
+  onExport?: (id: string, name: string) => Promise<ChatActionOutcome>;
 }
 
 /**
@@ -371,6 +445,30 @@ export function renderChatFilesPage(
   const root = el(doc, 'div', 'nb-page nb-chat-files');
   root.setAttribute('data-role', 'chat-files-page');
   root.append(buildTopbar(doc, '聊天文件', callbacks.onBack));
+
+  /*
+   * 「清理空聊天」按钮（2026-11-14）。
+   *
+   * ## 为什么需要
+   *
+   * 用户视频里有 8 个同角色的聊天文件，每个只有开场白 —— 那是旧版本
+   * "切角色就建档"的产物（已修，但**已经产生的垃圾不会自己消失**）。
+   *
+   * 一个一个点「删除」要 8 次，而且用户不一定分得清哪个是垃圾。
+   *
+   * ## 三条约束
+   *
+   * ```text
+   *   ① 只删 countKnown && count === 0 —— 拿不准的不许删
+   *   ② 跳过当前打开的那条 —— 删了会让聊天页指向不存在的文件
+   *   ③ 两步确认 —— 与每行的「删除」一致，不用阻塞式的 confirm()
+   * ```
+   */
+  const cleanBtn = el(doc, 'button', 'nb-mini-btn');
+  cleanBtn.setAttribute('type', 'button');
+  cleanBtn.setAttribute('data-role', 'chat-files-clean-empty');
+  cleanBtn.hidden = true;
+  root.append(cleanBtn);
 
   const status = el(doc, 'div', 'nb-hint-block');
   status.setAttribute('data-role', 'chat-files-status');
@@ -397,8 +495,22 @@ export function renderChatFilesPage(
     }
     if (files.length === 0) {
       say('这个角色还没有任何聊天记录。', 'warn');
+      cleanBtn.hidden = true;
       return;
     }
+
+    /*
+     * 算出"可以安全删的空文件"。
+     *
+     * 跳过 `current`：当前正打开那一条就算只有开场白也先留着 ——
+     * 删了会让聊天页的 `chatFileName` 指向一个不存在的文件，
+     * 下一次保存又会新建一个（正是我们要断掉的循环）。
+     */
+    const empties = files.filter((file) => isDeletableEmptyChat(file));
+    cleanBtn.hidden = empties.length === 0;
+    cleanBtn.textContent = `清理空聊天（${String(empties.length)}）`;
+    /* 每次重绘都把确认态复位 —— 否则用户看到"确认删除"却不知道确认什么 */
+    cleanBtn.removeAttribute('data-armed');
 
     for (const file of files) {
       const row = el(doc, 'div', 'nb-listitem nb-file-row');
@@ -409,7 +521,11 @@ export function renderChatFilesPage(
       const title = el(doc, 'span', 'nb-listitem-title');
       title.textContent = file.current ? `${file.name}（当前）` : file.name;
       const sub = el(doc, 'span', 'nb-listitem-sub');
-      sub.textContent = `${String(file.count)} 条消息`;
+      /*
+       * 未知就不写数字（2026-11-14）。
+       * 写 "0 条消息" 会让用户以为记录被清空了 —— 那比不显示更吓人。
+       */
+      sub.textContent = file.countKnown ? `${String(file.count)} 条消息` : '条数未知';
       main.append(title, sub);
       row.append(main);
 
@@ -426,6 +542,44 @@ export function renderChatFilesPage(
         })();
       });
       tools.append(openBtn);
+
+      /*
+       * 导出 TXT（2026-11-14，v0.1.9）。
+       *
+       * ## 为什么放在这一行而不是「我的」页
+       *
+       * 就近原则：用户看到某段聊天时才会想导出**这一段**。
+       * 集中到「我的 → 导出全部」会变成"先选角色再选聊天"的两级选择，
+       * 而这一页本来就是按角色列的聊天文件。
+       *
+       * ## 为什么禁用态要跟 `onExport` 走
+       *
+       * 没接能力还画按钮 = 点了没反应，用户会以为卡住了。
+       */
+      const exportRun = callbacks.onExport;
+      if (exportRun !== undefined) {
+        const exportBtn = el(doc, 'button', 'nb-mini-btn');
+        exportBtn.setAttribute('type', 'button');
+        exportBtn.setAttribute('data-role', 'chat-file-export');
+        exportBtn.textContent = '导出';
+        exportBtn.addEventListener('click', () => {
+          void (async () => {
+            /*
+             * 导出要读整份 jsonl + 编码 + 起分享面板，耗时明显。
+             * 先禁用防连点，且**失败要恢复** —— 否则一次失败之后
+             * 这个按钮就永久灰了。
+             */
+            exportBtn.setAttribute('disabled', 'true');
+            try {
+              const outcome = await exportRun(file.id, file.name);
+              say(outcome.detail, outcome.ok ? 'ok' : 'danger');
+            } finally {
+              exportBtn.removeAttribute('disabled');
+            }
+          })();
+        });
+        tools.append(exportBtn);
+      }
 
       /*
        * 改名：点一下把标题换成输入框，确认后提交。
@@ -469,7 +623,26 @@ export function renderChatFilesPage(
             }
           })();
         });
-        tools.replaceChildren(commit);
+
+        /*
+         * 「取消」必须有（2026-11-15）。
+         *
+         * 原来这里 `tools.replaceChildren(commit)` 把「改名」按钮顶掉了 ——
+         * 于是进入编辑态之后只有"保存"一条路：改名失败（比如重名）时，
+         * 用户既改不回标题、也没法放弃，只能切走再进一次列表。
+         *
+         * 失败后最需要的恰恰是"退出来" —— 而他手里只有"再试一次"。
+         */
+        const cancelEdit = el(doc, 'button', 'nb-mini-btn');
+        cancelEdit.setAttribute('type', 'button');
+        cancelEdit.setAttribute('data-role', 'chat-file-rename-cancel');
+        cancelEdit.textContent = '取消';
+        cancelEdit.addEventListener('click', () => {
+          /* 回到列表原样：重绘这一页比手工复原 DOM 可靠 */
+          void paint();
+        });
+
+        tools.replaceChildren(commit, cancelEdit);
       });
       tools.append(renameBtn);
 
@@ -506,6 +679,77 @@ export function renderChatFilesPage(
       listHost.append(row);
     }
   };
+
+  cleanBtn.addEventListener('click', () => {
+    void (async () => {
+      const files = await callbacks.loadFiles();
+      if (files === null) {
+        say('读不到聊天文件列表。检查一下引擎是否还在运行。', 'warn');
+        return;
+      }
+      const empties = files.filter((file) => isDeletableEmptyChat(file));
+      if (empties.length === 0) {
+        say('没有可以清理的空聊天。', 'warn');
+        return;
+      }
+
+      /* 两步确认，与每行的「删除」同一套手势 */
+      if (cleanBtn.getAttribute('data-armed') !== 'true') {
+        cleanBtn.setAttribute('data-armed', 'true');
+        cleanBtn.textContent = `确认删除 ${String(empties.length)} 个？`;
+        say(
+          `这 ${String(empties.length)} 个文件里没有任何对话内容（只有开场白）。再点一次就删掉。`,
+          'warn',
+        );
+        return;
+      }
+
+      /*
+       * 串行删。并发删同一个目录下的多个文件在 ST 那边没有保证，
+       * 而且失败时也说不清是哪一个 —— 串行的代价只是多几百毫秒。
+       */
+      /*
+       * ★★★ 逐条记录**删了什么、多大、几条**（2026-11-14）。
+       *
+       * ## 为什么必须记
+       *
+       * 用户这次给了一份 2.2 万行的引擎日志，里面只有 20 行
+       * `Deleted file: …jsonl`，**没有一个字提到那些文件里原来有什么**。
+       *
+       * 于是"记录是不是被清理功能删掉的"这个问题，谁都答不了 ——
+       * 包括我。日志该能回答的问题答不了，等于没有日志。
+       *
+       * 现在每条记成：
+       *
+       * ```text
+       *   [清理] 删除 <名字> count=0 size=312B
+       * ```
+       *
+       * 下次同样的疑问，一行就能定案。
+       *
+       * 走 `onNotify` 的 `info` 通道而不是新加一条桥调用：
+       * 它已经会落进 `app-00N-.log`（`StLog`）。
+       */
+      let done = 0;
+      let failed = 0;
+      for (const file of empties) {
+        callbacks.onNotify(
+          `[清理] 删除 ${file.name} count=${String(file.count)} size=${String(file.sizeBytes)}B`,
+          'info',
+        );
+        const outcome = await callbacks.onDelete(file.id);
+        if (outcome.ok) done += 1;
+        else failed += 1;
+      }
+      say(
+        failed === 0
+          ? `已清理 ${String(done)} 个空聊天文件。`
+          : `清理了 ${String(done)} 个，${String(failed)} 个没删掉（可以逐个点「删除」重试）。`,
+        failed === 0 ? 'ok' : 'warn',
+      );
+      await paint();
+    })();
+  });
 
   void paint();
   return root;

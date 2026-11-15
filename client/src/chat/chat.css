@@ -2412,6 +2412,78 @@ textarea,
   background: var(--nb-surface-1);
   font-size: var(--nb-fs-14);
   line-height: var(--nb-lh-body);
+  /*
+   * ★★★ 长串必须能断行，否则会横向顶破容器（2026-11-13 用户截图报的）。
+   *
+   * ## 现场
+   *
+   * 「诊断日志」里的说明段：
+   *
+   * ```text
+   *   日志文件：/storage/emulated/0/Android/data/com.taven…
+   *            ↑ 到这里就被卡片右边缘切掉了，后面全看不见
+   * ```
+   *
+   * 那一段是 `日志文件：${status.dir}（N 个文件…）`，而**中文 + 一条
+   * 没有空格的绝对路径**是最坏的组合：
+   *
+   * ```text
+   *   中文       每个字都能断 ⇒ 正常换行
+   *   路径       `/storage/emulated/0/Android/data/...` 是一个"词"
+   *              CSS 默认只在空格处断行 ⇒ 整条路径被当成一个不可分的块
+   *              ⇒ 溢出容器，被 overflow:hidden 或圆角裁掉
+   * ```
+   *
+   * ## 为什么 `overflow-wrap: anywhere` 而不是 `word-break: break-all`
+   *
+   * ```text
+   *   anywhere    只在"放不下"时才断，英文单词保持完整   ← 说明文字用这个
+   *   break-all   任何位置都断，单词被从中间劈开
+   * ```
+   *
+   * `break-all` 留给 `.nb-diag-pre`（等宽字体 + 日志对齐，需要严格逐字符断）。
+   * 这里是给人读的散文，断在单词中间会变难读。
+   *
+   * 两个属性一起写：`overflow-wrap` 是标准，`word-break: break-word`
+   * 是给旧内核的等价物 —— 与本项目 `.nb-bubble` 的处理保持一致。
+   */
+  overflow-wrap: break-word;
+}
+
+/*
+ * 诊断日志里的那条路径 —— **独立成块，不混在散文里**。
+ *
+ * ## 为什么不在 `.nb-note` 里靠 CSS 断行解决
+ *
+ * 试过 `overflow-wrap: anywhere` / `break-word`，真机上仍然把
+ * 「日志文件」拆成「日志文 / 件」——**断行算法在"中文 + 超长无空格串"
+ * 上的落点不可预测**（同一个属性在不同 WebView 版本上表现不同：
+ * 用户那台显示正常，红米这台拆在第三个字）。
+ *
+ * 与其和排版引擎博弈，不如改结构：说明走 `p`，路径单独一个块。
+ * 好处不止是不断错 —— 路径**可以长按选中复制**了，用户不用照着手打。
+ *
+ * ## 为什么这里用 `break-all`
+ *
+ * 路径是**机器串**，没有"词"的概念。逐字符断才是它该有的样子；
+ * 而散文用 `break-word` 保词完整。两者场景不同，不能混用。
+ */
+.nb-diag-path {
+  display: block;
+  margin: var(--nb-sp-2) 0 0;
+  padding: var(--nb-sp-2) var(--nb-sp-3);
+  border-radius: var(--nb-radius-sm);
+  background: var(--nb-surface-2);
+  color: var(--nb-text-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: var(--nb-fs-12);
+  line-height: 1.5;
+  /* 机器串：任何位置都可以断 */
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  /* 长按选中复制（省得用户照着手打一条 80 字符的路径） */
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -4278,6 +4350,45 @@ textarea,
   font-size: var(--nb-fs-14);
 }
 
+/*
+ * 三个分享渠道横排（2026-11-14，v0.1.9）。
+ *
+ * ## 为什么横排不是竖排
+ *
+ * `.nb-exit-actions` 本来是竖排，而这个弹窗里已经有
+ * 分享组 / 小程序 / 删除+取消 三行。分享再做竖排就是**五个全高按钮**，
+ * 弹窗会高到需要滚动 —— 而这是个确认框，不该滚。
+ *
+ * 横排还有语义作用：三个等宽的按钮并排，一眼看出是"选一个"；
+ * 竖排会读成"先点微信，再点 QQ"。
+ *
+ * ## 为什么 `flex: 1 1 0` + `min-width: 0`
+ *
+ * 三个标签字数不同（微信 2 字、QQ 2 字符、更多 2 字），
+ * 让它们等宽才不显得歪。`min-width: 0` 是 flex 子项的必须项 ——
+ * 缺了它，内容撑开会突破 `flex-basis: 0` 的分配。
+ */
+.nb-share-row {
+  display: flex;
+  gap: var(--nb-sp-2);
+}
+
+.nb-share-btn {
+  flex: 1 1 0;
+  min-width: 0;
+  text-align: center;
+  /* 三个按钮共用一条基线，字数不同也不许换行 */
+  white-space: nowrap;
+}
+
+/*
+ * 小程序占位：**比真按钮淡一档**，因为它是"现在不能用"的东西。
+ * 与可点的分享渠道长得一样会让人反复点。
+ */
+.nb-share-miniapp {
+  color: var(--nb-text-3);
+}
+
 @keyframes nb-exit-in {
   from {
     opacity: 0;
@@ -5077,4 +5188,39 @@ textarea,
 /* 深度在"跟随顺序"时置灰 —— 置灰但留着，别让表单高度跳 */
 .nb-field[data-disabled='true'] .nb-input {
   opacity: 0.5;
+}
+
+/* ─────────────────────────────────────────────
+   诊断日志（2026-11-12）
+
+   它是**纯文本块**，与其它面板不同：内容是可复制的原始日志。
+   三条要求：
+     · 等宽字体 —— 用户会照着念/截图，等宽对齐才好认
+     · 可选中 —— 复制失败时靠长按选择兜底
+     · 限高 + 自身滚动 —— 日志可能上百行，不能把整页撑长
+   ───────────────────────────────────────────── */
+.nb-diag-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nb-sp-3);
+}
+
+.nb-diag-pre {
+  max-height: 40vh;
+  overflow: auto;
+  margin: 0;
+  padding: var(--nb-sp-3);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-surface-2);
+  color: var(--nb-text-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: var(--nb-fs-12);
+  line-height: 1.5;
+  /* 日志里常有超长 URL / 堆栈路径，不换行会横向顶破容器 */
+  white-space: pre-wrap;
+  word-break: break-all;
+  /* 长按选择文本（复制失败时的兜底路径） */
+  user-select: text;
+  -webkit-user-select: text;
 }

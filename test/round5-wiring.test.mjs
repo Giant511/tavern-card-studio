@@ -231,22 +231,63 @@ test('★★ 自定义地址要随请求体发出去（custom_url）', () => {
   }
 });
 
-test('★ 非 custom 源不许带 custom_url', () => {
+test('★ 官方地址不额外带 custom_url（2026-11-11 改方向）', () => {
+  /*
+   * 原来这条叫「非 custom 源不许带 custom_url」，钉的是"源不是 custom
+   * 就别发地址"。
+   *
+   * 但用户的真机场景推翻了它：他填中转站地址却选了 DeepSeek 源，
+   * 地址被静默丢掉 ⇒ 请求打到官方、key 是别家的 ⇒ 「Key 错误」。
+   *
+   * 现在：**非官方地址 ⇒ 按 custom 发并带地址**（见下一条）；
+   * 这条改成守"官方地址时不多此一举"。
+   */
   const built = buildGenerateRequest({
     source: 'openai',
     model: 'gpt-4o-mini',
     messages: [{ role: 'user', content: 'hi' }],
-    customUrl: 'https://example.invalid/v1',
+    customUrl: 'https://api.openai.com/v1',
   });
   assert.equal(built.ok, true);
-  if (built.ok) assert.equal(built.request.custom_url, undefined);
+  if (built.ok) {
+    assert.equal(built.request.chat_completion_source, 'openai', '官方地址不改源');
+    assert.equal(built.request.custom_url, undefined, '官方地址不该带 custom_url');
+  }
+});
+
+test('★★★★★ 非官方地址 ⇒ 按 custom 发并带地址（用户这次报的那条）', () => {
+  const built = buildGenerateRequest({
+    source: 'deepseek',
+    model: 'gpt-4o-mini',
+    messages: [{ role: 'user', content: 'hi' }],
+    customUrl: 'https://vip4lai.xyz/v1',
+  });
+  assert.equal(built.ok, true);
+  if (built.ok) {
+    assert.equal(
+      built.request.chat_completion_source,
+      'custom',
+      '填了中转站地址就必须按 custom 发，否则 ST 不读这个地址',
+    );
+    assert.equal(built.request.custom_url, 'https://vip4lai.xyz/v1');
+  }
 });
 
 test('★ 自定义源没填地址要拦下来（不许"保存成功"却不知道发给谁）', () => {
   const apiPage = codeOnly(read('chat/api-page.ts'));
+  /*
+   * ★ 变量名从 `currentSource` 变成了 `actualSource`（2026-11-11）。
+   *
+   * 因为"填了非官方地址"会被 `effectiveSourceFor` 纠正成 custom，
+   * 所以校验必须针对**实际要用的源**，否则用户选了 DeepSeek + 填了地址
+   * 时会绕过这条校验（实际走 custom 却没地址可校验 —— 虽然那不可能，
+   * 但判据要保持与代码同一个口径）。
+   *
+   * 守的性质没变：**实际走 custom 就必须有地址**。
+   */
   assert.match(
     apiPage,
-    /currentSource === 'custom' && rawBaseUrl === ''/,
+    /actualSource === 'custom' && rawBaseUrl === ''/,
     '自定义源必须校验地址非空',
   );
 });

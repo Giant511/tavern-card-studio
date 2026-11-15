@@ -285,6 +285,90 @@ export function activeUserName(state: PersonaState): string {
  * ★ 关掉多绑定时**不是**"只显示第一套"，而是"只显示当前选中的" ——
  * 用户关这个开关的意思是"别让我每次挑"，不是"帮我挑一个"。
  */
+/**
+ * **该用哪套人设** —— 给定当前聊天角色。
+ *
+ * ## 与 `personasForCharacter` 的分工（别混）
+ *
+ * ```text
+ *   personasForCharacter   只是**筛列表**（界面上给用户挑的那几项）
+ *   pickPersonaForCharacter 决定**实际生效的那一套**（并发的、要真用）
+ * ```
+ *
+ * 之前只有前者，于是出现用户报的那串现象：
+ *
+ * ```text
+ *   ① 角色绑了人设，聊天里不自动用它
+ *   ② 切角色后显示的仍是上一个角色绑定的那套
+ *   ③ 再想手动选，提示"还没有人设"
+ *   ④ 只能去人设页点「使用」，而那一按就全局生效、影响所有角色
+ * ```
+ *
+ * 根因：`selectedId` 是**全局唯一**的一个 id，切角色时没人去动它。
+ *
+ * ## 选取优先级（对齐 ST 的语义）
+ *
+ * ```text
+ *   ① 当前这套明确绑了这个角色        → 不动（用户已经选对了）
+ *   ② 有专门绑这个角色的人设          → 切过去（这正是"按角色绑定"的意义）
+ *   ③ 当前这套没绑任何角色（默认人设） → 保留（它是所有角色的兜底）
+ *   ④ 有别的默认人设                  → 用它
+ *   ⑤ 都没有                          → null（用默认名）
+ * ```
+ *
+ * ★ ③ 排在 ② 之后是刻意的：一个角色**既绑了专属人设、又存在默认人设**时，
+ *   专属的应该赢。否则"绑定到角色"这个功能等于没用。
+ *
+ * ★ 返回 `null` 表示"没有人设可用"，调用方仍会退回 `options.userName`。
+ */
+export function pickPersonaForCharacter(state: PersonaState, avatar: string): Persona | null {
+  const current = activePersona(state);
+  const key = avatar.trim();
+
+  if (key !== '') {
+    /* ① 当前这套就绑着它 */
+    if (current !== null && current.boundCharacters.includes(key)) return current;
+
+    /* ② 有专门为它绑的 */
+    const bound = state.personas.find((one) => one.boundCharacters.includes(key));
+    if (bound !== undefined) return bound;
+  }
+
+  /* ③ 当前这套是默认人设（不绑任何角色）—— 保留用户的选择 */
+  if (current !== null && current.boundCharacters.length === 0) return current;
+
+  /* ④ 别的默认人设 */
+  const fallback = state.personas.find((one) => one.boundCharacters.length === 0);
+  if (fallback !== undefined) return fallback;
+
+  return null;
+}
+
+/**
+ * 切换角色后，把 `selectedId` 对齐到"该角色该用的人设"。
+ *
+ * 返回**新的 state**（没变化时原样返回同一个引用，便于调用方判断要不要落盘）。
+ *
+ * ## 为什么改全局 selectedId 而不是"按角色各存一个"
+ *
+ * ST 的模型就是全局一个 active persona（它的 `connections` 只决定
+ * "哪些可用"，不决定"当前用哪套"）。这里跟着 ST 走，好处是：
+ *
+ * ```text
+ *   · 用户在 ST 自己的界面里看到的人设与 App 一致
+ *   · 人设页「使用」按钮的语义不变（仍然是"设为当前"）
+ * ```
+ *
+ * 而"每个角色记住自己那套"是**效果**，由这个函数在切角色时自动达成 ——
+ * 用户不需要每次手动点。
+ */
+export function syncPersonaToCharacter(state: PersonaState, avatar: string): PersonaState {
+  const next = pickPersonaForCharacter(state, avatar);
+  if (next === null) return state;
+  if (state.selectedId === next.id) return state;
+  return { ...state, selectedId: next.id };
+}
+
 export function personasForCharacter(state: PersonaState, avatar: string): Persona[] {
   if (!state.allowMultiBinding) {
     const current = activePersona(state);

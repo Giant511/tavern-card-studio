@@ -89,9 +89,50 @@ export interface FieldPresetParseResult {
 }
 
 /** 每个板块允许的标签键（不在表里的键一律报错，避免"写了个不生效的标签"） */
+/**
+ * 每个板块允许的 `labelMap` 键。
+ *
+ * ## 初始场景有 4 个键（2026-11-11 加了两个）
+ *
+ * ```text
+ *   greeting   段标题：默认 @@开场白      ← 新增，可换成【开场白：】这类
+ *   first      第一条开场白的标签行        （原有）
+ *   alternate  备用开场白的标签行          （原有）
+ *   scenario   段标题：默认 @@情景        ← 新增，可换成【初始场景：】
+ * ```
+ *
+ * 为什么要加这两个：真机取证里，用户的自定义平台规则要求初始场景板块
+ * 出现 `^【初始场景[:：]】`，而代码把情景段标题写死成 `@@情景` ——
+ * **他的卡永远过不了自己的规则，且没有任何配置能修好**。
+ *
+ * 段标题与标签行是两个层级，别混：
+ *
+ * ```text
+ *   @@开场白                ← 段标题（greeting）
+ *   【第一条消息：】          ← 标签行（first）
+ *   (…台词…)                ← 正文
+ * ```
+ */
 export const FIELD_PRESET_LABEL_KEYS: Readonly<Record<FieldPresetBlock, readonly string[]>> = {
-  'initial-scene': ['first', 'alternate'],
-  'chat-examples': ['turn'],
+  'initial-scene': ['greeting', 'first', 'alternate', 'scenario'],
+  /*
+   * 对话示例有 3 个键（2026-11-11 加了 user / char）。
+   *
+   * ```text
+   *   turn   「轮次」的称呼，只用于统计与审计文案，不改写正文
+   *   user   用户说话人的写法：给了就 {{user}}: → 你写的那个（如 用户：）
+   *   char   角色说话人的写法：给了就 {{char}}: → 你写的那个（如 角色：）
+   * ```
+   *
+   * 为什么需要 user / char：平台规范可能要求 `用户：`「角色：」，
+   * 而 ST 标准卡是 `{{user}}:`。不给映射的话，导入后审计必然报
+   * "没有中文冒号说话人行"，而导出又会把 `用户：` 写进 `mes_example`
+   * —— ST 不认这种写法，整段对话示例读不到。
+   *
+   * ★ 这两个键是**双向**的：导入按它渲染，导出按它反解。
+   *   只配一边用，另一边就脏。
+   */
+  'chat-examples': ['turn', 'user', 'char'],
 };
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9._-]{1,63}$/;

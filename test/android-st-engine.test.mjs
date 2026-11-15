@@ -391,7 +391,77 @@ test('★ manifest 注册了服务且不导出', () => {
    六、JS 桥
    ═══════════════════════════════════════════════════════════ */
 
-test('★★ JS 桥只暴露九个窄方法，且 status 不做网络探测', () => {
+test('★★★★★ 引擎启动失败要带出日志里的真实错误，不许猜"安装包不完整"', () => {
+  /*
+   * ## 用户真实被误导的一次（2026-11-14）
+   *
+   * 在雷电模拟器上装 0.1.9，界面说：
+   *
+   * ```text
+   *   引擎没能启动：引擎启动后立即退出（退出码 1）。可能是安装包不完整。。
+   * ```
+   *
+   * 而去读 engine-8000.log，真因是：
+   *
+   * ```text
+   *   Error: Invalid package config …/node_modules/yargs/package.json
+   *     while importing "yargs/yargs"
+   * ```
+   *
+   * 根因是**模拟器不兼容**（houdini 把 arm64 转译成 x86，Node 的
+   * C++ `readPackageJSON`（simdjson）解析 1KB 以上的 package.json 一律失败；
+   * 47 字节的最小包能过、真实包全挂 —— 实测五个包无一例外）。
+   *
+   * 与安装包毫无关系。用户按那句话去卸载重装，只会重复失败。
+   *
+   * ## 所以判据钉两件事
+   *
+   * ```text
+   *   ① 不许再把"安装包不完整"当作默认归因
+   *   ② 必须把日志里的真实错误带进界面提示
+   * ```
+   *
+   * 只钉 ② 不够：文案里留着 ① 的话，用户仍会先看到那句误导话术。
+   * 只钉 ① 也不够：换成"启动失败"而不给原因，等于把定位成本又推回用户。
+   */
+  const kt = read('StLauncher.kt');
+
+  assert.doesNotMatch(
+    kt,
+    /可能是安装包不完整/,
+    '这句归因是错的（实测真因是环境不兼容），不许留着',
+  );
+
+  assert.match(kt, /private fun lastEngineError/, '要能从引擎日志捞错误');
+  assert.match(kt, /lastEngineError\(engineLog\)/, '失败分支要真的调它（不是写了没人用）');
+
+  /*
+   * ★ 还要钉"结果被用进文案"（2026-11-14，变异验证抓到的漏判）。
+   *
+   * 第一版只断言调了 `lastEngineError(engineLog)`。把下游改成
+   * `if (false) { … }` 之后**判据照样绿** —— 因为它只看到"捞了"，
+   * 没看到"捞到的东西有没有进提示"。捞而不用等于没捞。
+   *
+   * 这与本项目「实现了但没接线」是同一个形状，只是这里
+   * 接线的终点是**字符串模板**而不是 DOM append。
+   */
+  assert.match(kt, /\$detail/, '捞到的错误必须插进提示文案');
+
+  /*
+   * 只读尾部：日志会有 MB 级，整份读在低端机上就是一次几百毫秒的 IO，
+   * 而错误一定在最后。用 RandomAccessFile + seek 才能只读尾巴。
+   */
+  assert.match(kt, /RandomAccessFile/, '只读尾部，不许整份读进内存');
+  assert.match(kt, /maxBytes/, '要有读多少字节的上限');
+
+  /*
+   * 从后往前找"第一条命中"而不是"最后一条"：
+   * 最后一行往往是 `引擎进程退出，code=1`，把真正的异常盖住就白捞了。
+   */
+  assert.match(kt, /lines\.indices\.reversed\(\)/, '要倒着找');
+});
+
+test('★★ JS 桥只暴露白名单里的窄方法（精确相等），且 status 不做网络探测', () => {
   const kt = read('StBridge.kt');
 
   const exposed = [...kt.matchAll(/@JavascriptInterface\s+fun\s+(\w+)/g)].map((m) => m[1]);
@@ -475,21 +545,104 @@ test('★★ JS 桥只暴露九个窄方法，且 status 不做网络探测', ()
    *
    * 判据仍然要求"白名单精确相等" —— 再加方法要重新过这一关。
    */
+  /*
+   * ## 2026-11-12 扩到十五个：加日志那 6 个
+   *
+   * 起因：用户报「进入 APP 后过一段时间自动闪退」，而我们**一条现场都没有**。
+   * 用户同时明确了三个要求：
+   *
+   * ```text
+   *   ① 放在用户无 root 可访问的目录（反复崩溃时也能拿到）
+   *   ② 任何异常都要写入
+   *   ③ 严格限制在 10–20MB
+   * ```
+   *
+   * ## 逐个过安全边界
+   *
+   * ```text
+   *   log(level, tag, message)   写一条日志
+   *     · 最坏是页面往自己的日志里灌垃圾 ⇒ 有轮转 + 18MB 上限兜底
+   *     · 不碰日志目录之外的任何文件
+   *
+   *   logStatus()                只读状态（目录/占用/条数），**无参数**
+   *
+   *   logRead(maxBytes)          读日志内容
+   *     · 只读 `logs/` 下自己写的 `app-00N-.log`
+   *     · maxBytes 强制夹在 1KB–512KB（防止一次读 16MB 把 WebView 顶爆）
+   *     · 不接受路径参数
+   *
+   *   logExport()                把最近日志写一份到 Download/
+   *     · **无参数**，文件名由原生用时间戳生成
+   *     · 不读、不删、不返回文件内容（只返回展示用的文件名）
+   *
+   *   logClear()                 删 `logs/` 下的文件
+   *     · 只能删自己写的那批（`files()` 已按前缀过滤）
+   *
+   *   logRendererGone(didCrash)  写一条固定文案
+   *     · 只有一个 boolean 参数
+   * ```
+   *
+   * 结论：**没有一条接受路径、没有一条能读任意文件、没有一条能执行命令。**
+   * 能力上限是"管理自己写的日志"，与 `removeTestCards` 那类同级。
+   */
+  /*
+   * ## 2026-11-14 扩到十六个：加 `shareText`
+   *
+   * v0.1.9 的「聊天记录导出 TXT」。用户口径是导出成 TXT 再走分享面板。
+   *
+   * ## 为什么不复用 `sharePng`
+   *
+   * `Intent` 的类型不同：PNG 是 `image/png`，文本是 `text/plain`。
+   * 用错的后果很具体且不报错 —— 微信收到 `image/png` 会当图片解析，
+   * 得到一张打不开的图。
+   *
+   * ## 为什么它没有突破安全边界
+   *
+   * ```text
+   *   · 只接受**字符串**（文本内容），不接受路径
+   *   · 落点固定为 cacheDir/share/，文件名由它自己滤过
+   *   · 不读、不删、不返回文件内容（只返回 uri 与字节数）
+   * ```
+   *
+   * 能力上限与 `sharePng` 完全相同：**把一段自己产出的内容写进缓存目录
+   * 再交给系统分享面板**。多出来的只有"内容可以是文本"，
+   * 而那本来就是页面手上的东西。
+   */
   assert.deepEqual(
     exposed.sort(),
     [
       'httpRequest',
       'httpRequestAsync',
+      'log',
+      'logClear',
+      'logExport',
+      'logRead',
+      'logRendererGone',
+      'logStatus',
       'readAsset',
       'removeTestCards',
       'scanTestCards',
       'sharePng',
+      'shareText',
       'start',
       'status',
       'stop',
     ],
-    `桥只暴露这九个方法（多一个就是多一条越权路径）。实际：${exposed.join(', ')}`,
+    `桥只暴露这十六个方法（多一个就是多一条越权路径）。实际：${exposed.join(', ')}`,
   );
+
+  /*
+   * 日志接口的三条硬约束（与上面白名单同一层意思，写死防退化）：
+   *
+   * ```text
+   *   logRead   必须夹上限  —— 否则一次读 16MB 会把 WebView 顶爆
+   *   logExport 无参数      —— 有参数就等于"任意路径写"
+   *   logClear  走 files()  —— 只删自己写的那批
+   * ```
+   */
+  assert.match(kt, /maxBytes\.coerceIn\(1024, 512 \* 1024\)/, 'logRead 必须夹上限');
+  assert.match(kt, /fun logExport\(\): String/, 'logExport 不许接参数');
+  assert.match(kt, /fun logClear\(\)/, 'logClear 不许接参数');
 
   /*
    * 异步方法必须与同步方法**共用同一份实现**（不许复制一份、各行其是）。

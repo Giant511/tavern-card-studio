@@ -52,6 +52,7 @@ export * from './prompt-assemble.js';
 export * from './token-budget.js';
 export * from './prompt-toggle.js';
 export * from './prompt-edit.js';
+export * from './chat-export.js';
 export * from './nav.js';
 export * from './author-note.js';
 export * from './api-persist.js';

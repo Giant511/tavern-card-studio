@@ -49,17 +49,49 @@ import {
 } from './greeting-preset.js';
 
 /**
- * 三个子段的标记行。
+ * 两个子段的**默认**标记行。
  *
- * 冻结成常量而不是放进 TXT 预设，理由：用户可以改的是"整体标题样式"
- * （`【初始场景】` 与分隔行），而这三个子段的名字是**解析锚点** ——
- * 允许改名就等于允许"改完自己看不懂"，而收益只是措辞偏好。
- * 真要可配置时，改动点就是这张表（单一来源）。
+ * ## 从"冻结不可改"改成"可被预设覆盖"（2026-11-11）
+ *
+ * 原来的理由是"这三个名字是解析锚点，允许改名等于允许改完自己看不懂"。
+ * 那个理由在**单一平台**下成立，但真机取证推翻了它：
+ *
+ * ```text
+ *   用户的自定义平台规则要求  ^【初始场景[:：]】      （幻梦AI 的规范）
+ *   而这里渲染出来的是        @@情景
+ *   ⇒ 他的卡永远过不了自己的规则，且无法通过任何配置修好
+ * ```
+ *
+ * 也就是：**格式该由预设管，不该由代码写死**。同一个"初始场景"，
+ * ST 阵营习惯 `@@情景`，别的平台可能要求 `【初始场景：】` ——
+ * 这不是"改完看不懂"，这是不同平台的**方言**。
+ *
+ * 所以这张表降级为**默认值**：
+ *
+ * ```text
+ *   预设给了 labelMap.scenario / labelMap.greeting  → 用预设的
+ *   没给                                          → 用这里的默认
+ * ```
+ *
+ * ★ 只改了"能不能配"，没改"必须成对"这条铁律：渲染与解析读的是
+ *   同一份 format，所以不会出现"写进去的标签读不回来"。
  */
 export const SCENE_SECTION_LABELS = Object.freeze({
   greeting: '@@开场白',
   scenario: '@@情景',
 });
+
+/**
+ * 取某个子段的实际标记行（预设覆盖优先）。
+ *
+ * `labelMap` 里这两个键是可选的；空串/纯空白视为"没给"，回落默认 ——
+ * 空标签行会让解析把"空行"当标记，那是灾难性的二义。
+ */
+function sectionLabel(key: SceneSectionKey, format: GreetingFormatParams): string {
+  const custom = format.labelMap?.[key];
+  if (typeof custom === 'string' && custom.trim() !== '') return custom;
+  return SCENE_SECTION_LABELS[key];
+}
 
 /** 子段键 */
 export type SceneSectionKey = keyof typeof SCENE_SECTION_LABELS;
@@ -78,15 +110,33 @@ export interface SceneSections {
 }
 
 /** 把一段原始文本拆成"标记 → 正文"的映射；无标记时返回 null */
-function splitSections(text: string): Map<SceneSectionKey, string> | null {
+function splitSections(
+  text: string,
+  format: GreetingFormatParams,
+): Map<SceneSectionKey, string> | null {
   const lines = text.replace(/\r\n/g, '\n').split('\n');
-  /* 标记识别：整行 trim 后等于某个子标记（也接受 `@@情景：` 这种带全角冒号的写法） */
+  /*
+   * 标记识别：整行 trim 后等于某个子标记。
+   *
+   * ★ 除了预设给的那**一个**写法，还认三种变体（`标签：`、`标签:`、
+   *   以及把标签末尾的冒号挪到括号里的写法）。
+   *
+   * 为什么：用户写的时候不会严格照抄。`【初始场景：】` 与 `【初始场景:】`
+   * 是同一个意思（全角/半角），而 `【初始场景：】` 与 `【初始场景】：`
+   * 在中文输入法里只差一个字符位置 —— 认不出来就整段错位，
+   * 而报错又太吵（见下面"同一个标记出现两次"那段同样的理由）。
+   */
   const labelToKey = new Map<string, SceneSectionKey>();
   for (const key of SCENE_SECTION_ORDER) {
-    const label = SCENE_SECTION_LABELS[key];
-    labelToKey.set(label, key);
-    labelToKey.set(`${label}：`, key);
-    labelToKey.set(`${label}:`, key);
+    const label = sectionLabel(key, format);
+    const variants = new Set<string>([
+      label,
+      `${label}：`,
+      `${label}:`,
+      /* 把末尾的 `】` 挪到冒号后面：`【初始场景：】` → `【初始场景】：` */
+      label.replace(/：\]/, '】：').replace(/:\]/, ']:'),
+    ]);
+    for (const variant of variants) labelToKey.set(variant, key);
   }
 
   const found: Array<{ key: SceneSectionKey; index: number }> = [];
@@ -129,8 +179,8 @@ export function renderCompositeScene(
 ): string {
   const greetingText = renderGreetings(sections.firstMes, sections.alternateGreetings, format);
   const parts = [
-    `${SCENE_SECTION_LABELS.greeting}\n${greetingText}`.trimEnd(),
-    `${SCENE_SECTION_LABELS.scenario}\n${sections.scenario}`.trimEnd(),
+    `${sectionLabel('greeting', format)}\n${greetingText}`.trimEnd(),
+    `${sectionLabel('scenario', format)}\n${sections.scenario}`.trimEnd(),
   ];
   return parts.join('\n\n');
 }
@@ -151,7 +201,7 @@ export function parseCompositeScene(
   text: string,
   format: GreetingFormatParams = DEFAULT_GREETING_FORMAT,
 ): CompositeSceneParseResult {
-  const split = splitSections(text);
+  const split = splitSections(text, format);
 
   if (split === null) {
     /*

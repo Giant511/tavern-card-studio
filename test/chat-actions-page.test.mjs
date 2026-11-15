@@ -243,11 +243,28 @@ test('★★★ 文件列表解析要容错三种返回形态', () => {
   assert.deepEqual(parseChatFileRows('{"error":true}', 'x'), []);
   /* 坏 JSON 不抛 */
   assert.deepEqual(parseChatFileRows('{oops', 'x'), []);
-  /* 正常 */
+  /*
+   * 正常 —— 但**条数改用 `chat_items`**（2026-11-14）。
+   *
+   * ## 原来这三行断言的是 bug
+   *
+   * ```ts
+   *   { file_id: 'a', last_mes: 4 }      ⇒ count === 5
+   *   { file_id: 'b', last_mes: '9' }    ⇒ count === 10
+   * ```
+   *
+   * 它把"`last_mes` 是最后一条的下标"当成了规格。而 ST 的 `last_mes`
+   * 是**时间**（非空文件给 ISO 字符串，空文件给 mtimeMs 数字）。
+   *
+   * 真机上就是这样炸的：`parseInt("2026-11-11T…")` = 2026 ⇒ 显示 2027 条，
+   * 用户截图里 8 个文件全是 2027。
+   *
+   * ⇒ 断言改成读 `chat_items`，并**明确否定**"只有 last_mes 时编数字"。
+   */
   const rows = parseChatFileRows(
     JSON.stringify([
-      { file_id: 'a', file_name: 'a.jsonl', last_mes: 4 },
-      { file_id: 'b', file_name: 'b', last_mes: '9' },
+      { file_id: 'a', file_name: 'a.jsonl', last_mes: '2026-11-11T19:30:00.000Z', chat_items: 5 },
+      { file_id: 'b', file_name: 'b', last_mes: 1794000000000, chat_items: 10 },
     ]),
     'a',
   );
@@ -255,8 +272,18 @@ test('★★★ 文件列表解析要容错三种返回形态', () => {
   assert.equal(rows[0]?.id, 'a', '当前这条要排最前');
   assert.equal(rows[0]?.current, true);
   assert.equal(rows[0]?.name, 'a', '名字要去掉 .jsonl');
-  assert.equal(rows[0]?.count, 5, 'last_mes 是下标，条数要 +1');
-  assert.equal(rows[1]?.count, 10, '字符串形式的 last_mes 也要认');
+  assert.equal(rows[0]?.count, 5, '条数取 chat_items');
+  assert.equal(rows[1]?.count, 10, '数字型 last_mes（空文件）时也要取 chat_items');
+
+  /*
+   * 只有 last_mes、没有 chat_items ⇒ 0，不许把时间编成条数。
+   * 这一条是"2027"那个 bug 的直接否定断言。
+   */
+  const noCount = parseChatFileRows(
+    JSON.stringify([{ file_id: 'x', file_name: 'x.jsonl', last_mes: '2026-11-11T19:30:00.000Z' }]),
+    null,
+  );
+  assert.equal(noCount[0]?.count, 0, '只有时间没有条数字段时给 0，不许 parseInt 时间');
 });
 
 test('★★ 缺 file_id 的条目要跳过（否则点了会打空请求）', () => {

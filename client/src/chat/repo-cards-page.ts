@@ -24,6 +24,79 @@
 
 import { el, type DocLike, type ElLike } from './chat-view.ts';
 
+/**
+ * 卡片缩略图缓存：`仓库名/卡 id` → 内容指纹 + data URL。
+ *
+ * ## 为什么要有（2026-11-11，用户报的）
+ *
+ * > 卡片的缩略图在每次进仓库界面都要请求一次进行加载，我的建议是和仓库
+ * > 里面的卡片背景对比一下，如果不一样再进行替换
+ *
+ * 原来每进一次界面、每张有卡面的卡都发一次二进制请求。一个几十张卡的
+ * 仓库，来回切两次 Tab 就是上百次下载 —— 而图一次都没变。
+ *
+ * ## 为什么放模块级而不是外壳字段
+ *
+ * 外壳字段在切仓库/退出页面时会被清，而这里的价值恰恰是**跨渲染复用**。
+ * 缓存键带了仓库名，所以换仓库不会串图。
+ *
+ * ★ 但**不跨进程**：App 重启就没了。这是刻意的 —— 图是装饰性的，
+ *   为它做持久化（localStorage 塞几百 KB base64）不划算，而且
+ *   localStorage 有 5MB 上限，塞满会把别的配置挤掉。
+ *
+ * ## 为什么不担心内存
+ *
+ * 缩略图是服务端压过的（`X-TCS-Size` 很小），几十张也就几 MB。
+ * 仍设了上限：超出按插入顺序淘汰最旧的（Map 的迭代顺序就是插入顺序）。
+ */
+const repoFaceCache = new Map<string, { sha256: string; url: string }>();
+
+/** 缓存条目上限（张）。超出淘汰最早插入的那批。 */
+const REPO_FACE_CACHE_LIMIT = 240;
+
+function rememberFace(cacheKey: string, sha256: string, url: string): void {
+  /*
+   * 先删再设：同一个键再写入时要**移到队尾**，否则它会按"最早插入"被淘汰
+   * —— 而它其实刚刚才用过。
+   */
+  repoFaceCache.delete(cacheKey);
+  repoFaceCache.set(cacheKey, { sha256, url });
+  while (repoFaceCache.size > REPO_FACE_CACHE_LIMIT) {
+    const oldest = repoFaceCache.keys().next();
+    if (oldest.done === true) break;
+    repoFaceCache.delete(oldest.value);
+  }
+}
+
+/** 把缩略图画进容器（整体替换，不会并排出现两个头像） */
+function paintFace(faceBox: ElLike, doc: DocLike, url: string): void {
+  const img = el(doc, 'img', 'nb-avatar');
+  img.setAttribute('data-role', 'repo-card-face');
+  img.setAttribute('alt', '');
+  img.setAttribute('src', url);
+  faceBox.replaceChildren(img);
+}
+
+/**
+ * 清掉某个仓库的缩略图缓存（下载/上传后图可能变了）。
+ *
+ * 不给参数时全清 —— 换账号、换仓库地址这类场景用。
+ *
+ * ★ 其实不必在下载后清：下次渲染比对 `faceSha256` 就会自己发现图变了。
+ *   但"用户刚上传了新卡面，回来却还看到旧的"这种观感问题，
+ *   靠被动比对要等一次列表刷新。主动清一下更符合预期。
+ */
+export function clearRepoFaceCache(repoName?: string): void {
+  if (repoName === undefined) {
+    repoFaceCache.clear();
+    return;
+  }
+  const prefix = `${repoName}/`;
+  for (const key of [...repoFaceCache.keys()]) {
+    if (key.startsWith(prefix)) repoFaceCache.delete(key);
+  }
+}
+
 /** 一张卡的展示行（二级用） */
 export interface RepoCardRow {
   id: string;
@@ -35,6 +108,28 @@ export interface RepoCardRow {
   updatedAt: string;
   /** 服务端有没有卡面（决定要不要去取缩略图） */
   hasFace: boolean;
+  /**
+   * 卡面的内容指纹（服务端 `face.sha256`），没有卡面时为 null。
+   *
+   * ## 为什么缩略图缓存要用它当键（2026-11-11，用户要求）
+   *
+   * 用户：
+   *
+   * > 卡片的缩略图在每次进仓库界面都要请求一次进行加载，我的建议是和仓库
+   * > 里面的卡片背景对比一下，如果不一样再进行替换
+   *
+   * 原来每次渲染列表都会为**每张有卡面的卡**发一次请求 —— 进一次界面
+   * 几十张卡就是几十次二进制下载，而绝大多数时候图根本没变。
+   *
+   * 比对什么很关键：
+   *
+   * ```text
+   *   card.updatedAt   ✗ 改标题也会变，导致白拉一次图
+   *   card.seq         ✗ 改设定也会涨版本号
+   *   face.sha256      ✓ 只有图变了才变 —— 正是"背景有没有换"的判据
+   * ```
+   */
+  faceSha256: string | null;
 }
 
 export interface RepoCardsCallbacks {
@@ -156,6 +251,20 @@ export function renderRepoCardsPage(
      * 没有就不发请求，省掉每张卡一次 404。
      */
     if (!card.hasFace) continue;
+
+    const cacheKey = `${input.repoName}/${card.id}`;
+    const cached = repoFaceCache.get(cacheKey);
+    /*
+     * 命中条件：**同一张图**（sha256 相同）。
+     *
+     * 命中就直接画，一个请求都不发 —— 这是"每次进界面都重新拉"的解药。
+     * 图换了（sha 变了）就往下走正常的取图流程，取到后覆盖缓存。
+     */
+    if (card.faceSha256 !== null && cached !== undefined && cached.sha256 === card.faceSha256) {
+      paintFace(faceBox, doc, cached.url);
+      continue;
+    }
+
     void (async () => {
       let url: string | null = null;
       try {
@@ -170,12 +279,14 @@ export function renderRepoCardsPage(
       }
       if (url === null) return;
 
-      const img = el(doc, 'img', 'nb-avatar');
-      img.setAttribute('data-role', 'repo-card-face');
-      img.setAttribute('alt', '');
-      img.setAttribute('src', url);
-      /* 换掉兜底：对容器整体替换，不会并排出现两个头像 */
-      faceBox.replaceChildren(img);
+      /*
+       * 取到才写缓存。失败不写 —— 写个空的会让下次误以为"已经是最新的"，
+       * 那张卡就永远不重试了。
+       */
+      if (card.faceSha256 !== null) {
+        rememberFace(cacheKey, card.faceSha256, url);
+      }
+      paintFace(faceBox, doc, url);
     })();
   }
 

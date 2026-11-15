@@ -186,6 +186,26 @@ object StLauncher {
              */
             activePort = PRIMARY_PORT
             Log.i(TAG, "复用已有 ST 实例（孤儿）")
+            /*
+             * ★★★ 复用也要写进应用日志（2026-11-13）。
+             *
+             * ## 不写的后果，就是这次排查多绕的那段路
+             *
+             * 用户交上来的目录里**只有一个 `app-001-.log`，没有
+             * `engine-8000.log`**。第一反应是"引擎日志漏做了/丢了"，
+             * 实际是这个分支直接 return —— 本次**没有启动新进程**，
+             * 自然不产生新的引擎日志。
+             *
+             * 也就是说：**"没有引擎日志"本身就是一条信息**（引擎被复用了），
+             * 但它长得像缺陷，没人能从空白里读出这层意思。
+             *
+             * 现在把话写死在日志里。
+             */
+            StLog.i(
+                "ENGINE",
+                "复用上次的引擎实例（端口 $PRIMARY_PORT）：本次没有启动新进程，" +
+                    "所以不会产生新的引擎日志；要看引擎就看上一次的 engine-$PRIMARY_PORT.log",
+            )
             return StartResult(true, "引擎已在运行（复用了上次的实例）", reused = true)
         }
 
@@ -208,6 +228,70 @@ object StLauncher {
     }
 
     /**
+     * 从引擎日志尾部捞**最后一条像错误**的行（2026-11-14）。
+     *
+     * ## 为什么要捞
+     *
+     * 引擎退出码 1 本身零信息量。真正的原因在日志里，而那条日志
+     * 用户不一定知道去哪看 —— 现在把它带进界面提示，一句就能定位。
+     *
+     * ## 只读尾部 8 KB
+     *
+     * 日志会被 `trimEngineLog` 裁到 4 MB 量级，整份读进来在低端机上
+     * 就是一次几百毫秒的 IO。而**错误一定在最后** —— 启动失败是最后发生的事。
+     *
+     * 8 KB 覆盖几十行，足够包含一条完整堆栈的前几帧。
+     *
+     * ## 判定"像错误"的四个特征
+     *
+     * ```text
+     *   未捕获异常     钩子写的中文前缀
+     *   Error:         V8 的标准前缀
+     *   ENGINE/JSD: E  钩子的 error 级别
+     *   code=          进程退出码那一行
+     * ```
+     *
+     * 从后往前找**第一条命中的**（不是最后一条）—— 最后一行往往是
+     * "引擎进程退出，code=1"，把真正的异常盖在上面就白捞了。
+     * 所以 `code=` 只在前三类都没命中时才用。
+     *
+     * ## 返回 null 的两种情况
+     *
+     * 日志不存在（首次启动还没写）、或里面没有任何像错误的行。
+     * 两种都让调用方退回"只说事实"的文案，不许编原因。
+     */
+    private fun lastEngineError(log: File?): String? {
+        if (log == null || !log.exists() || log.length() <= 0) return null
+        return try {
+            val maxBytes = 8 * 1024L
+            val offset = maxOf(0L, log.length() - maxBytes)
+            val buffer = ByteArray((log.length() - offset).toInt())
+            java.io.RandomAccessFile(log, "r").use { raf ->
+                raf.seek(offset)
+                raf.readFully(buffer)
+            }
+            val lines = String(buffer, Charsets.UTF_8).split('\n')
+
+            val strong = listOf("未捕获异常", "Error:", "ENGINE/JSD: E ")
+            for (needle in strong) {
+                for (index in lines.indices.reversed()) {
+                    val line = lines[index].trim()
+                    if (line.isNotEmpty() && line.contains(needle)) return line.take(180)
+                }
+            }
+            for (index in lines.indices.reversed()) {
+                val line = lines[index].trim()
+                if (line.isNotEmpty() && line.contains("code=")) return line.take(180)
+            }
+            null
+        } catch (error: Throwable) {
+            /* 读不到日志不能反过来把启动流程搅乱 —— 静默退回通用文案 */
+            Log.w(TAG, "读引擎日志失败：${error.javaClass.simpleName} ${error.message ?: ""}")
+            null
+        }
+    }
+
+    /**
      * 等端口真的在听 ST（2026-11-09 抽出）。
      *
      * ## 为什么抽出来
@@ -225,7 +309,12 @@ object StLauncher {
      * @param proc 我们自己 spawn 的进程；复用别处进程时传 `null`
      *   （那时没法看 `isAlive`，只能靠 probe 与超时）
      */
-    private fun awaitListening(port: Int, limit: Long, proc: Process?): StartResult {
+    private fun awaitListening(
+        port: Int,
+        limit: Long,
+        proc: Process?,
+        engineLog: File? = null,
+    ): StartResult {
         val startedAt = System.currentTimeMillis()
         while (System.currentTimeMillis() - startedAt < limit) {
             /*
@@ -234,9 +323,34 @@ object StLauncher {
              */
             if (proc != null && !proc.isAlive) {
                 val code = runCatching { proc.exitValue() }.getOrNull()
+                val detail = lastEngineError(engineLog)
                 return StartResult(
                     false,
-                    "引擎启动后立即退出（退出码 ${code ?: "未知"}）。可能是安装包不完整。",
+                    /*
+                     * ★★★ 不再写"可能是安装包不完整"（2026-11-14）。
+                     *
+                     * 那句话是**猜的**，而且实测里大概率猜错：
+                     *
+                     * ```text
+                     *   雷电模拟器（houdini 转译 arm64）
+                     *     → Node 的 C++ readPackageJSON（simdjson）解析失败
+                     *     → Error: Invalid package config .../yargs/package.json
+                     *   ⇒ 提示却说"安装包不完整" ⇒ 用户卸载重装 ⇒ 还是失败
+                     * ```
+                     *
+                     * 用户那次就是这么被引偏的：他去查安装包，而真因是环境不兼容。
+                     * 归因错误的代价不是"多试一次"，而是**把人送到错误的方向**，
+                     * 这与 §105（四种网络原因被一句话盖掉）同源。
+                     *
+                     * 现在：日志里有错就**原样带出来**（用户能拿去搜/反馈），
+                     * 没有就只说事实并指向诊断页 —— 不猜。
+                     */
+                    if (detail !== null) {
+                        "引擎启动失败（退出码 ${code ?: "未知"}）：$detail"
+                    } else {
+                        "引擎启动失败（退出码 ${code ?: "未知"}）。" +
+                            "到「我的 → 诊断日志」可以看引擎日志。"
+                    },
                 )
             }
             if (probe(port).state == ProbeState.ST) {
@@ -301,19 +415,99 @@ object StLauncher {
          * · **不传 `--listen`**：默认只听回环。传了会暴露到局域网，
          *   而手机上的 ST 没有任何鉴权。
          */
-        val command = listOf(
-            node.absolutePath,
-            File(stDir, "server.js").absolutePath,
-            "--dataRoot=${dataDir.absolutePath}",
-            "--port=$port",
-            "--browserLaunchEnabled=false",
-        )
+        /*
+         * ★★★ 用 `sh -c 'exec node … > 日志 2>&1'` 而不是直接 exec node
+         * （2026-11-12，实测后改的）。
+         *
+         * ## 为什么必须改道
+         *
+         * 原来 `redirectErrorStream(true)` + `drain(proc)` 读 `proc.inputStream`，
+         * 预期能拿到引擎的 stdout/stderr。
+         *
+         * 实测（日志落盘后立刻看到）：
+         *
+         * ```text
+         *   logcat:  E nodejs : Error: Invalid package config …（完整堆栈）
+         *   StLog:   W StNode: 子进程输出流结束（进程已退出）      ← 只有这一条
+         * ```
+         *
+         * 也就是 **Android 版 Node 把 stderr 直接写进 logcat**
+         * （走 `__android_log_write`），**根本不经过我们的 pipe**。
+         * "引擎为什么崩"这个最关键的信息，我们一条都拿不到 ——
+         * 而用户明确要求"任何异常都会向日志里面写入"。
+         *
+         * ## 为什么用 `exec`
+         *
+         * `sh -c 'exec node …'` 里的 `exec` 会让 **sh 被 node 替换**，
+         * 进程号不变 —— 所以 `proc` 仍代表 node，`isAlive` / `exitValue`
+         * / 杀进程的逻辑全不受影响。
+         *
+         * 不加 `exec` 的话 `proc` 是 sh，退出码会变成 sh 的，
+         * 而"引擎退出码 1"这种关键信息就丢了。
+         *
+         * ## 日志文件
+         *
+         * 放 `logs/` 目录、名 `engine-<端口>.log` —— 与 `app-*.log` 同目录，
+         * 用户一次就能把整个目录取走。用 `>>` 追加，保留跨次启动的历史
+         * （配合 `trimEngineLog` 裁剪）。
+         */
+        val logDir = StLog.directory() ?: stDir
+        val engineLog = File(logDir, "engine-$port.log")
+        trimEngineLog(engineLog)
 
-        Log.i(TAG, "启动引擎：${command.joinToString(" ")}")
+        /*
+         * ★★★ 日志钩子（2026-11-12）。
+         *
+         * ## 为什么 fd 重定向不够
+         *
+         * 实测：`sh -c 'exec node … >> engine.log 2>&1'` 能创建文件，
+         * 但**写进去 0 字节** —— Android 版 Node 把 stdout/stderr
+         * 硬编码送 logcat（`__android_log_write`），fd 重定向拦不住。
+         *
+         * 所以唯一能接的位置在 **JS 内部**：`NODE_OPTIONS=--require hook.cjs`
+         * 会在主模块之前执行，把 `console.error` / 未捕获异常 / 退出码接住。
+         *
+         * 详见 `assets/tcs-log-hook.cjs` 的文件头（那里写了能抓什么、
+         * 抓不到什么 —— 模块解析失败那一类真拦不住，别误以为钩子坏了）。
+         */
+        val hookFile = File(stDir, "tcs-log-hook.cjs")
+        val hookReady = try {
+            context.assets.open("tcs-log-hook.cjs").use { input ->
+                hookFile.outputStream().use { output -> input.copyTo(output) }
+            }
+            true
+        } catch (error: Throwable) {
+            StLog.w("ENGINE", "日志钩子没铺开（引擎日志将只有退出码）：${error.message}")
+            false
+        }
+
+        /*
+         * 每个路径都加引号：正常不含空格，但拼进 shell 字符串时必须防御 ——
+         * 路径里一个空格就会让整条命令错位，而报错信息完全看不出来。
+         */
+        val shell = buildString {
+            append("exec ")
+            append("\"").append(node.absolutePath).append("\" ")
+            append("\"").append(File(stDir, "server.js").absolutePath).append("\" ")
+            append("--dataRoot=\"").append(dataDir.absolutePath).append("\" ")
+            append("--port=").append(port).append(" ")
+            append("--browserLaunchEnabled=false")
+            append(" >> \"").append(engineLog.absolutePath).append("\" 2>&1")
+        }
+
+        val command = listOf("/system/bin/sh", "-c", shell)
+
+        Log.i(TAG, "启动引擎：$shell")
+        StLog.i("ENGINE", "启动引擎（端口 $port，首次=$firstRun）：${File(stDir, "server.js").path}")
 
         return try {
             val builder = ProcessBuilder(command)
                 .directory(stDir)
+                /*
+                 * 输出已重定向进文件，pipe 里通常没有内容。
+                 * 仍保留 `redirectErrorStream(true)`：万一 sh 自身报错
+                 * （比如 exec 失败），那条信息还在 pipe 里，drain 能读到。
+                 */
                 .redirectErrorStream(true)
 
             /*
@@ -329,7 +523,29 @@ object StLauncher {
              * 让 node 的输出立刻落盘而不是攒满缓冲区再说 ——
              * 崩溃时最需要的是最后几行，缓冲会让它正好丢掉。
              */
-            builder.environment()["NODE_OPTIONS"] = "--no-warnings"
+            /*
+             * `--require` 加载的是 CJS（钩子后缀是 `.cjs`，不受 ST 的
+             * `"type": "module"` 影响），且**在主模块之前**执行 ——
+             * 这是唯一能接住启动期异常的位置。
+             *
+             * ★ **不加引号**（2026-11-12，真跑判据发现的）。
+             *
+             * 第一版写的是 `--require "<path>"`。那个引号在 Windows 上会让
+             * Node 把引号当成路径的一部分 ⇒ 加载失败（同一份钩子手动跑
+             * 能写日志、在测试里不能）。而 NODE_OPTIONS 本身是空格分隔的
+             * 参数串，没有可靠的转义规则。
+             *
+             * 所以反过来约束：**路径由我们决定，必须保证不含空格**。
+             * `<stDir>` 是 `<filesDir>/st`，`filesDir` 由包名决定，不含空格。
+             */
+            builder.environment()["NODE_OPTIONS"] =
+                if (hookReady) {
+                    "--no-warnings --require ${hookFile.absolutePath}"
+                } else {
+                    "--no-warnings"
+                }
+            /* 钩子从环境变量读落点：不把路径拼进 JS，避免转义问题 */
+            builder.environment()["TCS_ENGINE_LOG"] = engineLog.absolutePath
 
             val proc = builder.start()
             process = proc
@@ -347,7 +563,7 @@ object StLauncher {
 
             // 等端口就绪（与"复用已有进程"那条路径共用同一段等待逻辑）
             val limit = if (firstRun) FIRST_RUN_PROBE_TIMEOUT_MS else PROBE_TIMEOUT_MS
-            return awaitListening(port, limit, proc)
+            return awaitListening(port, limit, proc, engineLog)
 
             /*
              * ★★★ 超时**不等于失败**（2026-11-09）。
@@ -410,18 +626,137 @@ object StLauncher {
         }
     }
 
-    /** 把子进程输出读掉并转进 logcat（按行，前缀便于 grep） */
+    /**
+     * 引擎日志单文件上限：4MB。
+     *
+     * 为什么比 `StLog` 的 2MB 大：引擎输出是**人类可读的启动/请求日志**，
+     * 一次崩溃的完整堆栈加上启动过程可能几百 KB，太小会把关键部分截掉。
+     *
+     * 为什么不并进 `StLog` 的 18MB 预算：两者用途不同（一个是"我们的事件"，
+     * 一个是"引擎自己的话"），混在一起会互相挤掉。
+     */
+    private const val MAX_ENGINE_LOG_BYTES = 4L * 1024 * 1024
+
+    /**
+     * 裁剪引擎日志（超过 4MB 只留最后 1MB）。
+     *
+     * 留尾部而不是头部：启动失败时最有价值的是末尾那段堆栈，
+     * 前面几万行正常启动日志反而没用。
+     */
+    private fun trimEngineLog(file: File) {
+        try {
+            if (!file.exists() || file.length() <= MAX_ENGINE_LOG_BYTES) return
+            val keep = 1L * 1024 * 1024
+            val tail = ByteArray(keep.toInt())
+            java.io.RandomAccessFile(file, "r").use { raf ->
+                raf.seek(file.length() - keep)
+                raf.readFully(tail)
+            }
+            file.writeBytes(tail)
+        } catch (_: Throwable) {
+            /* 裁剪失败不影响启动：最坏是文件大一点 */
+        }
+    }
+
+    /**
+     * 把子进程输出读掉并转进 logcat **与 StLog**（按行，前缀便于 grep）。
+     *
+     * ## 为什么还要写 StLog（2026-11-12）
+     *
+     * 原来只进 logcat。而 logcat 需要数据线 + 开发者工具才能读 ——
+     * 用户报闪退时**一条都拿不到**。
+     *
+     * 引擎（node）自己的崩溃信息恰恰是最关键的一类：`ERR_INVALID_PACKAGE_CONFIG`、
+     * 端口占用、内存不足，全都只在这条流里。所以必须同时落进用户能取到的文件。
+     *
+     * ## 为什么要过滤
+     *
+     * node + SillyTavern 正常运行时也会持续输出（每个请求几行）。全量落盘
+     * 会把 16MB 的预算在半天内吃光，真正有价值的那几行反而被挤掉。
+     *
+     * 所以只落"看起来像问题"的行：
+     *
+     * ```text
+     *   Error / ERR_ / Exception / FATAL / failed / 失败 / 崩溃
+     * ```
+     *
+     * 其余仍进 logcat（开发时照样看得到），只是不占日志预算。
+     */
     private fun drain(proc: Process) {
         try {
             BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
                 while (true) {
                     val line = reader.readLine() ?: break
                     Log.i("StNode", line)
+                    if (looksLikeProblem(line)) {
+                        StLog.e("StNode", line)
+                    }
                 }
             }
+            /*
+             * 流结束 = 引擎进程结束了。这一条必须记 ——
+             * 它精确标出"引擎是什么时候没的"，而闪退往往紧随其后。
+             */
+            /*
+             * 退出码要**等**一下再取。
+             *
+             * 实测：输出流结束时 `exitValue()` 有时还抛
+             * `IllegalThreadStateException`（进程状态尚未回收），
+             * 于是日志写的是"退出码 未知" —— 而那个数字恰恰是区分
+             * "参数错误(1)"与"被信号杀(137/143)"的关键。
+             *
+             * 最多等 2 秒；等不到就如实说"仍在运行"，不猜。
+             */
+            val code = runCatching {
+                if (proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
+                    proc.exitValue()
+                } else {
+                    null
+                }
+            }.getOrNull()
+            StLog.w(
+                "StNode",
+                if (code === null) {
+                    "子进程输出流已结束，但进程仍在运行（未在 2 秒内退出）"
+                } else {
+                    "子进程已退出，退出码 $code" +
+                        when (code) {
+                            0 -> "（正常结束）"
+                            1 -> "（一般是参数错误或模块加载失败）"
+                            137 -> "（SIGKILL：被系统杀掉，多半是内存不足）"
+                            143 -> "（SIGTERM：被要求退出）"
+                            else -> ""
+                        }
+                }
+            )
         } catch (error: Exception) {
-            Log.w(TAG, "读子进程输出结束", error)
+            StLog.w("StNode", "读子进程输出时异常结束：${error.javaClass.simpleName}: ${error.message}")
         }
+    }
+
+    /**
+     * 这行值得落盘吗。
+     *
+     * 判据刻意保守（宁可漏一点，也不要被正常输出刷爆 —— 日志被刷爆之后
+     * 等于没有日志，而那种失败是静默的）。
+     */
+    private fun looksLikeProblem(line: String): Boolean {
+        if (line.length < 4) return false
+        val lowered = line.lowercase()
+        return lowered.contains("error") ||
+            lowered.contains("err_") ||
+            lowered.contains("exception") ||
+            lowered.contains("fatal") ||
+            lowered.contains("failed") ||
+            lowered.contains("cannot") ||
+            lowered.contains("enoent") ||
+            lowered.contains("eacces") ||
+            lowered.contains("enospc") ||
+            lowered.contains("out of memory") ||
+            line.contains("失败") ||
+            line.contains("错误") ||
+            line.contains("崩溃") ||
+            line.contains("无法")
     }
 
     /**

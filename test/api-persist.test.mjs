@@ -90,16 +90,39 @@ test('★★★ custom 源写 source + custom_model + custom_url', () => {
   assert.equal('openai_model' in patch, false);
 });
 
-test('★★ 非 custom 源不写 custom_url（避免动到用户的地址配置）', () => {
+test('★★ 填了非官方地址就按 custom 落盘（2026-11-11 改方向）', () => {
+  /*
+   * ## 这条判据原本守什么
+   *
+   * 「非 custom 源不写 custom_url」—— 当时的顾虑是"别动到用户在 ST 里
+   * 配的地址"。
+   *
+   * ## 用户推翻了它
+   *
+   * > 秘钥存储还是有问题
+   *
+   * 真机：他填了中转站地址 `https://vip4lai.xyz/v1`，然后选了 DeepSeek 源。
+   * ST 只有 custom 分支读 `custom_url` ⇒ 地址被静默丢掉 ⇒ 请求打到
+   * `api.deepseek.com`、key 是别家的 ⇒ 「Key 错误」。
+   *
+   * ## 现在守什么
+   *
+   * ```text
+   *   非官方地址 + 任何源 → 按 custom 落盘，地址写下去
+   *   官方地址           → 保持原源，**不碰** custom_url（那条顾虑仍在）
+   * ```
+   *
+   * 后者由 `官方地址不覆盖 custom_url` 那条单独守。
+   */
   const patch = buildStConnectionPatch({
     source: 'openai',
     model: 'gpt-4o',
     baseUrl: 'https://example.com/v1',
   });
 
-  assert.equal(patch['chat_completion_source'], 'openai');
-  assert.equal(patch['openai_model'], 'gpt-4o');
-  assert.equal('custom_url' in patch, false, 'openai 源不该碰 custom_url');
+  assert.equal(patch['chat_completion_source'], 'custom', '非官方地址 ⇒ 走 custom');
+  assert.equal(patch['custom_model'], 'gpt-4o', '模型写进 custom 字段');
+  assert.equal(patch['custom_url'], 'https://example.com/v1', '地址要真的落盘');
 });
 
 test('★★ baseUrl 为空时不写 custom_url（别把用户在 ST 里配的地址清掉）', () => {
@@ -305,10 +328,29 @@ test('★★ 三处都走同一个连接门（不能绕过 withConnection）', (
    *   **它守的性质没变**：写秘钥必须过连接门，不许直接调 Tauri 命令。
    *   只是现在那道门在**注入处**，所以判据跟到注入处。
    */
+  /*
+   * ★ 守**性质**：写秘钥必须过连接门。不守**写法**。
+   *
+   * 原判据要求这一行是 `() => this.bridge.writeSecret(...)` 单表达式。
+   * 2026-11-11 给它加了"写入前后比对 active id"的自证逻辑，变成
+   * `withConnection(async () => { ... })`，于是判据红了 —— 但**性质没坏**，
+   * 只是形状变了。
+   *
+   * 判据钉写法会把好改动拦在门外，钉性质才能随实现演进而继续有效。
+   */
+  const writerAt = shell.indexOf('writeSecret: (key');
+  assert.ok(writerAt > 0, '找不到注入给 api-page 的 writeSecret');
+  const writerBody = shell.slice(writerAt, writerAt + 1600);
+
   assert.match(
-    shell,
-    /writeSecret:\s*\(key[^)]*\)\s*=>\s*\n?\s*this\.withConnection\(\(\) => this\.bridge\.writeSecret/,
-    '注入给 api-page 的 writeSecret 必须包连接门',
+    writerBody,
+    /this\.withConnection\(/,
+    '注入给 api-page 的 writeSecret 必须包连接门（否则第一次保存必然 StUnavailable）',
+  );
+  assert.match(
+    writerBody,
+    /this\.bridge\.writeSecret\(/,
+    '真正写秘钥的那一步要在连接门内部',
   );
 
   const start = shell.indexOf('private async writeApiConnectionToSt');

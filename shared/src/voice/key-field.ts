@@ -119,7 +119,43 @@ export function keyToSave(rawInput: string): string | null {
  * 其余不变。
  */
 export function keyStateOnFocus(state: KeyFieldState): KeyFieldState {
-  return state === 'masked' ? 'editing' : state;
+  /*
+   * ★★★★★ `empty` 也必须进 `editing`（2026-11-12，真机日志定的案）。
+   *
+   * ## 原来只写了 masked → editing
+   *
+   * 那意味着：**一个从来没配过 key 的源，用户点进输入框后状态还是 `empty`**。
+   * 于是：
+   *
+   * ```text
+   *   initialKeyState(false)            = 'empty'
+   *   focus：empty → empty（没变）
+   *   用户粘好 key（内容在框里，但状态仍是 empty）
+   *   任何 blur（包括点「保存」）
+   *     → keyStateOnBlur('empty', 'sk-xxx') ：state !== 'editing' ⇒ 直接返回 'empty'
+   *     → 不认为"填了内容"
+   *     → paintKeyField() → value = keyFieldValue('empty') = ''
+   *     → **刚粘的 key 被抹掉**
+   * ```
+   *
+   * 真机日志（Redmi Note 8 Pro，用户那个源 52 个槽位全是 null）：
+   *
+   * ```text
+   *   [save] source=openai input=yes len=0 mask=no write=no
+   * ```
+   *
+   * ## 为什么"聚焦就是编辑"才是对的语义
+   *
+   * ```text
+   *   聚焦  = 用户打算输入 ⇒ 就是 editing
+   *   失焦 + 有内容 ⇒ 仍是 editing（内容还没提交）
+   *   失焦 + 没内容 ⇒ 回到 masked（配过）或 empty（没配过）
+   * ```
+   *
+   * 只有 `masked` 是"展示用的假状态"，它一聚焦就该消失；
+   * `empty` 不是一个"状态"，它只是"当前没有值"。
+   */
+  return state === 'masked' || state === 'empty' ? 'editing' : state;
 }
 
 /**
@@ -130,8 +166,63 @@ export function keyStateOnFocus(state: KeyFieldState): KeyFieldState {
  *
  * @param hadKey 聚焦之前是否已配置过
  */
+/**
+ * 失焦时**必须保住用户填的内容**吗。
+ *
+ * ## 这个函数存在的唯一理由：同一个 bug 犯了两次
+ *
+ * ```text
+ *   2026-11-07  语音页的秘钥框   → 修了
+ *   2026-11-12  API 页的秘钥框    → 又犯一次，用户报"填了 key 还是 401"
+ * ```
+ *
+ * 两次的形态一模一样：
+ *
+ * ```text
+ *   blur → keyStateOnBlur(…) 正确返回 'editing'（有值就保持）
+ *        → 紧接着 paintKeyField() 无条件执行 value = keyFieldValue(state)
+ *        → keyFieldValue('editing') 是空串
+ *        → 用户刚粘的 key 被自己抹掉
+ * ```
+ *
+ * 所以把判断抽到这里，**两处都只能调它** —— 各写一份必然第三次分叉。
+ *
+ * ## 判据
+ *
+ * ```text
+ *   状态是 editing（正在填）  且  内容非空（不是只剩空白）
+ *   ⇒ 只更新 type / placeholder，绝对不碰 value
+ * ```
+ *
+ * 为什么还要判"内容非空"：用户点进框又没填就离开，此时该退回
+ * masked / empty（让他看到"没配"的真相），而不是停在 editing。
+ *
+ * ## 为什么自动化探针测不出来
+ *
+ * 脚本用 `element.click()` 不会移动焦点，**不触发 blur**。
+ * 真实手指点击一定触发。所以这个 bug 只有真机能复现 ——
+ * 它也因此值得一个独立的、写明原因的函数。
+ */
+export function shouldKeepTypedValue(next: KeyFieldState, rawInput: string): boolean {
+  return next === 'editing' && rawInput.trim() !== '';
+}
+
 export function keyStateOnBlur(state: KeyFieldState, rawInput: string, hadKey: boolean): KeyFieldState {
-  if (state !== 'editing') return state;
+  /*
+   * ★ 有内容 ⇒ 一律算 editing（2026-11-12，与 `keyStateOnFocus` 的修复配套）。
+   *
+   * 这一条是**双保险**：万一某个入口没经过 focus（比如程序化设值、
+   * 或者将来新增一个不聚焦就填值的路径），只看"状态是不是 editing"
+   * 仍会漏掉它。而"框里有内容"是**客观事实**，比状态可靠。
+   *
+   * 判据在测试里钉死了这个组合：
+   *
+   * ```text
+   *   keyStateOnBlur('empty', 'sk-1', false) === 'editing'
+   *   keyStateOnBlur('masked', 'sk-1', true) === 'editing'
+   * ```
+   */
   if (rawInput.trim() !== '') return 'editing';
+  if (state !== 'editing') return state;
   return hadKey ? 'masked' : 'empty';
 }

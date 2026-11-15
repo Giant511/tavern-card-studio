@@ -979,8 +979,30 @@ export class ChatPanel {
     return root;
   }
 
-  /** 载入一个聊天 */
-  async loadChat(avatar: string, fileName: string): Promise<void> {    const raw = await this.bridge.loadChatRaw(avatar, fileName);
+  /**
+   * 载入一个聊天。
+   *
+   * @returns `true` = 真的读到了内容；`false` = 三种"读不到"之一
+   *   （`missing` / `empty` / `malformed`）。
+   *
+   * ## ★★★ 为什么必须返回布尔（2026-11-14）
+   *
+   * 原来返回 `void`，调用方**无从知道成没成**。外壳的
+   * `openChatFile()` 就是无条件把 `chatFileName` 设成传入的名字：
+   *
+   * ```ts
+   *   await this.chatPanel?.loadChat(avatar, fileName);
+   *   this.chatFileName = fileName;    // ← 不管读没读到
+   * ```
+   *
+   * 而本方法在失败分支里明确把 `this.fileName = null`（面板认为没文件）。
+   * 于是**面板说"没有文件"、外壳说"文件叫 X"** —— 同一件事两个答案。
+   *
+   * 后果：副标题显示已打开 X，而那个文件根本不存在或读不出。用户看到的是
+   * "打开了一段没有内容的对话"，与"记录丢了"长得一模一样。
+   */
+  async loadChat(avatar: string, fileName: string): Promise<boolean> {
+    const raw = await this.bridge.loadChatRaw(avatar, fileName);
     /*
      * ★ 三态判定（陷阱 #4）交给 `shared`：
      * `{}` = 目录不存在、`[]` = 文件读不到、数组 = 有内容。
@@ -995,7 +1017,7 @@ export class ChatPanel {
       this.fileName = fileName;
       this.syncSubtitle();
       this.render();
-      return;
+      return true;
     }
 
     /*
@@ -1018,6 +1040,7 @@ export class ChatPanel {
           : `聊天数据格式不认识（${parsed.reason}），已按"无记录"处理`;
     this.callbacks.onNotify?.(notice, parsed.kind === 'malformed' ? 'danger' : 'warn');
     this.render();
+    return false;
   }
 
   /**
