@@ -226,13 +226,20 @@ test('★★★ 写回后必须重新解析（否则聊天还用旧开关）', (
   /*
    * 不重新解析的话：用户关掉一条、回聊天、发消息 ——
    * 发出去的**还是**那一条。而界面上开关明明关了。
+   *
+   * ★ v0.2.0 起多了一层：解析结果先落到 `globalPromptConfig`（磁盘那份
+   *   预设），再由 `rebuildPromptConfig()` 叠上当前角色的覆盖、
+   *   推给面板。所以"重新解析"与"推给面板"之间的链路长了一环，
+   *   这一环漏接的表现是**本角色的定制被静默清掉**。
    */
   const shell = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
   /* 同上：重新解析现在在公共链路里 */
   const block = shell.slice(shell.indexOf('private async mutatePromptPreset'));
 
   assert.match(block, /parsePromptConfig\(next\.body\)/, '写完要重新解析');
-  assert.match(block, /setContext\(\{ promptConfig: this\.promptConfig \}\)/, '要把新配置推给面板');
+  assert.match(block, /this\.globalPromptConfig = fresh/, '解析结果要落到全局那份（不是合成结果）');
+  assert.match(block, /this\.rebuildPromptConfig\(\)/, '要重算"全局 ⊕ 角色"的生效配置');
+  assert.match(shell, /setContext\(\{ promptConfig: merged \}\)/, '重算后要把新配置推给面板');
 });
 
 test('★★ 开关失败时界面要退回原状并说明原因', () => {

@@ -304,8 +304,22 @@ test('★★★★★ 切角色必须先清空 loadedCard（否则新角色用�
   assert.ok(at > 0, '找不到切角色清状态的位置');
   const body = src.slice(at, at + 3000);
 
-  const clearAt = body.indexOf('this.loadedCard = {}');
-  assert.ok(clearAt > 0, '切角色时必须清空 loadedCard —— 否则新角色会用到上一个角色的卡');
+  /*
+   * v0.2.0 起清空卡改走 `adoptLoadedCard({})` —— 它做的事比裸赋值多一件：
+   * 顺带把 `characterPrompts` 也清掉（否则新角色会按上一个角色的
+   * 提示词发消息，而那条路**只在读卡失败时**走到，没人测得到）。
+   *
+   * 判据钉的是**性质**（卡被清空 + 在 renderPage 之前），不是写法。
+   * 钉写法的话，每次重构都要改判据 —— 而改判据的人会顺手把它改松。
+   */
+  const clearAt = ['this.adoptLoadedCard({})', 'this.loadedCard = {}']
+    .map((needle) => body.indexOf(needle))
+    .filter((one) => one >= 0)
+    .reduce((min, one) => Math.min(min, one), Number.POSITIVE_INFINITY);
+  assert.ok(
+    Number.isFinite(clearAt),
+    '切角色时必须清空 loadedCard —— 否则新角色会用到上一个角色的卡',
+  );
 
   const renderAt = body.indexOf('this.renderPage()');
   assert.ok(renderAt > 0, '找不到紧接着的 renderPage()');
