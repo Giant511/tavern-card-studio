@@ -205,6 +205,10 @@ import {
   isSupportedChatSource,
   type ParamFamily,
   type ThinkingIntent,
+  /* 角色级提示词覆盖（v0.2.0 主功能，见 PLAN §5） */
+  parseCharacterPrompts,
+  combineGlobalAndCharacter,
+  type CharacterPromptConfig,
 } from '@tcs/shared';
 
 /*
@@ -687,8 +691,38 @@ export class AppShell {
    * 与 `sampling` 同一个取舍：**进聊天页播种一次 + 切换预设后立即更新**，
    * 而不是每条消息都去读 ST 设置（那会让每条消息多一次 HTTP 往返，
    * 且 ST 没起来时聊天直接不可用）。
+   *
+   * ★★★ v0.2.0 起这是**合成结果**（全局预设 ⊕ 当前角色覆盖），不是磁盘上
+   * 那份预设的裸解析结果。裸结果在 `globalPromptConfig`。
+   * 谁想改全局那份，必须改 `globalPromptConfig` 再调 `rebuildPromptConfig()`
+   * —— 直接写 `this.promptConfig` 会被下一次 `rebuildPromptConfig()` 冲掉。
    */
   private promptConfig: ParsedPromptConfig | null = null;
+
+  /**
+   * 全局预设解析出的配置（**不含**角色覆盖）。v0.2.0。
+   *
+   * 为什么必须与 `promptConfig` 分开存：
+   *
+   * ```text
+   *   只有一个字段时，切角色要把"角色覆盖"叠上去 ⇒ 叠之前得先知道
+   *   "哪部分是全局的"。而 `promptConfig` 已经被叠过一次了 ——
+   *   从它反推全局值等于在猜。切回 A 角色就会带着 B 角色的改动。
+   * ```
+   *
+   * 两个字段的写入方是**互斥**的：`globalPromptConfig` 只由"读预设"写，
+   * `characterPrompts` 只由"读卡"写，`promptConfig` 只由
+   * `rebuildPromptConfig()` 写。这样"切角色带上一个角色的改动"在结构上
+   * 就不可能发生。
+   */
+  private globalPromptConfig: ParsedPromptConfig | null = null;
+
+  /**
+   * 当前角色的提示词覆盖（`data.extensions.tcs.prompts`）。v0.2.0。
+   *
+   * `null` = 这个角色没配过（绝大多数角色）⇒ 行为与 v0.1.10 完全一致。
+   */
+  private characterPrompts: CharacterPromptConfig | null = null;
 
   /**
    * 正在编辑的提示词 identifier（2026-11-07）。`null` = 新建。
@@ -4161,25 +4195,76 @@ export class AppShell {
       const pngBytes = await this.withConnection(() => this.bridge.characterPng(avatar));
       const parsed = parsePngCard(new Uint8Array(pngBytes));
       if (parsed.kind !== 'card') {
-        this.loadedCard = {};
+        this.adoptLoadedCard({});
         return false;
       }
       const json = JSON.parse(parsed.jsonText) as unknown;
       if (json === null || typeof json !== 'object') {
-        this.loadedCard = {};
+        this.adoptLoadedCard({});
         return false;
       }
       const root = json as Record<string, unknown>;
       const data = root['data'];
-      this.loadedCard =
-        data !== null && typeof data === 'object'
-          ? (data as Record<string, unknown>)
-          : root;
+      this.adoptLoadedCard(
+        data !== null && typeof data === 'object' ? (data as Record<string, unknown>) : root,
+      );
       return true;
     } catch {
-      this.loadedCard = {};
+      this.adoptLoadedCard({});
       return false;
     }
+  }
+
+  /**
+   * 收下一张卡的 `data` 段 —— **并且连带解析它带的角色级提示词**。
+   *
+   * ## 为什么收卡必须走这一个入口
+   *
+   * v0.2.0 之前 `this.loadedCard = ...` 在本文件里出现了 4 次（读卡成功、
+   * PNG 不是卡、JSON 不是对象、catch）。角色提示词也要跟着卡一起换，
+   * 如果另外在"成功"那一支单独写一行，**失败的三支就会把上一个角色的
+   * 提示词留在原地** ——
+   *
+   * ```text
+   *   切到角色 B（读卡失败）→ characterPrompts 还是 A 的
+   *                        → B 的对话按 A 的提示词发出去
+   * ```
+   *
+   * 而这个错误**在界面上完全看不出来**：B 的卡是空的（引擎没起），
+   * 用户只会觉得"模型怎么怪怪的"。所以把"收卡"与"清提示词"绑成一件事，
+   * 让漏掉其中一半在结构上不可能。
+   */
+  private adoptLoadedCard(card: Record<string, unknown>): void {
+    this.loadedCard = card;
+    /*
+     * `extensions` 是 V2/V3 规范里放应用私有数据的唯一位置。
+     * 取不到（V1 卡 / 没配过）就是 `null` —— 面板据此完全走全局。
+     */
+    this.characterPrompts = parseCharacterPrompts(card['extensions']);
+    this.rebuildPromptConfig();
+  }
+
+  /**
+   * 重算"最终生效"的提示词配置，并推给面板。**唯一写 `promptConfig` 的地方**。
+   *
+   * ## 为什么要一个单独的方法
+   *
+   * 生效配置有两个来源（全局预设、当前角色），任何一个变了都要重算。
+   * 让每个变化点各自拼一遍的后果本项目已经踩过四次（同一个事实两处表示）：
+   * 某处忘了叠角色覆盖 ⇒ "改了角色提示词没生效"；某处忘了用全局
+   * ⇒ "切回别的角色还带着上一个角色的改动"。集中在这里，两处只管
+   * 各写自己的字段。
+   *
+   * ## 为什么顺带 `setContext`
+   *
+   * 面板手上的配置是**推**过去的，不推就一直是旧的。而"重算完忘了推"
+   * 正是本项目最反复的缺陷类型（实现存在、接在错的函数里）。
+   * `setContext` 是浅合并语义，只推 `promptConfig` 不会清掉其它字段。
+   */
+  private rebuildPromptConfig(): void {
+    const merged = combineGlobalAndCharacter(this.globalPromptConfig, this.characterPrompts);
+    this.promptConfig = merged;
+    this.chatPanel?.setContext({ promptConfig: merged });
   }
 
   /**
@@ -4594,8 +4679,12 @@ export class AppShell {
          *   ② 清空后到新卡到位之间的窗口，若用户发消息会用空卡 ——
          *      但那比"用上一个角色的设定发消息"安全得多（现状就是后者）
          * ```
+         *
+         * ★ v0.2.0：走 `adoptLoadedCard({})` 而不是直接赋 `{}` ——
+         *   上一个角色留在 `characterPrompts` 里的覆盖必须一起清掉。
+         *   否则"点角色 B → 卡还没到 → 发一条消息"会按 A 的提示词发。
          */
-        this.loadedCard = {};
+        this.adoptLoadedCard({});
 
         /* ① 立即跳（不 await） */
         this.renderPage();
@@ -5588,15 +5677,22 @@ export class AppShell {
          * 找不到当前预设的**内容**（只有名字）。
          * 这时把配置清空，让面板回退 —— 比沿用上一份预设的配置好：
          * 沿用会让用户的提示词"串预设"，表现是换了预设但行为没变。
+         *
+         * ★ v0.2.0：清的是 `globalPromptConfig`，角色覆盖**不动**
+         *   （它跟着卡走，与预设无关）。`rebuildPromptConfig()` 会算出
+         *   `null`（全局为空时角色配置整体不生效，见
+         *   `combineGlobalAndCharacter` 的注释）。
          */
-        this.promptConfig = null;
+        this.globalPromptConfig = null;
         this.promptFormats = {};
-        this.chatPanel?.setContext({ promptConfig: null, promptFormats: {} });
+        this.rebuildPromptConfig();
+        this.chatPanel?.setContext({ promptFormats: {} });
         return;
       }
 
       const config = parsePromptConfig(body);
-      this.promptConfig = config.prompts.length > 0 ? config : null;
+      this.globalPromptConfig = config.prompts.length > 0 ? config : null;
+      this.rebuildPromptConfig();
 
       /*
        * 格式串与示例分隔提示：一律**照抄用户的配置**，缺省即空串。
@@ -5633,9 +5729,12 @@ export class AppShell {
        * 真机诊断入口（`__tcsPromptProbe__`）就是为分辨这个加的：
        * 它报 `hasAuthorNote: false` 而 `usePromptManager: true`，
        * 说明预设读到了、只有注释这一路断了。
+       *
+       * ★ v0.2.0：`promptConfig` 已由上面那句 `rebuildPromptConfig()`
+       *   推过（它才是"全局 ⊕ 角色"的唯一出口），这里不再重复推 ——
+       *   留两处写同一个字段，下次改其中一处就会被另一处悄悄回滚。
        */
       this.chatPanel?.setContext({
-        promptConfig: this.promptConfig,
         promptFormats: this.promptFormats,
         ...(this.authorNote === null ? {} : { authorNote: this.authorNote }),
       });
@@ -6611,10 +6710,16 @@ export class AppShell {
        * 重新解析，让面板手上的配置与磁盘一致。
        *
        * 这一步不能省：不重新解析的话，聊天时用的还是旧内容/旧开关。
+       *
+       * ★ v0.2.0：写的是 `globalPromptConfig`（磁盘那份预设），再由
+       *   `rebuildPromptConfig()` 叠上当前角色的覆盖。直接写
+       *   `this.promptConfig` 会把角色覆盖冲掉 —— 表现是"我改完这条
+       *   开关，本角色的定制全没了"，而且只在**这个角色有定制**时才出现，
+       *   一般人测不到。
        */
       const fresh = parsePromptConfig(next.body);
-      this.promptConfig = fresh.prompts.length > 0 ? fresh : null;
-      this.chatPanel?.setContext({ promptConfig: this.promptConfig });
+      this.globalPromptConfig = fresh.prompts.length > 0 ? fresh : null;
+      this.rebuildPromptConfig();
       if (this.authorNote !== null) {
         this.chatPanel?.setContext({ authorNote: this.authorNote });
       }
@@ -7515,9 +7620,13 @@ export class AppShell {
            * 表现是"换了预设，风格只变了一半"，而这看起来像模型不稳定。
            *
            * 这里直接传预设体（手上就有），不用再发一次请求。
+           *
+           * ★ v0.2.0：赋给 `globalPromptConfig` 再 `rebuildPromptConfig()`。
+           *   换预设不该改变"这个角色的定制"，所以角色覆盖要重新叠上去。
            */
           const nextConfig = parsePromptConfig(body);
-          this.promptConfig = nextConfig.prompts.length > 0 ? nextConfig : null;
+          this.globalPromptConfig = nextConfig.prompts.length > 0 ? nextConfig : null;
+          this.rebuildPromptConfig();
           {
             const readText = (key: string): string | undefined => {
               const value = (body as Record<string, unknown>)[key];
@@ -7530,10 +7639,7 @@ export class AppShell {
               newExampleChatPrompt: readText('new_example_chat_prompt'),
             };
           }
-          this.chatPanel?.setContext({
-            promptConfig: this.promptConfig,
-            promptFormats: this.promptFormats,
-          });
+          this.chatPanel?.setContext({ promptFormats: this.promptFormats });
 
           return { ok: true, skipped: plan.skipped.length };
         } catch (error) {

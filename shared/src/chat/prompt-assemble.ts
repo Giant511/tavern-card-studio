@@ -253,18 +253,84 @@ function resolveWorldInfo(
 }
 
 /**
+ * 卡片自带的两个「提示词覆盖」字段 —— 与 ST 的 `main` / `jailbreak` 槽对应。
+ *
+ * ## 为什么必须补这个（2026-11-15，v0.2.0 第一步）
+ *
+ * 卡片的 `system_prompt` / `post_history_instructions` 是 **Character Card V2
+ * 规范里的正式字段**（不是 ST 的私有扩展）：
+ *
+ * > `system_prompt` — Frontends' default behavior **MUST** be to replace what
+ * > users understand to be the "system prompt" global setting with the value
+ * > inside this field. （空串时回退到用户的全局设置）
+ *
+ * 而本项目在「提示词管理器开着」时**完全忽略它们** —— 那两条走的是
+ * `prompt.content`（预设里的全局文本）。也就是说：
+ *
+ * ```text
+ *   卡作者写了 system_prompt ⇒ 在 ST 网页里生效
+ *                            ⇒ 在我们 App 里**静默不生效**
+ * ```
+ *
+ * 这是规范层面的 MUST 未实现，不是"可选功能"。而且用户报的正是
+ * 「同样的卡，在 ST 里更贴，在 App 里差点意思」—— 这条是一个具体成因。
+ *
+ * ## 为什么只覆盖这两个
+ *
+ * ST 也只这么做（`public/scripts/openai.js` 里 `systemPromptOverride` /
+ * `jailbreakPromptOverride` 两处）。其余槽的内容来自卡片的
+ * `description` / `personality` / `scenario` 等**结构化字段**，本来就按
+ * marker 取（见 `resolveSlotContent` 的 switch），不需要"覆盖"。
+ */
+const CARD_OVERRIDE_FIELD: Record<string, 'system_prompt' | 'post_history_instructions'> = {
+  main: 'system_prompt',
+  jailbreak: 'post_history_instructions',
+};
+
+/**
+ * 展开 `{{original}}`。
+ *
+ * ST 的语义（V2 规范 MUST）：覆盖内容里写 `{{original}}` 表示
+ * "把我替换掉的那段原文放这儿" —— 让卡作者能写「在原基础上追加」，
+ * 而不是只能整体替换。
+ *
+ * 没有 `{{original}}` 时是**整体替换**（这是默认语义，不是追加）。
+ */
+function expandOriginal(override: string, presetContent: string): string {
+  return override.split('{{original}}').join(presetContent);
+}
+
+/**
+ * 取卡片对某个槽的覆盖内容；没有覆盖时返回 `null`。
+ *
+ * 空串**不算覆盖**（规范：空串时回退到用户设置）。所以这里必须
+ * `trim() !== ''` 而不是只判 `typeof === 'string'` —— 否则"卡里这个字段
+ * 是空"会把预设内容顶成空，等于把用户调好的提示词弄没了。
+ */
+function cardOverrideFor(identifier: string, card: StCardData): string | null {
+  const field = CARD_OVERRIDE_FIELD[identifier];
+  if (field === undefined) return null;
+  const raw = card[field];
+  if (typeof raw !== 'string') return null;
+  const text = raw.trim();
+  return text === '' ? null : text;
+}
+
+/**
  * 解析一条提示词最终要发什么内容。
  *
  * 返回 `null` = 这条这次不发（内容为空）。
  *
- * ## 三类分开处理
+ * ## 四类分开处理
  *
  * 1. **标记位**（`marker: true`）—— 内容从卡片/世界书/人设/历史来；
- * 2. **内置可编辑槽**（`system_prompt: true` 但非标记位，如 `main` / `nsfw` /
+ * 2. **卡片覆盖槽**（`main` / `jailbreak`，且卡片的对应字段非空）
+ *    —— 用**卡片**的内容，支持 `{{original}}`（2026-11-15 补）；
+ * 3. **内置可编辑槽**（`system_prompt: true` 但非标记位，如 `main` / `nsfw` /
  *    `jailbreak`）—— 用用户配置里的 `content`；
- * 3. **用户自建项** —— 同样用 `content`。
+ * 4. **用户自建项** —— 同样用 `content`。
  *
- * 2 与 3 处理方式一样，区别只在语义（前者是 ST 给的默认文本，后者是用户加的）。
+ * 2 的优先级高于 3：这与 ST 一致（卡片的 `system_prompt` 覆盖预设的 `main`）。
  */
 function resolveSlotContent(
   prompt: StPrompt,
@@ -275,6 +341,18 @@ function resolveSlotContent(
   const card = input.card;
 
   if (prompt.marker !== true && !MARKER_IDENTIFIERS.has(prompt.identifier)) {
+    /*
+     * ★ 先看卡片有没有覆盖（`main` / `jailbreak`）。
+     *
+     * 顺序很重要：先卡片、后预设 —— 与 ST 的 `prompts.override()` 同一语义。
+     * 反过来的话卡作者的意图永远被预设盖住，而那正是我们要修的缺陷。
+     */
+    const override = cardOverrideFor(prompt.identifier, card);
+    if (override !== null) {
+      const text = applyBasicMacros(expandOriginal(override, prompt.content.trim()), charName, userName);
+      return text === '' ? null : text;
+    }
+
     /* 普通正文：套宏后直接用 */
     const text = applyBasicMacros(prompt.content.trim(), charName, userName);
     return text === '' ? null : text;
