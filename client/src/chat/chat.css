@@ -4178,6 +4178,175 @@ textarea,
  * 只使用 `nebula-tokens.css` 里**确实存在**的变量 ——
  * 写不存在的变量不报错，只会静默退回继承值（§73 / §91.4 都踩过）。
  */
+/* ═══════════════════════════════════════════════════════════
+   作用域切换（全局 / 本角色，v0.2.0）
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 两个胶囊并排。
+ *
+ * 用 `grid 1fr 1fr` 而不是 flex：两档文案长度差很多
+ * （"全局 / 所有角色" vs "西奥 / 只这个角色"），flex 会让它们
+ * 宽度不一致 —— 而这两档是**对等**的选择，宽度不等会暗示
+ * 其中一个是次要的。
+ *
+ * ★ 不写死宽度（§131 跨设备硬约束）：320dp 到 1024dp 都得好看。
+ */
+.nb-scope-bar {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--nb-sp-2);
+  margin: var(--nb-sp-3);
+}
+
+.nb-scope-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  /*
+   * 触屏目标硬下限。视觉上这个胶囊本来就够高，但小屏 + 大字号
+   * （1.5× 系统缩放）时会撑不住 —— 那时 `min-height` 兜住。
+   */
+  min-height: var(--nb-hit-min);
+  padding: var(--nb-sp-2) var(--nb-sp-3);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-glass-bg);
+  color: var(--nb-text-2);
+  font: inherit;
+  text-align: left;
+  /*
+   * 有 `min-height` + 内容可能换行 ⇒ 必须 border-box，
+   * 否则 padding 会把高度顶出容器（§130 走查 11）。
+   */
+  box-sizing: border-box;
+}
+
+.nb-scope-btn.is-active {
+  border-color: var(--nb-nebula-a);
+  background: var(--nb-grad-soft);
+  color: var(--nb-text-1);
+}
+
+.nb-scope-btn-label {
+  font-size: var(--nb-fs-14);
+  font-weight: 600;
+  /*
+   * 角色名可能很长。单行截断 —— 换行会把两个胶囊的高度拉开，
+   * 而它们本该一样高。`min-width: 0` 是 ellipsis 在 grid 项里生效的前提。
+   */
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nb-scope-btn-hint {
+  font-size: var(--nb-fs-11);
+  color: var(--nb-text-3);
+}
+
+.nb-scope-btn.is-active .nb-scope-btn-hint {
+  color: var(--nb-text-2);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   上限计数（v0.2.0，PLAN §5.6）
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-quota-bar {
+  margin-top: var(--nb-sp-3);
+  padding-top: var(--nb-sp-3);
+  border-top: 1px solid var(--nb-glass-border);
+}
+
+.nb-quota-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--nb-sp-2);
+  font-size: var(--nb-fs-12);
+}
+
+.nb-quota-line + .nb-quota-line {
+  margin-top: var(--nb-sp-1);
+}
+
+.nb-quota-label {
+  color: var(--nb-text-2);
+}
+
+.nb-quota-value {
+  color: var(--nb-text-1);
+  /*
+   * 数字用等宽字体：`1,240 / 24,000` 这种在切换数值时会跳动，
+   * 等宽能让它稳住（这页会重绘，跳动很明显）。
+   */
+  font-variant-numeric: tabular-nums;
+}
+
+/* 超限：不该出现（保存会被拒），但别的工具改过卡就可能读到 */
+.nb-quota-line[data-over='true'] .nb-quota-value {
+  color: var(--nb-danger);
+  font-weight: 600;
+}
+
+.nb-quota-note {
+  margin-top: var(--nb-sp-2);
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-11);
+  line-height: 1.5;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   「本角色已改」/「角色特有」标记（v0.2.0）
+   ═══════════════════════════════════════════════════════════ */
+
+.nb-prompt-override-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--nb-sp-2);
+  margin-top: var(--nb-sp-1);
+}
+
+.nb-prompt-override-tag {
+  padding: 1px var(--nb-sp-2);
+  border: 1px solid var(--nb-warn);
+  border-radius: var(--nb-radius-sm);
+  color: var(--nb-warn);
+  font-size: var(--nb-fs-11);
+  line-height: 1.6;
+}
+
+/*
+ * 角色特有项用另一种色：它和「已改」是两件事
+ * （已改 = 我改过全局那条；特有 = 全局里根本没有这条）。
+ * 同色会让人以为"改过就变成特有的了"。
+ */
+.nb-prompt-row[data-own='true'] .nb-prompt-override-tag {
+  border-color: var(--nb-info);
+  color: var(--nb-info);
+}
+
+.nb-prompt-restore {
+  padding: 1px var(--nb-sp-2);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-sm);
+  background: transparent;
+  color: var(--nb-text-2);
+  font: inherit;
+  font-size: var(--nb-fs-11);
+  line-height: 1.6;
+}
+
+.nb-prompt-restore:active {
+  background: var(--nb-glass-bg-2);
+  color: var(--nb-text-1);
+}
+
 .nb-prompts-summary {
   margin: var(--nb-sp-3);
   padding: var(--nb-sp-3);

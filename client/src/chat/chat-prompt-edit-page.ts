@@ -47,6 +47,19 @@ export interface PromptEditTarget {
   readonly marker: boolean;
   /** 只读展示的触发器（空 = 全部类型） */
   readonly triggers: readonly string[];
+  /**
+   * 只能改正文，其余字段只读（v0.2.0）。
+   *
+   * 出现在：**角色作用域下编辑一条全局预设里的提示词**。
+   *
+   * 那种情况写回的是卡片里的 `overrideOrder[identifier].content` ——
+   * 只有正文有地方存。如果这页还让人改名称/身份/位置，改了没处放，
+   * 保存后会"看着改了但没变"，那是本项目最忌讳的一类。
+   *
+   * 所以把其余字段**显示但禁用**：用户看得到当前值（判断要不要改成
+   * 别的正文），也知道这些不归这一层管。
+   */
+  readonly contentOnly?: boolean;
 }
 
 export interface ChatPromptEditCallbacks {
@@ -139,6 +152,22 @@ export function renderChatPromptEditPage(
     body.append(note);
   }
 
+  /*
+   * 只改正文的说明（v0.2.0）。
+   *
+   * 必须写"为什么"：用户看到一堆置灰的输入框，第一反应是"坏了"。
+   * 说清"这些属于全局预设"之后，他就知道该去全局作用域改。
+   */
+  const contentOnly = target.contentOnly === true;
+  if (contentOnly) {
+    const note = el(doc, 'div', 'nb-prompt-edit-note');
+    note.setAttribute('data-role', 'prompt-edit-content-only-note');
+    note.textContent =
+      '名字、身份、位置这些是全局预设的属性，这里改不了也存不下 —— 只能改正文。' +
+      '要让这条换个身份或位置，去「全局」改（会影响所有角色）。';
+    body.append(note);
+  }
+
   /* ── 姓名 ── */
   const nameBits = field(doc, '姓名', 'prompt-field-name', '这条提示词在你列表里显示的名字。');
   const nameInput = el(doc, 'input', 'nb-input');
@@ -207,9 +236,14 @@ export function renderChatPromptEditPage(
    *
    * 置灰而不是隐藏：隐藏会让表单高度跳一下，用户以为点错了。
    * 置灰 + 说明「只在按深度插入时用到」，一眼就懂。
+   *
+   * ★ `contentOnly` 时**恒置灰**：位置本身不可改（那属于全局预设），
+   *   所以由它派生的深度也不该能编辑。写成 `position === '1'` 就会
+   *   在"全局那条恰好是按深度插入"时把深度框解锁 —— 而保存时它会
+   *   被丢弃，用户白改。
    */
   const syncDepthState = (): void => {
-    const active = position === '1';
+    const active = position === '1' && !contentOnly;
     depthInput.setAttribute('data-disabled', String(!active));
     if (active) depthInput.removeAttribute('disabled');
     else depthInput.setAttribute('disabled', 'true');
@@ -226,6 +260,19 @@ export function renderChatPromptEditPage(
   (orderInput as unknown as HTMLInputElement).value = String(target.draft.injectionOrder);
   orderBits.mount(orderInput);
   body.append(orderBits.row);
+
+  /*
+   * 其余字段统一锁住（只保留正文可改）。
+   *
+   * `disabled` 而不是 `readonly`：这几栏里有 `<select>` 触发器（是个按钮），
+   * `readonly` 对按钮无效。而"看着能点、点了没反应"比置灰更糟。
+   */
+  if (contentOnly) {
+    for (const control of [nameInput, roleTrigger.el, posTrigger.el, orderInput, depthInput]) {
+      control.setAttribute('disabled', 'true');
+      control.setAttribute('data-locked', 'true');
+    }
+  }
 
   /* ── 触发器（只读） ── */
   const trigBits = field(doc, '触发器', 'prompt-field-trigger');
