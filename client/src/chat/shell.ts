@@ -208,7 +208,20 @@ import {
   /* 角色级提示词覆盖（v0.2.0 主功能，见 PLAN §5） */
   parseCharacterPrompts,
   combineGlobalAndCharacter,
+  writeCharacterPrompts,
+  emptyCharacterPrompts,
+  isCharacterPromptsEmpty,
+  validateCharacterPrompts,
+  setCharacterPromptEnabled,
+  setCharacterPromptContent,
+  clearOverride,
+  upsertOwnPrompt,
+  removeOwnPrompt,
+  nextOwnPromptId,
+  effectiveEnabled,
+  ownIdentifierOf,
   type CharacterPromptConfig,
+  type OwnPrompt,
 } from '@tcs/shared';
 
 /*
@@ -730,6 +743,17 @@ export class AppShell {
    * 只在 `chatSettingsRoute === 'promptEdit'` 时有意义。
    */
   private promptEditId: string | null = null;
+
+  /**
+   * 提示词页当前在改"谁的那一份"（v0.2.0）。
+   *
+   * 挂在**外壳**而不是页面里：页面每次切 Tab 都会重建，
+   * 挂在闭包里等于"每次回来都跳回全局"—— 用户正在给某个角色调提示词，
+   * 切出去看一眼聊天再回来就得重新点一次，而且**不知道跳回去了**。
+   *
+   * 与 §126 的仓库状态、§129 的缓存同一条纪律。
+   */
+  private promptScope: 'global' | 'character' = 'global';
 
   /**
    * 每条提示词的**触发器**（只读展示用，2026-11-07）。
@@ -4267,6 +4291,153 @@ export class AppShell {
     this.chatPanel?.setContext({ promptConfig: merged });
   }
 
+  /* ═══════════════════════════════════════════════════════════
+     角色级提示词：写回卡片（v0.2.0 第 2 步）
+     ═══════════════════════════════════════════════════════════ */
+
+  /**
+   * 改当前角色的提示词配置，并**写回卡片 PNG**。
+   *
+   * ## 为什么"读-改-写"每次都重读 PNG
+   *
+   * 不用内存副本（`loadedCard` / 缓存字节）的理由：
+   *
+   * ```text
+   *   用户可能在 ST 网页里刚改过这张卡（改人设、加世界书条目）
+   *   此时内存副本是旧的 ⇒ 用旧副本当基底写回 = 把用户刚做的改动抹掉
+   *   —— 而那是**不可逆**的（PNG 里的旧版本已经没了）
+   * ```
+   *
+   * 读一次本地 PNG 是毫秒级，而这个操作是低频的（点一次开关）。
+   * 用"多一次 IO"换"绝不覆盖别人刚写的"，这个交换划算。
+   *
+   * ## 与「保存开场白」用同一套序列化规则
+   *
+   * `stringifyStCard` + `buildPngCard` + `writeCharacterPng`，三处完全一致。
+   * 自己另写一条的话，两条写卡路径会产出形态不同的卡（一条补世界书
+   * `comment`、一条不补），而用户看不出差别，只会在导进 ST 时发现某条
+   * 标题是空的。
+   *
+   * ## 超限拒绝，不截断
+   *
+   * 截断的 JSON 之后会在更莫名的地方炸（PLAN §5.6）。而且用户根本不知道
+   * 自己被截了什么 —— 所以在这里挡住，把具体数字报给他。
+   *
+   * @param mutate 拿到当前配置返回新配置。传空配置 = 从零开始
+   */
+  private async saveCharacterPrompts(
+    mutate: (config: CharacterPromptConfig) => CharacterPromptConfig,
+  ): Promise<{ ok: boolean; reason?: string }> {
+    const avatar = this.chatAvatar();
+    if (avatar === null) return { ok: false, reason: '还没选角色，不知道该存到哪张卡。' };
+
+    const next = mutate(this.characterPrompts ?? emptyCharacterPrompts());
+
+    /*
+     * 上限校验。**先校验后写盘** —— 反过来的话卡已经被改坏了才发现超限，
+     * 那时只能再写一次去修，而两次写之间用户可能已经杀掉 App。
+     */
+    const violations = validateCharacterPrompts(next);
+    if (violations.length > 0) {
+      return { ok: false, reason: violations.map((one) => one.message).join(' ') };
+    }
+
+    try {
+      const pngBytes = await this.withConnection(() => this.bridge.characterPng(avatar));
+      const bytes = new Uint8Array(pngBytes);
+      const parsedPng = parsePngCard(bytes);
+      if (parsedPng.kind !== 'card') {
+        return { ok: false, reason: '这个角色不是 PNG 卡，存不了角色级提示词。' };
+      }
+
+      const parsedCard = parseStCardText(parsedPng.jsonText);
+      const card = parsedCard.card;
+
+      /*
+       * `extensions` 在 `passthrough.data` 这个**原样桶**里。
+       *
+       * `writeCharacterPrompts` 只动 `tcs.prompts`，其余键（别的工具放的
+       * `depth_prompt` / `world` / `fav`，以及我们自己的 `tcs.cardId`）
+       * 逐个保留 —— V2 规范 MUST NOT destroy unknown key-value pairs。
+       */
+      const prevExtensions = card.passthrough.data['extensions'];
+      const extensions = writeCharacterPrompts(
+        prevExtensions !== null && typeof prevExtensions === 'object' && !Array.isArray(prevExtensions)
+          ? (prevExtensions as Record<string, unknown>)
+          : null,
+        next,
+      );
+
+      const updated = {
+        ...card,
+        passthrough: {
+          ...card.passthrough,
+          data: {
+            ...card.passthrough.data,
+            /*
+             * 强转的理由：`writeCharacterPrompts` 的输出**自证是 JSON-safe** ——
+             * 它只写我们从卡片 JSON 里读出来的值（string / boolean / number /
+             * 数组 / 普通对象），没有 Date / Map / undefined。
+             *
+             * 而它的返回类型故意是 `Record<string, unknown>`：那个文件在
+             * `shared/src/chat/` 下，不该为了一个类型去依赖 format 层的
+             * `JsonObject`（否则改 format 会牵动 chat）。所以边界处转一次，
+             * 且只在这一个位置转。
+             */
+            extensions: extensions as unknown as (typeof card.passthrough.data)[string],
+          },
+        },
+      };
+
+      const jsonText = stringifyStCard(updated, { indent: 2, entryTitleToComment: true });
+      /*
+       * `spec` 要跟原卡走：v3 卡写 `ccv3`、v2 卡写 `chara`。
+       * 传错会在 ST 读不到的关键字上写一块 —— 表现是"改完 ST 里没变化"。
+       */
+      const spec = card.meta.spec === 'v3' ? 'v3' : 'v2';
+      const png = buildPngCard(bytes, jsonText, spec);
+
+      const status = this.readEngineStatus();
+      const charactersDir = status?.charactersDir ?? '';
+      if (charactersDir === '') return { ok: false, reason: '拿不到角色库目录，无法保存。' };
+
+      await this.withConnection(() =>
+        this.bridge.writeCharacterPng(avatar, charactersDir, png, false),
+      );
+
+      /*
+       * 写成功后更新内存并重算。顺序不能反：先重算再写盘的话，
+       * 写盘失败时内存里已经是"已保存"的状态，界面会骗人。
+       */
+      this.characterPrompts = isCharacterPromptsEmpty(next) ? null : next;
+      this.rebuildPromptConfig();
+
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, reason: describeBridgeError(error).message };
+    }
+  }
+
+  /**
+   * 「恢复卡片默认」：把这个角色的提示词配置整个清空。
+   *
+   * ## 为什么这个操作必须能撤回思考成本
+   *
+   * 恢复 = 删掉 `extensions.tcs.prompts`。用户的改动和卡作者写的那份
+   * **存在同一个位置**，所以删掉之后连卡作者原版的也读不回来。
+   * 因此 UI 侧要做两步确认（与「删除聊天文件」同一套手势，不用
+   * 阻塞式 `confirm()` —— 它在 Android WebView 里会冻住主线程）。
+   *
+   * 这里不再问第二遍：确认属于 UI 的职责，重复问只会让人烦。
+   */
+  private async restoreCharacterPrompts(): Promise<{ ok: boolean; reason?: string }> {
+    const result = await this.saveCharacterPrompts(() => emptyCharacterPrompts());
+    if (!result.ok) return result;
+    this.renderPage();
+    this.options.onNotify?.('已恢复到卡片原本的提示词设置', 'ok');
+    return { ok: true };
+  }
+
   /**
    * 读角色卡，**读不到就重试**。
    *
@@ -6460,10 +6631,36 @@ export class AppShell {
     }
   }
 
+  /**
+   * 提示词页（v0.2.0 起有两种作用域）。
+   *
+   * ## 为什么按作用域传不同的 config
+   *
+   * ```text
+   *   全局     传 globalPromptConfig —— "这份预设本身长什么样"
+   *   本角色   传 promptConfig（合成后）—— "这个角色实际发出去什么"
+   * ```
+   *
+   * 不能两个作用域都传合成结果：那样「全局」里会显示角色 own 的条目，
+   * 而用户在全局下改不到它们（它们只存在于卡里），点了等于没反应。
+   *
+   * 也不能两个都传全局：那样「本角色」里看不到角色特有的条目 ——
+   * 而"这个角色到底发什么"正是用户切到这一档要回答的问题。
+   */
   private renderChatPrompts(): void {
     if (this.pageHost === null) return;
 
-    const page = renderChatPromptsPage(this.doc, this.promptConfig, {      /*
+    const characterName = this.selectedCharacter?.name ?? '';
+    /*
+     * 没选角色（或角色名拿不到）就不给角色作用域。
+     * 同时把 scope 落回全局 —— 否则下次进来还挂着 `'character'`
+     * 却画不出切换条，界面状态与字段值对不上。
+     */
+    const canUseCharacter = this.chatAvatar() !== null && characterName !== '';
+    const scope = canUseCharacter ? this.promptScope : 'global';
+    const config = scope === 'character' ? this.promptConfig : this.globalPromptConfig;
+
+    const page = renderChatPromptsPage(this.doc, config, {      /*
        * 返回**上一级**（= AI 响应配置），不是回到设置菜单。
        *
        * ★ 第一版写的是 `'menu'`，用户实测发现"点了直接退到聊天设置"。
@@ -6477,8 +6674,61 @@ export class AppShell {
       onBack: () => {
         this.goBackOneLevel();
       },
-      loadConfig: () => this.promptConfig,
-      togglePrompt: (identifier, enabled) => this.savePromptToggle(identifier, enabled),
+      scope,
+      ...(canUseCharacter
+        ? {
+            character: {
+              characterName,
+              config: this.characterPrompts ?? emptyCharacterPrompts(),
+              onScopeChange: (next: 'global' | 'character') => {
+                if (this.promptScope === next) return;
+                this.promptScope = next;
+                this.renderPage();
+              },
+              onRestoreOne: (identifier: string) =>
+                this.saveCharacterPrompts((current) => clearOverride(current, identifier)).then(
+                  (result) => {
+                    if (result.ok) this.renderPage();
+                    return result;
+                  },
+                ),
+              onRestoreAll: () => this.restoreCharacterPrompts(),
+            },
+          }
+        : {}),
+      /*
+       * 开关按作用域分流（v0.2.0）。
+       *
+       * 同一行、同一个勾选框，在「全局」下改预设、在「本角色」下改这张卡。
+       * 界面上必须能看出区别 —— 靠上面的切换条与每行的「本角色已改」标记。
+       */
+      togglePrompt: (identifier, enabled) =>
+        scope === 'character'
+          ? this.saveCharacterPrompts((current) => {
+              /*
+               * 需要"全局这一条现在是什么状态"才能判断"要不要留下覆盖"：
+               * 与全局相同就删掉覆盖项（否则 `overrideOrder` 里会攒一堆
+               * "恰好等于全局值"的条目，「已改」标记会全线误报）。
+               */
+              const globalEntry = this.globalPromptConfig?.order?.find(
+                (one) => one.identifier === identifier,
+              );
+              const globalEnabled = globalEntry?.enabled ?? true;
+              /*
+               * 全局预设里根本没这一条（角色特有项）⇒ 改它自己的 `enabled`，
+               * 不能走 `setCharacterPromptEnabled` —— 那个写的是 overrideOrder。
+               */
+              const ownIndex = current.own.findIndex(
+                (one) => ownIdentifierOf(one) === identifier,
+              );
+              if (ownIndex >= 0) {
+                const own = [...current.own];
+                own[ownIndex] = { ...own[ownIndex], enabled } as OwnPrompt;
+                return { ...current, own };
+              }
+              return setCharacterPromptEnabled(current, identifier, enabled, globalEnabled);
+            })
+          : this.savePromptToggle(identifier, enabled),
       /*
        * ★ 这里**不能**直接把这个回调赋成 `this.options` 里那一个。
        *
@@ -6545,7 +6795,18 @@ export class AppShell {
   private renderPromptEdit(): void {
     if (this.pageHost === null) return;
 
-    const config = this.promptConfig;
+    /*
+     * 与列表页同一条规则（v0.2.0）：编辑页要显示**当前作用域那份**内容。
+     *
+     * ```text
+     *   全局     显示预设原文（哪怕这个角色覆盖过正文）
+     *   本角色   显示实际生效的正文（覆盖后的）
+     * ```
+     *
+     * 用同一个 `promptConfig` 的话，在全局作用域下会显示角色覆盖过的正文，
+     * 用户以为预设里就是那样 —— 然后在全局改一遍，反而把预设改掉了。
+     */
+    const config = this.promptScope === 'character' ? this.promptConfig : this.globalPromptConfig;
     const id = this.promptEditId;
     const existing = id === null ? undefined : config?.prompts.find((one) => one.identifier === id);
 
@@ -6563,6 +6824,18 @@ export class AppShell {
       return;
     }
 
+    /*
+     * 角色作用域下编辑"全局预设里的那条" ⇒ 只能改正文（v0.2.0）。
+     *
+     * 判据是"当前作用域 + 这条不在角色的 own 里"。新建（`id === null`）
+     * 不受影响 —— 那时建的是角色特有项，所有字段都有效。
+     */
+    const inCharacterScope = this.promptScope === 'character' && this.chatAvatar() !== null;
+    const editingOwnPrompt =
+      id !== null &&
+      (this.characterPrompts?.own.some((one) => ownIdentifierOf(one) === id) ?? false);
+    const contentOnly = inCharacterScope && id !== null && !editingOwnPrompt;
+
     const target: PromptEditTarget =
       existing === undefined
         ? {
@@ -6576,6 +6849,7 @@ export class AppShell {
             draft: draftOf(existing),
             marker: existing.marker,
             triggers: this.promptTriggers.get(existing.identifier) ?? [],
+            ...(contentOnly ? { contentOnly: true } : {}),
           };
 
     const page = renderChatPromptEditPage(this.doc, target, {
@@ -6601,13 +6875,30 @@ export class AppShell {
     this.pageHost.append(page);
   }
 
-  /** 保存（新建或编辑）一条提示词 */
+  /**
+   * 保存（新建或编辑）一条提示词。
+   *
+   * ## 两个作用域，两条完全不同的写回路径（v0.2.0）
+   *
+   * ```text
+   *   全局     改预设文件（POST /api/presets/save，整份写回）
+   *   本角色   改这张卡（写 extensions.tcs.prompts，再写 PNG）
+   * ```
+   *
+   * 分流放在这里而不是页面里：页面只负责"收集 draft"，它不需要知道
+   * 存到哪。而"存到哪"如果由页面判断，将来加第三种作用域就要改页面，
+   * 且两处判断必然分叉。
+   */
   private async savePromptDraft(
     identifier: string | null,
     draft: PromptDraft,
   ): Promise<{ ok: boolean; reason?: string }> {
     const problem = validateDraft(draft);
     if (problem !== null) return { ok: false, reason: problem };
+
+    if (this.promptScope === 'character' && this.chatAvatar() !== null) {
+      return this.saveCharacterPromptDraft(identifier, draft);
+    }
 
     const isCreate = identifier === null;
     const newId = isCreate ? newPromptIdentifier() : identifier;
@@ -6630,8 +6921,139 @@ export class AppShell {
     return { ok: true };
   }
 
+  /**
+   * 「本角色」作用域下保存一条提示词（v0.2.0）。
+   *
+   * ## 三种情况，三种写法
+   *
+   * ```text
+   *   新建                → upsertOwnPrompt（角色特有，id 由 App 生成）
+   *   编辑角色特有项       → upsertOwnPrompt（按 id 覆盖）
+   *   编辑全局预设里的那条 → setCharacterPromptContent（正文覆盖）
+   * ```
+   *
+   * ## 为什么编辑全局条目时**只写正文**
+   *
+   * 名称 / 身份 / 注入位置这些字段是"这条提示词怎么发"的描述，
+   * 属于预设；角色级的差异只该是"这个角色想让它说什么"。
+   * 让角色覆盖也改 name/role 会带来一个没人能解释的状态：
+   * 同一个 identifier 在全局叫 A、在这个角色叫 B —— ST 网页里看到的是 A。
+   *
+   * 所以正文之外的字段在角色作用域下**按全局走**，编辑页里那几栏
+   * 也应当只读（`kind: 'content-only'`）。这里若拿到不同的值，
+   * 只取 content，其余静默忽略 —— 但要在返回的提示里说清楚。
+   */
+  private async saveCharacterPromptDraft(
+    identifier: string | null,
+    draft: PromptDraft,
+  ): Promise<{ ok: boolean; reason?: string }> {
+    const global = this.globalPromptConfig;
+    const isCreate = identifier === null;
+
+    // ① 新建 → 角色特有项
+    if (isCreate) {
+      const result = await this.saveCharacterPrompts((current) => {
+        const own: OwnPrompt = {
+          id: nextOwnPromptId(current),
+          name: draft.name.trim() === '' ? '未命名' : draft.name.trim(),
+          content: draft.content,
+          role: draft.role,
+          enabled: true,
+          injection: {
+            position: draft.injectionPosition,
+            depth: draft.injectionDepth,
+            order: draft.injectionOrder,
+          },
+        };
+        return upsertOwnPrompt(current, own);
+      });
+      if (!result.ok) return result;
+      this.promptEditId = null;
+      this.chatSettingsRoute = 'prompts';
+      this.renderPage();
+      this.options.onNotify?.('已加到这个角色，默认是开启的', 'ok');
+      return { ok: true };
+    }
+
+    // ② 编辑角色特有项 → 按 id 覆盖
+    const own = this.characterPrompts?.own.find((one) => ownIdentifierOf(one) === identifier);
+    if (own !== undefined) {
+      const result = await this.saveCharacterPrompts((current) => {
+        const exists = current.own.some((one) => one.id === own.id);
+        if (!exists) return current;
+        return upsertOwnPrompt(current, {
+          ...own,
+          name: draft.name.trim() === '' ? own.name : draft.name.trim(),
+          content: draft.content,
+          role: draft.role,
+          injection: {
+            position: draft.injectionPosition,
+            depth: draft.injectionDepth,
+            order: draft.injectionOrder,
+          },
+        });
+      });
+      if (!result.ok) return result;
+      this.promptEditId = null;
+      this.chatSettingsRoute = 'prompts';
+      this.renderPage();
+      this.options.onNotify?.('已保存', 'ok');
+      return { ok: true };
+    }
+
+    // ③ 编辑全局条目 → 只覆盖正文
+    const globalPrompt = global?.prompts.find((one) => one.identifier === identifier);
+    if (globalPrompt === undefined) {
+      return { ok: false, reason: '这条提示词已经不在全局预设里了，先回列表刷新一下。' };
+    }
+    /*
+     * 标记位（`charDescription` / `chatHistory` …）的正文来自卡片与时序，
+     * 覆盖它语义不清 —— `setCharacterPromptContent` 会拒绝并给原因，
+     * 这里直接把它的话透出去（不自己再写一份判断，那样两处会分叉）。
+     */
+    const changed = setCharacterPromptContent(
+      this.characterPrompts ?? emptyCharacterPrompts(),
+      identifier,
+      draft.content,
+      globalPrompt.content,
+      globalPrompt.marker,
+    );
+    if (!changed.ok) return { ok: false, reason: changed.reason };
+
+    const result = await this.saveCharacterPrompts(() => changed.config);
+    if (!result.ok) return result;
+    this.promptEditId = null;
+    this.chatSettingsRoute = 'prompts';
+    this.renderPage();
+    this.options.onNotify?.('已保存，只影响这个角色', 'ok');
+    return { ok: true };
+  }
+
   /** 删除一条提示词 */
   private async deletePromptById(identifier: string): Promise<{ ok: boolean; reason?: string }> {
+    /*
+     * 角色作用域下：角色特有项可以删；全局预设里的那条**不许删** ——
+     * 它属于预设，删掉会让所有角色都少一条。要让它不生效，只能关掉。
+     *
+     * 这两件事在前端看起来都是"删除"，但后果差一个数量级。
+     */
+    if (this.promptScope === 'character' && this.chatAvatar() !== null) {
+      const own = this.characterPrompts?.own.find((one) => ownIdentifierOf(one) === identifier);
+      if (own === undefined) {
+        return {
+          ok: false,
+          reason: '这条在全局预设里，删掉会影响所有角色。只想让它在这个角色下不生效的话，把它关掉。',
+        };
+      }
+      const result = await this.saveCharacterPrompts((current) => removeOwnPrompt(current, own.id));
+      if (!result.ok) return result;
+      this.promptEditId = null;
+      this.chatSettingsRoute = 'prompts';
+      this.renderPage();
+      this.options.onNotify?.('已删除', 'ok');
+      return { ok: true };
+    }
+
     const result = await this.mutatePromptPreset((body) => deletePrompt(body, identifier));
     if (!result.ok) return result;
 
