@@ -414,12 +414,22 @@ test('★★★★ own 缺省启用（卡作者写了这条就是要它生效）
    ⑥ 上限
    ═══════════════════════════════════════════════════════════ */
 
-test('★★★★★ 超限要给出**带具体数字**的错误', () => {
+test('★★★★★ 超总量要给出**带具体数字**的错误，并点出最长那条', () => {
   /*
-   * 「超出限制」这种话等于让用户自己找。要说到「第 3 条正文 5,240 字符，
-   * 超过 4,000」他才知道该删哪里。
+   * 「超出限制」这种话等于让用户自己找。要说到「合计 24,900 字符，
+   * 超过总量上限 24,000」他才知道超了多少。
+   *
+   * ## ★ 2026-11-16 改：从"单条超限"改成"总量超限"
+   *
+   * 原来这条测的是 `contentPerPrompt: 4000`（单条上限）。用户指出
+   * 20 条 × 4000 = 80,000 与总量 24,000 自相矛盾，那个额度永远用不到，
+   * 所以单条上限已删掉。
+   *
+   * 但这条判据守的**性质**没变：**错误信息必须能让用户定位到该改哪里**。
+   * 单条上限没了之后，超总量时如果只说"合计 24,900 超过 24,000"，
+   * 用户仍然不知道删哪条 —— 所以补上"最长的一条是「X」（N 字符）"。
    */
-  const long = 'x'.repeat(PROMPT_LIMITS.contentPerPrompt + 240);
+  const long = 'x'.repeat(PROMPT_LIMITS.totalContent + 240);
   const overlay = {
     version: 1,
     overrideOrder: {},
@@ -428,10 +438,35 @@ test('★★★★★ 超限要给出**带具体数字**的错误', () => {
   const violations = validateCharacterPrompts(overlay);
 
   assert.equal(violations.length, 1);
-  assert.equal(violations[0].kind, 'contentPerPrompt');
+  assert.equal(violations[0].kind, 'totalContent');
   assert.match(violations[0].message, new RegExp(String(long.length)), '错误信息里要有实际字符数');
-  assert.match(violations[0].message, new RegExp(String(PROMPT_LIMITS.contentPerPrompt)), '也要有上限值');
-  assert.match(violations[0].message, /长的那条/, '要点名是哪一条');
+  assert.match(violations[0].message, new RegExp(String(PROMPT_LIMITS.totalContent)), '也要有上限值');
+  assert.match(violations[0].message, /长的那条/, '要点名最长的是哪一条（否则用户不知道删哪）');
+});
+
+test('★★★★★ 上限三个数必须自洽：条数 × 单条不该超过总量', () => {
+  /*
+   * 这条判据是**防止那个矛盾再回来**。
+   *
+   * 用户原话：「你这按条数来算的话每条上限就不对」。
+   *
+   * 当时的三个数：ownCount=20、contentPerPrompt=4000、totalContent=24000
+   * ⇒ 20 × 4000 = 80,000 ≫ 24,000 ⇒ 写到第 7 条就超总量，
+   *   界面上的「每条 4000」是句谎话。
+   *
+   * 现在没有 contentPerPrompt 了（总量天然限制单条）。这条判据钉两件事：
+   * ```text
+   * ① 不许再出现"每条上限"这类与总量打架的量
+   * ② 总量必须 ≥ 一条合理的提示词（否则单条就写不下）
+   * ```
+   */
+  assert.equal(
+    'contentPerPrompt' in PROMPT_LIMITS,
+    false,
+    '不许再有单条上限 —— 它与「条数 × 总量」必然打架',
+  );
+  assert.ok(PROMPT_LIMITS.totalContent >= 4000, '总量至少要容得下一条正常长度的提示词');
+  assert.ok(PROMPT_LIMITS.ownCount >= 1, '条数上限要 ≥ 1');
 });
 
 test('★★★★★ 条数、总量、name、comment 都要查', () => {
@@ -472,15 +507,23 @@ test('★★★★★ 条数、总量、name、comment 都要查', () => {
   assert.ok(longComment.some((one) => one.kind === 'commentLength'));
 });
 
-test('★★★★ 覆盖项的正文也占额度（否则可以绕过上限）', () => {
+test('★★★★ 覆盖项的正文也占总量额度（否则可以绕过上限）', () => {
+  /*
+   * 只能靠"覆盖"两个字的正文把总量顶爆 —— 如果不计入，用户可以把
+   * 24000 字全塞进 overrideOrder 而不触发任何上限。
+   *
+   * ★ 2026-11-16：原来靠单条上限测（contentPerPrompt + 1），
+   *   单条上限删掉后改成靠总量测。守的性质一样（覆盖项不许绕过）。
+   */
   const overlay = {
     version: 1,
-    overrideOrder: { main: { content: 'x'.repeat(PROMPT_LIMITS.contentPerPrompt + 1) } },
+    overrideOrder: { main: { content: 'x'.repeat(PROMPT_LIMITS.totalContent + 1) } },
     own: [],
   };
   const violations = validateCharacterPrompts(overlay);
   assert.equal(violations.length, 1);
-  assert.match(violations[0].message, /覆盖「main」/, '要说明是覆盖项超了');
+  assert.equal(violations[0].kind, 'totalContent');
+  assert.match(violations[0].message, /覆盖「main」/, '要说明最长的是覆盖项');
 });
 
 test('★★★★ 合格的配置要零违规', () => {

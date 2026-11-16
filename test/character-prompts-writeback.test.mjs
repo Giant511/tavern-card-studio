@@ -271,8 +271,22 @@ test('★★★★ 两个作用域的文案都说清"改的影响范围"', () =>
   assert.match(pageCode, /只这个角色/, '角色档要说只影响这个角色');
   /*
    * 汇总条那句也要跟着作用域变 —— 它是用户读开关后果的地方。
+   *
+   * ★ 2026-11-16：这句改成「改动只留在这个角色上」。
+   *
+   * 两件事都不许再回来：
+   * ```text
+   *   ① 「存在卡里」—— 与下面计数条重复（用户截图标红的那一对）
+   *   ② 角色名再出现一次 —— 标题已经带了名字，一屏两次就是重复
+   * ```
+   * 所以这里同时钉"要有这句"和"不许在这一句里重复角色名"。
    */
-  assert.match(pageCode, /存在卡里/, '角色作用域要说清改动存到哪');
+  assert.match(pageCode, /改动只留在这个角色上/, '角色作用域要说清改动只影响这个角色');
+  assert.doesNotMatch(
+    pageCode,
+    /只影响「\$\{character\.characterName\}」/,
+    '副标题不许再重复角色名（标题已经有了）',
+  );
 });
 
 test('★★★★ 「本角色已改」标记只在角色作用域出现', () => {
@@ -310,22 +324,60 @@ test('★★★★ 「恢复」两级：单条恢复 + 整角色恢复（后者�
   assert.match(seg, /removeAttribute\('data-armed'\)/, '失败要复位按钮');
 });
 
-test('★★★★ 上限计数显示"还能加几条"，超限要标红', () => {
+test('★★★★ 上限计数只显示"已用 / 上限"，超限才说超出多少', () => {
   /*
-   * ★ `data-role` 是模板拼出来的（`prompts-quota-${...}`），
+   * ★ `data-role` 是模板拼出来的（`prompts-quota-${key}`），
    *   所以不能搜字面量 `prompts-quota-count` —— 那是假红。
-   *   钉的是"有条数与字数两项、且值里带剩余量"。
+   *
+   * ## ★ 2026-11-16 用户要求删掉「还能加 N」
+   *
+   * 原来写 `3 / 20（还能加 17）`。那句是算术重复（20 − 3 用户自己一减就有），
+   * 却把一行撑长、320dp 屏上会折行。
+   *
+   * 但**超限时必须说**（`（超 N）`）—— 那个数用户算不出来，
+   * 而且它意味着"保存会被拒"。所以判据钉的是"平时不说、超了才说"。
    */
   assert.match(pageCode, /data-role', 'prompts-quota'/, '要有计数区');
-  assert.match(pageCode, /prompts-quota-\$\{/, '条数与字数用同一套模板（两处不许各写一份）');
+  assert.match(pageCode, /prompts-quota-\$\{key\}/, '条数与字数用同一套模板（两处不许各写一份）');
   assert.match(pageCode, /'角色特有'/, '要有条数那一行');
   assert.match(pageCode, /'正文字数'/, '要有字数那一行');
-  assert.match(pageCode, /还能加/, '要说剩余量（用户据此判断能不能再加）');
+  assert.doesNotMatch(pageCode, /还能加/, '不许再显示"还能加 N"（用户要求删）');
+  assert.match(pageCode, /（超 \$\{String\(over\)\}）/, '超限要说超出多少');
   assert.match(pageCode, /data-over'/, '超限要标出来');
   /*
-   * 「存在卡里」这句不能省：它决定了用户怎么理解"换设备会不会丢"。
+   * "存哪"仍要说 —— 但只说这一件事，不重复"换设备也能带走"（用户要求删），
+   * 也不再提"每条上限"（与总量矛盾，已删）。
    */
-  assert.match(pageCode, /存在角色卡里/, '要说清存哪');
+  assert.match(pageCode, /这些设置存在角色卡里/, '要说清存哪');
+  assert.doesNotMatch(pageCode, /换设备也能带走/, '去掉"换设备也能带走"（用户要求）');
+  assert.doesNotMatch(pageCode, /每条正文上限/, '去掉矛盾的单条上限文案');
+});
+
+test('★★★★ 汇总标题要带角色名（滚下去也不会搞错在改谁）', () => {
+  /*
+   * 用户要求：「14/15 这里更改为角色名+提示词+已启用 14/15」。
+   *
+   * 原来只有 `14 / 15 条启用`。而这一页最容易忘的是"我在改谁的那份"——
+   * 作用域切换条在上面，滚到列表底部就看不见了。
+   */
+  assert.match(pageCode, /scopeName/, '要算出当前作用域的名字');
+  assert.match(pageCode, /inCharacter \? character\.characterName : '全局'/, '角色用角色名、全局用「全局」');
+  assert.match(
+    pageCode,
+    /\$\{scopeName\} · 提示词 · 已启用 \$\{String\(enabledIds\.size\)\} \/ \$\{String\(order\.length\)\}/,
+    '标题格式必须是「名字 · 提示词 · 已启用 N / M」',
+  );
+});
+
+test('★★★★ 角色特有标签只写四个字，不带括号解释', () => {
+  /*
+   * 用户要求删掉「（全局里没有这条）」。
+   *
+   * 截图里连着三条都带这个括号，整页被它占满；而"角色特有"本身就是
+   * 那个意思，切换条上也写着「只这个角色」。删掉不丢信息。
+   */
+  assert.match(pageCode, /tag\.textContent = '角色特有'/, '标签就四个字');
+  assert.doesNotMatch(pageCode, /全局里没有这条/, '不许再带那句括号解释');
 });
 
 test('★★★ 只能在角色作用域用时，不画作用域切换条（假控件要删）', () => {
