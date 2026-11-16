@@ -3289,9 +3289,7 @@ export class AppShell {
      * 反着传会直接报错（Rust 侧两个方向都校验），这正是我们要的：
      * "该新建却去覆盖" / "该覆盖却去新建" 立刻暴露，而不是静默走错。
      */
-    await this.withConnection(() =>
-      this.bridge.writeCharacterPng(plan.avatar, charactersDir, png, !plan.overwrite),
-    );
+    await this.writeCardPng(plan.avatar, charactersDir, png, !plan.overwrite);
 
     return {
       worldbook,
@@ -4087,9 +4085,7 @@ export class AppShell {
       const charactersDir = status?.charactersDir ?? '';
       if (charactersDir === '') throw new Error('拿不到角色库目录，无法保存');
 
-      await this.withConnection(() =>
-        this.bridge.writeCharacterPng(avatar, charactersDir, png, false),
-      );
+      await this.writeCardPng(avatar, charactersDir, png, false);
 
       /* 写成功后把内存里的旧副本换掉：否则再点一次保存会基于旧 JSON 重算 */
       this.greetingJson = jsonText;
@@ -4401,9 +4397,7 @@ export class AppShell {
       const charactersDir = status?.charactersDir ?? '';
       if (charactersDir === '') return { ok: false, reason: '拿不到角色库目录，无法保存。' };
 
-      await this.withConnection(() =>
-        this.bridge.writeCharacterPng(avatar, charactersDir, png, false),
-      );
+      await this.writeCardPng(avatar, charactersDir, png, false);
 
       /*
        * 写成功后更新内存并重算。顺序不能反：先重算再写盘的话，
@@ -4411,6 +4405,16 @@ export class AppShell {
        */
       this.characterPrompts = isCharacterPromptsEmpty(next) ? null : next;
       this.rebuildPromptConfig();
+
+      /*
+       * 记下"这几个数"。排查"改了没生效"时：
+       * 日志里有这行而卡里没有 ⇒ 写盘或序列化出的问题；
+       * 日志里没有这行 ⇒ 根本没走到保存（前端状态没更新）。
+       */
+      diagNote(
+        'note',
+        `[提示词] 写回 avatar=${avatar} own=${String(next.own.length)} override=${String(Object.keys(next.overrideOrder).length)} 字节=${String(png.length)}`,
+      );
 
       return { ok: true };
     } catch (error) {
@@ -4975,9 +4979,22 @@ export class AppShell {
      * 而读 PNG 必须走异步的 `invoke`。等到用户点"导出并分享"才去读，
      * 那次点击就只能拿到"正在准备"。
      *
-     * 逐张串行预取而不是并发：一张卡几百 KB，20 张并发会把
-     * WebView 的内存顶起来（实测过 788 KB × N）。列表通常不超过 20 张，
-     * 串行只多几百毫秒。
+     * ## ★★★ 这里必须 force（2026-11-16 用户报的真缺陷）
+     *
+     * 原来这里有一句 `if (this.shareCache.has(item.avatar)) continue` ——
+     * 配合 `prefetchForShare` 内部同样的早退，效果是**缓存永不刷新**。
+     *
+     * ```text
+     *   进卡片列表（缓存旧卡）→ 回聊天加提示词（写卡成功）→ 回卡片列表
+     *   ⇒ 两个 has 判断都跳过 ⇒ 导出的是**加提示词之前**的字节
+     *   ⇒ 用户导出的卡里没有提示词，导入回来也就没有
+     * ```
+     *
+     * 改成 force 之后，每次进这一页都重读一遍。代价是每张卡一次本地读，
+     * 而原来第一次进也要读同样的次数 —— 没有额外开销，只多几百毫秒。
+     *
+     * 逐张串行而不是并发：一张卡几百 KB，20 张并发会把 WebView 的内存
+     * 顶起来（实测过 788 KB × N）。
      */
     void (async () => {
       try {
@@ -4985,8 +5002,7 @@ export class AppShell {
         const parsed = parseCharacterList(raw);
         if (!parsed.ok) return;
         for (const item of parsed.items) {
-          if (this.shareCache.has(item.avatar)) continue;
-          await this.prefetchForShare(item.avatar);
+          await this.prefetchForShare(item.avatar, true);
         }
       } catch {
         /* 预取失败不影响列表；用户点分享时会再试一次并给出原因 */
@@ -4994,12 +5010,84 @@ export class AppShell {
     })();
   }
 
-  /** 预取一张卡的 PNG 字节到分享缓存（失败就清掉，下次重试） */
-  private async prefetchForShare(avatar: string): Promise<void> {
-    if (this.shareCache.has(avatar)) return;
+  /**
+   * 把 PNG **写到角色库**，并让分享缓存失效。**所有写卡都必须走这里**。
+   *
+   * ## ★★★ 为什么必须收口（2026-11-16 用户报的真缺陷）
+   *
+   * > 新增角色特有的提示词，重新导入后没有了
+   *
+   * 真因不是"导出丢字段"，而是**导出用的是旧字节**：
+   *
+   * ```text
+   *   进「卡片」Tab → prefetchForShare 把每张卡的 PNG 缓存起来
+   *   回聊天加提示词 → 写卡成功（磁盘已是新卡）
+   *   再回「卡片」Tab → 预取里 `if (shareCache.has(avatar)) continue` 直接跳过
+   *   点「导出并分享」→ 用的是**加提示词之前**那份字节
+   *   ⇒ 导出的卡里没有 tcs.prompts，导入回来当然也没有
+   * ```
+   *
+   * 而 `shareCache` 原来**没有任何一处清空** —— 一次 App 生命周期内，
+   * 只要进过一次卡片列表，之后所有导出都是那一刻的旧卡。
+   *
+   * 本项目已有的三处写卡（导入 / 存开场白 / 存提示词）此前各自直接调
+   * `bridge.writeCharacterPng`，谁也没想到要清缓存。收口之后，
+   * **新增第四处写卡也不可能漏** —— 这比"记得在每个地方补一行"可靠。
+   */
+  private async writeCardPng(
+    avatar: string,
+    charactersDir: string,
+    png: Uint8Array,
+    allowCreate: boolean,
+  ): Promise<void> {
+    await this.withConnection(() =>
+      this.bridge.writeCharacterPng(avatar, charactersDir, png, allowCreate),
+    );
+    /*
+     * 写成功就作废这张卡的分享缓存。顺序不能反：先清再写的话，
+     * 写失败时缓存已经没了 —— 下次导出会重新读（也能读到旧的），
+     * 但白丢一次预取。
+     */
+    this.shareCache.delete(avatar);
+    diagNote('note', `[卡] 已写回 avatar=${avatar} 缓存已作废`);
+  }
+
+  /**
+   * 预取一张卡的 PNG 字节到分享缓存（失败就清掉，下次重试）。
+   *
+   * @param force `true` = 缓存里有也重读。
+   *   进入「卡片」列表时**必须**用 force：用户可能刚在别的页面改过这张卡，
+   *   而缓存里的字节是改之前的（见 `writeCardPng` 的注释）。
+   */
+  private async prefetchForShare(avatar: string, force = false): Promise<void> {
+    if (!force && this.shareCache.has(avatar)) return;
     try {
       const bytes = await this.withConnection(() => this.bridge.characterPng(avatar));
       this.shareCache.set(avatar, new Uint8Array(bytes));
+      /*
+       * 记一条"这张卡里到底有没有角色级提示词"。
+       *
+       * 这条日志是为了下一次再出"提示词没了"时能**一眼分开两种原因**：
+       *
+       * ```text
+       *   有提示词=no  ⇒ 卡本身就没写进去（写回失败）
+       *   有提示词=yes ⇒ 卡里有，丢在导入/别的环节
+       * ```
+       *
+       * 上一轮排查全靠推演，就是因为没有任何一条这样的日志。
+       */
+      const parsed = parsePngCard(new Uint8Array(bytes));
+      if (parsed.kind === 'card') {
+        const card = parseStCardText(parsed.jsonText);
+        const ext = card.card.passthrough.data['extensions'];
+        const prompts = parseCharacterPrompts(ext);
+        const own = prompts?.own.length ?? 0;
+        const over = prompts === null ? 0 : Object.keys(prompts.overrideOrder).length;
+        diagNote(
+          'note',
+          `[分享] 取卡 avatar=${avatar} 有提示词=${prompts === null ? 'no' : 'yes'} own=${String(own)} override=${String(over)}`,
+        );
+      }
     } catch {
       this.shareCache.delete(avatar);
     }

@@ -491,12 +491,17 @@ test('★★★★ 写回用当前状态重读 PNG，不用内存副本', () => 
   assert.match(seg, /parseStCardText/, '要解析卡 JSON');
   assert.match(seg, /writeCharacterPrompts/, '要写 extensions');
   assert.match(seg, /buildPngCard/, '要嵌回 PNG');
-  assert.match(seg, /writeCharacterPng/, '要落盘');
+  /*
+   * ★ 2026-11-16 起落盘收口到 `writeCardPng()`（它负责作废分享缓存）。
+   *   判据钉"走了收口"而不是"直接调 bridge" —— 后者已不允许
+   *   （见 test/share-cache-freshness.test.mjs 第 1 例）。
+   */
+  assert.match(seg, /this\.writeCardPng\(/, '要落盘（走收口，才会作废分享缓存）');
   /*
    * 上限校验必须在写盘之前 —— 反过来的话卡已经被改坏了才发现超限。
    */
   const validateAt = seg.indexOf('validateCharacterPrompts');
-  const writeAt = seg.indexOf('this.bridge.writeCharacterPng');
+  const writeAt = seg.indexOf('this.writeCardPng(');
   assert.ok(validateAt > 0, '要有上限校验');
   assert.ok(writeAt > 0, '要写盘');
   assert.ok(validateAt < writeAt, '校验必须在写盘之前');
@@ -504,7 +509,8 @@ test('★★★★ 写回用当前状态重读 PNG，不用内存副本', () => 
 
 test('★★★★ 写盘成功后才更新内存（失败不许让界面显示已保存）', () => {
   const seg = between(shellCode, 'private async saveCharacterPrompts', 'private async restoreCharacterPrompts');
-  const writeAt = seg.indexOf('this.bridge.writeCharacterPng');
+  /* 落盘收口之后，这一句代表"写盘"这件事（见上面那条判据的说明） */
+  const writeAt = seg.indexOf('this.writeCardPng(');
   const memAt = seg.indexOf('this.characterPrompts = isCharacterPromptsEmpty');
   assert.ok(writeAt > 0 && memAt > 0, '找不到写盘与更新内存');
   assert.ok(writeAt < memAt, '先落盘、后更新内存');

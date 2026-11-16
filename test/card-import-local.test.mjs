@@ -271,11 +271,17 @@ test('★★★★ allowCreate 与 overwrite 必须成对反传', () => {
   const body = methodBody(shellSrc, 'private async writeCardToLibrary');
   assert.ok(body !== '', '找不到 private async writeCardToLibrary');
 
+  /*
+   * ★ 2026-11-16：落盘收口到 `writeCardPng()`（它负责作废分享缓存），
+   *   所以这里钉的是「走收口 + 第 4 参是 !plan.overwrite」，
+   *   而不是"直接调 bridge"。性质一个字没变。
+   */
   assert.match(
     body,
-    /writeCharacterPng\(\s*plan\.avatar,\s*charactersDir,\s*png,\s*!plan\.overwrite\s*\)/,
-    '第 4 参必须是 !plan.overwrite',
+    /this\.writeCardPng\(\s*plan\.avatar,\s*charactersDir,\s*png,\s*!plan\.overwrite\s*\)/,
+    '第 4 参必须是 !plan.overwrite，且必须走 writeCardPng 收口',
   );
+  assert.doesNotMatch(body, /bridge\.writeCharacterPng\(/, '不许绕过收口直接写卡');
 });
 
 test('★★ 世界书先落地、卡后写（顺序反了会留下指向空书的卡）', () => {
@@ -284,7 +290,8 @@ test('★★ 世界书先落地、卡后写（顺序反了会留下指向空书�
 
   const worldAt = body.indexOf('persistEmbeddedWorldbook(');
   const buildAt = body.indexOf('buildPngCard(');
-  const writeAt = body.indexOf('writeCharacterPng(');
+  /* 落盘收口后代表"写卡"的是 writeCardPng（见上一条判据的说明） */
+  const writeAt = body.indexOf('this.writeCardPng(');
 
   assert.ok(worldAt >= 0 && buildAt >= 0 && writeAt >= 0, '三步都要在');
   assert.ok(worldAt < buildAt, '世界书要在建 PNG 之前（卡里要写书名）');
