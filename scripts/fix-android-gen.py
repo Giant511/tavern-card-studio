@@ -510,6 +510,56 @@ def patch_cleartext_loopback(check_only: bool) -> list[str]:
     return [msg]
 
 
+
+def patch_version_code_override(check_only: bool) -> list[str]:
+    """
+    允许构建时用环境变量单独指定 versionCode。
+
+    ## 为什么需要这个开关
+
+    版本名（versionName）和版本号（versionCode）在 `tauri.properties` 里
+    是**一起**由 tauri CLI 从 `tauri.conf.json` 的 version 算出来的。
+    于是"把版本名退回 0.2.0"这件事，会顺带把 versionCode 从 2001 退回 200 ——
+    而 **Android 不允许降级安装**：
+
+    ```text
+      手机上装过 0.2.1 (2001)
+      再装 0.2.0 (200)   ⇒ INSTALL_FAILED_VERSION_DOWNGRADE
+      而卸载重装会丢掉聊天记录（存在应用内部存储）
+    ```
+
+    用户明确要求"版本名回到 0.2.0"，同时又不能丢数据。
+    两个诉求只有一个交集：**版本名 0.2.0 + versionCode 不低于已装的**。
+
+    所以这里加一个**只影响 versionCode** 的旁路：设了
+    `TCS_VERSION_CODE` 就用它，没设就完全走原逻辑（正常发版不受影响）。
+    """
+    path = GEN / "app" / "build.gradle.kts"
+    if not path.is_file():
+        return [f"[跳过] 没有 {path.name}"]
+    text = path.read_text(encoding="utf-8")
+
+    if "TCS_VERSION_CODE" in text:
+        return ["[OK] build.gradle.kts 已支持 TCS_VERSION_CODE 覆盖"]
+
+    old = 'versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()'
+    if old not in text:
+        return ["[跳过] 找不到 versionCode 行（tauri 模板变了？）"]
+
+    new = (
+        '// 允许构建时单独指定 versionCode（只覆盖它，版本名不动）。\n'
+        '        // 用途：版本名回退到旧号时，仍能覆盖安装已装的新版本 ——\n'
+        '        // Android 不许降级，而卸载会丢聊天记录。见 fix-android-gen.py。\n'
+        '        versionCode = (System.getenv("TCS_VERSION_CODE")\n'
+        '            ?: tauriProperties.getProperty("tauri.android.versionCode", "1")).toInt()'
+    )
+    msg = "[修] build.gradle.kts 支持 TCS_VERSION_CODE 覆盖 versionCode"
+    if check_only:
+        return [msg]
+    text = text.replace(old, new, 1)
+    path.write_text(text, encoding="utf-8", newline="\n")
+    return [msg]
+
 def main() -> int:
     check_only = "--check" in sys.argv
 
@@ -524,6 +574,7 @@ def main() -> int:
     lines += patch_signing_config(check_only)
     lines += patch_min_sdk_for_v1(check_only)
     lines += patch_cleartext_loopback(check_only)
+    lines += patch_version_code_override(check_only)
 
     for line in lines:
         print(line)

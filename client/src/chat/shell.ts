@@ -8235,6 +8235,14 @@ export class AppShell {
        * 因为回调是构造参数。这不会导致重复保存：`persistChat` 靠指纹去重。
        */
       onChatChanged: (messages) => this.handleChatChanged(messages),
+      /*
+       * 面板的装配诊断接到 App 日志（2026-11-16）。
+       *
+       * 排查"提示词没生效"时，这一行是**唯一**能区分"没发出去"和
+       * "发出去了但模型没听"的证据 —— 上一轮就是因为没有它，
+       * 只能靠读代码推演，还推错了方向。
+       */
+      onDiag: (message) => diagNote('note', message),
       // 角色与聊天选择器本期用最简形态：由外壳提供候选（后续接真实列表）
       /*
        * ★ 2026-10-31 第五批：这两行原来是 `async () => null`。

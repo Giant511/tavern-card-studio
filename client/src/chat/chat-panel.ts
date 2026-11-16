@@ -150,6 +150,25 @@ export interface ChatPanelCallbacks {
   /** 状态栏提示 */
   onNotify?: (message: string, kind?: 'info' | 'ok' | 'warn' | 'danger') => void;
   /**
+   * 诊断日志出口（2026-11-16）。
+   *
+   * ## 为什么面板要往外报一行装配结果
+   *
+   * 用户报过「角色特有的提示词没有生效」。排查时**日志里一条相关记录都没有**，
+   * 只能靠读代码推演 —— 而推演的方向一开始就错了（以为是导出丢字段）。
+   *
+   * 有了这一行，下次能一眼分开三种情况：
+   *
+   * ```text
+   *   完全没有这条记录      ⇒ 没走到装配（配置没读到）
+   *   记录里 applied 不含它  ⇒ 被跳过（关掉了 / 内容为空）
+   *   记录里 depthInjected 有 ⇒ 发出去了，位置在 N —— 那是模型没听
+   * ```
+   *
+   * 面板自己不写文件（它可能跑在桌面端），由外壳接到 `diagNote`。
+   */
+  onDiag?: (message: string) => void;
+  /**
    * 请求切换「当前聊天的用户人设」（2026-11-06）。
    *
    * ## 用户的原话
@@ -1878,6 +1897,36 @@ export class ChatPanel {
           persona: this.ctx.userName === '' ? undefined : { name: this.ctx.userName },
           worldbook,
         });
+
+    /*
+     * 报一行装配结果（2026-11-16）。
+     *
+     * 用 `report` 里的四个数字就够定位：少了哪一类一眼能看出来。
+     * 拼上"深度注入的标识 + 深度"，因为**深度是最容易设错的一项**
+     * （用户那三条设成 0 = 排在最后，模型基本不听）。
+     */
+    if (usePromptManager && 'report' in assembled) {
+      /*
+       * `report` 在 `PromptAssembleResult` 上是必填，但 `assembled` 是两条
+       * 分支的联合类型、且 `in` 收窄对可选属性不彻底 —— 显式标一次类型，
+       * 比在调用点散布 `as` 好（这里只有一个地方读它）。
+       */
+      const report = assembled.report as {
+        applied: number;
+        skippedDisabled: number;
+        skippedEmpty: number;
+        depthInjected: number;
+      };
+      const depthList = (promptConfig?.prompts ?? [])
+        .filter((one) => one.injectionPosition === 1)
+        .map((one) => `${one.identifier}@${String(one.injectionDepth)}`)
+        .join(',');
+      this.callbacks.onDiag?.(
+        `[装配] 消息=${String(assembled.messages.length)} 用=${String(report.applied)} ` +
+          `关=${String(report.skippedDisabled)} 空=${String(report.skippedEmpty)} ` +
+          `深度注入=${String(report.depthInjected)} 深度项=[${depthList}]`,
+      );
+    }
 
     /*
      * 额外指令（2026-11-03，给「AI 帮答」「续写」用）。
