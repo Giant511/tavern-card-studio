@@ -234,8 +234,14 @@ test('★★★ 导入必须走「允许新建」，否则新卡写不进去', a
    * 不认变量名：`!overwrite` / `!plan.overwrite` / `!planned.plan.overwrite` 都算对。
    * 守的是"第 4 参必须是对某个 overwrite 标志取反"，而不是它叫什么。
    */
-  const call = /writeCharacterPng\(([^)]*)\)/.exec(block);
-  assert.ok(call !== null, '找不到 writeCharacterPng 调用');
+  /*
+   * ★ 2026-11-16：落盘收口到 `writeCardPng()`，所以这里的"写卡调用"
+   *   可能是 `this.writeCardPng(...)` 也可能（在收口方法内部）是
+   *   `bridge.writeCharacterPng(...)`。两种形状都认 ——
+   *   守的性质是"第 4 参由 overwrite 取反决定"，不是它长什么样。
+   */
+  const call = /(?:writeCharacterPng|writeCardPng)\(([^)]*)\)/.exec(block);
+  assert.ok(call !== null, '找不到写卡调用（writeCardPng / writeCharacterPng）');
   const args = call[1].split(',');
   const flag = (args[args.length - 1] ?? '').trim();
   assert.match(

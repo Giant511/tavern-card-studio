@@ -138,8 +138,12 @@ test('★★★★★ writeCharacterPng 的 allowCreate 必须跟着 overwrite �
   const at = shellSrc.indexOf('private async writeCardToLibrary(');
   assert.ok(at > 0, '找不到 writeCardToLibrary');
   const block = shellSrc.slice(at, at + 3600);
-  const call = /writeCharacterPng\(([^)]*)\)/.exec(block);
-  assert.ok(call !== null, '找不到 writeCharacterPng 调用');
+  /*
+   * ★ 2026-11-16：落盘收口到 `writeCardPng()`（它负责作废分享缓存），
+   *   所以这里找的是收口方法的调用。守的性质（第 4 参取反）没变。
+   */
+  const call = /this\.writeCardPng\(([^)]*)\)/.exec(block);
+  assert.ok(call !== null, '找不到 writeCardPng 调用');
   const flag = call[1].split(',').pop().trim();
   assert.match(flag, /^!\s*[\w.]*overwrite$/, `allowCreate 要取 !<overwrite>，实际是：${flag}`);
 
@@ -435,7 +439,8 @@ test('★★★★ 世界书要在**写卡之前**落地（书名要先定下来
 
   const worldAt = body.indexOf('this.persistEmbeddedWorldbook');
   const attachAt = body.indexOf('attachWorldToCard');
-  const writeAt = body.indexOf('writeCharacterPng');
+  /* 落盘收口后代表"写卡"的是 writeCardPng（2026-11-16） */
+  const writeAt = body.indexOf('this.writeCardPng(');
   assert.ok(worldAt > 0, '要落地世界书');
   assert.ok(attachAt > 0, '要把书名写进卡');
   assert.ok(writeAt > 0, '要写卡');
