@@ -221,7 +221,22 @@ export function renderChatPromptEditPage(
   body.append(posBits.row);
 
   /* ── 深度 ── */
-  const depthBits = field(doc, '深度', 'prompt-field-depth', '0 = 在最后一条消息之后，1 = 在最后一条消息之前，依次往前。');
+  const depthBits = field(
+    doc,
+    '深度',
+    'prompt-field-depth',
+    /*
+     * ★ 必须写清 0 的**后果**，不只是它的定义（2026-11-16）。
+     *
+     * 原来只说「0 = 在最后一条消息之后」，用户会以为"0 就是最靠后，
+     * 那应该最强吧"。事实相反：末尾那条 system 会被模型当成
+     * "补充说明"，前面十几轮的既有文风压得住它。
+     *
+     * ST 的默认值是 4，这里也一样 —— 说清为什么。
+     */
+    '0 = 在最后一条消息之后，1 = 在最后一条消息之前，依次往前。' +
+      '深度 0 会排在最后，模型常常忽略它，一般用 4。',
+  );
   const depthInput = el(doc, 'input', 'nb-input');
   depthInput.setAttribute('type', 'number');
   depthInput.setAttribute('inputmode', 'numeric');

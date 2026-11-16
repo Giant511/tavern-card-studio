@@ -48,13 +48,32 @@ export type PromptWriteResult =
   | { ok: true; body: Record<string, unknown>; changed: boolean }
   | { ok: false; reason: string };
 
-/** 新建时的默认值（与 ST 新建一条时的初值一致） */
+/**
+ * 新建时的默认值（与 ST 新建一条时的初值一致）。
+ *
+ * ## ★ `injectionDepth` 必须是 4，不能是 0（2026-11-16 用户报的真缺陷）
+ *
+ * 原来这里写 `0`。而 0 的语义是"排在**最后一条消息之后**"——
+ * 于是用户在编辑页把「位置」切到"按深度插入聊天记录"时，深度框里
+ * 显示的是 0，绝大多数人不会去改它，结果这条提示词被当成
+ * **一条末尾的 system 消息**发出去。
+ *
+ * 那个位置是**最弱**的位置：模型把最后那条用户消息当成本轮任务，
+ * 末尾追加的 system 基本压不住前面十几轮的既有文风。
+ * 用户的现象就是"设了提示词但没生效"。
+ *
+ * ST 自己的默认值是 4（`public/index.html` 里
+ * `<input name="injection_depth" ... value="4" />`），
+ * 4 落在对话里靠后的位置，既能影响文风、又不像末尾那样被忽略。
+ *
+ * ⇒ 与 ST 对齐：**4**。
+ */
 export const NEW_PROMPT_DRAFT: PromptDraft = {
   name: '',
   content: '',
   role: 'system',
   injectionPosition: 0,
-  injectionDepth: 0,
+  injectionDepth: 4,
   injectionOrder: 100,
 };
 
