@@ -559,6 +559,25 @@ if [ "$VARIANT" = "release" ]; then
 
     OUT_DIR="$REPO/release/android"
     mkdir -p "$OUT_DIR"
+    # ★★★ 版本号必须**在读一次**（2026-11-16 踩到）。
+    #
+    # `tauri.properties` 是 `tauri android build` 期间由 CLI **重写**的
+    # （它用 tauri.conf.json 的 version 算 versionName/versionCode）。
+    # 而脚本第 98 行是在**构建之前**读的 —— 于是升版后第一次构建：
+    #
+    # ```text
+    #   98 行读到 0.2.0（上一次构建写的）
+    #   构建过程中 CLI 把文件改成 0.2.1，包内 versionName 也是 0.2.1
+    #   产物却叫 …-0.2.0-arm64-release.apk
+    # ```
+    #
+    # 后果不是"文件名难看"：用户看到 0.2.0 会以为**没更新**，
+    # 而内容确实是新的 —— 那是"文案与行为相反"最坏的一种，
+    # 直接导致他重复装旧包或以为修了没生效。
+    #
+    # 所以落盘前按**磁盘上的当前值**再读一次。
+    VERSION_NAME=$(sed -n 's/^tauri\.android\.versionName=//p' "$TAURI_PROPS" | tr -d '\r')
+    echo "  包内版本（构建后重读）：$VERSION_NAME"
     SIGNED="$OUT_DIR/tavern-card-studio-$VERSION_NAME-arm64-release.apk"
 
     # ★ AGP 已经签过了（gradle 里配了 signingConfig）——**不要再签第二遍**。
