@@ -4359,6 +4359,18 @@ textarea,
   color: var(--nb-text-1);
   font-size: var(--nb-fs-16);
   font-weight: 600;
+  /*
+   * 标题带上角色名之后（v0.2.1：「<名> · 提示词 · 已启用 14 / 15」）
+   * 可能很长，而角色名可能是没空格的英文（`Seraphina`）。
+   *
+   * 中文天然会断行，英文长单词不会 —— 那会**顶破容器**（横向溢出，
+   * 整页可以左右拖动）。`anywhere` 让它在该断的地方断。
+   *
+   * ★ 不用 `ellipsis`：这一行后半截是「已启用 N / M」，截掉它
+   *   等于把用户最想看的数字藏了。
+   */
+  overflow-wrap: anywhere;
+  line-height: var(--nb-lh-title);
 }
 
 .nb-prompts-summary-sub {

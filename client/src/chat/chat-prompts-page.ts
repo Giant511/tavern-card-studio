@@ -147,8 +147,17 @@ function buildScopeBar(doc: DocLike, character: CharacterPromptScope, scope: Pro
 /**
  * 上限计数条（PLAN §5.6）。
  *
- * 显示"已用 / 上限"而不是只显示一条进度 —— 用户要据此判断"还能不能加"，
- * 而"还剩 3 条"比"用了 17 条"更容易直接决策。所以两样都给。
+ * 显示"已用 / 上限"。
+ *
+ * ## ★ 为什么不显示"还能加 N"（2026-11-16 用户要求删）
+ *
+ * 原来写 `3 / 20（还能加 17）`，用户明确要求把括号去掉。
+ *
+ * 判断：那句是**同一件事的算术重复**（20 − 3 = 17，用户自己一减就有），
+ * 而它把一行撑长、在 320dp 屏上还会折行。信息密度上没有增益。
+ *
+ * ★ 唯一保留它的场合是**超限**（`（超 N）`）—— 那个数用户自己算不出来
+ * （他得先知道上限才知道超了多少），且说明"保存会被拒"。
  *
  * `data-over` 标出来超限的那些（正常情况下不应该出现，因为保存会被拒；
  * 但用户在别的工具里改过卡就可能读到超限数据，那时要显眼）。
@@ -162,34 +171,52 @@ function buildQuotaBar(doc: DocLike, config: CharacterPromptConfig): ElLike {
     config.own.reduce((sum, one) => sum + one.content.length, 0) +
     Object.values(config.overrideOrder).reduce((sum, one) => sum + (one.content?.length ?? 0), 0);
 
-  const line = (label: string, used: number, limit: number): ElLike => {
+  /*
+   * `key` 显式传，不从 `label` 反推。
+   *
+   * 原来写 `label === '角色特有' ? 'count' : 'chars'` —— 拿**显示文案**
+   * 当判据。改一次文案就让 data-role 全错，而探针按 data-role 定位，
+   * 表现是"探针找不到元素"而不是"文案错了"（§114 同源：一个论点写两处）。
+   */
+  const line = (key: 'count' | 'chars', label: string, used: number, limit: number): ElLike => {
     const row = el(doc, 'div', 'nb-quota-line');
-    row.setAttribute('data-role', `prompts-quota-${label === '角色特有' ? 'count' : 'chars'}`);
+    row.setAttribute('data-role', `prompts-quota-${key}`);
     const name = el(doc, 'span', 'nb-quota-label');
     name.textContent = label;
     const value = el(doc, 'span', 'nb-quota-value');
-    const remaining = limit - used;
+    const over = used - limit;
     value.textContent =
-      remaining >= 0
-        ? `${String(used)} / ${String(limit)}（还能加 ${String(remaining)}）`
-        : `${String(used)} / ${String(limit)}（超 ${String(-remaining)}）`;
-    if (remaining < 0) row.setAttribute('data-over', 'true');
+      over > 0
+        ? `${String(used)} / ${String(limit)}（超 ${String(over)}）`
+        : `${String(used)} / ${String(limit)}`;
+    if (over > 0) row.setAttribute('data-over', 'true');
     row.append(name, value);
     return row;
   };
 
   wrap.append(
-    line('角色特有', ownCount, PROMPT_LIMITS.ownCount),
-    line('正文字数', totalChars, PROMPT_LIMITS.totalContent),
+    line('count', '角色特有', ownCount, PROMPT_LIMITS.ownCount),
+    line('chars', '正文字数', totalChars, PROMPT_LIMITS.totalContent),
   );
 
   const note = el(doc, 'div', 'nb-quota-note');
   /*
-   * 这句必须写：用户会问"为什么我只能加 20 条"。
-   * 答案（卡片藏在 PNG 里、base64 ×1.33）不需要写，但"藏哪"要写 ——
-   * 它决定了"为什么换个 App 可能丢"。
+   * 只说"存哪"。上限的数字已经在上面两行里了，不重复。
+   *
+   * ★ 2026-11-16 去掉的两句（用户要求）：
+   *
+   * ```text
+   *   「换设备也能带走」
+   *     用户说去掉。而且它本来就不严谨：卡片文件跟着走，但
+   *     `tcs.prompts` 是扩展键，别的编辑器可能不保留（PLAN §5.5 ③ 记过）。
+   *     写"一定带得走"是在承诺一件我们控制不了的事。
+   *   「每条正文上限 4000 字符」
+   *     与"最多 20 条 + 总量 24000"矛盾：20 × 4000 = 80,000 ≫ 24,000，
+   *     写到第 7 条就超总量了，「每条 4000」这个额度永远用不到。
+   *     已随 PROMPT_LIMITS 一起删掉单条上限。
+   * ```
    */
-  note.textContent = `存在角色卡里，换设备也能带走。每条正文上限 ${String(PROMPT_LIMITS.contentPerPrompt)} 字符。`;
+  note.textContent = '这些设置存在角色卡里。';
   wrap.append(note);
   return wrap;
 }
@@ -273,8 +300,19 @@ export function renderChatPromptsPage(
   const summary = el(doc, 'div', 'nb-prompts-summary');
   summary.setAttribute('data-role', 'prompts-summary');
   const summaryMain = el(doc, 'div', 'nb-prompts-summary-main');
+  /*
+   * 标题写「<角色名> · 提示词 · 已启用 N / M」（2026-11-16 用户指定）。
+   *
+   * 原来只有 `14 / 15 条启用` —— 用户在这一页最容易忘的是"我在改谁的那份"
+   * （作用域切换条就在上面，但滚下去之后看不见了）。把名字写进标题，
+   * 滚到列表底部也不会搞错对象。
+   *
+   * 全局用「全局」当名字，与切换条左档一致 —— 两处说的是同一个东西，
+   * 就不该有两种叫法。
+   */
+  const scopeName = inCharacter ? character.characterName : '全局';
   const refreshSummary = (): void => {
-    summaryMain.textContent = `${String(enabledIds.size)} / ${String(order.length)} 条启用`;
+    summaryMain.textContent = `${scopeName} · 提示词 · 已启用 ${String(enabledIds.size)} / ${String(order.length)}`;
   };
   refreshSummary();
   summary.append(summaryMain);
@@ -282,16 +320,27 @@ export function renderChatPromptsPage(
   const summarySub = el(doc, 'div', 'nb-prompts-summary-sub');
   summarySub.setAttribute('data-role', 'prompts-summary-sub');
   /*
-   * 说清"关掉会怎样" **以及"改的东西存到哪"**。
+   * 说清"关掉会怎样"。
    *
    * 只说数字的话，用户不知道关掉一条的后果 ——
    * 是"不发这条"还是"整个预设失效"。前者才是事实。
    *
-   * 第二句按作用域变：这是 v0.2.0 最容易误会的点 ——
-   * 同一个开关，在两个作用域下改的是**完全不同的东西**。
+   * ## ★ 角色作用域这句不提"存在卡里"，也不重复角色名（2026-11-16）
+   *
+   * 两个理由：
+   *
+   * ```text
+   * ① 「存在卡里」与下面计数条的「这些设置存在角色卡里」重复 ——
+   *    用户截图标红的就是这一对，20px 内说了两遍。
+   * ② 标题（上面那行）已经带了角色名，这句再说「只影响「威廉」」
+   *    就是同一个名字在一屏里出现两次。改用"这个角色"指代，
+   *    信息一个不少。
+   * ```
+   *
+   * "存哪"交给紧挨着上限数字的那条 note —— 它本来就更该在那儿。
    */
   summarySub.textContent = inCharacter
-    ? `关掉的不会发出去，其他照发。这里的改动只影响「${character.characterName}」，存在卡里。`
+    ? '关掉的不会发出去，其他照发。改动只留在这个角色上。'
     : '关掉的不会发出去，其他照发。改完立即生效，也会写回这份预设。';
   summary.append(summarySub);
 
@@ -477,10 +526,21 @@ export function renderChatPromptsPage(
       const tag = el(doc, 'span', 'nb-prompt-override-tag');
       tag.setAttribute('data-role', 'prompt-own-tag');
       /*
-       * 说清"这条只在这个角色下有" —— 用户去全局作用域找不到它时，
-       * 得能回想起为什么。
+       * 只写「角色特有」（2026-11-16 用户要求删掉「（全局里没有这条）」）。
+       *
+       * 原来那句是解释，但它有三个问题：
+       *
+       * ```text
+       * ① 每条都重复一遍 —— 截图里连着三条，整页被括号占满
+       * ② 它是"这条不在全局里"的另一种说法，而"角色特有"这四个字
+       *    本身就是那个意思
+       * ③ 一行的宽度被它撑到必须折行，而标签本该是个小标记
+       * ```
+       *
+       * ★ 用户只是要求删括号，但删掉后信息没少 —— 因为切换条上已经写着
+       *   「只这个角色」，而他不会同时怀疑"这条在全局里也有"。
        */
-      tag.textContent = '角色特有（全局里没有这条）';
+      tag.textContent = '角色特有';
       tagRow.append(tag);
       main.append(tagRow);
     }

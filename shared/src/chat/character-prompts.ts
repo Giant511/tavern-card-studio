@@ -132,21 +132,39 @@ export function isCharacterPromptsEmpty(config: CharacterPromptConfig | null): b
 /**
  * 上限数值。
  *
- * 依据：卡片藏在 PNG 的 tEXt chunk 里、base64 后 ×1.33；而 ST 的预设本身
- * 38 条能正常跑，说明单条正文的实用上限在 2~4 KB 量级。
+ * 依据：卡片藏在 PNG 的 tEXt chunk 里、base64 后 ×1.33，所以**总量**才是
+ * 真实约束（体积），条数是"别拆太碎"的实用约束。
  *
  * **超限不截断**：截断的 JSON 之后会在更莫名的地方炸。要明确报错并拒绝保存。
+ *
+ * ## ★ 为什么没有「每条正文上限」（2026-11-16 用户指出）
+ *
+ * 原来有 `contentPerPrompt: 4000`，而 `ownCount` 是 20、`totalContent` 是
+ * 24000 —— 三个数**互相矛盾**：
+ *
+ * ```text
+ *   20 × 4000 = 80,000  ≫  24,000
+ *   ⇒ 写到第 7 条（7 × 4000 = 28,000）就已经超总量
+ *   ⇒ 「每条 4000」这个额度实际永远用不到
+ * ```
+ *
+ * 用户原话：「你这按条数来算的话每条上限就不对」。
+ *
+ * 而他指出的不只是文案难看：界面上同时写着「每条 4000」和「总量 24000」，
+ * 用户按前者规划就必然被后者拦，而错误信息里两个数都出现 —— 他无从判断
+ * 该删哪里。
+ *
+ * 处理：**删掉单条上限**。因为 `总量 ≤ 24000` 天然限制了单条 ≤ 24000，
+ * 单条检查是它的真子集 —— 留着只会产生"同一次保存报两条错"。
  */
 export const PROMPT_LIMITS = {
-  /** 每条 content 的字符上限 */
-  contentPerPrompt: 4000,
   /** 每条 name 的字符上限 */
   nameLength: 40,
   /** 每条 comment 的字符上限 */
   commentLength: 500,
   /** 角色特有提示词的条数上限 */
   ownCount: 20,
-  /** 全部正文总量（own 的 content 之和） */
+  /** 全部正文总量（own + override 的 content 之和） */
   totalContent: 24000,
 } as const;
 
@@ -154,7 +172,7 @@ export interface LimitViolation {
   /** 给人看的一句话（带具体数字，用户能据此删） */
   message: string;
   /** 哪一项超了，便于判据定位 */
-  kind: 'ownCount' | 'contentPerPrompt' | 'nameLength' | 'commentLength' | 'totalContent';
+  kind: 'ownCount' | 'nameLength' | 'commentLength' | 'totalContent';
 }
 
 /**
@@ -162,8 +180,8 @@ export interface LimitViolation {
  *
  * 返回空数组 = 全部合格。**不修改入参**（校验与修正是两件事）。
  *
- * 错误信息必须带具体数字：用户看到「第 3 条正文 5,240 字符，超过 4,000」
- * 才知道该删哪里；只说「超出限制」等于让他自己找。
+ * 错误信息必须带具体数字：用户看到「全部提示词正文合计 24,900 字符，
+ * 超过总量上限 24,000」才知道该删哪里；只说「超出限制」等于让他自己找。
  */
 export function validateCharacterPrompts(config: CharacterPromptConfig): LimitViolation[] {
   const out: LimitViolation[] = [];
@@ -177,19 +195,31 @@ export function validateCharacterPrompts(config: CharacterPromptConfig): LimitVi
     });
   }
 
+  /*
+   * 总量超了要说"从哪下手"。
+   *
+   * 删掉单条上限之后（见 `PROMPT_LIMITS` 的注释），超限只剩一个入口：
+   * 「合计 24,900 超过 24,000」。而用户下一步必然是"那我删哪条"——
+   * 只说合计等于让他自己逐条去数。
+   *
+   * 所以顺手记下**最长的那一条**，附在总量错误后面。一条就够：
+   * 用户的动作是"删／缩短点什么"，最长的那条收益最大。
+   */
+  let longestLabel = '';
+  let longestLength = 0;
+  const noteLength = (label: string, length: number): void => {
+    if (length > longestLength) {
+      longestLabel = label;
+      longestLength = length;
+    }
+  };
+
   let total = 0;
   config.own.forEach((prompt, index) => {
     const label = prompt.name.trim() === '' ? `第 ${String(index + 1)} 条` : `「${prompt.name.trim()}」`;
     total += prompt.content.length;
+    noteLength(label, prompt.content.length);
 
-    if (prompt.content.length > PROMPT_LIMITS.contentPerPrompt) {
-      out.push({
-        kind: 'contentPerPrompt',
-        message:
-          `${label} 正文 ${String(prompt.content.length)} 字符，` +
-          `超过每条上限 ${String(PROMPT_LIMITS.contentPerPrompt)}。`,
-      });
-    }
     if (prompt.name.length > PROMPT_LIMITS.nameLength) {
       out.push({
         kind: 'nameLength',
@@ -208,19 +238,12 @@ export function validateCharacterPrompts(config: CharacterPromptConfig): LimitVi
     }
   });
 
-  /* 覆盖项的正文也占总量与单条额度 —— 否则可以通过"覆盖"绕过上限 */
+  /* 覆盖项的正文也占总量与注释额度 —— 否则可以通过"覆盖"绕过上限 */
   for (const [identifier, override] of Object.entries(config.overrideOrder)) {
     const content = override.content;
     if (content === undefined) continue;
     total += content.length;
-    if (content.length > PROMPT_LIMITS.contentPerPrompt) {
-      out.push({
-        kind: 'contentPerPrompt',
-        message:
-          `覆盖「${identifier}」的正文 ${String(content.length)} 字符，` +
-          `超过每条上限 ${String(PROMPT_LIMITS.contentPerPrompt)}。`,
-      });
-    }
+    noteLength(`覆盖「${identifier}」`, content.length);
     if ((override.comment ?? '').length > PROMPT_LIMITS.commentLength) {
       out.push({
         kind: 'commentLength',
@@ -232,11 +255,21 @@ export function validateCharacterPrompts(config: CharacterPromptConfig): LimitVi
   }
 
   if (total > PROMPT_LIMITS.totalContent) {
+    /*
+     * 附上"最长的那一条"。
+     *
+     * 没有这句，用户看到「合计 24,900 超过 24,000」只知道超了 900，
+     * 却不知道该删哪条 —— 而他下一步就得干这件事。
+     * 只点最长的一条：他的动作是"删/缩短点什么"，那条收益最大，
+     * 全列出来反而变成一张要自己排序的表。
+     */
+    const hint =
+      longestLength > 0 ? `最长的一条是${longestLabel}（${String(longestLength)} 字符）。` : '';
     out.push({
       kind: 'totalContent',
       message:
         `全部提示词正文合计 ${String(total)} 字符，` +
-        `超过总量上限 ${String(PROMPT_LIMITS.totalContent)}。`,
+        `超过总量上限 ${String(PROMPT_LIMITS.totalContent)}。${hint}`,
     });
   }
 
