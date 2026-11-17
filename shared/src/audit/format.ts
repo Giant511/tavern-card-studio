@@ -21,6 +21,13 @@ import { greetingDividerToken } from '../format/greeting-preset.js';
 import { parseWorldbookTextWith } from '../format/worldbook.js';
 import { DEFAULT_WORLDBOOK_FORMAT, type WorldbookFormatParams } from '../format/worldbook-preset.js';
 import { stringifyStCard } from '../format/sillytavern-io.js';
+/*
+ * 角色级提示词（2026-11-17）。
+ *
+ * ★ 依赖方向：`chat/character-prompts.ts` 只 import `chat/prompt-config.ts`，
+ *   不碰 audit —— 所以这里反向 import 不会成环。加之前核过。
+ */
+import { parseCharacterPrompts, validateCharacterPrompts } from '../chat/character-prompts.js';
 import { BLOCK_DEFINITIONS, BLOCK_DEFINITION_MAP, BLOCK_IDS, DESCRIPTION_BLOCK_IDS } from '../model/blocks.js';
 import type { BlockId } from '../model/blocks.js';
 import type { UnifiedCard } from '../model/unified-card.js';
@@ -637,6 +644,109 @@ export interface FormatCheckOptions {
   includeStDefaults?: boolean;
 }
 
+/**
+ * 角色级提示词（`data.extensions.tcs.prompts`）的识别与校验。
+ *
+ * ## 为什么这条检查必须存在（2026-11-17）
+ *
+ * 安卓端从 v0.2.0 起会把「角色专属提示词 / 开关覆盖」写进卡片 PNG 的
+ * `data.extensions.tcs.prompts`。那一层是**扩展键**：
+ *
+ * ```text
+ *   存储层：服务端字节原样入库、桌面端 stringifyStCard 原样带出
+ *           ⇒ 不会丢（已有判据）
+ *   识别层：没人读它 ⇒ 用户把卡传上仓库、或在桌面端打开，
+ *           一个字都看不到"这卡带了 3 条专属提示词、2 处覆盖"
+ * ```
+ *
+ * "不丢"是底线，"看不见"是缺陷 —— 因为这意味着**换台设备排障时
+ * 完全不知道卡里还有这一层**，而它恰恰会改变模型输出。
+ *
+ * ## 三态，必须分开报
+ *
+ * ```text
+ *   没有这个键           → 不报（绝大多数卡都是这样）
+ *   有键但读不出来       → warning（存了但坏了，等于白存）
+ *   有键且能读           → info 汇总 + 上限校验（超限 = error）
+ * ```
+ *
+ * ★ 不能只靠 `parseCharacterPrompts()` 的 null 判断：它把
+ *   "没有"和"有但坏"都返回 null（那个函数刻意容错到"什么都不信"）。
+ *   所以这里先用 `'prompts' in tcs` 判**键在不在**。
+ *
+ * ## 超限为什么是 error 而不是 warning
+ *
+ * 超限的卡在 App 里**保存会被拒绝**，也就是说它只可能来自"别的工具
+ * 硬写"或"旧版本写的"。这种卡本身能用（多出来的提示词只是多发点 token），
+ * 但用户从仓库下载回来再改就会撞上保存失败 —— 提前在审计里喊，
+ * 比让他改到一半才发现好。
+ */
+export function checkCharacterPrompts(card: UnifiedCard): AuditIssue[] {
+  const extensions = card.passthrough.data['extensions'];
+  if (extensions === null || typeof extensions !== 'object' || Array.isArray(extensions)) return [];
+
+  const tcs = (extensions as Record<string, unknown>)['tcs'];
+  if (tcs === null || typeof tcs !== 'object' || Array.isArray(tcs)) return [];
+
+  const namespace = tcs as Record<string, unknown>;
+  /* 键在不在 —— 与"值长得对不对"是两件事，分开判 */
+  if (!('prompts' in namespace)) return [];
+
+  const config = parseCharacterPrompts(extensions);
+  if (config === null) {
+    return [
+      makeAuditIssue({
+        ruleId: 'builtin:character-prompts-malformed',
+        category: 'structure',
+        severity: 'warning',
+        message: '卡片里有 extensions.tcs.prompts，但读不出任何一条',
+        hint: '形状不是 { overrideOrder, own }，或两条都是空的。这一层会被所有客户端忽略 —— 若这张卡本该带角色提示词，请回 Tavern Card Studio 重新保存一次',
+        field: 'data.extensions.tcs.prompts',
+      }),
+    ];
+  }
+
+  const ownCount = config.own.length;
+  const overrideCount = Object.keys(config.overrideOrder).length;
+  const issues: AuditIssue[] = [
+    makeAuditIssue({
+      ruleId: 'builtin:character-prompts',
+      category: 'structure',
+      severity: 'info',
+      message:
+        `这个角色带了 ${String(ownCount)} 条专属提示词、${String(overrideCount)} 处开关/正文覆盖` +
+        '（extensions.tcs.prompts）',
+      /*
+       * hint 要说清"别的工具会忽略"——这是扩展键的固有代价，
+       * 用户需要知道"导进 ST 网页时这一层不生效"，否则会以为是 bug。
+       */
+      hint: '这是 Tavern Card Studio 的角色级提示词。其他工具（含 ST 网页版）会忽略它，卡片本身仍然可用',
+      field: 'data.extensions.tcs.prompts',
+    }),
+  ];
+
+  /*
+   * 上限校验直接复用 App 保存时那一套（`validateCharacterPrompts`）。
+   *
+   * ★ 绝不在这里另写一份判断：两份规则必然分叉，而分叉的表现是
+   *   "审计说没问题，App 却不让保存" —— 用户完全无从理解。
+   */
+  for (const violation of validateCharacterPrompts(config)) {
+    issues.push(
+      makeAuditIssue({
+        ruleId: `builtin:character-prompts-${violation.kind}`,
+        category: 'structure',
+        severity: 'error',
+        message: violation.message,
+        hint: '在 Tavern Card Studio 的「提示词管理 → 本角色」里删减后重新导出',
+        field: 'data.extensions.tcs.prompts',
+      }),
+    );
+  }
+
+  return issues;
+}
+
 export function checkFormat(card: UnifiedCard, options: FormatCheckOptions = {}): AuditIssue[] {
   const issues = [
     ...checkJsonValidity(card, options.rawJsonText),
@@ -644,6 +754,7 @@ export function checkFormat(card: UnifiedCard, options: FormatCheckOptions = {})
       platformRule: options.platformRule ?? null,
       ...(options.worldbookFormat ? { worldbookFormat: options.worldbookFormat } : {}),
     }),
+    ...checkCharacterPrompts(card),
   ];
   if (options.includeStDefaults !== false) issues.push(...checkStDefaults(card));
   if (options.preset) issues.push(...checkPresetConformance(card, options.preset));
