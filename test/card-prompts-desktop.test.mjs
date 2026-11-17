@@ -19,7 +19,11 @@
  * ```
  */
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { test } from 'node:test';
+
+const ROOT = join(import.meta.dirname, '..');
 
 import {
   hasPromptChanges,
@@ -256,4 +260,29 @@ test('★★★ 正常配置在上限内', () => {
   const { config } = cardWithPrompts();
   assert.equal(promptsWithinLimits(config), true);
   assert.deepEqual(promptLimitMessages(config), []);
+});
+
+/* ═══════════════════════════════════════════════════════════
+   五、跨卡隔离（草稿不许串卡）
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★★ 切卡时清草稿（面板 refresh 必须清 pending）', () => {
+  /*
+   * 场景：在 A 卡点「新增」留一个空草稿 → 切到 B 卡。
+   *
+   * 不清的话那个草稿会挂在 B 卡下面显示，用户以为 B 卡也有一条，
+   * 写完正文就**真的写进了 B 卡**。这是"状态串卡" ——
+   * 本项目最忌讳的一类缺陷（多标签并行的核心难点就在状态隔离）。
+   *
+   * 这条只能读源码钉：`pending` 是闭包里的数组，外部拿不到。
+   * 所以钉的是"refresh 的第一件事是清空它"。
+   */
+  const panel = readFileSync(join(ROOT, 'client/src/editor/prompts-panel.ts'), 'utf8');
+  const at = panel.indexOf('refresh: () => {');
+  assert.ok(at > 0, '找不到 refresh 实现');
+  const body = panel.slice(at, at + 400);
+  assert.match(body, /pending\.length = 0/, 'refresh 必须先清空草稿数组');
+  const clearAt = body.indexOf('pending.length = 0');
+  const paintAt = body.indexOf('paint()');
+  assert.ok(clearAt >= 0 && paintAt > clearAt, '先清草稿、再重画（顺序反了会画出一帧旧草稿）');
 });

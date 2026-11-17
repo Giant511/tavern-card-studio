@@ -629,7 +629,16 @@ export function createPromptsPanel(callbacks: PromptsPanelCallbacks): PromptsPan
 
   return {
     el: root,
+    /*
+     * `refresh` 只在**卡被整体替换**时调（切标签 / 新建 / 打开文件）。
+     *
+     * ★ 必须先清草稿：草稿只存在于当前卡的上下文里。
+     *   不清的话，在 A 卡点「新增」留一个空草稿、切到 B 卡，
+     *   那个草稿会挂在 B 卡下面显示 —— 用户以为 B 卡也有一条，
+     *   写完正文就真的写进了 B 卡。这是"状态串卡"，本项目最忌讳的一类。
+     */
     refresh: () => {
+      pending.length = 0;
       paint();
     },
   };
