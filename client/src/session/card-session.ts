@@ -18,12 +18,20 @@ import {
   DEFAULT_WORLDBOOK_FORMAT,
   type AuditReport,
   type BlockId,
+  type CharacterPromptConfig,
   type UnifiedCard,
   type WorldbookFormatParams,
   type WorldbookImportResult,
 } from '@tcs/shared';
 
 import { reparseWorldbook as reparseWorldbookCard, serializeCard, setBlockText } from '../editor/block-doc.ts';
+import {
+  hasPromptChanges,
+  promptsWithinLimits,
+  readCardPrompts,
+  samePrompts,
+  writePromptsIntoCard,
+} from './card-prompts.ts';
 import {
   applyCardInfo,
   readCardInfo,
@@ -406,6 +414,40 @@ export class CardSession {
     this.#card = applyCardInfo(this.#card, info);
     this.#onContentChanged();
     return true;
+  }
+
+  /**
+   * 更新角色级提示词（2026-11-17，「角色提示词」板块）。
+   *
+   * ## 三个刻意的决定
+   *
+   * ```text
+   * ① 上限在这里再判一次
+   *    组件里已判，但"能改卡"的入口不止一个（将来还有拖拽、粘贴）。
+   *    在唯一的写口上判，才不可能被绕过。
+   * ② 超限**不写**并返回 false
+   *    返回 true 而实际没写，是"界面说存了、文件里没有"的经典成因。
+   * ③ 判重与 updateCardInfo 同一套
+   *    没改就不置脏 —— 否则"点开又收起"会被记成一次内容变更。
+   * ```
+   */
+  updateCharacterPrompts(config: CharacterPromptConfig): boolean {
+    if (!promptsWithinLimits(config)) return false;
+    const current = readCardPrompts(this.#card);
+    if (samePrompts(current, config)) return false;
+    this.#card = writePromptsIntoCard(this.#card, config);
+    this.#onContentChanged();
+    return true;
+  }
+
+  /** 读当前卡的角色提示词（给板块组件用；每次现读，不缓存） */
+  readCharacterPrompts(): CharacterPromptConfig {
+    return readCardPrompts(this.#card);
+  }
+
+  /** 当前卡有没有角色级提示词改动（给统计/状态栏用） */
+  hasCharacterPrompts(): boolean {
+    return hasPromptChanges(readCardPrompts(this.#card));
   }
 
   // ── 写：落盘状态 ────────────────────────────────────────

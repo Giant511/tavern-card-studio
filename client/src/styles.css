@@ -3920,3 +3920,251 @@ body.st-pane-resizing {
   margin-right: auto;
 }
 
+
+/* ═══════════════════════════════════════════════════════════
+   「角色提示词」板块（2026-11-17）
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 它复用 `.block` / `.block-head` / `.block-body` 的既有样式（视觉上是第九块），
+ * 这里只补本板块独有的部分。
+ *
+ * ★ 只用 `:root` 里**确实存在**的变量。写一个不存在的变量不报错，
+ *   只会静默退回继承值 —— 表现是"这块看着有点不对"但说不清哪里不对。
+ */
+
+.prompts-block .prompts-badge {
+  margin-left: auto;
+  /* 「随卡片走」是说明不是警告：用虚线边框的轻样式，别和「原文缺失」混淆 */
+  cursor: help;
+}
+
+.prompts-intro {
+  margin: 10px 12px 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* ── 上限计数 ── */
+
+.prompts-quota {
+  display: grid;
+  gap: 2px;
+  margin: 10px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fbfcfd;
+}
+
+.prompts-quota-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.prompts-quota-label {
+  color: var(--muted);
+}
+
+.prompts-quota-value {
+  color: #344054;
+  /* 数字等宽：切换数值时不跳动（这块会频繁重绘） */
+  font-variant-numeric: tabular-nums;
+}
+
+.prompts-quota-line[data-over='true'] .prompts-quota-value {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* ── 违规提示 ── */
+
+.prompts-problems {
+  margin: 0 12px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  background: var(--danger-bg);
+}
+
+.prompts-problem {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.prompts-problem + .prompts-problem {
+  margin-top: 4px;
+}
+
+/* ── 两段（专属 / 覆盖） ── */
+
+.prompts-section {
+  padding: 0 12px 12px;
+}
+
+.prompts-section + .prompts-section {
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.prompts-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.prompts-section-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.prompts-section-note {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.prompts-empty {
+  margin: 0;
+  font-size: 12px;
+}
+
+/* ── 单条 ── */
+
+.prompts-row {
+  margin-bottom: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.prompts-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.prompts-check {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+.prompts-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.prompts-content {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+}
+
+.prompts-name:focus,
+.prompts-content:focus,
+.prompts-select:focus,
+.prompts-number:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.prompts-del {
+  flex: 0 0 auto;
+}
+
+.prompts-override-id {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 元信息行（身份 / 位置 / 深度 / 排序） ── */
+
+.prompts-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.prompts-meta-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.prompts-select,
+.prompts-number {
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+  font: inherit;
+  font-size: 12px;
+}
+
+.prompts-number {
+  width: 56px;
+  box-sizing: border-box;
+}
+
+.prompts-number:disabled {
+  color: var(--muted);
+  background: #f2f4f7;
+}
+
+/*
+ * 草稿行（还没写正文、尚未落盘的那条）。
+ *
+ * 为什么必须视觉上区分：它的「删除」只删内存、它的内容还没进卡。
+ * 用户看不出差别的话，会以为"我已经加了一条"然后关窗口 —— 那条就没了。
+ */
+.prompts-row[data-draft='1'] {
+  border-style: dashed;
+  border-color: var(--accent);
+  background: #f8fbff;
+}
+
+/*
+ * ★ 不要用 `.prompts-name::after` 加「未保存」——`<input>` 是替换元素，
+ *   `::after` 在它上面**不渲染**（不报错，只是什么都没有）。
+ *   所以草稿标记做成一个真实元素（见 prompts-panel.ts 的 `prompts-draft-tag`）。
+ */
+.prompts-draft-tag {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--accent);
+  font-size: 11px;
+  white-space: nowrap;
+}
