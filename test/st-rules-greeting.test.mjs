@@ -91,13 +91,21 @@ test('★★★ 新增规则一律 warning，不许用 error 拦导出', () => {
   }
 });
 
-test('★★★ 规则 id 要与 README 里引用的一致（同一件事不许写两处不同的名字）', () => {
+test('★★★ 规则 id 要与文档里引用的一致（同一件事不许写两处不同的名字）', () => {
   /*
    * 审计报告里每条问题都带 `ruleId`（`audit/types.ts:56`），
    * 所以文档可以逐条引用。**文档写的名字必须能在规则包里找到**，
    * 否则用户看到"规则 example-xxx 未通过"却在文档里搜不到。
+   *
+   * ★ 2026-11-17：判据从"README 里要有"改成"**已发布的文档里要有**"。
+   *   原因：规则细节从 README 搬到 `docs/44-custom-rules.md` 了
+   *   （README 只留"可以自定义"这件事本身 + 一个链接），
+   *   继续钉 README 会要求把同样的 id 清单在 README 里再抄一遍 ——
+   *   那正是这条判据本身反对的"两处写同一件事"。
+   *
+   *   现在检查**两者之一**提到即可，但两边都必须真实存在（read 会抛）。
    */
-  const readme = read('README.md');
+  const docs = [read('README.md'), read('docs/44-custom-rules.md')];
   const mentioned = [
     'example-uses-start-marker',
     'example-speaker-halfwidth-colon',
@@ -106,7 +114,10 @@ test('★★★ 规则 id 要与 README 里引用的一致（同一件事不许�
   ];
   for (const id of mentioned) {
     assert.ok(byId.has(id), `规则包里没有 ${id}`);
-    assert.ok(readme.includes(id), `README 里没提到 ${id} —— 文档与规则必须同名，否则必然分叉`);
+    assert.ok(
+      docs.some((text) => text.includes(id)),
+      `README 与规则文档都没提到 ${id} —— 文档与规则必须同名，否则必然分叉`,
+    );
   }
 });
 

@@ -17,8 +17,10 @@ import type { StWorldbookEntry } from '../model/sillytavern.js';
 import {
   DEFAULT_WORLDBOOK_FORMAT,
   labelForField,
+  resolveFieldSeparatorList,
   reverseLabelMap,
   WORLDBOOK_KNOWN_FIELDS,
+  writeFieldSeparator,
   type WorldbookFormatParams,
 } from './worldbook-preset.js';
 
@@ -218,12 +220,28 @@ interface CompiledFormat {
    */
   entryEnd: RegExp | null;
   labels: Map<string, string>;
-  fieldCore: string;
+  /**
+   * 字段分隔符的**候选列表**（2026-11-17 起可能是多个）。
+   *
+   * 长度 > 1 时按"出现位置升序 + 标签能识别"挑选，见 `parseFieldLine`。
+   * 单元素时行为与旧版完全一致。
+   */
+  fieldCores: string[];
 }
 
 /** 预编译一次，避免在逐行循环里反复构造正则与反查表 */
 function compileFormat(params: WorldbookFormatParams): CompiledFormat {
-  const core = params.fieldSeparator.trim() === '' ? ':' : params.fieldSeparator.trim();
+  /*
+   * 分隔符候选：去空、去重、**长优先**。
+   *
+   * 长优先是为了 `": "` 不被 `":"` 抢走 —— 否则 `constant: false` 会被切成
+   * 标签 `constant` + 值 ` false`（多一个前导空格，布尔解析仍能容错，
+   * 但 `comment:  两个空格` 这种就说不清了）。
+   */
+  const cores = [...new Set(resolveFieldSeparatorList(params.fieldSeparator).map((s) => s.trim()))]
+    .filter((s) => s !== '')
+    .sort((a, b) => b.length - a.length);
+  if (cores.length === 0) cores.push(':');
   const closeTemplate = typeof params.entryClose === 'string' ? params.entryClose.trim() : '';
   return {
     entryStart: markerPattern(params.entryOpen),
@@ -232,7 +250,7 @@ function compileFormat(params: WorldbookFormatParams): CompiledFormat {
     // 那会把每一行正文都当闭标记，所以必须显式挡掉。
     entryEnd: closeTemplate === '' ? null : markerPattern(closeTemplate),
     labels: reverseLabelMap(params),
-    fieldCore: core,
+    fieldCores: cores,
   };
 }
 
@@ -582,11 +600,17 @@ export function ensureEntryIds(entries: readonly StWorldbookEntry[]): {
 
 // ---------------------------------------------------------------- 写出
 
-/** 头部行：空值时不留尾随空格（`secondary_keys:` 而不是 `secondary_keys: `） */
-function header(label: string, value: string, fieldSeparator: string): string {
+/**
+ * 头部行：空值时不留尾随空格（`secondary_keys:` 而不是 `secondary_keys: `）
+ *
+ * `fieldSeparator` 可能是数组（2026-11-17），写回时只用**第一个** ——
+ * 输出格式必须唯一，否则同一份数据两次导出会不一样。
+ */
+function header(label: string, value: string, fieldSeparator: string | readonly string[]): string {
+  const separator = writeFieldSeparator(fieldSeparator);
   // v1.0 的 fieldSeparator 是 ": "，空值时要退化成 ":"（不含尾随空格）。
   // 所以空值取 separator 去掉尾部空白后的形态，而不是直接拼 separator。
-  return value === '' ? `${label}${fieldSeparator.trimEnd()}` : `${label}${fieldSeparator}${value}`;
+  return value === '' ? `${label}${separator.trimEnd()}` : `${label}${separator}${value}`;
 }
 
 function renderEntry(entry: StWorldbookEntry, index: number, params: WorldbookFormatParams): string {
@@ -667,21 +691,63 @@ interface DraftEntry {
  * 反解顺序：**先按预设的标签映射**，再按字段名本身 —— 这样自定义预设既可以
  * 把 `keys` 写成「关键词」，也可以不改标签直接沿用字段名。
  */
+/**
+ * 解析一行字段（`标签 + 分隔符 + 值`）。
+ *
+ * ## 多个候选分隔符时怎么挑（2026-11-17）
+ *
+ * 用户的世界书正文常常**中英混排**：
+ *
+ * ```text
+ *   关键词：            全角 —— 中文字段
+ *   内容：              全角
+ *   顺序: 250           半角 —— ST 原生字段名
+ *   constant: false     半角
+ * ```
+ *
+ * 预设只能声明一个分隔符时，另一批行会被整行丢弃（实测 7 行/条目，见
+ * `fieldSeparator` 的注释）。所以允许声明数组，这里按两条规则挑：
+ *
+ * 1. **位置靠前优先** —— 分隔符越早出现，标签越短、越可能是真标签；
+ * 2. **标签必须能识别** —— 认不出来就换下一个候选。
+ *
+ * 第 2 条是必需的：`comment: 备注：补充` 里全角冒号出现得更晚但也在，
+ * 只按"先出现"会切成标签 `comment: 备注`，那一行就废了。加上"标签能识别"
+ * 就自然跳过它、用 `": "` 得到 `comment`。
+ *
+ * 位置相同则长分隔符优先（`": "` 胜过 `":"`），由 `compileFormat` 的排序保证。
+ */
 function parseFieldLine(
   line: string,
   fmt: CompiledFormat,
 ): { field: string | null; label: string; value: string } | null {
-  const at = line.indexOf(fmt.fieldCore);
-  if (at <= 0) return null;
-  const label = line.slice(0, at).trim();
-  if (label === '') return null;
-  let value = line.slice(at + fmt.fieldCore.length);
-  // 与 v1.0 的 `[ \t]?` 一致：吃掉紧跟的一个空白字符，多的留给值本身
-  if (value.startsWith(' ') || value.startsWith('\t')) value = value.slice(1);
-  const mapped = fmt.labels.get(label);
-  const field =
-    mapped ?? ((WORLDBOOK_KNOWN_FIELDS as readonly string[]).includes(label) ? label : null);
-  return { field, label, value };
+  const candidates: Array<{ at: number; core: string }> = [];
+  for (const core of fmt.fieldCores) {
+    const at = line.indexOf(core);
+    // `at <= 0` 一律跳过：没有分隔符，或分隔符在行首（标签为空）
+    if (at > 0) candidates.push({ at, core });
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => a.at - b.at || b.core.length - a.core.length);
+
+  for (const { at, core } of candidates) {
+    const label = line.slice(0, at).trim();
+    if (label === '') continue;
+    const mapped = fmt.labels.get(label);
+    const field =
+      mapped ?? ((WORLDBOOK_KNOWN_FIELDS as readonly string[]).includes(label) ? label : null);
+    /*
+     * 认不出来：若有别的候选就继续试（`comment: 备注：x` 那种）；
+     * 都没有就返回这第一条 —— 让调用方照旧报 `unknown-field`，
+     * 用户才知道"这一行我看见了，但标签不认识"。
+     */
+    if (field === null && candidates.length > 1) continue;
+    let value = line.slice(at + core.length);
+    // 与 v1.0 的 `[ \t]?` 一致：吃掉紧跟的一个空白字符，多的留给值本身
+    if (value.startsWith(' ') || value.startsWith('\t')) value = value.slice(1);
+    return { field, label, value };
+  }
+  return null;
 }
 
 /**
@@ -1120,8 +1186,49 @@ export function parseWorldbookTextWith(text: string, params: WorldbookFormatPara
     });
   }
 
-  return { entries, issues, ok: issues.every((issue) => issue.severity !== 'error') };
+  return { entries: withNamesFromComments(entries), issues, ok: issues.every((issue) => issue.severity !== 'error') };
 }
+
+/**
+ * 条目没有 `name` 但写了 `comment` 时，用 comment 当名字（2026-11-17）。
+ *
+ * ## 为什么
+ *
+ * ST 生态里"条目标题"的权威字段是 `comment`（`addMemo` 也按它判），
+ * 我们的 TXT 格式把同一个东西叫 `name`。两者的写法都可能出现：
+ *
+ * ```text
+ *   【条目0：
+ *   comment: 西奥的人际关系      ← 这个名字只在 comment 里
+ *   内容：
+ * ```
+ *
+ * 不回落的话，解析出的条目 `name` 为空，于是：
+ *
+ * ```text
+ *   ① 审计的 `wb-name-required` 报「缺少名称」
+ *   ② 界面上所有条目都显示成「第 1 条 / 第 2 条」，用户认不出是哪一条
+ * ```
+ *
+ * 而 **JSON 导入路径本来就是这个语义** —— `character_book.entries[i]` 里
+ * 只有 `comment` 没有 `name` 时，界面照样显示 comment。两条路径不一致
+ * 会让"同一张卡导入 JSON 正常、把世界书粘进面板就报错"，最难查的那种。
+ *
+ * ## 边界
+ *
+ * · 只补 `name`，**不动** `comment`（回写时两者都有值，round-trip 稳定）；
+ * · `name` 已有值时不覆盖（用户显式写了两行，听他的）。
+ */
+function withNamesFromComments(entries: readonly StWorldbookEntry[]): StWorldbookEntry[] {
+  return entries.map((entry) => {
+    const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+    if (name !== '') return entry;
+    const comment = typeof entry.comment === 'string' ? entry.comment.trim() : '';
+    if (comment === '') return entry;
+    return { ...entry, name: comment };
+  });
+}
+
 
 /**
  * 猜这段文本是哪套世界书写法（仅用于错误提示，不参与解析）。

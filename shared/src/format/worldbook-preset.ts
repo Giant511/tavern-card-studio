@@ -46,8 +46,28 @@ export interface WorldbookFormatParams {
   fieldOrder: string[];
   /** 字段标签映射：字段键 → TXT 里的标签文字。未列出的键用键名本身 */
   labelMap: Record<string, string>;
-  /** 字段名与值之间的分隔串（默认 `": "`） */
-  fieldSeparator: string;
+  /**
+   * 字段名与值之间的分隔串（默认 `": "`）。
+   *
+   * **可以是数组**（2026-11-17 容错）：写成 `["：", ": ", ":"]` 就同时认
+   * 全角冒号与半角冒号。为什么需要：幻梦AI 的世界书正文里，**中文字段用全角**
+   * （`关键词：`、`内容：`）、**ST 原生字段用半角**（`constant: false`、
+   * `顺序: 250`）。预设只能给一个分隔符时，另一批字段会被整行丢弃：
+   *
+   * ```text
+   *   实测（用户「幻梦AI世界书格式预设」+ 他的卡）
+   *   fieldSeparator 写成 "：" ⇒ 7 行/条目 全部 "unexpected-line"
+   *   ⇒ constant / enabled / selective / comment / priority 全丢
+   *   ⇒ 条目名退化成「第 1 条」，且「有没有关键词」判据按缺省值误判
+   * ```
+   *
+   * 数组时**长分隔符优先**（`": "` 不会被 `":"` 抢先切走），并且**先试位置靠前的**、
+   * 标签认不出来就换下一个 —— 否则 `comment: 备注：补充` 会被全角冒号切成
+   * 标签 `comment: 备注`，那行就废了。
+   *
+   * 写回时只用第一个 —— 输出格式必须唯一，否则同一份数据每次导出都不一样。
+   */
+  fieldSeparator: string | readonly string[];
   /**
    * 列表字段（keys / secondary_keys）的项分隔串（默认 `", "`）。
    *
@@ -153,6 +173,38 @@ const PRESET_KEYS = ['$schema', 'schemaVersion', 'id', 'name', 'version', 'descr
 /** 预设参数的白名单（供客户端与测试复用，避免两处各写一份） */
 export const WORLDBOOK_PRESET_KEYS = PRESET_KEYS;
 export const WORLDBOOK_FORMAT_KEYS = FORMAT_KEYS;
+
+/** 默认分隔符列表（冻结值 `': '`）。数组形态供解析侧统一处理。 */
+export const DEFAULT_FIELD_SEPARATORS: readonly string[] = Object.freeze([': ']);
+
+/**
+ * 把 `fieldSeparator` 规范化成"解析时依次尝试"的列表（2026-11-17）。
+ *
+ * 规则：
+ * · 字符串 → 单元素列表；
+ * · 数组 → 原样（过滤非字符串/空串）；
+ * · 都没给 / 给坏了 → 冻结默认值 `': '`。
+ *
+ * ★ **不做去重与排序**：顺序由预设作者决定，含义是"写出用第一个"。
+ *   解析侧的匹配顺序另有一层（按出现位置 + 标签能否识别），见 `worldbook.ts`。
+ */
+export function resolveFieldSeparatorList(value: unknown): string[] {
+  if (typeof value === 'string') {
+    return value === '' ? [...DEFAULT_FIELD_SEPARATORS] : [value];
+  }
+  if (Array.isArray(value)) {
+    const list = value.filter((item): item is string => typeof item === 'string' && item !== '');
+    return list.length === 0 ? [...DEFAULT_FIELD_SEPARATORS] : list;
+  }
+  return [...DEFAULT_FIELD_SEPARATORS];
+}
+
+/** 写回时用的那一个分隔符（数组取首个；字符串原样） */
+export function writeFieldSeparator(value: string | readonly string[] | undefined): string {
+  const list = resolveFieldSeparatorList(value);
+  return list[0] ?? ': ';
+}
+
 
 export function suggestSimilarKey(unknown: string, allowed: readonly string[]): string | null {
   // 局部实现，避免 format 层反向依赖 rules 层（unknown-keys 在 rules 下，
@@ -315,7 +367,12 @@ export function parseWorldbookPreset(input: unknown): WorldbookPresetParseResult
   // 标签映射：键必须在已知字段内，值不能为空、不能含换行/分隔符
   const labelMap: Record<string, string> = {};
   const rawLabelMap = rawFormat['labelMap'];
-  const fieldSeparator = typeof rawFormat['fieldSeparator'] === 'string' ? rawFormat['fieldSeparator'] : DEFAULT_WORLDBOOK_FORMAT.fieldSeparator;
+  /*
+   * 分隔符先规范化成数组（2026-11-17）：字符串 = 单元素数组。
+   * 两处消费：`labelMap` 的"标签里不许含分隔符"检查（要用全部），
+   * 以及写回时的首元素（`writeFieldSeparator`）。
+   */
+  const separatorList: string[] = resolveFieldSeparatorList(rawFormat['fieldSeparator']);
   if (rawLabelMap !== undefined) {
     if (!isObject(rawLabelMap)) {
       errors.push('format.labelMap 必须是对象（字段键 → 标签文字）');
@@ -334,8 +391,9 @@ export function parseWorldbookPreset(input: unknown): WorldbookPresetParseResult
           errors.push(`format.labelMap.${field} 不能含换行`);
           continue;
         }
-        if (fieldSeparator !== '' && label.includes(fieldSeparator.trim())) {
-          errors.push(`format.labelMap.${field} 含字段分隔符 "${fieldSeparator.trim()}"，解析会错位`);
+        const hitSeparator = separatorList.map((s) => s.trim()).find((s) => s !== '' && label.includes(s));
+        if (hitSeparator !== undefined) {
+          errors.push(`format.labelMap.${field} 含字段分隔符 "${hitSeparator}"，解析会错位`);
           continue;
         }
         const owner = seenLabels.get(label);
@@ -350,8 +408,28 @@ export function parseWorldbookPreset(input: unknown): WorldbookPresetParseResult
   }
 
   const rawFieldSeparator = rawFormat['fieldSeparator'];
-  if (rawFieldSeparator !== undefined && (typeof rawFieldSeparator !== 'string' || rawFieldSeparator.trim() === '')) {
-    errors.push('format.fieldSeparator 必须含冒号或其它可见字符（否则字段名与值无法切分）');
+  /*
+   * 2026-11-17：允许字符串**或**非空字符串数组，与 `listSeparator` 同构。
+   *
+   * 为什么必须支持数组：用户的世界书正文中英混排 —— `关键词：` 用全角、
+   * `constant: false` 用半角。只能给一个时另一批行被整行丢弃（`constant` /
+   * `enabled` / `selective` / `comment` / `priority` 全丢），而表现是
+   * "条目名变成『第 1 条』"+"凭空多出十几个语义错误"，很难归因到预设。
+   */
+  if (rawFieldSeparator !== undefined) {
+    if (typeof rawFieldSeparator === 'string') {
+      if (rawFieldSeparator.trim() === '') {
+        errors.push('format.fieldSeparator 必须含冒号或其它可见字符（否则字段名与值无法切分）');
+      }
+    } else if (Array.isArray(rawFieldSeparator)) {
+      if (rawFieldSeparator.length === 0) {
+        errors.push('format.fieldSeparator 数组不能为空；想用默认值就整个字段省略');
+      } else if (rawFieldSeparator.some((item: unknown) => typeof item !== 'string' || item.trim() === '')) {
+        errors.push('format.fieldSeparator 数组的每一项都必须是非空字符串');
+      }
+    } else {
+      errors.push('format.fieldSeparator 必须是字符串或非空字符串数组');
+    }
   }
   const listSeparator = rawFormat['listSeparator'];
   /*
@@ -390,7 +468,10 @@ export function parseWorldbookPreset(input: unknown): WorldbookPresetParseResult
       entryClose,
       fieldOrder,
       labelMap,
-      fieldSeparator: typeof rawFieldSeparator === 'string' ? rawFieldSeparator : DEFAULT_WORLDBOOK_FORMAT.fieldSeparator,
+      fieldSeparator:
+        typeof rawFieldSeparator === 'string' || Array.isArray(rawFieldSeparator)
+          ? (rawFieldSeparator as string | string[])
+          : (DEFAULT_WORLDBOOK_FORMAT.fieldSeparator as string),
       listSeparator: typeof listSeparator === 'string' ? listSeparator : DEFAULT_WORLDBOOK_FORMAT.listSeparator,
       entrySeparator: typeof entrySeparator === 'string' ? entrySeparator : DEFAULT_WORLDBOOK_FORMAT.entrySeparator,
     },
