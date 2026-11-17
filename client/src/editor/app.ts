@@ -2362,7 +2362,32 @@ class EditorApp {
     return block === 'initial-scene' ? this.greetingPreset : this.chatExamplePreset;
   }
 
-  /** 导入字段板块预设：原子回退 / 同 id 覆盖 / 不自动切换 全部在 preset-library 里 */
+  /**
+   * 导入字段板块预设：原子回退 / 同 id 覆盖 在 preset-library 里；
+   * **「导入即启用」在这一层补**（2026-11-17，用户报「导入还是不对」）。
+   *
+   * ## 为什么必须显式启用（这不是体验问题，是 bug）
+   *
+   * 激活项是**对象引用**（`this.greetingPreset` / `this.chatExamplePreset`），
+   * 而 `importFieldPreset` 返回的是**新数组、新对象**：
+   *
+   * ```text
+   *   导入前  greetingPresets = [old]      greetingPreset → old
+   *   导入后  greetingPresets = [new]      greetingPreset → old   ← 还指着旧对象！
+   *   `effectiveGreetingFormat` 读 greetingPreset ⇒ 格式一个字都没变
+   * ```
+   *
+   * 所以"改了预设文件、重新导入"这个最常见的动作，**效果是零**，
+   * 而界面只说「导入成功」—— 用户完全不知道还要去下拉里点一下。
+   * 真机取证（2026-11-17）：段标题仍是 `@@开场白`、说话人仍是 `{{user}}:`，
+   * 与本轮修好的预设内容完全不符，就是这个原因。
+   *
+   * ## 为什么新 id 也一起启用
+   *
+   * 导入一份预设的唯一合理意图就是"用它"；想留作备选的情况极罕见，
+   * 而那种情况下下拉里还留着、切回成本很低。反过来，"导入成功却不生效"
+   * 会让用户去怀疑代码坏了 —— 这次的排查就这么发生了一次。
+   */
   private importFieldPresetText(block: FieldPresetBlock, text: string): PresetImportOutcome<FieldPreset[]> {
     const outcome = importFieldPreset(this.fieldPresetsOf(block), text, block);
     if (!outcome.ok) return outcome;
@@ -2378,6 +2403,13 @@ class EditorApp {
     } else {
       void this.rememberPreset('chat-examples', outcome.name ?? '对话示例预设', text, outcome.id);
     }
+    /*
+     * 导入即启用。`selectFieldPreset` 已经包含全部后续动作：
+     * 重指对象 → 按新格式重算未编辑板块的视图 → 重检 → 记下选择 → 状态栏说明。
+     * 自己再写一遍必然漏一项（这正是 2026-11-17 之前的状况：只更新了数组，
+     * 没重指对象，也没重算视图）。
+     */
+    if (outcome.id !== null) this.selectFieldPreset(block, outcome.id);
     return outcome;
   }
 
@@ -2396,7 +2428,15 @@ class EditorApp {
 
     if (this.hasSession) {
       const before = this.card;
-      const refreshed = refreshFieldBlockViews(this.card, this.greetingFormat().format);
+      /*
+       * 两个格式都要给（2026-11-17）。只给 greeting 时，切换「对话示例预设」
+       * 对板块文本毫无影响 —— 而这条路径正是"选了下拉但没反应"的来源。
+       */
+      const refreshed = refreshFieldBlockViews(
+        this.card,
+        this.greetingFormat().format,
+        this.chatExamplesFormat(),
+      );
       if (refreshed !== before) {
         // 视图变了就整体重挂一次——板块文本是会话状态的一部分，
         // 只改 DOM 不同步会话，下一次校验读到的还是旧文本。
@@ -4996,6 +5036,15 @@ class EditorApp {
     const result = normalizeOnArrival(card, {
       worldbook: this.worldbookPreset.format,
       greeting: this.greetingFormat().format,
+      /*
+       * ★ 对话示例的说话人写法必须一起给（2026-11-17）。
+       *
+       * 少了这一项，`refreshFieldBlockViews` 会拿初始场景的格式去重算
+       * 「对话示例」板块 —— 那套格式没有 `user`/`char` 映射，于是
+       * `renderChatExamples` 原样返回，**把导入时刚渲染好的 `用户：`
+       * 刷回 `{{user}}:`**。导入那一步永远看起来是对的，所以极难归因。
+       */
+      chatExamples: this.chatExamplesFormat(),
     });
 
     /*

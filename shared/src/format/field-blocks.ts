@@ -239,14 +239,40 @@ export function applyFieldBlockReflection(
  *
  * `dirty` 的板块**不刷新**：那是用户正在编辑的内容，重新渲染会覆盖掉它。
  */
+/**
+ * 按格式重算**未编辑**字段板块的视图（`dirty === true` 的一律不动）。
+ *
+ * ## 两个格式参数，不能合一（2026-11-17 修）
+ *
+ * ```text
+ *   format              初始场景：段标题 / 多条开场白分隔 / 标签行
+ *   chatExamplesFormat  对话示例：说话人写法（用户：/角色：）
+ * ```
+ *
+ * 原来这里只有 `format` 一个参数，于是 `chat-examples` 板块被按**初始场景
+ * 的格式**重算 —— 而那个格式的 `labelMap` 里没有 `user`/`char`，
+ * `renderChatExamples` 拿到 `undefined` 就**原样返回**（它的约定是
+ * "不给就一个字都不转"）。
+ *
+ * 后果不是崩溃，而是**转换被悄悄撤销**：
+ *
+ * ```text
+ *   parseStCard 用 chatExamplesFormat 渲染出「用户：」   ← 对
+ *   normalizeOnArrival → 本函数（只传 greeting）        ← 刷回「{{user}}:」
+ *   ⇒ 用户导入卡看到的是未转换的原文
+ * ```
+ *
+ * 这类"前一步做对了、后一步冲掉"的缺陷最难查：单看导入那一层永远是对的。
+ */
 export function refreshFieldBlockViews(
   card: UnifiedCard,
   format: GreetingFormatParams = DEFAULT_GREETING_FORMAT,
+  chatExamplesFormat?: GreetingFormatParams,
 ): UnifiedCard {
   let changed = false;
   const blocks = card.blocks.map((block) => {
     if (!isFieldBlock(block.id) || block.dirty) return block;
-    const text = fieldBlockTextFrom(card.residual, block.id, format);
+    const text = fieldBlockTextFrom(card.residual, block.id, format, chatExamplesFormat);
     if (text === block.text) return block;
     changed = true;
     // 只更新视图（text），**不动 raw**：raw 是"导入时的原文"，与 description.raw 同性质，

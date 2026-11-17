@@ -59,6 +59,19 @@ import { parseWorldbookTextWith, renderWorldbookTextWith } from './worldbook.js'
 export interface ArrivalFormats {
   worldbook: WorldbookFormatParams;
   greeting: GreetingFormatParams;
+  /**
+   * 「对话示例」的说话人写法（2026-11-17 补）。
+   *
+   * **不传 = 不转换对话示例的说话人**（保持 `mes_example` 原文）。
+   * 这与 `renderChatExamples` 的约定一致：没有 `labelMap.user/char`
+   * 就一个字符都不改。
+   *
+   * 为什么必须在这里：到达流程会调 `refreshFieldBlockViews` 重算未编辑
+   * 板块的视图。少了这个参数，对话示例会被按初始场景格式重算 ——
+   * 那套格式里没有 `user`/`char`，于是**刚渲染好的 `用户：` 被刷回
+   * `{{user}}:`**，而导入那一层看起来完全正确。
+   */
+  chatExamples?: GreetingFormatParams;
 }
 
 export interface ArrivalFailure {
@@ -179,7 +192,7 @@ export function normalizeOnArrival(
   const beforeFieldTexts = new Map(
     next.blocks.filter((block) => isFieldBlock(block.id)).map((block) => [block.id, block.text]),
   );
-  next = refreshFieldBlockViews(next, active.greeting);
+  next = refreshFieldBlockViews(next, active.greeting, active.chatExamples);
   for (const block of next.blocks) {
     if (!isFieldBlock(block.id)) continue;
     const before = beforeFieldTexts.get(block.id) ?? '';
@@ -242,8 +255,12 @@ function describeFormat(format: WorldbookFormatParams): string {
  * 与 `refreshFieldBlockViews` 是**同一实现**：这里只是把"当前格式"固定成参数，
  * 免得调用方（三条到达路径）各传一次、某一条忘了传就退回默认。
  */
-export function normalizeGreetings(card: UnifiedCard, greeting: GreetingFormatParams): UnifiedCard {
-  return refreshFieldBlockViews(card, greeting);
+export function normalizeGreetings(
+  card: UnifiedCard,
+  greeting: GreetingFormatParams,
+  chatExamples?: GreetingFormatParams,
+): UnifiedCard {
+  return refreshFieldBlockViews(card, greeting, chatExamples);
 }
 
 /** 供测试与诊断：某张卡在当前预设下"渲染出来的世界书文本" */
