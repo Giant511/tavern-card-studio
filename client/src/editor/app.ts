@@ -45,6 +45,7 @@ import {
 import {
   appendClientErrorLog,
   configGet,
+  askConfirm,
   configPatch,
   findStCandidates,
   isShellAvailable,
@@ -101,6 +102,19 @@ import {
   describePresets,
   previewPresetSelection,
 } from '../rules/preset-switch';
+/*
+ * ★ 这一行是**副作用注册**，不能删（2026-11-17）。
+ *
+ * 它把 `server_http_request` 注册成 HTTP 传输层，从而让同步请求在
+ * 桌面端走原生命令 —— 那是**唯一**能处理自签证书的通道（webview 的
+ * 证书校验无法配置）。删了不会白屏，而是在第一次探测/同步时抛错：
+ * "桌面端没有注册原生 HTTP 通道"。
+ *
+ * 为什么不做成"自动发现"：纯层不能 import 契约层（Node 单测会挂，
+ * 见 `net/http-transport.ts` 文件头），只能由入口显式带进来。
+ */
+import '../net/http-native';
+import { isOriginCertAcked, withCertAckedOrigin } from '../net/http-transport';
 import { isSyncReady, probeServer, type ProbeResult } from '../net/server-probe';
 import { ExportDialog } from '../export/export-dialog';
 import { buildExportAsync, checkWorldbookExportSafety } from '../export/export-card';
@@ -278,6 +292,14 @@ class EditorApp {
   // 多标签下"当前是哪张卡"由 activeId 决定，app.ts 再留一份必然串卡。
   /** 设置里保存的 token（同步请求要用；probeServer 的 url 不含 token） */
   private settingsToken = '';
+  /**
+   * 用户已确认「证书不受信任但继续」的 origin（2026-11-17）。
+   *
+   * 从配置读一次、确认后写回。**按 origin 存**而不是按地址存 ——
+   * 证书是按主机签发的，同一台机器的 /api/health 与 /api/stats 是
+   * 两个 URL 但同一个 origin（见 `ClientConfig.certAckedOrigins`）。
+   */
+  private certAckedOrigins: string[] = [];
   /**
    * 上次导出 PNG 用的卡面（v0.1.4 / T12.5）。
    *
@@ -802,6 +824,79 @@ class EditorApp {
         }
       }
       await this.accountDeleteDialog?.open();
+    }
+  }
+
+  /**
+   * 证书不受信任时的确认流程（2026-11-17，修 memory §105 的核心）。
+   *
+   * ## 为什么要问、而且只问一次
+   *
+   * 自签证书意味着"无法确认对面是谁"—— 中间人可以冒充它看到账号与令牌。
+   * 所以不能静默跳过校验，必须让用户知道风险。
+   *
+   * 但**每次都问**的结果是三秒后开始无脑点确认（memory §106 的结论），
+   * 那等于没有提示。所以按 origin 记住，下次不再问。
+   *
+   * ## 为什么确认后要立刻重新探测
+   *
+   * 不重探的话界面还停在"连不上"，用户会以为确认没生效 —— 而它其实
+   * 已经生效了，只是没人再去试一次。
+   *
+   * ## 为什么用 `certAsking` 挡一下
+   *
+   * `autoProbe` 会在启动、设置保存、登录后各跑一次。用户还没点确认时
+   * 又跑一次探测就会**再弹一个框**，两个框叠在一起（点掉一个还有一个，
+   * 而两个都在问同一件事）。用状态位挡住，等这一次有结论再说。
+   */
+  private certAsking = false;
+
+  private async offerCertTrust(serverUrl: string): Promise<void> {
+    if (this.certAsking) return;
+    /* 已经确认过的 origin 不再问（autoProbe 会带 allowInvalidCert 直接成功） */
+    if (isOriginCertAcked(this.certAckedOrigins, serverUrl)) return;
+
+    this.certAsking = true;
+    try {
+      const origin = serverUrl.trim();
+      const proceed = await askConfirm(
+        `这个服务器的证书没通过系统校验（多半是自签证书）。\n\n` +
+          `这意味着无法确认对面真的是这台服务器 —— 中间的任何人都有可能冒充它，` +
+          `看到你的账号、令牌和卡片内容。\n\n` +
+          `目标：${origin}\n\n` +
+          `如果这是你自己部署的服务，可以继续；继续后不会再问这个地址。`,
+        '这个服务器的证书不受信任',
+      );
+      if (!proceed) {
+        this.setStatus('已取消：证书不受信任，同步保持不可用（本地功能不受影响）', 'warn');
+        return;
+      }
+
+      this.certAckedOrigins = withCertAckedOrigin(this.certAckedOrigins, serverUrl);
+      /*
+       * 落盘失败也要继续重试 —— 用户已经点了确认，这一次能连上；
+       * 只是下次启动会再问一遍。静默失败而不重试才是更糟的选择
+       * （他会觉得"点了确认还是连不上"）。
+       */
+      try {
+        await configPatch({ certAckedOrigins: this.certAckedOrigins });
+      } catch {
+        this.setStatus('已确认证书风险（本次有效，但没能存进配置，下次启动会再问一次）', 'warn');
+      }
+
+      const accountToken = this.authSession?.accessToken ?? '';
+      const result = await probeServer({
+        serverUrl,
+        token: accountToken !== '' ? accountToken : this.settingsToken,
+        allowInvalidCert: true,
+      });
+      this.applyConnection(result);
+      this.setStatus(
+        result.reachable ? '已连上（证书未经系统校验，已按你的确认继续）' : `仍然连不上：${result.message}`,
+        result.reachable ? 'ok' : 'warn',
+      );
+    } finally {
+      this.certAsking = false;
     }
   }
 
@@ -1607,7 +1702,18 @@ class EditorApp {
     const token = accountToken !== '' ? accountToken : legacyToken;
     const serverUrl = this.connection?.url ?? this.authServerUrl;
     if (!hasServerUrl(serverUrl) || token === '') return null;
-    return { serverUrl, token };
+    /*
+     * 用户已确认过这个 origin 的证书风险吗（2026-11-17）。
+     *
+     * 只有桌面端用得上（webview 的 fetch 无法配置证书校验）。
+     * 注意这里是**每次现算**而不是缓存一个布尔：用户在设置里确认完
+     * 立刻就要生效，缓存会让"确认了还是传不上去"。
+     */
+    return {
+      serverUrl,
+      token,
+      ...(isOriginCertAcked(this.certAckedOrigins, serverUrl) ? { allowInvalidCert: true } : {}),
+    };
   }
 
   /** 当前是否持有可用凭证（账户令牌或 legacy 全局令牌） */
@@ -1620,7 +1726,18 @@ class EditorApp {
    * 探测结果不参与判定 —— 否则"刚打开客户端、探测还没回来"会让面板说"未连接"。
    */
   private syncGate(): SyncGateState {
-    return resolveSyncGate(this.connection?.url ?? this.authServerUrl, this.hasCredentials());
+    /*
+     * 第三个参数是探测结果（2026-11-17）。
+     *
+     * memory §105 缺陷 ②：原来这里只传"地址 + 凭证"，于是探测红字
+     * ✗ 无法连接 与顶栏绿字 ✓ 同步已就绪 同时出现 —— 两句互斥的话同屏。
+     * 探测**明确失败**时必须说那件事。
+     */
+    return resolveSyncGate(
+      this.connection?.url ?? this.authServerUrl,
+      this.hasCredentials(),
+      this.connection,
+    );
   }
 
   /**
@@ -2506,7 +2623,23 @@ class EditorApp {
   // 因此这里做三件事：① 顶栏状态胶囊；② 同步条按钮启用/禁用；③ 最多一次自动探测。
   private wireSettings(): void {
     this.settings = new SettingsDialog({
-      onConnectionChange: (result) => this.applyConnection(result),
+      /*
+       * 设置面板测出"证书不受信任"时，由**外壳**统一问（2026-11-17）。
+       *
+       * 面板自己不弹框：它的 `test()` 会被「连接本机服务端」与端到端脚本
+       * 反复调用，两处各弹一个就会叠在一起问同一件事。确认入口只能有一个。
+       */
+      onConnectionChange: (result) => {
+        this.applyConnection(result);
+        if (result?.certUntrusted === true) {
+          /*
+           * `result.url` 在失败时是**归一化后的那个**（见 `failure()` 里
+           * 传了 `url: base`），所以能直接用来取 origin。
+           * 理论上不会为空；真为空就退回当前配置的地址。
+           */
+          void this.offerCertTrust(result.url ?? this.authServerUrl);
+        }
+      },
       // T10.26：诊断导出由 app 实现（它知道版本、连接状态、会话摘要与日志路径）
       onExportDiagnostics: () => this.exportDiagnostics(),
       onSaved: () => {
@@ -2763,6 +2896,8 @@ class EditorApp {
       this.authServerUrl = config.serverUrl;
       serverUrl = config.serverUrl;
       legacyToken = config.token;
+      /* 用户以前确认过的证书风险（2026-11-17）；旧配置没有这个键 → 空表 */
+      this.certAckedOrigins = Array.isArray(config.certAckedOrigins) ? config.certAckedOrigins : [];
     } catch {
       // 浏览器模式（无 C5 能力）读不到配置：回落到 ?serverUrl= 调试参数。
       // 这不是给正式用户用的入口 —— 壳里永远能读到配置，走不到这里。
@@ -2776,8 +2911,11 @@ class EditorApp {
       const result = await probeServer({
         serverUrl,
         token: accountToken !== '' ? accountToken : legacyToken,
+        ...(isOriginCertAcked(this.certAckedOrigins, serverUrl) ? { allowInvalidCert: true } : {}),
       });
       this.applyConnection(result);
+      /* 证书不受信任 → 问一次；确认后记住 origin 并重试（见方法注释） */
+      if (result.certUntrusted) void this.offerCertTrust(serverUrl);
     } catch {
       // 探测失败：保持"未连接"，不影响本地功能
     }

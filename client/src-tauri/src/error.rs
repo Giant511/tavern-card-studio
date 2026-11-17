@@ -162,6 +162,31 @@ pub enum ShellError {
 
     #[error("{detail}")]
     StBadResponse { detail: String },
+
+    /// 通用 HTTP 请求失败（2026-11-17，修「自签证书被拒」）。
+    ///
+    /// ## 为什么不让前端解析文案
+    ///
+    /// 证书失败在 Windows 上走 schannel，底层是**系统错误消息**，中文系统
+    /// 上是中文、英文系统上是英文 —— 按字符串匹配"certificate"必然漏判。
+    /// 所以判定放在 Rust（见 `server_http.rs` 的两段探测），把结论用
+    /// `kind` 交出去，前端只按 kind 分支：
+    ///
+    /// ```text
+    ///   cert    —— 证书不受信任（跳过校验重试能成功，已经证实）
+    ///   connect —— 连不上（拒连 / DNS / 端口未开）
+    ///   timeout —— 超时
+    ///   other   —— 其它（协议错误、构造请求失败…）
+    /// ```
+    ///
+    /// `insecure_would_work` 只有 `kind=cert` 时才可能为 true，
+    /// 它表示"用户确认风险后确实能连上"—— UI 据此决定是否给出那个出口。
+    #[error("{message}")]
+    NetRequestFailed {
+        kind: String,
+        message: String,
+        insecure_would_work: bool,
+    },
 }
 
 impl ShellError {
@@ -189,6 +214,7 @@ impl ShellError {
             Self::UpstreamRejected { .. } => "UPSTREAM_REJECTED",
             Self::StHttpStatus { .. } => "ST_HTTP_STATUS",
             Self::StBadResponse { .. } => "ST_BAD_RESPONSE",
+            Self::NetRequestFailed { .. } => "NET_REQUEST_FAILED",
         }
     }
 
@@ -265,6 +291,14 @@ impl ShellError {
             Self::StHttpStatus { path, status, .. } => {
                 map.insert("path".to_string(), path.clone().into());
                 map.insert("status".to_string(), (*status).into());
+            }
+            Self::NetRequestFailed {
+                kind,
+                insecure_would_work,
+                ..
+            } => {
+                map.insert("kind".to_string(), kind.clone().into());
+                map.insert("insecureWouldWork".to_string(), (*insecure_would_work).into());
             }
             Self::StBadResponse { .. } => {}
             /*

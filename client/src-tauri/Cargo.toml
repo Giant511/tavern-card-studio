@@ -67,6 +67,29 @@ http-body-util = "0.1"
 # 所以仓库的 HTTPS 走 **Android 原生 HttpURLConnection**（见 StBridge.httpRequest）：
 # 用系统证书链，比自带一份 TLS 栈更正确，也不用编译 C。
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "stream"] }
+
+# ── 桌面端需要 TLS（2026-11-17，修「自签证书被拒」）──────────────
+#
+# ## 为什么必须按目标分流，而不是直接给上面那行加 `native-tls`
+#
+# 同一份 Cargo.toml 也要编 Android（`tauri android build`）。而
+# `native-tls` 在 **Android 上会去找 OpenSSL**（交叉编译环境里没有），
+# 直接让 APK 打不出来 —— 与 `rustls-tls` 因 `ring` 需要 clang 而失败
+# 是同一类问题（上面那段注释记着那次撤退）。
+#
+# 在 **Windows 上 `native-tls` 映射到 `schannel`**：纯 Rust 绑定系统
+# TLS API，不编译任何 C 代码，而且证书链判断交给系统 —— 这正是我们要的
+# 语义（"系统信不信这个证书"就是用户装证书后应该生效的东西）。
+#
+# 所以只在**非 Android** 目标上加这个 feature。Cargo 会按目标合并
+# feature，Android 构建完全看不到 native-tls。
+#
+# ## 为什么现在才需要
+#
+# 同步服务端可能跑在 https 上，而自签证书会被系统拒绝。webview 里
+# 的 fetch 无法配置证书校验，只能把这条请求搬到 Rust（见 server_http.rs）。
+[target.'cfg(not(target_os = "android"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "stream", "native-tls"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "rt-multi-thread", "macros"] }

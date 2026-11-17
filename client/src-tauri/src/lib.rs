@@ -8,6 +8,14 @@ mod error;
 mod paths;
 mod pick_file;
 mod proxy;
+/*
+ * `pub` 而不是 `mod`：`.verify` 侧的 `examples/cert-probe.rs` 要直接调它
+ * 做**真实自签证书**的判决验证（`cargo test` 在本仓库跑不起来 ——
+ * release profile 有 panic="abort"，而 test harness 需要 unwind，
+ * 上游 proc-macro crate 会直接编译失败，与本模块无关）。
+ * 这个 lib 没有任何外部使用者，放开可见性没有扩散面。
+ */
+pub mod server_http;
 mod st_api;
 mod st_chat;
 
@@ -139,7 +147,20 @@ pub fn run() {
             st_chat::st_chat_preset_save,
             st_chat::st_chat_count_tokens,
             pick_file::pick_json_file,
-            st_chat::st_chat_abort
+            st_chat::st_chat_abort,
+            /*
+             * 服务端同步的 HTTP 通道（2026-11-17，修「自签证书被拒」）。
+             *
+             * 为什么需要一条原生命令：webview 里的 fetch 用系统的证书链、
+             * 且**无法配置** —— 自签证书一律拒绝，也没有"只对这个 origin
+             * 放行"的开关。搬到 Rust 才能让用户在确认风险后连上去。
+             *
+             * Android 端不用它（那边走 `StBridge.httpRequest`）：TLS 只在
+             * 非 Android 目标上启用（见 Cargo.toml 的目标分段），所以在
+             * Android 上调 https 会得到一条诚实的"没有 TLS 后端"错误，
+             * 而不是静默降级。
+             */
+            server_http::server_http_request
         ])
         .build(tauri::generate_context!())
         .expect("启动 Tauri 应用失败：请检查 tauri.conf.json 与 icons")

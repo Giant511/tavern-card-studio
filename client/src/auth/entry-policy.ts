@@ -42,7 +42,15 @@ export type AccountEntryState = 'no-server' | 'anonymous' | 'authenticated';
  * 不是"你不能进这个面板"。面板进去后能看到具体错误，比在门外弹一句
  * 「同步未就绪」有用得多 —— 后者正是本次要修的症状。
  */
-export type SyncGateState = 'no-server' | 'need-login' | 'ready';
+/**
+ * 同步门槛状态。
+ *
+ * `unreachable` 是 2026-11-17 加的，补的是 memory §105 缺陷 ②：
+ * 原来这张表只看"有没有地址 + 有没有凭证"，于是探测显示红色
+ * ✗ 无法连接 的同时右边写着 ✓ 同步已就绪 —— 两句互斥的话同屏，
+ * 用户不知道该信哪个。
+ */
+export type SyncGateState = 'no-server' | 'need-login' | 'ready' | 'unreachable';
 
 /** 地址是否已配置（只管"有没有"，不管"通不通"） */
 export function hasServerUrl(serverUrl: string | null | undefined): boolean {
@@ -101,8 +109,26 @@ export function canOpenAccount(entry: AccountEntryState): boolean {
 export function resolveSyncGate(
   serverUrl: string | null | undefined,
   hasCredentials: boolean,
+  /**
+   * 最近一次探测结果。不传 / 传 null = **还没探测过**，此时不参与判定。
+   *
+   * ★ `null` 与"探测失败"必须分开：
+   * ```text
+   *   null（没探测过）      → 按凭证判（否则刚打开客户端那几百毫秒里
+   *                          面板会说"连不上"，而其实只是还没测）
+   *   { reachable: false }  → unreachable（这次是真的测过、真的不通）
+   * ```
+   * 这就是 2026-11-02 那条"探测结果不参与判定"的注释要保留一半的原因：
+   * 它当时防的是 `null` 被当成失败，而不是"测过失败也不许说"。
+   */
+  probe?: { reachable: boolean } | null,
 ): SyncGateState {
   if (!hasServerUrl(serverUrl)) return 'no-server';
+  /*
+   * 探测**明确失败**时优先说这件事 —— 它比"有没有凭证"更接近用户
+   * 此刻的处境：凭证填对了也传不上去。
+   */
+  if (probe !== null && probe !== undefined && probe.reachable === false) return 'unreachable';
   return hasCredentials ? 'ready' : 'need-login';
 }
 
@@ -140,6 +166,13 @@ export function syncGateMessage(state: SyncGateState): string {
     case 'need-login':
       // 需求原话：未登录时显示「登录后可同步」，而不是"未连接"
       return '登录后可同步。';
+    case 'unreachable':
+      /*
+       * 这句话必须**指向具体动作**。原来说"同步已就绪"会把用户带偏
+       * （memory §105 缺陷 ②：红字说连不上、绿字说已就绪，同屏互斥）。
+       * 具体原因由探测结果那一行自己说（它带地址与耗时）。
+       */
+      return '连不上服务端，同步暂时用不了（编辑 / 审计 / 导出不受影响）。';
     default:
       return '';
   }
@@ -164,5 +197,13 @@ export function syncHintText(
     };
   }
   if (gate === 'need-login') return { text: '登录后可同步（编辑 / 审计 / 导出不受影响）', tone: 'warn' };
+  if (gate === 'unreachable') {
+    /*
+     * ★ 这里**不再说"已就绪"**。原状是顶栏写着"同步已就绪"、
+     *   设置面板的红字写着"无法连接"—— 用户不知道该信哪句
+     *   （memory §105 缺陷 ②）。
+     */
+    return { text: '连不上服务端（同步暂不可用，本地功能不受影响）', tone: 'warn' };
+  }
   return { text: '填好服务端地址后即可登录并同步（本地功能不受影响）', tone: 'warn' };
 }
