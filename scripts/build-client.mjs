@@ -232,6 +232,18 @@ const SHELL_STRINGS = [
   'x-frame-options',        // 剥 XFO：面板 iframe 才显示得出来
   'frame-ancestors',        // 剥 CSP 的那条指令
   'SameSite=None',          // 会话 cookie 跨站可发：否则卡在「正在初始化…」
+  /*
+   * 自签证书修复（2026-11-17）。这三条是**壳侧**的，都在 Rust 里，
+   * 所以不会被 minify 改名，能在出厂件里搜到 —— 与 §150 那条
+   * 「dist 被 brotli 压过、中文搜不到」不矛盾：这里搜的是 ASCII 命令名
+   * 与序列化字段名，不是前端文案。
+   *
+   * ★ 为什么不拿 `certAckedOrigins` 当判据：它是纯前端变量，
+   *   压缩后名字被改掉（实测出厂件里 0 命中），加了只会造成假红。
+   */
+  'server_http_request',    // 命令名：壳必须注册了这条才能走原生通道
+  'insecureWouldWork',      // 错误详情字段：两段探测的定性结果
+  'NET_REQUEST_FAILED',     // 稳定错误码：界面据此把"证书"与"连不上"分开
 ];
 const shipped = auditMsiShellAssets(bundleMsi, DIST, { strings: SHELL_STRINGS });
 if (shipped.skipped) die(`无法审计出厂件：${shipped.reason}`);
