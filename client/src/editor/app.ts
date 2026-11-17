@@ -200,6 +200,7 @@ import { isPngBytes, parsePngCard } from '../../../shared/src/png-card.ts';
 import { convertToPng } from '../export/face-convert.ts';
 import { TabBar, type TabItem } from '../session/tab-bar';
 import { generateCardId, readCardIdFromCard, withCardId } from '../session/card-id';
+import { decideOpenTarget } from '../session/open-target';
 import { collectDirtyNames, installUnloadGuard } from '../session/unload-guard';
 
 import sampleCardJson from '../../../test/fixtures/sample-card.json';
@@ -4686,14 +4687,10 @@ class EditorApp {
       // JSON 悄悄当成纯文本再解析一次，用户看到的是一份莫名其妙的板块缺失列表，
       // 而真正的原因（JSON 少了个逗号）被完全掩盖。
       //
-      // 零标签（v0.1.2 反馈项三）：**先建会话再导入**。以前这里直接
-      // `importCardTextFile` / `replaceCard`，两者都要求"当前有一张卡"，
-      // 于是零标签下点「打开…」选 TXT 只会得到一句"先打开或新建一张卡" ——
-      // 而用户想做的就是打开这一份。名字只能从文件名推导（见 open-name.ts）。
-      const created = this.hasSession ? null : this.createSessionFromFile(path);
-
+      // ★ TXT 走 `openTextCard`（2026-11-17）：它自己判"同名覆盖 / 异名新建"，
+      //   因为 TXT 的卡名只能从文件名推，判定必须在读文本之后、建会话之前做。
       if (/\.txt$/i.test(path)) {
-        await this.importCardTextFile(file.pathDisplay ?? path, file.text, created);
+        await this.openTextCard(file.pathDisplay ?? path, file.text, dir);
         return;
       }
 
@@ -4702,7 +4699,13 @@ class EditorApp {
         chatExamplesFormat: this.chatExamplesFormat(),
         worldbookFormat: this.worldbookPreset.format,
       });
-      this.replaceCard(parsed.card);
+      /*
+       * ★ 同名覆盖 / 异名新建（2026-11-17）。以前这里无条件 `replaceCard`，
+       *   于是"打开一张新卡"＝悄悄丢弃当前卡的内容。
+       */
+      const placed = await this.openArrivedCard(parsed.card, path);
+      // 用户在覆盖确认里选了取消：什么都不做（连 PNG 来源都不动）
+      if (placed.mode === 'cancelled') return;
       /*
        * 打开了 JSON 卡 ⇒ 这张卡的原图来源失效。
        *
@@ -4712,14 +4715,11 @@ class EditorApp {
       this.session.setPngSource(null);
       // 打开的文件不在 cardsDir 里时说一句：用户会以为"打开过的卡都在那个目录"
       const outside = dir !== '' && !path.toLowerCase().startsWith(dir.toLowerCase());
-      const opened = `已打开：${file.pathDisplay ?? '(非 UTF-8 路径)'}（${file.bytesLen} 字节）`;
       this.setStatus(
-        created === null
-          ? opened + (outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${dir}` : '')
-          : `已新建「${created}」并打开：${file.pathDisplay ?? '(非 UTF-8 路径)'}（${file.bytesLen} 字节）${
-              outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${dir}` : ''
-            }`,
-        outside ? 'warn' : created === null ? 'info' : 'ok',
+        `${placed.mode === 'created' ? `已新建「${placed.name}」并打开` : `已覆盖同名卡「${placed.name}」`}：` +
+          `${file.pathDisplay ?? '(非 UTF-8 路径)'}（${file.bytesLen} 字节）` +
+          (outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${dir}` : ''),
+        outside ? 'warn' : placed.mode === 'created' ? 'ok' : 'info',
       );
     } catch (error) {
       this.setStatus(`打开失败：${describe(error)}`, 'bad');
@@ -4774,11 +4774,15 @@ class EditorApp {
       chatExamplesFormat: this.chatExamplesFormat(),
       worldbookFormat: this.worldbookPreset.format,
     });
-    const created = this.hasSession ? null : this.createSessionFromFile(path);
-    this.replaceCard(parsed.card);
+    /* 同名覆盖 / 异名新建（2026-11-17）—— 与 JSON、TXT 同一条规则 */
+    const placed = await this.openArrivedCard(parsed.card, path);
+    if (placed.mode === 'cancelled') return;
     /*
      * 记住原图（D4）。注意存的是**完整字节**（含数据块）：导出时
      * `buildPngCard` 会剥掉旧块再写新卡，所以"复用原图"不会把旧内容留在图里。
+     *
+     * `openArrivedCard` 可能已经切到另一个标签，所以这里读的 `this.session`
+     * 是切过之后的那一个 —— 正是刚写入这张卡的那个，符合预期。
      */
     this.session.setPngSource(toPngSource(bytes, binary.pathDisplay, inspected.keyword));
     this.exportDialog?.refreshFaceChoices();
@@ -4787,10 +4791,9 @@ class EditorApp {
     const outside = cardsDir !== '' && !path.toLowerCase().startsWith(cardsDir.toLowerCase());
     const tail = outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${cardsDir}` : '';
     this.setStatus(
-      created === null
-        ? `已打开 PNG 卡：${display}（${spec} 数据块 · ${String(binary.bytesLen)} 字节）${tail}`
-        : `已新建「${created}」并打开 PNG 卡：${display}（${spec} · ${String(binary.bytesLen)} 字节）${tail}`,
-      outside ? 'warn' : 'ok',
+      `${placed.mode === 'created' ? `已新建「${placed.name}」并打开` : `已覆盖同名卡「${placed.name}」`} PNG 卡：` +
+        `${display}（${spec} 数据块 · ${String(binary.bytesLen)} 字节）${tail}`,
+      outside ? 'warn' : placed.mode === 'created' ? 'ok' : 'info',
     );
   }
 
@@ -4813,15 +4816,196 @@ class EditorApp {
   }
 
   /**
-   * **零标签自动建卡的唯一入口**（v0.1.3 追加项三）。
+   * 覆盖前的确认（只有在目标标签**有未保存修改**时才问）。
    *
-   * 两条路共用它，不各写一份：
-   *   · 「打开…」选了 TXT/JSON（`createSessionFromFile`）—— 名字从文件名推；
+   * ## 为什么要问
+   *
+   * 同名覆盖会整卡替换，`replaceCard` 会 markSaved 把脏标记清掉 ——
+   * 用户刚编辑的内容就此消失，而且**没有任何提示**。旧版"打开即替换"
+   * 本来就有这个洞，只是一直没人踩到（因为打开任何卡都会替换，用户学会了
+   * 先保存）。现在覆盖变成"同名才发生"，反倒是**意外触发**更可能 ——
+   * 用户以为在开新标签，结果撞上同名。
+   *
+   * ## 为什么不做"保存了再覆盖"
+   *
+   * 那不是用户此刻的意图（他想打开这个文件）。给两选：覆盖 / 取消。
+   * 想保留旧内容就取消、先另存，再打开。
+   */
+  private confirmOverwrite(targetName: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const overlay = el('div', 'modal-overlay');
+      const panel = el('div', 'modal confirm-close-modal');
+      const head = el('div', 'modal-head');
+      head.append(el('h2', 'modal-title', '要覆盖同名卡吗'));
+      const body = el('div', 'modal-body');
+      body.append(
+        el(
+          'p',
+          'confirm-text',
+          `已打开「${targetName}」这张卡，而它还有未保存到磁盘的修改。` +
+            '继续打开会用文件里的内容整张替换它，那些修改会丢失。',
+        ),
+      );
+      const foot = el('div', 'modal-foot');
+      const cancel = el('button', 'btn', '取消');
+      cancel.type = 'button';
+      const overwrite = el('button', 'btn primary', '覆盖');
+      overwrite.type = 'button';
+      foot.append(cancel, overwrite);
+      panel.append(head, body, foot);
+      overlay.append(panel);
+      document.body.append(overlay);
+
+      const finish = (value: boolean): void => {
+        overlay.remove();
+        resolve(value);
+      };
+      cancel.addEventListener('click', () => finish(false));
+      overwrite.addEventListener('click', () => finish(true));
+      // 与 confirmClose 同一条规矩：点遮罩不关闭，只有按钮或 Esc
+      document.addEventListener(
+        'keydown',
+        (event) => {
+          if (event.key === 'Escape' && overlay.isConnected) {
+            event.preventDefault();
+            finish(false);
+          }
+        },
+        { once: true },
+      );
+      cancel.focus();
+    });
+  }
+
+  /**
+   * 「打开」路径的**唯一落点**：同名覆盖，异名新建（2026-11-17）。
+   *
+   * ## 为什么需要
+   *
+   * 旧行为是"打开即 `replaceCard`"——把当前标签的内容整个换掉。用户原话：
+   *
+   * > 点打开选择一张新的卡的时候会自动替换当前的卡的内容，打开应该检查是否与
+   * > 已打开的卡名字相同，如果不同就创建新卡并导入，如果有相同的才覆盖替换
+   *
+   * 多标签编辑器的常识预期是"打开＝新开一个"，覆盖只是同名时的特例。
+   * 判定逻辑在 `session/open-target.ts`（纯函数，有判据）；这里只负责执行。
+   *
+   * ## 覆盖时的两个动作
+   *
+   * ```text
+   * ① 同名的那张不在当前标签 → 先 activateSession 切过去
+   *    不切的话表现为"我点了打开，界面完全没变"（改的是看不见的另一个标签）
+   * ② replaceCard —— 它内含到达规范化 + markSaved + 重挂界面 + 重检
+   * ```
+   *
+   * ## 新建时不沿用旧会话的 cardId
+   *
+   * 卡里带 `cardId`（同一个角色卡的多个副本）就沿用它 —— 那是卡的身份，
+   * 换掉会让服务端历史分叉；卡里没有才按名字生成。
+   *
+   * @param fallbackName 卡里没有名字时用它兜底（通常是文件路径）
+   */
+  private async openArrivedCard(
+    card: UnifiedCard,
+    fallbackName: string,
+  ): Promise<{ mode: 'replaced' | 'created' | 'cancelled'; name: string }> {
+    const incomingName = (card.meta.name ?? '').trim();
+    const target = decideOpenTarget({
+      incomingName,
+      openSessions: this.sessions.map((item) => ({ id: item.id, name: item.card.meta.name })),
+      activeId: this.hasSession ? this.activeId : null,
+    });
+
+    if (target.kind === 'replace') {
+      /*
+       * 目标标签有未保存修改 → 先问（只有这条路径会静默丢内容，
+       * TXT 那条有导入对话框兜底，不必二次确认）。
+       */
+      const victim = this.sessions.find((item) => item.id === target.sessionId);
+      if (victim !== undefined && victim.dirty && !(await this.confirmOverwrite(target.name))) {
+        return { mode: 'cancelled', name: target.name };
+      }
+      if (target.sessionId !== this.activeId) this.activateSession(target.sessionId);
+      this.replaceCard(card);
+      return { mode: 'replaced', name: target.name };
+    }
+
+    /*
+     * 新建。名字优先用卡里的；没有就从文件名推，并**去重**——
+     * 两个同名标签会让"覆盖哪一个"变得无法预期。
+     */
+    const name =
+      incomingName !== ''
+        ? incomingName
+        : deriveCardNameFromFile(fallbackName, this.sessions.map((item) => item.card.meta.name));
+    const named = incomingName !== '' ? card : { ...card, meta: { ...card.meta, name } };
+    const created = this.createSessionWithCard(
+      named,
+      readCardIdFromCard(named) ?? generateCardId(name),
+    );
+    return { mode: 'created', name: created };
+  }
+
+  /**
+   * 打开 TXT 角色卡（2026-11-17）：**先判同名，再决定导入到哪张卡**。
+   *
+   * ## 为什么 TXT 要单独一条路
+   *
+   * TXT 里没有 `meta.name` 字段 —— 卡名只能从**文件名**推导（与零标签建卡
+   * 同一规则，见 `open-name.ts`）。所以判定必须在"读完文本、还没建会话"时做：
+   *
+   * ```text
+   * 同名已打开  → 切到那张，导入进它（覆盖语义）
+   * 没有同名    → 先建空会话再导入（新建语义）
+   * ```
+   *
+   * ## 为什么导入对话框仍然以"当前卡"为 base
+   *
+   * `previewCardText(base, ...)` 用 base 补齐 TXT 里没识别到的板块。
+   * 所以"覆盖"时 base 必须是**那张同名卡**（否则会把另一张卡的内容
+   * 混进来）；"新建"时 base 是刚建的空卡 —— 两者都通过先切/先建来满足。
+   */
+  private async openTextCard(fileName: string, text: string, dir: string): Promise<void> {
+    // 不去重地推一次名字，用于"是否有同名卡"的判断
+    const incomingName = deriveCardNameFromFile(fileName);
+    const target = decideOpenTarget({
+      incomingName,
+      openSessions: this.sessions.map((item) => ({ id: item.id, name: item.card.meta.name })),
+      activeId: this.hasSession ? this.activeId : null,
+    });
+
+    let createdSession: string | null = null;
+    if (target.kind === 'replace') {
+      if (target.sessionId !== this.activeId) this.activateSession(target.sessionId);
+    } else {
+      createdSession = this.createSessionFromFile(fileName);
+    }
+
+    /*
+     * 后缀交给 `importCardTextFile` 拼在它自己的结论后面（而不是在这里
+     * 再 setStatus 一次盖掉它）—— 那句结论带着"多少原文被放到了哪里"，
+     * 是用户真正需要读的内容。
+     */
+    const outside = dir !== '' && !fileName.toLowerCase().startsWith(dir.toLowerCase());
+    const note =
+      (target.kind === 'replace' ? `（已覆盖同名卡「${target.name}」）` : '') +
+      (outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${dir}` : '');
+    await this.importCardTextFile(fileName, text, createdSession, false, note);
+  }
+
+  /**
+   * **新建标签的唯一入口**（v0.1.3 追加项三；2026-11-17 用途扩展）。
+   *
+   * 三条路共用它，不各写一份：
+   *   · 「打开…」选了 TXT（`createSessionFromFile`）—— 名字从文件名推；
+   *   · 「打开…」的卡名与所有已开标签都不同（`openArrivedCard`）——
+   *     名字用卡里的 `meta.name`；
    *   · 同步面板零标签「取回 / 回滚」—— 名字与 cardId 都来自服务端那张卡。
    *
-   * 第二条路**必须传入服务端的 cardId**：这里不生成。若按名字重新生成，
-   * 下一次「上传当前内容」会在服务端新建一张卡，而原卡历史还留着 ——
-   * 两份历史从此分叉，且没有任何提示（`planRemoteApply` 的注释里写了这条）。
+   * 后两条**必须沿用卡里已有的 cardId**（本函数的 `cardId` 参数由调用方决定）：
+   * 若按名字重新生成，下一次「上传当前内容」会在服务端新建一张卡，而原卡
+   * 历史还留着 —— 两份历史从此分叉，且没有任何提示
+   * （`planRemoteApply` 的注释里写了这条）。
    *
    * 返回新卡的名字（调用方要放进状态栏 —— "我建了一张卡"这件事必须说出来）。
    */
@@ -4903,6 +5087,8 @@ class EditorApp {
     text: string,
     createdSession: string | null = null,
     autoConfirm = false,
+    /** 追加在最终结论后面的说明（打开路径用它说清"覆盖了哪张卡 / 目录外"） */
+    note = '',
   ): Promise<void> {
     if (!this.hasSession) {
       this.setStatus('先打开或新建一张卡，再导入 TXT（导入会替换当前卡的板块内容）', 'warn');
@@ -4919,11 +5105,14 @@ class EditorApp {
     }
     const decision = await pending;
     if (!decision || !('card' in decision)) {
-      // 用户取消：零标签下刚建的那张卡**留着**（它是用户点「打开…」的直接结果，
+      // 用户取消：刚建的那张卡**留着**（它是用户点「打开…」的直接结果，
       // 而且里面还是空卡，没有需要回滚的内容）。状态栏说明这一点，避免"我点了取消
       // 怎么多了一张卡"的困惑。
       if (createdSession !== null) {
-        this.setStatus(`已新建「${createdSession}」（空卡）；TXT 导入已取消，未写入任何内容`, 'info');
+        this.setStatus(
+          `已新建「${createdSession}」（空卡）；TXT 导入已取消，未写入任何内容${note}`,
+          'info',
+        );
       }
       return;
     }
@@ -4945,10 +5134,10 @@ class EditorApp {
     // 措辞由 import-flow.preservedNoteOf 统一给出，对话框里显示的是同一句。
     if (decision.preservedNote !== '') {
       const tone = decision.preserved?.wholeText === true ? 'warn' : 'info';
-      this.setStatus(`${prefix} —— ${decision.preservedNote}`, tone);
+      this.setStatus(`${prefix} —— ${decision.preservedNote}${note}`, tone);
       return;
     }
-    this.setStatus(`${prefix}（原文全部识别，无未识别内容）`, 'ok');
+    this.setStatus(`${prefix}（原文全部识别，无未识别内容）${note}`, 'ok');
   }
 
   /**
