@@ -1,9 +1,12 @@
 /**
- * 服务端连接探测（T6.8）。
+ * 服务端连接探测（T6.8；2026-11-17 改走传输层）。
  *
  * 设计要点：
- *   1. **不依赖壳**：服务端已返回 `Access-Control-Allow-Origin: *`，
- *      渲染层用 `fetch` 直连即可，局域网 IP / 域名都成立，无需新增原生命令；
+ *   1. **传输层可换**：桌面壳走原生命令（`server_http_request`），
+ *      浏览器走 `fetch`（服务端已返回 `Access-Control-Allow-Origin: *`）。
+ *      ★ 原来是"一律用 fetch"—— 那在桌面端有个死结：webview 的证书校验
+ *      无法配置，自签证书一律被拒，而失败只剩一个 `TypeError`，
+ *      界面上就变成"端口没开"（memory §105 的原始缺陷）。
  *   2. **分两步判定**：`/api/health` 是公开接口（只证可达），
  *      `/api/stats` 需鉴权（才证 token 有效）。只测前者会把"token 错了"误报成"连上了"；
  *   3. **必须有超时**：服务端挂掉时 `fetch` 可能长时间悬挂，用 AbortController 兜住，
@@ -11,9 +14,23 @@
  *   4. 纯函数 + 可注入 fetch，便于离线单测（见 test/client-settings.test.mjs）。
  */
 
+import {
+  createFetchTransport,
+  defaultTransport,
+  type HttpTransport,
+} from './http-transport.ts';
+
 export interface ServerConfigInput {
   serverUrl: string;
   token: string;
+  /**
+   * 用户已确认这个 origin 的证书风险（2026-11-17）。
+   *
+   * ★ 只有桌面壳会真的用它（浏览器 fetch 无法配置证书校验）。
+   * 语义是"别先失败一次"—— 已经确认过的地址直接带跳过校验去连，
+   * 免得界面先闪一下"连不上"再变绿。
+   */
+  allowInvalidCert?: boolean;
 }
 
 export type UrlCheck =
@@ -104,18 +121,48 @@ export interface ProbeResult {
   latencyMs: number | null;
   /** 归一化后的地址（失败时为 null） */
   url: string | null;
+  /**
+   * 证书不受信任（2026-11-17）。
+   *
+   * 只有**桌面壳**能给出确定的 true —— 它走原生命令的两段探测：
+   * 正常校验失败、跳过校验成功 ⇒ 证实就是证书问题。浏览器端的 fetch
+   * 拿不到这个信号，所以恒为 false（那里也没法给"继续"的出口）。
+   *
+   * 这一位是"能不能给出继续按钮"的唯一依据。**不要**用文案匹配去猜。
+   */
+  certUntrusted: boolean;
   /** 面向用户的一句话结论 */
   message: string;
   /** 细分阶段，便于 UI 决定提示位置 */
-  stage: 'url' | 'health' | 'auth' | 'ok';
+  stage: 'url' | 'cert' | 'health' | 'auth' | 'ok';
 }
 
 const DEFAULT_TIMEOUT_MS = 6000;
 
 export interface ProbeOptions {
   timeoutMs?: number;
-  /** 便于测试注入；默认用全局 fetch */
+  /**
+   * 便于测试注入；默认用全局 fetch。
+   *
+   * ★ 只有在**没有**显式给 `transport` 时才生效（保留它是为了不破坏
+   * 已有的那批测试 —— 它们全都注入 fetchImpl 来模拟 401/404/断网）。
+   */
   fetchImpl?: typeof fetch;
+  /**
+   * 传输层（2026-11-17）。不给就按环境自动选：
+   * 桌面壳走原生命令（能识别证书），浏览器走 fetch。
+   *
+   * 为什么要能注入：`certUntrusted` 只有原生命令能给，而单测里
+   * 不该去起一个 Tauri 壳。注入一个返回 cert 失败的替身即可覆盖那条分支。
+   */
+  transport?: HttpTransport;
+  /**
+   * 用户已确认过证书风险的 origin 是否包含当前地址（2026-11-17）。
+   *
+   * 传 true 时第一次请求就带 `allowInvalidCert`，不会先失败一次
+   * （否则每次探测都白跑一次失败请求，界面还会闪一下错误）。
+   */
+  allowInvalidCert?: boolean;
 }
 
 function failure(
@@ -134,38 +181,10 @@ function failure(
     url: null,
     message,
     stage,
+    /* 默认 false：只有确认过的证书问题才置 true（见字段注释） */
+    certUntrusted: extra.certUntrusted === true,
     ...extra,
   };
-}
-
-/** 带超时的 fetch：超时后 abort，并把原因翻译成人话 */
-async function fetchWithTimeout(
-  target: string,
-  init: RequestInit,
-  timeoutMs: number,
-  fetchImpl: typeof fetch,
-): Promise<{ response: Response | null; error: string | null; elapsed: number }> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const started = Date.now();
-  try {
-    const response = await fetchImpl(target, { ...init, signal: controller.signal });
-    return { response, error: null, elapsed: Date.now() - started };
-  } catch (error) {
-    const elapsed = Date.now() - started;
-    const aborted = error instanceof Error && error.name === 'AbortError';
-    if (aborted) {
-      return { response: null, error: `请求超时（${timeoutMs} ms）`, elapsed };
-    }
-    // 浏览器对 CORS / DNS / 拒连都抛 TypeError，只能给一个覆盖这些可能性的提示
-    return {
-      response: null,
-      error: '无法连接（地址不通、端口未开、或服务端未启动）',
-      elapsed,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /**
@@ -179,7 +198,25 @@ export async function probeServer(
   options: ProbeOptions = {},
 ): Promise<ProbeResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const fetchImpl = options.fetchImpl ?? fetch;
+  /*
+   * 传输层：显式给了就用给的；否则有 fetchImpl 就用它（兼容老测试）；
+   * 都没给就按环境自动选（桌面壳 → 原生命令，浏览器 → fetch）。
+   */
+  const transport =
+    options.transport ??
+    (options.fetchImpl === undefined
+      ? defaultTransport()
+      : createFetchTransport(options.fetchImpl));
+
+  /*
+   * ★ 两个来源都要认（2026-11-17）。
+   *
+   * `input.allowInvalidCert` 是"这个地址我已经确认过"（来自配置）；
+   * `options.allowInvalidCert` 是"这一次探测就按跳过校验走"（确认后重试用）。
+   * 我第一版只读了 options，于是外壳传在 input 里的确认状态被**静默丢掉** ——
+   * 现象是"确认过了下次启动还是要确认"，而这点在单测里才暴露。
+   */
+  const allowInvalidCert = options.allowInvalidCert === true || input.allowInvalidCert === true;
 
   const checked = normalizeServerUrl(input.serverUrl);
   if (!checked.ok) {
@@ -188,36 +225,57 @@ export async function probeServer(
   const base = checked.url;
 
   // ① 可达性：/api/health 是公开路径，不需要 token
-  const health = await fetchWithTimeout(
-    `${base}/api/health`,
-    { method: 'GET', headers: { Accept: 'application/json' } },
+  const health = await transport({
+    url: `${base}/api/health`,
+    method: 'GET',
+    headers: { Accept: 'application/json' },
     timeoutMs,
-    fetchImpl,
-  );
-  if (!health.response) {
-    return failure('health', health.error ?? '连接失败', { url: base, latencyMs: health.elapsed });
-  }
-  if (!health.response.ok) {
-    return failure('health', `服务端返回 HTTP ${health.response.status}（该地址不是本服务？）`, {
+    ...(allowInvalidCert ? { allowInvalidCert: true } : {}),
+  });
+  if (health.status === null) {
+    /*
+     * ★ 证书要**单独一个阶段**（memory §105 缺陷 ①）。
+     *
+     * 原来这里只有一句「地址不通、端口未开、或服务端未启动」，
+     * 而证据显示真因是自签证书（8ms 快速失败、`curl -k` 立刻 200）。
+     * 把证书问题说成端口问题，用户会去查一件根本没坏的事。
+     *
+     * `errorKind === 'cert'` 是**证实过**的（原生通道两段探测），
+     * 不是猜的 —— 只有它才给"确认后可继续"的出口。
+     */
+    if (health.errorKind === 'cert') {
+      return failure('cert', health.error ?? '证书不受信任', {
+        url: base,
+        latencyMs: health.elapsedMs,
+        certUntrusted: true,
+      });
+    }
+    return failure('health', health.error ?? '连接失败', {
       url: base,
-      latencyMs: health.elapsed,
+      latencyMs: health.elapsedMs,
+    });
+  }
+  if (health.status < 200 || health.status >= 300) {
+    return failure('health', `服务端返回 HTTP ${String(health.status)}（该地址不是本服务？）`, {
+      url: base,
+      latencyMs: health.elapsedMs,
     });
   }
 
   let healthBody: Record<string, unknown> = {};
   try {
-    healthBody = (await health.response.json()) as Record<string, unknown>;
+    healthBody = JSON.parse(health.text ?? '') as Record<string, unknown>;
   } catch {
     return failure('health', '这个地址返回的内容无法识别（可能不是 Tavern Card Studio 服务端）', {
       url: base,
-      latencyMs: health.elapsed,
+      latencyMs: health.elapsedMs,
     });
   }
 
   if (healthBody['status'] !== 'ok') {
     return failure('health', '服务端状态异常（health.status 不是 ok）', {
       url: base,
-      latencyMs: health.elapsed,
+      latencyMs: health.elapsedMs,
     });
   }
 
@@ -233,10 +291,11 @@ export async function probeServer(
       tokenValid: null,
       cardCount: null,
       isolationEnforced: null,
-      latencyMs: health.elapsed,
+      latencyMs: health.elapsedMs,
       url: base,
       message: `已连接${version ? `（服务端 ${version}）` : ''}，服务端未启用鉴权`,
       stage: 'ok',
+      certUntrusted: false,
     };
   }
 
@@ -254,30 +313,32 @@ export async function probeServer(
       tokenValid: null,
       cardCount: null,
       isolationEnforced: null,
-      latencyMs: health.elapsed,
+      latencyMs: health.elapsedMs,
       url: base,
       message: `已连接${version ? `（服务端 ${version}）` : ''}，未登录：登录后可同步`,
       stage: 'auth',
+      certUntrusted: false,
     };
   }
 
   // ④ 用受保护接口验证 token：/api/stats 轻量且一定需要鉴权
-  const stats = await fetchWithTimeout(
-    `${base}/api/stats`,
-    { method: 'GET', headers: { Accept: 'application/json', Authorization: `Bearer ${token}` } },
+  const stats = await transport({
+    url: `${base}/api/stats`,
+    method: 'GET',
+    headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
     timeoutMs,
-    fetchImpl,
-  );
-  if (!stats.response) {
+    ...(allowInvalidCert ? { allowInvalidCert: true } : {}),
+  });
+  if (stats.status === null) {
     return failure('auth', `已连接但鉴权检查失败：${stats.error ?? '未知错误'}`, {
       url: base,
-      latencyMs: health.elapsed,
+      latencyMs: health.elapsedMs,
       version,
       authRequired: true,
     });
   }
 
-  if (stats.response.status === 401 || stats.response.status === 403) {
+  if (stats.status === 401 || stats.status === 403) {
     return {
       reachable: true,
       version,
@@ -285,17 +346,18 @@ export async function probeServer(
       tokenValid: false,
       cardCount: null,
       isolationEnforced: null,
-      latencyMs: health.elapsed,
+      latencyMs: health.elapsedMs,
       url: base,
       message: '已连接，但访问令牌无效 —— 请从服务端配置或管理面板重新获取',
       stage: 'auth',
+      certUntrusted: false,
     };
   }
 
-  if (!stats.response.ok) {
-    return failure('auth', `鉴权检查返回 HTTP ${stats.response.status}`, {
+  if (stats.status < 200 || stats.status >= 300) {
+    return failure('auth', `鉴权检查返回 HTTP ${String(stats.status)}`, {
       url: base,
-      latencyMs: health.elapsed,
+      latencyMs: health.elapsedMs,
       version,
       authRequired: true,
     });
@@ -303,7 +365,7 @@ export async function probeServer(
 
   let statsBody: Record<string, unknown> = {};
   try {
-    statsBody = (await stats.response.json()) as Record<string, unknown>;
+    statsBody = JSON.parse(stats.text ?? '') as Record<string, unknown>;
   } catch {
     statsBody = {};
   }
@@ -323,12 +385,13 @@ export async function probeServer(
     cardCount,
     // 只有服务端明确说 true 才算已隔离；缺字段 = 旧版服务端 = 未隔离
     isolationEnforced: statsBody['isolationEnforced'] === true,
-    latencyMs: health.elapsed,
+    latencyMs: health.elapsedMs,
     url: base,
     message:
       `已连接${version ? `（服务端 ${version}）` : ''}，token 有效` +
       (cardCount === null ? '' : `，现有 ${cardCount} 张卡`),
     stage: 'ok',
+    certUntrusted: false,
   };
 }
 

@@ -2,7 +2,12 @@
  * 服务端同步（T6.7）——上传 / 版本历史 / 回滚。
  *
  * 复用 T6.8 的 `probeServer` / `isSyncReady` 判定可用性（不在这里另设判据）。
- * 全部走 `fetch`（服务端已开 CORS，见 docs/13），不新增原生命令。
+ * 走**传输层**（`net/http-transport.ts`）：桌面壳走原生命令
+ * `server_http_request`，浏览器走 `fetch`（服务端已开 CORS，见 docs/13）。
+ *
+ * ★ 2026-11-17 之前是一律 `fetch`。那在桌面端连自签证书的服务端时
+ * 必然失败，而失败只剩一个 `TypeError` —— 界面说"连不上"，用户去查端口，
+ * 真正该做的是"确认证书风险"（memory §105）。
  *
  * 关键设计：
  *   · 上传按**原始字节**发送（`Content-Type: application/json`，body 就是文件内容），
@@ -10,10 +15,25 @@
  *   · 每个调用都可注入 `fetch`，便于离线测试全部错误分支（401/404/409/网络断）。
  */
 
+import {
+  base64ToBytes,
+  createFetchTransport,
+  defaultTransport,
+  type HttpTransport,
+} from '../net/http-transport.ts';
+
 export interface SyncConfig {
   /** 归一化后的基地址，如 http://127.0.0.1:8730 */
   serverUrl: string;
   token: string;
+  /**
+   * 用户已确认这个 origin 的证书风险（2026-11-17）。
+   *
+   * 只有桌面壳用得上（webview 的 fetch 无法配置证书校验，见
+   * `net/http-transport.ts` 的模块头）。**不设时一律校验证书** ——
+   * 默认安全，不能因为"传漏了"就悄悄放宽。
+   */
+  allowInvalidCert?: boolean;
 }
 
 export type SyncErrorCode =
@@ -133,7 +153,14 @@ const DEFAULT_TIMEOUT_MS = 15000;
 
 interface RequestOptions {
   timeoutMs?: number;
+  /**
+   * 便于测试注入；默认用全局 fetch。
+   *
+   * ★ 只在没给 `transport` 时生效（兼容既有测试）。
+   */
   fetchImpl?: typeof fetch;
+  /** 传输层；不给就按环境自动选（桌面壳 → 原生命令） */
+  transport?: HttpTransport;
   /**
    * 除 2xx 之外也**当作正常结果**返回的状态码（v0.1.7 修订二）。
    *
@@ -152,41 +179,97 @@ async function request(
   options: RequestOptions = {},
 ): Promise<Response> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const fetchImpl = options.fetchImpl ?? fetch;
+  const url = `${config.serverUrl}${path}`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  let response: Response;
-  try {
-    response = await fetchImpl(`${config.serverUrl}${path}`, {
-      ...init,
-      signal: controller.signal,
-      headers: {
-        Accept: 'application/json',
-        ...(config.token.trim() === '' ? {} : { Authorization: `Bearer ${config.token.trim()}` }),
-        ...(init.headers ?? {}),
-      },
-    });
-  } catch (error) {
-    const aborted = error instanceof Error && error.name === 'AbortError';
-    /*
-     * `cause` 保留原始错误链（2026-11-04）。
-     *
-     * 原来这里把底层失败压成一句「无法连接服务端」，丢掉了可操作信息：
-     * 自签证书失败 → 界面上只显示"连不上"，用户不知道还能确认风险后继续。
-     *
-     * 对外文案与 code 完全不变，只是让上层能看穿这一层。
-     */
-    const wrapped = new SyncError(
-      aborted ? 'TIMEOUT' : 'NETWORK',
-      aborted ? `请求超时（${timeoutMs} ms）` : '无法连接服务端',
-    );
-    (wrapped as Error & { cause?: unknown }).cause = error;
-    throw wrapped;
-  } finally {
-    clearTimeout(timer);
+  /*
+   * 请求头：Accept + 令牌 + 调用方给的。
+   * `init.headers` 可能是 Headers / 数组 / 对象 —— transport 只吃对象，
+   * 所以这里拉平一次。本模块的调用方只传对象，但别让形状成为隐患。
+   */
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    ...(config.token.trim() === '' ? {} : { Authorization: `Bearer ${config.token.trim()}` }),
+  };
+  const extra = init.headers;
+  if (extra !== undefined && extra !== null) {
+    if (Array.isArray(extra)) {
+      for (const [name, value] of extra) headers[name] = value;
+    } else if (typeof (extra as Headers).forEach === 'function') {
+      (extra as Headers).forEach((value, name) => {
+        headers[name] = value;
+      });
+    } else {
+      Object.assign(headers, extra as Record<string, string>);
+    }
   }
+
+  /*
+   * 传输层：显式给 > fetchImpl（兼容老测试）> 按环境自动选。
+   *
+   * ★ 桌面壳必须走原生命令，否则自签证书永远连不上（webview 的证书校验
+   * 无法配置）。而"忘了传"不能退回不安全行为 —— `defaultTransport()`
+   * 自己按环境判断，调用方不需要知道。
+   */
+  const transport =
+    options.transport ??
+    (options.fetchImpl === undefined
+      ? defaultTransport()
+      : createFetchTransport(options.fetchImpl));
+
+  const outcome = await transport({
+    url,
+    method: typeof init.method === 'string' ? init.method : 'GET',
+    headers,
+    ...(typeof init.body === 'string' ? { body: init.body } : {}),
+    timeoutMs,
+    ...(config.allowInvalidCert === true ? { allowInvalidCert: true } : {}),
+  });
+
+  if (outcome.status === null) {
+    /*
+     * 失败：按原因分码（2026-11-17）。
+     *
+     * 原来只有 TIMEOUT / NETWORK 两种，而证书失败被压成 NETWORK
+     * （"无法连接服务端"）—— 用户不知道可以确认风险后继续。
+     * 现在 `cert` 单独一类，上层能据此给出那个出口。
+     *
+     * `cause` 保留原始信息（诊断日志要看得到底层说了什么）。
+     */
+    const code = outcome.errorKind === 'timeout' ? 'TIMEOUT' : 'NETWORK';
+    const wrapped = new SyncError(code, outcome.error ?? '无法连接服务端');
+    (wrapped as Error & { cause?: unknown }).cause = {
+      kind: outcome.errorKind,
+      message: outcome.error,
+    };
+    (wrapped as Error & { certUntrusted?: boolean }).certUntrusted =
+      outcome.errorKind === 'cert';
+    throw wrapped;
+  }
+
+  /*
+   * 造一个真的 `Response` 交回去。
+   *
+   * 为什么不改所有调用点去读 transport 的结果：本文件里有十几处
+   * `response.json()` / `.text()` / `.arrayBuffer()`，逐个改容易漏，
+   * 而 `Response` 是标准形状、行为一致（`.ok` / `.status` 都对）。
+   * 唯一代价是一次内存拷贝 —— 卡面最大几 MB，可以接受。
+   */
+  /*
+   * 二进制响应用 Uint8Array，文本用 string。
+   *
+   * ★ 不能统一成 Uint8Array：文本响应被转成字节后会按 UTF-8 再解码一次，
+   * 这个过程对合法 UTF-8 是无损的，但多一次拷贝；而 `Response` 收
+   * `Uint8Array` 的 TS 类型要求是 `ArrayBufferView` 的具体子类型 ——
+   * 直接传会报类型错（见下面那个分支）。
+   */
+  const bodyInit: BodyInit =
+    outcome.base64 !== null
+      ? new Uint8Array(base64ToBytes(outcome.base64))
+      : (outcome.text ?? '');
+  const response = new Response(bodyInit, {
+    status: outcome.status,
+    ...(outcome.contentType === '' ? {} : { headers: { 'content-type': outcome.contentType } }),
+  });
 
   if (response.ok) return response;
   // 显式声明为"正常结果"的状态码直接返回（见 acceptStatus 的注释）

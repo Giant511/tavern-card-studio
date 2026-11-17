@@ -54,6 +54,16 @@ export type ShellErrorCode =
   | 'ST_FORBIDDEN'
   | 'ST_HTTP_STATUS'
   | 'ST_BAD_RESPONSE'
+  /**
+   * 原生 HTTP 请求失败（2026-11-17，`server_http_request`）。
+   *
+   * `details.kind` 是 `'cert' | 'connect' | 'timeout' | 'other'`，
+   * `details.insecureWouldWork` 表示"用户确认风险后确实能连上"。
+   *
+   * 与 `ST_UNAVAILABLE` 分开：那个说的是"SillyTavern 没起来"，
+   * 这个说的是"连不上你配的同步服务端"。两者的下一步动作完全不同。
+   */
+  | 'NET_REQUEST_FAILED'
   /** 非壳错误（前端参数错误、插件异常等） */
   | 'SHELL_BRIDGE_ERROR';
 

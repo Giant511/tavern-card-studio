@@ -30,6 +30,8 @@ import {
   type PortProbe,
   type RuleDirScan,
   type RuleKind,
+  type ServerHttpRequestInput,
+  type ServerHttpResponse,
   type ShellInfo,
   type SpawnReceipt,
   type SpawnTarget,
@@ -645,6 +647,31 @@ export function shellInfo(): Promise<ShellInfo> {
 }
 
 /** 供 UI 判断「是不是跑在壳里」（浏览器直开时这些能力不可用） */
+/**
+ * 走原生命令发一次 HTTP 请求（2026-11-17，修「自签证书被拒」）。
+ *
+ * ## 为什么需要它（而不是直接用 fetch）
+ *
+ * webview 的证书校验用系统证书链，且**无法配置**：自签证书一律拒绝，
+ * 也没有"只对这个 origin 放行"的开关。而这类请求一旦失败，浏览器只给
+ * 一个 `TypeError` —— 界面上就变成"地址不通、端口未开"，把用户引向
+ * 错误的方向（memory §105 的取证：8ms 快速失败，`curl -k` 立刻 200）。
+ *
+ * ## 失败时抛的是 `NET_REQUEST_FAILED`
+ *
+ * `details.kind` 是 `'cert' | 'connect' | 'timeout' | 'other'`，
+ * 由 Rust 侧的两段探测证实（见 `server_http.rs` 模块头）。**只有 `cert`
+ * 才意味着"用户确认风险后能连上"** —— 那是唯一该给出继续出口的情况。
+ *
+ * ## 为什么参数里用数组传 headers
+ *
+ * 同名头可以重复出现（`Set-Cookie` 之类），用对象会丢掉重复项；
+ * 而且不依赖 JSON 对象的键序。
+ */
+export function serverHttpRequest(input: ServerHttpRequestInput): Promise<ServerHttpResponse> {
+  return call<ServerHttpResponse>('server_http_request', { request: input });
+}
+
 export function isShellAvailable(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }

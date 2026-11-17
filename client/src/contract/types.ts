@@ -522,6 +522,24 @@ export interface ClientConfig {
    * 换 ASR 厂商不该重置确认开关，反之亦然。决策 #309 有隔离断言。
    */
   voiceConfirmBeforeSend: boolean;
+  /**
+   * 用户已确认「证书不受信任但继续」的 origin 列表（2026-11-17）。
+   *
+   * ## 为什么要持久化
+   *
+   * 每次连都弹一次确认框的结果是：用户三秒后就开始无脑点"继续"，
+   * 那等于没有提示（memory §106 的结论）。所以按 **origin** 记住 —— 只记住
+   * 那一个地址，别的 https 站点仍然正常校验证书。
+   *
+   * ## 为什么存 origin 而不是完整 URL
+   *
+   * 同一个服务的 `/api/health` 与 `/api/stats` 是两个 URL，但证书是
+   * **按主机**签发的。存完整 URL 会导致"同一台服务器要确认两次"。
+   *
+   * 用户换地址后旧 origin 留在表里也无害：匹配是按当前 origin 精确比，
+   * 不会外溢到别的主机。
+   */
+  certAckedOrigins: string[];
 }
 
 export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
@@ -558,4 +576,50 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
   // 空对象 = 没有自定义默认值（不用 null，省掉一处判空）
   cardDefaults: {},
   voiceConfirmBeforeSend: false,
+  // 空数组 = 还没有确认过任何证书风险（绝大多数用户都是这样）
+  certAckedOrigins: [],
 };
+
+/* ═══════════════════════════════════════════════════════════
+   原生 HTTP 通道（2026-11-17，修「自签证书被拒」）
+   ═══════════════════════════════════════════════════════════ */
+
+/**
+ * 一次原生 HTTP 请求。
+ *
+ * 形状与 Rust 侧的 `ServerHttpRequest` 一一对应（`rename_all = "camelCase"`）。
+ * 两侧改一处必须改另一处 —— `test/server-http-contract.test.mjs` 对拍字段名。
+ */
+export interface ServerHttpRequestInput {
+  url: string;
+  method?: string;
+  /** 数组而不是对象：同名头可以重复，也不依赖 JSON 对象键序 */
+  headers?: Array<[string, string]>;
+  body?: string;
+  timeoutMs?: number;
+  /** 用户已确认风险、允许跳过证书校验 */
+  allowInvalidCert?: boolean;
+  /** 强制要 base64（图片等二进制响应用） */
+  wantBase64?: boolean;
+}
+
+/** 原生 HTTP 的成功结果 */
+export interface ServerHttpResponse {
+  status: number;
+  contentType: string;
+  /** 文本响应体；二进制响应时为 null */
+  bodyText: string | null;
+  /** 二进制响应体的 base64；文本响应时为 null */
+  bodyBase64: string | null;
+  elapsedMs: number;
+  /** 这次是否用了"跳过校验" */
+  insecure: boolean;
+}
+
+/**
+ * 失败的分类。
+ *
+ * `cert` 是我们**唯一**能给出"确认后可继续"出口的那一类 —— 它是
+ * Rust 侧两段探测证实出来的（跳过校验能成功），不是猜的。
+ */
+export type ServerHttpErrorKind = 'cert' | 'connect' | 'timeout' | 'other';

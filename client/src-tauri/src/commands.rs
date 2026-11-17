@@ -189,7 +189,7 @@ fn base64_decode(input: &str) -> ShellResult<Vec<u8>> {
 /// 20 行无分支的实现，换来 Cargo 依赖表不动 —— MSI 离线构建时少一个要拉取的包，
 /// 也少一个版本漂移点。正确性由 `test/contract-binary.test.mjs` 用 Node 的
 /// `Buffer.toString('base64')` 逐例对拍（含 0/1/2 字节的补位边界）。
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     // 每 3 字节 → 4 字符，向上取整后预留容量（避免反复 realloc 大图）

@@ -865,10 +865,25 @@ export class SettingsDialog {
       });
       this.lastResult = result;
 
+      /*
+       * 证书不受信任（2026-11-17）：在这里**不弹新框**，只把状态说清并
+       * 交出去 —— 外壳的 `offerCertTrust` 会统一问，问完重新探测。
+       *
+       * ★ 为什么不在这一层弹：这个面板的 `test()` 会被「连接本机服务端」
+       *   与端到端脚本反复调用，两处各弹一个框就会叠在一起
+       *   （两个框问同一件事，点掉一个还有一个）。确认这件事必须只有
+       *   一个入口 —— 那在外壳。
+       */
       const ready = isSyncReady(result);
       const kind: 'ok' | 'warn' | 'bad' = ready ? 'ok' : result.reachable ? 'warn' : 'bad';
       const latency = result.latencyMs === null ? '' : `（${result.latencyMs} ms）`;
       this.setProbeStatus(`${result.message}${latency}`, kind);
+      if (result.certUntrusted) {
+        this.setProbeStatus(
+          `${result.message}${latency} —— 确认风险后可以继续，稍候会问你要不要继续。`,
+          'warn',
+        );
+      }
 
       this.callbacks.onConnectionChange(result);
     } catch (error) {
@@ -1249,11 +1264,33 @@ export class SettingsDialog {
     const hasAccount = (this.callbacks.getIdentity?.() ?? { phase: 'anonymous' as AuthPhase }).phase === 'authenticated';
     // legacy 兼容模式也算凭证：≤v0.1.1 的服务端只有它
     const hasCredentials = hasAccount || this.tokenInput.value.trim() !== '';
-    const gate = resolveSyncGate(this.urlInput.value, hasCredentials);
+    /*
+     * ★ 把探测结果交给门禁（2026-11-17）。
+     *
+     * 原来只传"地址 + 凭证"，于是探测红字「无法连接」与这里绿字
+     * 「同步已就绪」同屏互斥（memory §105 缺陷 ②）。
+     *
+     * `this.lastResult` 为 null（还没测过）时门禁不看它 —— 否则刚打开
+     * 面板那几百毫秒里会显示"连不上"，而其实只是还没测。
+     */
+    const gate = resolveSyncGate(this.urlInput.value, hasCredentials, this.lastResult);
 
     if (gate === 'ready') {
       this.syncNote.textContent = '同步已就绪：可使用上传 / 历史版本 / 回滚。';
       this.syncNote.className = 'sync-note ok';
+      return;
+    }
+    if (gate === 'unreachable') {
+      /*
+       * 单独一档，文案指向"下一步能做什么"。
+       *
+       * 不说"检查端口"这种泛泛的话 —— 具体原因在上面那行探测结果里
+       * （它带地址、耗时、以及是不是证书问题）。这里只保证
+       * **不再说"已就绪"**。
+       */
+      this.syncNote.textContent =
+        '连不上服务端：同步暂时用不了（编辑 / 审计 / 导出不受影响）。';
+      this.syncNote.className = 'sync-note warn';
       return;
     }
     if (gate === 'no-server') {
