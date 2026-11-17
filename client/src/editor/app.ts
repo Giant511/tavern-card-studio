@@ -80,6 +80,8 @@ import {
   type EditorBlockSnapshot,
 } from './block-doc';
 import { BlockEditor, type EditorIssue } from './block-editor';
+import { createPromptsPanel, type PromptsPanel } from './prompts-panel';
+import { promptsWithinLimits } from '../session/card-prompts';
 import { planRemoteApply } from '../sync/remote-apply';
 import { applySchemeStyles, buildPreviewFragment } from './highlight';
 import {
@@ -383,6 +385,13 @@ class EditorApp {
   private newCardDialog: NewCardDialog | null = null;
   /** 卡片级信息对话框（v0.1.6）：作者 / 版本 / 创作说明 / 标签 / 系统提示 / 世界书说明 */
   private cardInfoDialog: CardInfoDialog | null = null;
+  /**
+   * 「角色提示词」板块（2026-11-17）。
+   *
+   * 惰性创建、之后复用：滚动位置与展开态是 DOM 状态，
+   * 每次重建会让用户刚滚到的那条跳回顶部。
+   */
+  private promptsPanel: PromptsPanel | null = null;
   /** 读一次缓存；新建卡时套用。「设为新卡默认值」写完会刷新它 */
   private cardDefaults: CardInfoDefaults = { ...EMPTY_CARD_INFO_DEFAULTS };
   /** 另存为的格式选择对话框（v0.1.5 / G6） */
@@ -2399,6 +2408,21 @@ class EditorApp {
     // （2026-10-22 截图里同时出现空占位与八个板块，就是这个原因）。
     this.blockList.replaceChildren();
     this.blocks = collectBlocks(this.card).map((snapshot) => this.createBlock(snapshot));
+    /*
+     * 「角色提示词」板块（2026-11-17，用户要求"桌面端开一个板块专门编辑角色提示词"）。
+     *
+     * ## 为什么排在最后、且不是 `BlockId`
+     *
+     * 它存的是 `data.extensions.tcs.prompts` —— **我们自己的扩展键**，
+     * 不是 ST 卡字段。硬塞进 `BLOCK_IDS` 会让它进 `TEXT_BLOCK_IDS`，
+     * 而那条链会把内容拼进 `description`（角色描述里凭空多出提示词）。
+     * 详见 `prompts-panel.ts` 顶部。
+     *
+     * 放在最后一位：前八块是"卡里写了什么"，这一块是"这个角色额外怎么说话"，
+     * 读的顺序也是先内容后调优。
+     */
+    const panel = this.ensurePromptsPanel();
+    if (panel !== null) this.blockList.append(panel.el);
     // `?expand=all` 全展开；`?expand=chat-examples,initial-scene` 只展开指定板块。
     //
     // 后者是为 v0.1.3 的截图验收加的：要拍「新板块展开编辑」就必须只展开
@@ -2422,6 +2446,58 @@ class EditorApp {
     }
     this.refreshStats();
     this.renderCardName();
+  }
+
+  /**
+   * 惰性创建「角色提示词」板块（只创建一次，之后每次重绘只重新挂载 + 刷新）。
+   *
+   * 为什么不在构造里建：构造时 `this.session` 还不一定有卡（空工作台）。
+   * 为什么只创建一次：滚动位置与展开态是 DOM 状态，每次都新建会让
+   * 用户刚滚到的那条提示词跳回顶部 —— 而这块正好是"要滚着改很多条"的界面。
+   */
+  private ensurePromptsPanel(): PromptsPanel | null {
+    if (!this.hasSession) return null;
+    if (this.promptsPanel === null) {
+      this.promptsPanel = createPromptsPanel({
+        getConfig: () => this.session.readCharacterPrompts(),
+        /*
+         * 写回走 session：它内部再判一次上限并置脏。
+         *
+         * 返回 false 时**组件会保留原样**（不刷新）—— 用户看到的是
+         * "输入框里还是我刚写的内容"，同时下面那条违规提示说的是为什么。
+         * 刷新掉会让他以为自己的输入被吞了。
+         */
+        onChange: (next) => {
+          const accepted = this.session.updateCharacterPrompts(next);
+          if (accepted) {
+            this.setStatus('已更新角色提示词（记得保存或导出）', 'ok');
+            this.refreshStats();
+            this.scheduleValidate(0);
+          } else if (!this.session.hasCharacterPrompts() || !this.sessionPromptsWithinLimits()) {
+            /*
+             * 走到这里有两种可能，必须分开说：
+             *   · 超上限被拒 → 明确告诉他"没保存"
+             *   · 没改动     → 不吭声（点一下复选框又点回来不该弹提示）
+             */
+            this.setStatus('角色提示词超出上限，这次改动没有保存', 'warn');
+          }
+          return accepted;
+        },
+        logError: (line) => this.crashLogger?.record('error', new Error(line), this.sessionSummary()),
+      });
+    } else {
+      this.promptsPanel.refresh();
+    }
+    return this.promptsPanel;
+  }
+
+  /** 当前卡的角色提示词是否在上限内（给状态提示用） */
+  private sessionPromptsWithinLimits(): boolean {
+    try {
+      return promptsWithinLimits(this.session.readCharacterPrompts());
+    } catch {
+      return true;
+    }
   }
 
   // ── 设置与同步可用性（T6.8）──────────────────────────────
