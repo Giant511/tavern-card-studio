@@ -82,6 +82,40 @@ export const SCENE_SECTION_LABELS = Object.freeze({
 });
 
 /**
+ * 内置标记的**兼容别名**：解析时额外认这些写法，但**从不写出**。
+ *
+ * ```text
+ *   @@开场白 / @开场白      开场白段（@@ 是我们自己的约定，@ 是手写卡常见漏打）
+ *   @@情景 / @情景          情景段（原名）
+ *   @@场景 / @场景          情景段（同义的另一叫法，实测卡里就是这么写的）
+ * ```
+ *
+ * 只进解析：`renderCompositeScene` 永远只用 `sectionLabel()` 取到的那一个，
+ * 所以"写出去的和预设一致"这条不会被这些别名破坏。
+ */
+const EXTRA_SECTION_LABELS: ReadonlyArray<{ label: string; key: SceneSectionKey }> = [
+  { label: '@@开场白', key: 'greeting' },
+  { label: '@开场白', key: 'greeting' },
+  { label: '@@情景', key: 'scenario' },
+  { label: '@情景', key: 'scenario' },
+  { label: '@@场景', key: 'scenario' },
+  { label: '@场景', key: 'scenario' },
+];
+
+/** 预设显式配置的标签（排在别名前面 ⇒ 解析时优先归属给预设那个段） */
+function configuredLabels(format: GreetingFormatParams): Array<{ label: string; key: SceneSectionKey }> {
+  const out: Array<{ label: string; key: SceneSectionKey }> = [];
+  for (const key of SCENE_SECTION_ORDER) {
+    const label = sectionLabel(key, format);
+    // 与内置默认重合时不必重复加（Map 会去重，这里只为少一次循环）
+    if (!EXTRA_SECTION_LABELS.some((item) => item.label === label && item.key === key)) {
+      out.push({ label, key });
+    }
+  }
+  return out;
+}
+
+/**
  * 取某个子段的实际标记行（预设覆盖优先）。
  *
  * `labelMap` 里这两个键是可选的；空串/纯空白视为"没给"，回落默认 ——
@@ -127,8 +161,18 @@ function splitSections(
    * 而报错又太吵（见下面"同一个标记出现两次"那段同样的理由）。
    */
   const labelToKey = new Map<string, SceneSectionKey>();
-  for (const key of SCENE_SECTION_ORDER) {
-    const label = sectionLabel(key, format);
+  /*
+   * 候选标签 = 预设给的那个 + **内置那一套**（2026-11-17 补）。
+   *
+   * 为什么解析要认两套：标记是**写进正文的**。用户换了一份预设（或从别的
+   * 平台拿卡进来）以后，旧文本里还是 `@@开场白`。只认新预设的话，那些行
+   * 认不出来 —— 它们不会报错，而是**整段连同标记一起被当成开场白正文**，
+   * 下次导出就把 `@@开场白` 写进 `first_mes`，玩家会看到这行字。
+   *
+   * 认两套只影响解析（渲染永远只写预设那一套），所以不会造成"写出去的和
+   * 预设不符"。误判风险也低：这些标记行不会自然出现在正文里。
+   */
+  for (const { label, key } of [...EXTRA_SECTION_LABELS, ...configuredLabels(format)]) {
     const variants = new Set<string>([
       label,
       `${label}：`,
@@ -136,7 +180,10 @@ function splitSections(
       /* 把末尾的 `】` 挪到冒号后面：`【初始场景：】` → `【初始场景】：` */
       label.replace(/：\]/, '】：').replace(/:\]/, ']:'),
     ]);
-    for (const variant of variants) labelToKey.set(variant, key);
+    for (const variant of variants) {
+      // 先写先赢：`configuredLabels` 把预设的放前面，所以预设优先
+      if (!labelToKey.has(variant)) labelToKey.set(variant, key);
+    }
   }
 
   const found: Array<{ key: SceneSectionKey; index: number }> = [];

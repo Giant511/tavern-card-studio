@@ -55,6 +55,12 @@ const PUBLISHED_DOCS = [
   'docs/spike-01-node-android.md',
   'docs/design-language-nebula.md',
   'docs/wireframe-nebula-tabs.html',
+  /*
+   * 规则与预设的完整规范（2026-11-17）。README 只保留"可以自定义"这件事，
+   * 细节搬到这里 —— 用户手上的自定义规则必须有一份能查的规范，
+   * 否则"配了不生效"只能靠聊天记录。
+   */
+  'docs/44-custom-rules.md',
 ];
 
 const doc = existsSync(DOC) ? readFileSync(DOC, 'utf8') : '';

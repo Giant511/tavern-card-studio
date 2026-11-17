@@ -126,6 +126,10 @@ docs/*
 !docs/spike-01-node-android.md
 !docs/design-language-nebula.md
 !docs/wireframe-nebula-tabs.html
+# 规则与预设的完整规范（2026-11-17）。README 只留"可以自定义"这件事本身，
+# 细节全在这份里 —— 不入库的话，用户手上的自定义规则就成了没人能查的黑盒。
+# 它不含本机路径 / 内网地址 / 密钥，所以与上面几份同档，可以公开。
+!docs/44-custom-rules.md
 PLAN.md
 
 # 记忆全文卷（2026-10-26 用户要求）：与 PLAN.md 同类 —— 含本机路径、真实卡数据与排障记录，
