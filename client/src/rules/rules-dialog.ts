@@ -878,16 +878,27 @@ export class RulesDialog {
 
     const notes = [...outcome.warnings];
     if (outcome.renameHint !== '') notes.push(outcome.renameHint);
+    /*
+     * 字段板块预设**导入即启用**（2026-11-17）。
+     *
+     * 以前这里只说「导入成功」，而生效项是另一个对象引用、没跟着更新 ——
+     * 用户以为已经用上了，实际格式一个字都没变（真机取证：段标题仍是
+     * `@@开场白`）。现在两件事一起改：导入就启用，提示也明说。
+     *
+     * TXT 预设与世界书预设仍不自动切换（它们影响导出与解析口径，
+     * 静默切走风险更大），所以文案按 kind 区分。
+     */
+    const activated = kind === 'greeting' || kind === 'example' ? '，已设为当前使用' : '';
     if (notes.length > 0) {
       this.showWarnings(`导入成功（${outcome.name ?? outcome.id}），但有以下需要注意的问题`, notes);
       this.callbacks.notify(
-        `导入成功${outcome.replaced ? '（覆盖同 id 预设）' : ''}：${outcome.name ?? outcome.id}，${notes.length} 条提示`,
+        `导入成功${outcome.replaced ? '（覆盖同 id 预设）' : ''}：${outcome.name ?? outcome.id}${activated}，${notes.length} 条提示`,
         'warn',
       );
     } else {
       this.hideErrors();
       this.callbacks.notify(
-        `导入成功${outcome.replaced ? '（覆盖同 id 预设）' : ''}：${outcome.name ?? outcome.id}`,
+        `导入成功${outcome.replaced ? '（覆盖同 id 预设）' : ''}：${outcome.name ?? outcome.id}${activated}`,
         'ok',
       );
     }
