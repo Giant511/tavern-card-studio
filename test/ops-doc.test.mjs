@@ -60,7 +60,7 @@ const PUBLISHED_DOCS = [
    * 细节搬到这里 —— 用户手上的自定义规则必须有一份能查的规范，
    * 否则"配了不生效"只能靠聊天记录。
    */
-  'docs/44-custom-rules.md',
+  'docs/custom-rules.md',
 ];
 
 const doc = existsSync(DOC) ? readFileSync(DOC, 'utf8') : '';

@@ -98,14 +98,14 @@ test('★★★ 规则 id 要与文档里引用的一致（同一件事不许写
    * 否则用户看到"规则 example-xxx 未通过"却在文档里搜不到。
    *
    * ★ 2026-11-17：判据从"README 里要有"改成"**已发布的文档里要有**"。
-   *   原因：规则细节从 README 搬到 `docs/44-custom-rules.md` 了
+   *   原因：规则细节从 README 搬到 `docs/custom-rules.md` 了
    *   （README 只留"可以自定义"这件事本身 + 一个链接），
    *   继续钉 README 会要求把同样的 id 清单在 README 里再抄一遍 ——
    *   那正是这条判据本身反对的"两处写同一件事"。
    *
    *   现在检查**两者之一**提到即可，但两边都必须真实存在（read 会抛）。
    */
-  const docs = [read('README.md'), read('docs/44-custom-rules.md')];
+  const docs = [read('README.md'), read('docs/custom-rules.md')];
   const mentioned = [
     'example-uses-start-marker',
     'example-speaker-halfwidth-colon',
