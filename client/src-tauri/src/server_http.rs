@@ -130,8 +130,23 @@ fn build(allow_invalid_cert: bool, timeout_ms: u64) -> ShellResult<reqwest::Clie
         // 只在"用户已确认风险"或"探测第二段"时走到这里。
         // 关掉的是**证书链校验**，不是加密 —— 通道仍然是 TLS 加密的，
         // 只是无法确认对面是谁。这正是自签证书的语义。
-        builder = builder.danger_accept_invalid_certs(true);
+        //
+        // ★ 必须按目标平台分流（2026-11-18）：`danger_accept_invalid_certs`
+        //   由 TLS 后端提供，而 `native-tls` 只在**非安卓**目标上开启
+        //   （见 Cargo.toml：安卓上它会去找 OpenSSL，交叉编译环境没有）。
+        //   安卓构建里 reqwest 完全没有 TLS feature，这个方法不存在 ——
+        //   不加 cfg 就是 `error[E0599]: no method named ... found`。
+        //
+        //   安卓端本来也不走这里：HTTPS 由系统 `HttpURLConnection` 负责
+        //   （见 `StBridge.httpRequest`），用的是系统证书链。
+        #[cfg(not(target_os = "android"))]
+        {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
     }
+    // 安卓上 `allow_invalid_cert` 用不到，显式消费一次避免 unused 警告
+    #[cfg(target_os = "android")]
+    let _ = allow_invalid_cert;
 
     builder.build().map_err(|error| ShellError::NetRequestFailed {
         kind: "other".to_string(),

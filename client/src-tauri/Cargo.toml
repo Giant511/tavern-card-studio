@@ -68,6 +68,43 @@ http-body-util = "0.1"
 # 用系统证书链，比自带一份 TLS 栈更正确，也不用编译 C。
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "stream"] }
 
+# ── 这四个**必须**留在通用区（2026-11-18 修：安卓构建曾被它们搞挂）──
+#
+# 2026-11-17 的 `170b3f4`（自签证书修复）在下面插了
+# `[target.'cfg(not(target_os = "android"))'.dependencies]` 区段标题，
+# 而那四行恰好写在标题**上方**、注释之前 —— 于是被静默归入"仅非安卓"，
+# 安卓构建从此看不到 tokio：
+#
+# ```text
+#   error[E0433]: cannot find module or crate `tokio` in this scope
+#   --> src\proxy.rs:440
+#   共 39 个 error，横跨 proxy / st_api / st_chat / commands
+# ```
+#
+# 而 v0.1.10 及更早的 tag 不含那个提交，所以历史版本一直能打 ——
+# **只有主线（0.2.0）的安卓构建是坏的**，直到重建 APK 才暴露。
+#
+# 判据：`test/android-deps.test.mjs` 断言这四行在 `[dependencies]` 里。
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "rt-multi-thread", "macros"] }
+# 代理的失败要能落到 client-error.log 同级（tauri-plugin-log 已注册）
+log = "0.4"
+
+# ── 仅用于特性合并，代码里不使用 ──────────────────────────────
+# indexmap 1.9.x 的 [features] 里没有 `default = ["std"]`（上游疏漏），
+# 而 tauri-build / tauri-plugin 会打开 `schemars/preserve_order`，
+# 该路径下 schemars 写的是 `IndexMap<K, V>`（两参数），只有在 std 特性开启时
+# `IndexMap<K, V, S = RandomState>` 才有默认参数；否则报
+#   error[E0107]: struct takes 3 generic arguments but 2 generic arguments were supplied
+# 这里不引入任何代码依赖，只借 Cargo 的同版本特性合并把 std 打开。
+# 详见 docs/11 §10.2。删除后必然编译失败。
+#
+# ★ 和上面四行是同一类：它原本就写在通用区，被 170b3f4 插的区段标题
+#   误吞进"仅非安卓"。安卓构建同样需要这次特性合并，必须留在通用区。
+#   `[build-dependencies]` 里那份是独立的（特性解析不共享），保留。
+indexmap = { version = "1.9", features = ["std"] }
+
 # ── 桌面端需要 TLS（2026-11-17，修「自签证书被拒」）──────────────
 #
 # ## 为什么必须按目标分流，而不是直接给上面那行加 `native-tls`
@@ -89,22 +126,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "coo
 # 同步服务端可能跑在 https 上，而自签证书会被系统拒绝。webview 里
 # 的 fetch 无法配置证书校验，只能把这条请求搬到 Rust（见 server_http.rs）。
 [target.'cfg(not(target_os = "android"))'.dependencies]
+# 只放**真的不能进安卓**的那一项：native-tls。
+# bytes / futures-util / tokio / log 已移回上面的 `[dependencies]` ——
+# 它们本来就是跨平台可用的，被误放进这个区段导致安卓构建全面失败。
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "stream", "native-tls"] }
-bytes = "1"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "rt-multi-thread", "macros"] }
-# 代理的失败要能落到 client-error.log 同级（tauri-plugin-log 已注册）
-log = "0.4"
 
-# ── 仅用于特性合并，代码里不使用 ──────────────────────────────
-# indexmap 1.9.x 的 [features] 里没有 `default = ["std"]`（上游疏漏），
-# 而 tauri-build / tauri-plugin 会打开 `schemars/preserve_order`，
-# 该路径下 schemars 写的是 `IndexMap<K, V>`（两参数），只有在 std 特性开启时
-# `IndexMap<K, V, S = RandomState>` 才有默认参数；否则报
-#   error[E0107]: struct takes 3 generic arguments but 2 generic arguments were supplied
-# 这里不引入任何代码依赖，只借 Cargo 的同版本特性合并把 std 打开。
-# 详见 docs/11 §10.2。删除后必然编译失败。
-indexmap = { version = "1.9", features = ["std"] }
 
 [features]
 # 供 CI 显式开关（默认跟随 tauri 的 custom-protocol 约定）
