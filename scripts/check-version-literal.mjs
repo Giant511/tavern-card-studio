@@ -85,6 +85,17 @@ const SKIP_FILES = new Set([
   'installer.zip',
   'package-lock.json',
   'client/src-tauri/Cargo.lock',
+  /*
+   * 第三方依赖清单（2026-11-18）。
+   *
+   * 它是 `.verify/gen-third-party-appendix.mjs` 生成的**数据文件**，列出了 771 个
+   * 第三方组件的版本号。这些数字与"本项目版本"没有任何语义关系，但必然有
+   * 几个恰好等于历史版本 —— 实测 `http-body-util` 那个 v0.1.5 就撞上了，
+   * 被判成"残留的裸版本字面量"。
+   *
+   * 与 `Cargo.lock` / `package-lock.json` 同类：锁文件/清单文件不承载项目版本。
+   */
+  'THIRD-PARTY-NOTICES-APPENDIX.md',
 ]);
 
 /**

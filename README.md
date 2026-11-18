@@ -1436,4 +1436,16 @@ JSON，**都可以自定义**：放在程序规则目录下改完重启生效，
 
 ## 许可证
 
-MIT
+本项目自己的代码以 [MIT](LICENSE) 发布。
+
+**第三方组件另有其许可**，详见 [第三方组件声明](THIRD-PARTY-NOTICES.md) 与
+[完整清单](THIRD-PARTY-NOTICES-APPENDIX.md)；16 份许可全文放在仓库根目录的
+`LICENSES/` 下，索引见第三方组件声明的第 6 节。
+
+其中最需要留意的一条：**安卓 APK 内置了 SillyTavern 1.19.0，它是 AGPL-3.0**。
+未修改原样分发，对应源码即
+[SillyTavern v1.19.0](https://github.com/SillyTavern/SillyTavern/tree/1.19.0)。
+也就是说 —— **源码仓库是 MIT，但安卓 APK 作为一个整体包含 AGPL-3.0 组件**。
+如果你要再分发 APK，请同时保留 `THIRD-PARTY-NOTICES.md` 与 `LICENSES/` 目录。
+
+桌面端 / 服务端安装包不含 AGPL 组件（只有 Node.js 与 MIT/Apache-2.0 依赖）。
