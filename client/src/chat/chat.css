@@ -5405,3 +5405,94 @@ textarea,
   user-select: text;
   -webkit-user-select: text;
 }
+
+/* ═══════════════════════════════════════════════════════════
+   「关于」（2026-11-18，合规要求）
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * ★ 用户明确要求：**不要收纳结构**，像桌面端一样用蓝色文字，
+ *   放在「我的」页最底部、靠左。
+ *
+ * 所以这里没有 `.nb-section`（那是收纳项：整宽点击行 + 折叠箭头），
+ * 只有一个左对齐的文字按钮。
+ *
+ * ★★ 只用**已存在**的 token。这个文件里已经三次踩到"引用了不存在的
+ *   accent token"（2026-11-02 / 11-03 / 11-13）—— `var()` 取不到值时整条
+ *   声明静默失效，颜色退化成继承值，界面上看不出报错。
+ *   本项目里正确的一对是 `--nb-nebula-a` (#8b5cf6) / `--nb-nebula-b` (#22d3ee)。
+ *
+ * 移动端主题是深色（`--nb-abyss: #0c0a14`），所以用偏亮的 `--nb-nebula-b`
+ * 保证对比度；桌面端是浅色主题，那边用 `--accent`（在 styles.css 里）。
+ */
+.nb-about {
+  display: flex;
+  justify-content: flex-start;
+  /*
+   * 上方多留一点：它跟在最后一个收纳项后面，若只留 8px 会显得
+   * 像"第四个收纳项"的一部分（截图里确实偏挤）。16px 把它归到"页脚"。
+   */
+  padding: 16px 0 8px;
+}
+
+.nb-about-link {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 4px 0;
+  margin: 0;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--nb-nebula-b);
+  cursor: pointer;
+  text-align: left;
+  text-decoration: none;
+  /* 触控目标别太小：手指点得准 */
+  min-height: var(--nb-hit-min, 44px);
+  min-width: var(--nb-hit-min, 44px);
+}
+
+.nb-about-link:active {
+  opacity: 0.7;
+}
+
+.nb-about-body {
+  max-height: 60vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 4px 0 8px;
+}
+
+.nb-about-version {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: var(--nb-text-1);
+}
+
+.nb-about-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--nb-text-2);
+}
+
+.nb-about-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 12px 0;
+}
+
+.nb-about-label {
+  font-size: 11px;
+  color: var(--nb-text-3);
+}
+
+/* URL 很长，必须允许断行，否则会把 sheet 撑破 */
+.nb-about-url {
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-all;
+  min-height: 0;
+}

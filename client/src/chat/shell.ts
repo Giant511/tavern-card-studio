@@ -58,6 +58,9 @@ import {
 } from './greeting-page.ts';
 import { pickFetch, setInsecureOrigins } from './native-fetch.ts';
 import { askCertTrust, isCertificateError } from './cert-trust.ts';
+import { openExternal } from '../contract';
+import { androidAbout, type AboutInfo } from '../settings/about-info.ts';
+import { appVersion } from '../settings/app-version.ts';
 import { readDefaultFaceBytes } from './default-face.ts';
 import { clearThumbnailCacheFor, loadThumbnail } from './thumbnail.ts';
 /* 引擎/崩溃取证：见 diagnostics/mobile-diag.ts 的文件头 */
@@ -9274,7 +9277,122 @@ export class AppShell {
        * 有了这个入口，他闪退后重进 App 点一下就能把原因发回来。
        */
       this.renderDiagSection(),
+      /*
+       * 「关于」（2026-11-18，合规要求）。
+       *
+       * ★ 用户明确要求：**不要收纳结构**，直接像桌面端一样用蓝色文字，
+       *   放在页面最底部、靠左。
+       *
+       * 内容必须与桌面端不同：安卓端内置了 SillyTavern（AGPL-3.0），
+       * 所以这里要给出它的对应源码地址；桌面端没有内置，那边不提 ST。
+       */
+      this.renderAboutEntry(),
     );
+  }
+
+  /**
+   * 「我的」页最底部的一行「关于」蓝色文字（2026-11-18，合规要求）。
+   *
+   * ## 为什么不做成收纳项
+   *
+   * 用户明确要求：「不要用收纳结构，直接像桌面端一样使用蓝色文字：关于，
+   * 放在底部左边」。收纳项（`.nb-section`）会带一个整宽点击行 + 折叠箭头，
+   * 视觉上像"又一个设置分组"；而「关于」是**只读的版权信息**，
+   * 一行文字更像"页脚"，也更符合桌面端的形态。
+   *
+   * ## 为什么用 `<button>` 而不是 `<span>`
+   *
+   * 它要能 Tab 聚焦、回车触发、有 `cursor: pointer`。样式上把按钮外观
+   * 全部抹掉（`appearance:none; background:none; border:0`），
+   * 只留蓝色文字 —— 见 `chat.css` 的 `.nb-about-link`。
+   *
+   * ## 为什么内容与桌面端不同
+   *
+   * 安卓端**内置** SillyTavern（AGPL-3.0），必须给对应源码地址（§6 义务）；
+   * 桌面端没有内置，若照搬这段文案就是对桌面用户说假话。
+   */
+  private renderAboutEntry(): ElLike {
+    const info = androidAbout(appVersion());
+    const wrap = el(this.doc, 'div', 'nb-about');
+    const link = el(this.doc, 'button', 'nb-about-link');
+    link.setAttribute('type', 'button');
+    link.textContent = '关于';
+    link.setAttribute('data-role', 'about-open');
+    link.addEventListener('click', () => this.openAboutSheet(info));
+    wrap.append(link);
+    return wrap;
+  }
+
+  /**
+   * 弹出「关于」内容（安卓端）。
+   *
+   * ★ 用**真实存在**的类名（`.nb-sheet-mask` / `.nb-sheet` / `.nb-sheet-title` /
+   *   `.nb-sheet-actions` / `.nb-sheet-action`）—— 与 `bubble-menu.ts` 同一套。
+   *
+   *   第一版我凭印象写了 `.nb-modal-overlay` / `.nb-modal-*`，那套类在 CSS 里
+   *   **根本不存在**。CSS 对未知类不报错，结果是弹窗没有任何定位/遮罩/
+   *   圆角样式 —— 内容会以裸流的形式挤在页面底部，看起来像"点了没反应"。
+   */
+  private openAboutSheet(info: AboutInfo): void {
+    const mask = el(this.doc, 'div', 'nb-sheet-mask');
+    mask.setAttribute('data-role', 'about-dialog');
+    const sheet = el(this.doc, 'div', 'nb-sheet');
+    const title = el(this.doc, 'div', 'nb-sheet-title');
+    title.textContent = '关于';
+    const body = el(this.doc, 'div', 'nb-about-body');
+
+    const line = el(this.doc, 'p', 'nb-about-version');
+    line.textContent = `Tavern Card Studio · 版本 v${info.version}`;
+    const summary = el(this.doc, 'p', 'nb-about-note');
+    summary.textContent = info.summary;
+    body.append(line, summary);
+
+    for (const item of info.links) {
+      const row = el(this.doc, 'div', 'nb-about-row');
+      const label = el(this.doc, 'span', 'nb-about-label');
+      label.textContent = item.label;
+      const link = el(this.doc, 'button', 'nb-about-link nb-about-url');
+      link.setAttribute('type', 'button');
+      link.textContent = item.text;
+      link.setAttribute('title', item.url);
+      link.setAttribute('data-role', 'about-external');
+      link.setAttribute('data-url', item.url);
+      link.addEventListener('click', () => {
+        void openExternal(item.url).catch(() => {
+          /* 打不开就把地址留在界面上，用户能自己复制 */
+        });
+      });
+      row.append(label, link);
+      body.append(row);
+    }
+    for (const note of info.notes) {
+      const p = el(this.doc, 'p', 'nb-about-note');
+      p.textContent = note;
+      body.append(p);
+    }
+
+    const actions = el(this.doc, 'div', 'nb-sheet-actions');
+    const closeButton = el(this.doc, 'button', 'nb-sheet-action nb-sheet-action--primary');
+    closeButton.setAttribute('type', 'button');
+    closeButton.textContent = '关闭';
+    closeButton.addEventListener('click', () => mask.remove());
+    actions.append(closeButton);
+
+    sheet.append(title, body, actions);
+    mask.append(sheet);
+    /*
+     * `DocLike` 没有声明 `body`（渲染层只暴露 createElement）。这里是移动壳
+     * 自己的调用点，`doc` 一定是真 `document` —— 用一次断言比给 `DocLike`
+     * 加一个只有这里用的成员更干净（加成员会让所有单测 stub 都要跟着补）。
+     * 与 `bubble-menu.ts` 同一写法。
+     */
+    const host = (this.doc as unknown as { body?: { append?: (n: unknown) => void } }).body;
+    if (host?.append !== undefined) {
+      host.append(mask);
+    } else {
+      (this.doc as unknown as { documentElement?: { append?: (n: unknown) => void } })
+        .documentElement?.append?.(mask);
+    }
   }
 
   /* ═══════════════════════════════════════════════════════════

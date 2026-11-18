@@ -973,6 +973,80 @@ body {
   line-height: 1.5;
 }
 
+/* ── 关于（2026-11-18，合规要求）─────────────────────────
+ *
+ * 用户明确要求：**蓝色文字，不要气泡/按钮外壳**。
+ * 所以 .about-link 是一个裸 <button>，去掉全部浏览器默认外观，
+ * 只保留 accent 色 + 下划线（鼠标移上去才加），让它看起来像文字链接。
+ *
+ * 为什么用 <button> 而不是 <span>：它要能用 Tab 聚焦、能回车触发 ——
+ * 这一点对桌面端键盘用户和自动化判据都重要（判据靠点击 data-role）。
+ */
+.settings-about {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.about-link {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  text-align: left;
+  text-decoration: none;
+}
+
+.about-link:hover,
+.about-link:focus-visible {
+  text-decoration: underline;
+}
+
+.about-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.about-modal {
+  max-width: 520px;
+}
+
+.about-line {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: var(--app-fg);
+}
+
+.about-note {
+  margin: 10px 0 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.about-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 10px 0;
+}
+
+.about-label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* 弹窗里的链接要能换行：URL 很长，不换行会把弹窗撑破 */
+.about-link-url {
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
 /* 账户身份行（v0.1.2 追加任务）：只描述"我是谁"，不再要求填令牌 */
 .settings-identity-row {
   align-items: center;
