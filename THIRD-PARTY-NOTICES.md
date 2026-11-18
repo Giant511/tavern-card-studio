@@ -26,18 +26,28 @@
 我们对 AGPL 的处理是按"提供对应源码 + 明确声明"来做的：
 
 ```text
-① 未修改 SillyTavern 源码 —— 原样分发（AGPL-3.0 §2 允许 verbatim distribution）
+① 未修改 SillyTavern **源码** —— 原样分发（AGPL-3.0 §4 允许 verbatim distribution）
    · 无补丁、无裁剪、无二次修改（`scripts/pack-st-assets.mjs` 只做打包与排除用户数据）
-② 对应源码即上游 tag v1.19.0，公开可取：
+   · `st.zip` 内每个文件都能与上游 1.19.0 逐字节对上
+② 对应源码：上游 tag v1.19.0 公开可取，另外每个 Release 都附源码 zip
    https://github.com/SillyTavern/SillyTavern/tree/1.19.0
 ③ AGPL-3.0 全文随本仓库与安装包分发：LICENSES/AGPL-3.0.txt
 ④ 运行方式为**独立进程**：ST 在自己的 Node VM 里跑 `server.js`，
    本应用通过其自身的 HTTP API（`/api/chats/get` 等）通信，
    不静态链接、不共享内部数据结构
+⑤ **有一处运行时注入，已主动披露**（§1.1「运行时日志钩子」）：
+   `NODE_OPTIONS=--require tcs-log-hook.cjs` 在我们写的日志钩子，
+   不修改 ST 源码、不改变其业务行为
 ```
+
+**⑤ 是本项目最需要留意的一条**：它不改变"源码未修改"这个事实，但确实是
+"我们的代码在 ST 进程内运行"。我们按聚合（`§5` 末段）处理，并把事实写在
+明面上 —— 不披露才是实质风险，披露之后是可以逐条核对的。
 
 如果有人（包括我们自己）将来**修改**了 SillyTavern 的源码，必须把修改后的源码一并公开，
 这是 AGPL-3.0 §5/§6 的要求，不能只留一个上游链接。
+**这条纪律写成了判据**：`test/third-party-notices.test.mjs` 会检查
+`assets/st.zip`（若存在）内每个关键文件的版本与声明一致。
 
 ---
 
@@ -56,10 +66,37 @@
 | 上游 | https://github.com/SillyTavern/SillyTavern |
 | 对应源码 | https://github.com/SillyTavern/SillyTavern/tree/1.19.0 |
 | 出现位置 | 安卓 APK：`assets/st.zip`（解包至应用私有目录后运行） |
-| 是否修改 | **否**（原样打包；仅排除 `data/`、`.git/`、`tests/`、`backups/`、`doc/`） |
+| 是否修改源码 | **否**（`st.zip` 内每一个文件都与上游 1.19.0 逐字节相同；仅排除了 `data/`、`.git/`、`tests/`、`backups/`、`doc/`） |
+| 运行时是否有外部代码注入 | **有，一处**：见下方「运行时日志钩子」 |
 
 > `data/` 被排除是有意的：那里面是**用户自己的**聊天记录与角色，既不应进别人的
 > 安装包，也让"首启是干净环境"这个前提成立。
+
+#### 运行时日志钩子（主动披露）
+
+安卓端启动引擎时，通过 Node 官方的 `--require` 扩展点加载一个**我们写的**
+日志钩子（`assets/tcs-log-hook.cjs`，168 行，以 MIT 公开在本仓库）：
+
+```text
+启动命令：libnode.so server.js --dataRoot=… --port=… --browserLaunchEnabled=false
+环境变量：NODE_OPTIONS="--no-warnings --require <filesDir>/st/tcs-log-hook.cjs"
+```
+
+| 项 | 内容 |
+|---|---|
+| 文件名 | `tcs-log-hook.cjs`（**新增文件，不替换任何 ST 文件**） |
+| 位置 | 运行时复制到引擎目录，与 `server.js` 同级 |
+| 它做什么 | 重写 `console.error` / `console.warn` 写入我们自己的日志文件；挂 `uncaughtException` / `unhandledRejection` / `exit` 钩子记录崩溃原因 |
+| 它不做什么 | **不读改写任何 ST 源文件；不改变 ST 的业务逻辑、网络行为或输出内容** |
+| 为什么需要 | 安卓版 Node 把 stdout/stderr 直接写 logcat，`ProcessBuilder` 的管道拿不到内容（实测文件被创建但 0 字节）；`--require` 是唯一能接住启动期异常的入口 |
+
+**为什么要把这条写出来**：这是本项目唯一一处"我们的代码在 ST 进程内运行"的地方。
+不披露会让"未修改、原样分发"这句话显得含糊；披露之后性质是清楚的——
+ST 的**源码**一字未改，注入的是一份独立的、可单独审查的日志工具。
+该钩子的源码本身也以 MIT 随本仓库公开，任何人都可以核对它做了什么。
+
+> 若你据此认为这不属于"聚合"而是"形成更大程序"，请以 AGPL-3.0 对待整个 APK。
+> 我们的立场是它构成聚合（`§5` 末段），理由见 [§0](#0-先读这一节本项目有两种分发物义务不同)。
 
 ### 1.2 Node.js
 

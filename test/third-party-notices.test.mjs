@@ -187,6 +187,49 @@ test('★★ 打包脚本确实没有修改 ST 源码（只做打包与排除）
 });
 
 /* ═══════════════════════════════════════════════════════════
+   ③·2 运行时注入必须披露（2026-11-18 评估后补）
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★ 声明必须披露运行时日志钩子（本项目唯一的进程内注入）', () => {
+  /*
+   * `StLauncher.kt` 设了 `NODE_OPTIONS=--require tcs-log-hook.cjs`，
+   * 让**我们的代码**在 ST 进程里执行。这是事实，且它削弱了"纯独立进程"的说法。
+   *
+   * 不写出来，"未修改、原样分发"就成了含糊表述 —— 那才是实质风险。
+   * 披露之后性质清楚：ST 源码一字未改，注入的是一份可单独审查的日志工具。
+   */
+  const notices = read('THIRD-PARTY-NOTICES.md');
+  assert.match(notices, /tcs-log-hook\.cjs/, '必须点名那个钩子文件');
+  assert.match(notices, /--require/, '必须说明是通过 --require 注入的');
+  assert.match(
+    notices,
+    /不读改写|不修改.*源文件|不改变.*业务逻辑/,
+    '必须说明它不修改 ST 的源码与业务逻辑',
+  );
+});
+
+test('★★★ 代码里若还有注入，声明里就必须还有披露（两边不许脱节）', () => {
+  /*
+   * 反向守护：将来若新增了别的注入点（比如又加一个 --import / --loader），
+   * 声明里只有 tcs-log-hook 就会漏。这里把"代码里的注入点"数一遍。
+   */
+  const launcher = read(
+    'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StLauncher.kt',
+  );
+  const injections = [...launcher.matchAll(/NODE_OPTIONS|--require|--import|--loader/g)].map(
+    (m) => m[0],
+  );
+  assert.ok(injections.length > 0, 'StLauncher 里应当有注入点（--require）');
+  // 目前只允许 require 一种；新增别的方式时这条会红，逼作者回来更新声明
+  const kinds = new Set(injections.filter((one) => one.startsWith('--')));
+  assert.deepEqual(
+    [...kinds],
+    ['--require'],
+    '注入方式变了（' + [...kinds].join(', ') + '），必须同步更新 THIRD-PARTY-NOTICES 的披露段落',
+  );
+});
+
+/* ═══════════════════════════════════════════════════════════
    ④ 链接有效
    ═══════════════════════════════════════════════════════════ */
 
