@@ -13,6 +13,7 @@ import {
   configPatch,
   defaultCardsDir,
   isShellAvailable,
+  openExternal,
   openFolder,
   pickDirectory,
   probeCardsDir,
@@ -29,6 +30,12 @@ import type { AuthPhase } from '../auth/session';
 import type { AuthUser } from '../auth/auth-client';
 import { identityLabel, resolveSyncGate, syncGateMessage } from '../auth/entry-policy';
 import { appVersion } from './app-version';
+/*
+ * ★ 用 `desktopAbout` 而不是 `androidAbout`：这个设置页属于**桌面编辑器**。
+ * 桌面端不内置 SillyTavern，所以这里不能出现它的源码地址。
+ * 安卓端的「关于」在 `chat/shell.ts` 的 `renderMe()` 里，那边才用 androidAbout。
+ */
+import { desktopAbout } from './about-info';
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -513,6 +520,24 @@ export class SettingsDialog {
     this.diagnosticsStatus.hidden = true;
     diagSection.append(this.diagnosticsStatus);
 
+    /*
+     * ── 关于（2026-11-18，合规要求）──────────────────────
+     *
+     * 位置：**所有设置分区之后、底部按钮之前**（用户要求"设置页最底部"）。
+     *
+     * 形态：一行**蓝色文字**，不是按钮、不是气泡。点了才弹窗 ——
+     * 因为内容（两个源码地址 + 版本号）看一眼就走，不该占着设置页的地方。
+     *
+     * 为什么必须在这里而不是只写在 README 里：AGPL-3.0 §6 要求分发时
+     * **随附**源码获取方式。装到手机上的用户看不到 README。
+     */
+    const aboutSection = el('section', 'form-section settings-about');
+    const aboutLink = el('button', 'about-link', '关于 · 开源许可与源码');
+    aboutLink.type = 'button';
+    aboutLink.dataset['role'] = 'about-open';
+    aboutLink.addEventListener('click', () => this.openAbout());
+    aboutSection.append(aboutLink);
+
     // ── 底部按钮 ────────────────────────────────────────
     const foot = el('div', 'modal-foot');
     const browserWarn = el(
@@ -528,7 +553,16 @@ export class SettingsDialog {
     cancel.addEventListener('click', () => this.close());
     foot.append(browserWarn, cancel, this.saveButton);
 
-    panel.append(head, serverSection, stSection, dirSection, voiceSection, diagSection, foot);
+    panel.append(
+      head,
+      serverSection,
+      stSection,
+      dirSection,
+      voiceSection,
+      diagSection,
+      aboutSection,
+      foot,
+    );
     this.overlay.append(panel);
 
     // 点遮罩关闭
@@ -635,6 +669,88 @@ export class SettingsDialog {
 
   close(): void {
     this.overlay.hidden = true;
+  }
+
+  /**
+   * 打开「关于」弹窗（2026-11-18，合规要求）。
+   *
+   * ## ★★ 桌面端**不内置** SillyTavern
+   *
+   * 这个设置页是**桌面编辑器**的（`index.html`；Android 上会被重定向到
+   * `mobile.html`，那条路的「关于」在 `chat/shell.ts` 的 `renderMe()` 里）。
+   *
+   * 桌面端没有内置 ST：用户想联动就自己装一个，我们连它的 HTTP API ——
+   * 那是**互操作**，不涉及 AGPL 分发。所以这里用 `desktopAbout()`，
+   * 文案里只讲 MIT + 第三方依赖，**不出现 SillyTavern 的源码地址**
+   * （那会让人以为安装包里打了 ST）。
+   *
+   * 第一版把两端写成同一份，桌面设置页里出现了「内置引擎源码」—— 用户当场指出。
+   *
+   * ## 为什么自己画一层而不是用 `<a href>` 直接跳
+   *
+   * 桌面壳里点 `<a href="https://...">` 有两种坏结果：在应用内导航
+   * （把整个 SPA 顶掉且回不来），或者毫无反应。
+   * 统一走契约的 `openExternal`，由壳决定用系统浏览器打开。
+   */
+  private openAbout(): void {
+    // 版本号在这里取（唯一实现），about-info 只负责拼文案与地址
+    const info = desktopAbout(appVersion());
+
+    const overlay = el('div', 'modal-overlay');
+    overlay.dataset['role'] = 'about-dialog';
+    const panel = el('div', 'modal about-modal');
+    const head = el('div', 'modal-head');
+    head.append(el('h2', 'modal-title', '关于'));
+    const body = el('div', 'modal-body');
+
+    body.append(
+      el('p', 'about-line', `Tavern Card Studio · 版本 v${info.version}`),
+      el('p', 'about-note', info.summary),
+    );
+
+    /** 一行"标签 + 可点链接" */
+    const linkRow = (label: string, text: string, url: string): HTMLElement => {
+      const row = el('div', 'about-row');
+      row.append(el('span', 'about-label', label));
+      const link = el('button', 'about-link about-link-url', text);
+      link.type = 'button';
+      link.title = url;
+      link.dataset['role'] = 'about-external';
+      link.dataset['url'] = url;
+      link.addEventListener('click', () => {
+        void openExternal(url).catch(() => {
+          /* 打不开就把地址留在界面上，用户能自己复制 */
+        });
+      });
+      row.append(link);
+      return row;
+    };
+
+    for (const link of info.links) body.append(linkRow(link.label, link.text, link.url));
+    for (const note of info.notes) body.append(el('p', 'about-note', note));
+
+    const foot = el('div', 'modal-foot');
+    const closeButton = el('button', 'btn primary', '关闭');
+    closeButton.type = 'button';
+    closeButton.addEventListener('click', () => overlay.remove());
+    foot.append(closeButton);
+
+    panel.append(head, body, foot);
+    overlay.append(panel);
+    document.body.append(overlay);
+
+    // 与其它弹窗同一条规矩：点遮罩不关闭，只有按钮或 Esc
+    document.addEventListener(
+      'keydown',
+      (event) => {
+        if (event.key === 'Escape' && overlay.isConnected) {
+          event.preventDefault();
+          overlay.remove();
+        }
+      },
+      { once: true },
+    );
+    closeButton.focus();
   }
 
   /**

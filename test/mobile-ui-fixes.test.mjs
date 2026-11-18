@@ -273,8 +273,35 @@ test('★ 问题三：语音区块的展开状态记在外壳，不记在页面�
 test('★ 问题三：语音区块收起时不留 DOM', () => {
   /*
    * 与问题二同一理由：避免字段重复导致取值歧义，也省内存。
+   *
+   * ## 这条判据原来测的是"碰巧"
+   *
+   * 它取 `indexOf('renderVoiceSection')` 往后 4000 字符，断言里面有
+   * `body.replaceChildren()` —— 但语音区块**自己**没有 replaceChildren，
+   * 清空发生在 `renderAccordion()` 里。原来的通过是因为调用处恰好离
+   * `renderAccordion` 的实现不到 4000 字符，窗口**顺带**覆盖到了它。
+   *
+   * 2026-11-18 我在调用处附近加了注释，这个"碰巧"就断了 —— 判据假红，
+   * 而代码一行没错。修判据，别改代码迁就判据。
+   *
+   * ## 真正的机制
+   *
+   * ```text
+   * 语音区块 = renderAccordion({ expanded: this.voiceExpanded, ... })
+   * 收起时   renderAccordion 里 body.replaceChildren() 把展开体清空
+   * ```
+   *
+   * 所以断言要写成"走 renderAccordion + renderAccordion 自身会清空"两段。
    */
   const src = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
-  const seg = src.slice(src.indexOf('renderVoiceSection'), src.indexOf('renderVoiceSection') + 4000);
-  assert.match(seg, /body\.replaceChildren\(\)/, '收起时要清空语音面板 DOM');
+
+  const defStart = src.indexOf('private renderVoiceSection');
+  assert.notEqual(defStart, -1, '找不到 renderVoiceSection 的定义');
+  const seg = src.slice(defStart, defStart + 1200);
+  assert.match(seg, /this\.renderAccordion\(\{/, '语音区块必须走 renderAccordion（它负责收起清空）');
+
+  const accStart = src.indexOf('private renderAccordion');
+  assert.notEqual(accStart, -1, '找不到 renderAccordion 的定义');
+  const accSeg = src.slice(accStart, accStart + 6000);
+  assert.match(accSeg, /body\.replaceChildren\(\)/, '收起时要清空展开体 DOM');
 });

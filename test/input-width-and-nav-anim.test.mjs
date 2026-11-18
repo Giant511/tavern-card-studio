@@ -272,6 +272,10 @@ test('★★★ 每一个能纵向滚动的容器都要有归属（白名单 或
     ['.nb-model-list', '模型名列表，整行是按钮，没有输入框'],
     ['.nb-select-popover', '下拉候选面板，整行是按钮，没有输入框'],
     ['.nb-thinking', '思考链正文，纯文本展示（data-full 时允许滚动）'],
+    [
+      '.nb-about-body',
+      '「关于」弹窗正文：只有版本号、几行说明和链接按钮，永远不会有输入框',
+    ],
   ]);
 
   const all = scrollableClasses(css);
