@@ -70,36 +70,37 @@ if [ -x "D:/tcs-bin/node.exe" ]; then
   export PATH="/d/tcs-bin:$PATH"
 fi
 
-# 版本号从生成的 tauri.properties 读 —— 不在脚本里手写，避免升版后文件名漂移
-TAURI_PROPS="$CLIENT/src-tauri/gen/android/app/tauri.properties"
+# 版本号从 `client/package.json` 读 —— 那是 `check:version` 断言的**单一真源**。
 #
-# ★★★ 文件不存在时必须**明确报错**，不能让 set -e 静默带走整条构建
-# （2026-11-15 亲手踩到）。
+# ## ★★★ 为什么不再读 tauri.properties（2026-11-18 血的教训）
 #
-# 原来是这样：
+# 原来读的是 `gen/android/app/tauri.properties`，理由是"它是 tauri 生成的，
+# 不会漂移"。但那个文件是 **`tauri android build` 运行期间**才被重写的：
 #
-# ```bash
-#   VERSION_NAME=$(sed -n '...' "$TAURI_PROPS" 2>/dev/null | tr -d '\r')
+# ```text
+#   本脚本读 tauri.properties   ← 此刻还是**上一次构建**留下的版本号
+#     ↓
+#   tauri android build         ← 这里面才按 package.json 重新生成
+#     ↓
+#   按旧 VERSION_NAME 拷贝产物   ← 文件名是上一版
 # ```
 #
-# 文件不存在时 `sed` 返回非零，`set -o pipefail` 让**管道整体**返回非零，
-# 于是 `set -e` 立刻退出 —— 退出码 2、**一行输出都没有**。
+# 实测后果（2026-11-18，重建 v0.1.7 时）：从 v0.1.7 分支构建，
+# `tauri.properties` 里残留着 0.2.0，于是**新打的 v0.1.7 包被拷成了
+# `tavern-card-studio-0.2.0-arm64-release.apk`，把真正的 0.2.0 产物覆盖掉了**。
+# 构建全绿、APK 也能装（versionName 确实是 0.1.7），只有文件名是错的 ——
+# 这类"名字骗人"的问题比构建失败严重得多。
 #
-# 表现是"打包 32 秒就结束了，但什么也没生成"，而没有任何线索说明
-# 是版本号文件的问题。`2>/dev/null` 把唯一的那句错误也吞了。
-#
-# 现在：先判存在，缺了就说清缺什么、怎么补。
-if [ ! -f "$TAURI_PROPS" ]; then
-  echo "[FATAL] 缺少 $TAURI_PROPS" >&2
-  echo "        它是 tauri 构建时生成的版本号来源。手写也可以：" >&2
-  echo "        tauri.android.versionName=<版本> / tauri.android.versionCode=<整数>" >&2
-  exit 2
-fi
-VERSION_NAME=$(sed -n 's/^tauri\.android\.versionName=//p' "$TAURI_PROPS" | tr -d '\r')
+# package.json 在整个构建过程中不变，读它没有这个窗口期。
+# 构建完成后仍会用 tauri.properties **反查一次**（见 ⑧c），确保 tauri 真的
+# 按包版本生成了 apk。
+VERSION_NAME=$(node -e "process.stdout.write(String(require('$CLIENT/package.json').version))" 2>/dev/null)
 if [ -z "$VERSION_NAME" ]; then
-  echo "[FATAL] $TAURI_PROPS 里没有 tauri.android.versionName" >&2
+  echo "[FATAL] 读不到 $CLIENT/package.json 的 version" >&2
   exit 2
 fi
+
+TAURI_PROPS="$CLIENT/src-tauri/gen/android/app/tauri.properties"
 
 VARIANT="debug"
 TAURI_ARGS=(--apk --target aarch64 --debug)
@@ -246,6 +247,29 @@ echo
 
 cd "$CLIENT"
 node "$TAURI_CLI" android build "${TAURI_ARGS[@]}" "${EXTRA_ARGS[@]}"
+
+# ════════════════════════════════════════════════════════════
+#  ⑦b ★ tauri 真的按 package.json 生成了版本号吗（2026-11-18 加）
+# ════════════════════════════════════════════════════════════
+#
+# 这道断言是为了防住"文件名骗人"：脚本按 `VERSION_NAME` 拷贝产物，
+# 而 `tauri.properties` 是 tauri 在构建期生成的。两者不一致时，
+# 会得到一个**内容对、文件名错**的 APK，进而覆盖掉另一个版本的产物。
+#
+# 实测事故（2026-11-18）：从 v0.1.7 分支构建，tauri.properties 残留 0.2.0，
+# 新打的 0.1.7 包被拷成 `…-0.2.0-arm64-release.apk`，把真正的 0.2.0 覆盖了。
+# 构建全绿、能装能跑，只有文件名是假的 —— 这类问题比构建失败危险得多。
+if [ -f "$TAURI_PROPS" ]; then
+  ACTUAL_VN=$(sed -n 's/^tauri\.android\.versionName=//p' "$TAURI_PROPS" | tr -d '\r')
+  if [ "$ACTUAL_VN" != "$VERSION_NAME" ]; then
+    echo "[FATAL] 版本号不一致，拒绝继续拷贝产物：" >&2
+    echo "        package.json        = $VERSION_NAME" >&2
+    echo "        tauri.properties    = $ACTUAL_VN" >&2
+    echo "        两者不一致时按哪个命名都是错的。先查 client/package.json 与 tauri.properties。" >&2
+    exit 2
+  fi
+  echo "[OK] 版本号一致：$ACTUAL_VN（package.json = tauri.properties）"
+fi
 
 # ════════════════════════════════════════════════════════════
 #  ⑧ 修补 jniLibs 里的 .so，然后**重新打包**
