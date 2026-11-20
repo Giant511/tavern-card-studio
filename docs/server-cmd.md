@@ -1,9 +1,9 @@
 # 服务端运维命令（PowerShell）
 
 Tavern Card Studio Server 的全部运维操作都在命令行完成：建账户、看/换令牌、
-  
+
 注册 Windows 服务、离线自检。**管理面板只做查看与配置，不提供这些操作** ——
-  
+
 所以面板进不去时（忘了密码、服务没起、端口被改），这条路仍然能用。
 
 > 适用版本：0.1.2 及以后。命令面一旦变化，本文件必须同步（见文末「维护约定」）。
@@ -31,11 +31,11 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 `$tcs` 只在**当前这个 PowerShell 窗口**有效。关掉重开要重新定义一次。
 
 **为什么用这个形态**：`node.exe` 和 `app\` 目录是任何安装包都会铺的；而
-  
-`tcs-server.cmd` / `start-server.cmd` 是后来才加进包里的脚本，**同一个版本号
-  
-再装一次不会替换已有文件**（Windows Installer 对相同版本只做维护），所以
-  
+
+`tcs-server.cmd` / `start-server.cmd` 是后来才加进包里的脚本，\*\*同一个版本号
+
+再装一次不会替换已有文件\*\*（Windows Installer 对相同版本只做维护），所以
+
 老安装上可能没有它们。
 
 ### 1.1 两个脚本形态（新装才有）
@@ -49,15 +49,15 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 | C     | `.\start-server.cmd user list` | 较新的安装包才有；无参数时启动服务      |
 
 **别敲裸 `tcs-server`**。安装目录里没有这个 exe，只会得到
-  
+
 「无法将"tcs-server"项识别为 cmdlet」。要么带 `.cmd`，要么用形态 A。
 
 ### 1.2 `--config` 为什么必须写
 
 它指向**服务正在用的那份配置**。省掉的话，CLI 会按当前目录另算一个数据目录
-  
+
 （`<当前目录>\data\`），**等于在旁边新建一个空库**。症状是
-  
+
 「账户明明建好了，服务却说不存在」，而两处都不会报错。
 
 配置文件的解析顺序（`.cmd` 脚本内部也是这个顺序）：
@@ -67,7 +67,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 3. 否则按绿色包处理 → `%HERE%\data\config.json`
 
 `install-layout.ini` 只有 MSI 才会装。用它而不是"猜 `data\config.json` 存不存在"，
-  
+
 是因为那个文件绿色包跑过一次就会有、安装版被误跑一次也会生成，猜错就写进另一个库。
 
 ---
@@ -98,17 +98,17 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 | `help`                                          | 打印内置帮助（也可写 `--help`）        |
 
 > **邀请码没有命令行子命令**（v0.1.7）。它在管理面板「注册策略」里生成与作废，
->   
+>
 > 或直接调 `POST/DELETE /control/invites`（见 §3.8）。这是刻意的：生成后要立刻
->   
+>
 > 复制发给对方，面板比命令行合适；命令行的位置留给必须脚本化的运维动作。
 
 > `--version` 与 `version` 等价。**拼错的选项会被拒绝**（退出码 2）并提示
->   
+>
 > 敲 `tcs-server help`。它不会被当成"没有子命令，启动服务"。
->   
+>
 > 这条不是洁癖：以前 `--verison` 会静默起一个真服务，还在当前目录写出
->   
+>
 > `data/config.json`（含明文令牌）。
 
 ---
@@ -118,23 +118,23 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 ### 3.1 `user migrate` —— 从旧版升级、或全新安装时建第一个账户
 
 **这是 v0.1.1 升上来的必经一步。** v0.1.2 起卡片按账户隔离，没有账户时
-  
+
 客户端登录不了（自助注册默认关闭），全局令牌也看不到已归属的卡片。
 
 ```powershell
 & $tcs user migrate admin
 ```
 
-提示 `首账户密码` 时输入（至少 8 个字符，不回显）。**密码只从标准输入读，
-  
-不接受命令行参数**。参数会进 shell 历史，也会出现在进程列表里。
+提示 `首账户密码` 时输入（至少 8 个字符，不回显）。\*\*密码只从标准输入读，
+
+不接受命令行参数\*\*。参数会进 shell 历史，也会出现在进程列表里。
 
 它做的事：
 
 1. 建账户（首账户自动是管理员）；
 2. 把历史卡片接管进这个账户的默认仓库；
 3. **动库之前先备份**（`VACUUM INTO`，含最新事务），备份在原库旁边，
-     
+
    文件名形如 `state.db.pre-accounts-<时间戳>.bak`。
 
 典型输出：
@@ -159,7 +159,7 @@ $tcs = ".\node.exe", ".\app\server\dist\index.js",
 ```
 
 提示 `设置密码` 时输入。**第一个账户无论 `--role` 写什么都会被设为管理员**
-  
+
 （否则建完没人能管理服务端），此时会额外打印一行说明。
 
 ### 3.3 `user list` —— 看账户现状
@@ -177,7 +177,7 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 ```
 
 - 一个账户都没有时，它会直接提示「还没有任何账户。用 `tcs-server user add <用户名>`
-    
+
   创建第一个（管理员）」。看到这句就说明库是空的（或路径选错了，见 §1.2）。
 - 库里有无归属的历史卡片时，末尾会多一行 `注意：有 N 张卡片没有归属账户`。
 
@@ -188,7 +188,7 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 ```
 
 提示 `新密码`。改完该账户**已签发的会话全部失效**（密码变了就不再接受旧令牌），
-  
+
 这是忘了密码、或怀疑泄露时的标准处置。
 
 ### 3.5 `user enable` / `user disable` —— 停用而不删除
@@ -207,9 +207,9 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 ```
 
 把 `owner_id` 为空的历史卡片划给该账户，**同时入它的默认仓库**
-  
+
 （否则会出现「账户能看到、仓库令牌看不到」的中间态）。适合"当初没跑 migrate / 又
-  
+
 从旧备份里导回几张卡"的情况。
 
 ### 3.7 `user repos` / `user repos add` —— 看与建仓库
@@ -235,25 +235,25 @@ bob     user   active  2026-10-23T11:25:02.000Z  -
 ### 3.8 邀请码 —— 只能通过面板或 API 管理（v0.1.7）
 
 **没有对应的命令行子命令**，这是刻意的：邀请码是
-  
+
 "把注册入口临时开放给指定的人"的一次性动作，用面板点两下比敲命令合适，
-  
+
 而且生成后要立刻复制发给对方。命令行的位置留给"必须脚本化"的运维动作
-  
+
 （建账户、换令牌、注册服务）。
 
 #### 首选：管理面板
 
 「参数配置 → 注册策略」选 **邀请码注册** → 保存 → 下方出现邀请码管理区。
-  
+
 选有效期（1 小时 / 6 小时 / 1 天 / 3 天 / 7 天 / 15 天）→ 点「生成邀请码」→
-  
+
 码会自动复制到剪贴板。列表里能看作废。
 
 #### 备选：直接调 API（脚本化时用）
 
 **注意端口与凭证**：这三条走**控制端口**（默认 **8731**，不是 API 的 8730），
-  
+
 凭证是**全局访问令牌**（就是面板登录用的那个，`tcs-server token show` 可看）。
 
 ```bash
@@ -275,17 +275,17 @@ curl -s -X DELETE http://127.0.0.1:8731/control/invites/<id> \
 ```
 
 > 数据面（8730）**没有** `/api/invites`，调了会 404。这是刻意的：
->   
+>
 > 两条路径意味着两套凭证模型，而"哪套生效取决于端口"最难排查。
 
 `validityMs` 是**毫秒**，上限 15 天（`1296000000`）。超了返回 `400 BAD_REQUEST` ——
-  
+
 这个校验在服务端，不在界面里。
 
 #### 三个容易踩的点
 
 1. **码不能被"编辑"**，只能作废重发。次数上限与有效期一旦签发就不该改 ——
-     
+
    否则"已经说出去的承诺"和系统里的记录会分叉。
 2. **作废不影响已注册的账户**：它只是让这张码不再能用来建新号。
 3. **每张码最多 3 个账户**，这是产品口径，不是可调参数。
@@ -303,7 +303,7 @@ curl -s -X DELETE http://127.0.0.1:8731/control/invites/<id> \
 | **全局令牌**（legacy）  | 服务端首次启动自动生成       | **只有未归属账户的卡片**   | 仅运维、或 ≤v0.1.1 的旧服务端 |
 
 **迁移到账户之后，全局令牌看不到任何卡片**。卡都已归属账户。这是 0.1.2 的
-  
+
 有意降权，不是故障。
 
 ### 4.2 `token show` —— 取全局令牌原文
@@ -315,7 +315,7 @@ curl -s -X DELETE http://127.0.0.1:8731/control/invites/<id> \
 只打印令牌本身，方便管道或复制。配置里还没有令牌时会提示用 `token rotate` 生成。
 
 也可以从这三处拿到：面板「API 与令牌」页、配置文件 `auth.token` 字段、
-  
+
 或 `config show`（打码显示前后各 4 位）。
 
 ### 4.3 `token rotate` —— 换一个新的全局令牌
@@ -352,9 +352,9 @@ curl -s -X DELETE http://127.0.0.1:8731/control/invites/<id> \
 ```
 
 输出 JSON：`configPath`、`port`、`controlPort`、`host`、`controlHost`、`dataDir`、
-  
+
 `rulesDir`、`maxUploadBytes`、`logLevel`、`installDirWriteCheck`、`auth.token`（形如 `tcs_…a1b2`）、
-  
+
 `service`、以及拼好的 `panel` / `api` 地址。
 
 需要明文令牌时用 `token show`。
@@ -368,7 +368,7 @@ curl -s -X DELETE http://127.0.0.1:8731/control/invites/<id> \
 3. 运行期每 60 秒比对一次安装目录快照，发现新增或改写就告警。
 
 告警落在启动日志（`server.log` 里 `installDir.writeDetected`）与应用程序事件日志
-  
+
 （来源 `TavernCardStudio`）。查证据：
 
 ```powershell
@@ -377,7 +377,7 @@ Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCard
 ```
 
 `dataDir` 故意放在安装目录里（不推荐）时，把那个相对路径加进 `installDirWriteAllow`
-  
+
 就不再按文件刷屏。但配置检查那一条仍会告警一次：
 
 ```json
@@ -385,7 +385,7 @@ Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCard
 ```
 
 测试环境想彻底关掉：`"installDirWriteCheck": false`。注意它**默认开**，
-  
+
 所以"没有告警"有两种可能。真的没问题，或者被关了。`config show` 会直接显示这个值。
 
 ---
@@ -405,13 +405,13 @@ Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCard
 ```
 
 **注册服务需要宿主程序。** `install` 会检查同目录下的
-  
+
 `tcs-service-host.exe` + `tcs-service-host.xml`（WinSW 宿主），找不到就拒绝并说明原因。
-  
+
 为什么不直接挂 `node.exe`：node 从不调用 `StartServiceCtrlDispatcher`，
-  
+
 服务会永久卡在 `Start Pending`，而进程其实活着、端口也在听，看起来完全正常，
-  
+
 但安装程序会一直等它。
 
 **用 MSI 装的机器上服务已经注册好了**，一般不需要碰这一组命令。
@@ -421,8 +421,9 @@ Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='TavernCard
 ## 6b. 卸载与数据清理
 
 MSI 的卸载流程会弹一页「Uninstall options」，问要不要**连数据一起删**。
-  
+
 复选框默认**不勾**（数据保留），勾了才删整个 `C:\ProgramData\TavernCardStudio`。
+
 
 图形界面卸载（开始菜单 / 设置 → 应用）：按提示走，注意那一页的复选框。
 

@@ -511,6 +511,98 @@ def patch_cleartext_loopback(check_only: bool) -> list[str]:
 
 
 
+def patch_locked_portrait(check_only: bool) -> list[str]:
+    """
+    锁定 **竖屏** —— 否则手机横过来界面就跟着转。
+
+    ## 为什么该锁
+
+    这个 App 的形态是"手机上聊天"：消息列表、输入框、底部标签栏都是按
+    竖屏长边滚动的布局设计的。横屏之后：
+
+    ```text
+      · 输入框被压到很矮，键盘一弹几乎看不见
+      · 底部 tabbar 与键盘叠加，可点区域互相打架
+      · 消息气泡单行宽度过长，阅读时眼睛要来回扫
+    ```
+
+    用户原话：「APP 的应用场景一般是竖屏不是横屏，但是在我的手机上不锁定
+    旋转，手机横过来就会自动变成横屏」。
+
+    ## 为什么在 manifest 而不是运行时
+
+    两条路都能做到：
+
+    ```text
+      A. AndroidManifest: android:screenOrientation="portrait"
+         ⇒ 由系统在**创建 Activity 之前**决定方向，没有中间态
+      B. Rust/JS 侧运行时 setRequestedOrientation
+         ⇒ 要等 WebView 起来才调用，会先按系统方向渲染一帧再转
+            （肉眼可见的"先横后竖"闪一下）
+    ```
+
+    选 A。启动瞬间就正确，不闪。
+
+    ## `configChanges` 里已经有 orientation，为什么还要锁
+
+    那行是 tauri 模板自带的，含义是"旋转时**不要重建** Activity，交给应用
+    自己处理布局"。它允许旋转，只是避免重建。锁定方向是另一件事 ——
+    两行并不冲突：锁定后系统不会发起旋转，`configChanges` 继续兜住多窗口
+    等场景带来的尺寸变化。
+
+    ## 为什么不锁 `nosensor` / `user`
+
+    - `nosensor`：忽略方向传感器，但**平板横置时仍是横的**，语义不对
+    - `user`：跟随用户系统的自动旋转开关 —— 用户正是关了它才期望锁定，
+      而系统那一档在这个 App 里不该生效（竖屏是产品决定，不是用户偏好）
+    - `portrait`：无论传感器、无论系统开关，永远是竖的。这才是"锁定"
+    """
+    manifest = GEN / "app" / "src" / "main" / "AndroidManifest.xml"
+    if not manifest.is_file():
+        return [f"[跳过] 没有 {manifest}"]
+
+    text = manifest.read_text(encoding="utf-8")
+
+    # 只认 MainActivity 那一个 <activity ...> 开标签（后面可能还有别的 activity）
+    match = re.search(r"<activity\b[^>]*\.MainActivity[^>]*>", text, re.S)
+    if match is None:
+        return ["[跳过] 找不到 MainActivity 的 <activity> 标签（tauri 模板变了？）"]
+
+    tag = match.group(0)
+    if "android:screenOrientation=" in tag:
+        return ["[OK] 已锁定竖屏（android:screenOrientation=portrait）"]
+
+    msg = "[修] 锁定竖屏（MainActivity android:screenOrientation=portrait）"
+    if check_only:
+        return [msg]
+
+    # 插在 configChanges 之前 —— 属性顺序不影响语义，但放在首位最显眼，
+    # 一眼能看出"这个页面是锁方向的"
+    new_tag = tag.replace(
+        "android:configChanges=",
+        'android:screenOrientation="portrait"\n'
+        "            android:configChanges=",
+        1,
+    )
+    if new_tag == tag:
+        # 模板若哪天去掉 configChanges，退到 name 之前插，不要静默不修
+        new_tag = tag.replace(
+            'android:name=".MainActivity"',
+            'android:screenOrientation="portrait"\n'
+            '            android:name=".MainActivity"',
+            1,
+        )
+    if new_tag == tag:
+        return ["[跳过] 找不到插入点（<activity> 属性全变了？）"]
+
+    manifest.write_text(
+        text[: match.start()] + new_tag + text[match.end() :],
+        encoding="utf-8",
+        newline="\n",
+    )
+    return [msg]
+
+
 def patch_version_code_override(check_only: bool) -> list[str]:
     """
     允许构建时用环境变量单独指定 versionCode。
@@ -574,6 +666,7 @@ def main() -> int:
     lines += patch_signing_config(check_only)
     lines += patch_min_sdk_for_v1(check_only)
     lines += patch_cleartext_loopback(check_only)
+    lines += patch_locked_portrait(check_only)
     lines += patch_version_code_override(check_only)
 
     for line in lines:
