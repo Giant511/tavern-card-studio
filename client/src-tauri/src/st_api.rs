@@ -73,9 +73,31 @@ const CSRF_DISABLED_SENTINEL: &str = "disabled";
 /// CSRF 头名（`src/server-main.js:177`）
 const CSRF_HEADER: &str = "X-CSRF-Token";
 
-/// 请求超时。取 30 秒：ST 的 `/api/characters/all` 会重新读盘，
-/// 角色多的时候能到几秒；但也不该无限等 —— 卡住时必须能报错。
+/// 普通请求的**总**超时（从发出到读完整个 body）。取 30 秒：
+/// ST 的 `/api/characters/all` 会重新读盘，角色多的时候能到几秒；
+/// 但也不该无限等 —— 卡住时必须能报错。
+///
+/// ★★★ 流式请求**不能**用这个值（2026-11-21）。
+///
+/// `ClientBuilder::timeout` 是**整个请求**的总时限，包含读完 body。
+/// 而一次流式生成要几十秒到几分钟，用它必然在读流中途被掐断，
+/// 报出来的就是 `error decoding response body`。
+///
+/// 真机日志对上了这一点：每次生成的落盘间隔都是 30.1 秒，一次不多一次不少。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 流式请求的「多久没收到新数据」上限（不是总时长）。
+///
+/// `read_timeout` 管的是**两次读到字节之间**的间隔，所以一次跑三分钟、
+/// 只要上游一直在吐字就不会超时；而真挂死了（连接还在但不发数据）
+/// 120 秒后仍然会报错，不会永远转圈。
+///
+/// 120 秒的依据：推理模型在出第一帧之前可能长时间静默（思考阶段），
+/// 跨洋中转站的首字延迟也常见 30–60 秒。给到 120 秒，比"够用"再多一档。
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 连接建立超时。两类请求共用 —— 连不上就该快速失败，不该等总超时。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// CSRF token 的三种状态。
 ///
@@ -90,6 +112,29 @@ enum Csrf {
     Token(String),
     /// 服务端关了 CSRF，**不要发这个头**
     Disabled,
+}
+
+/// 取哪一只 client。
+///
+/// 两只共享同一份 cookie jar，区别只在超时策略：
+///
+/// ```text
+///   Plain   总超时 30s        —— 普通接口，卡住必须报错
+///   Stream  无总超时 + 读超时  —— 流式生成，不能被总时长掐断
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientKind {
+    Plain,
+    Stream,
+}
+
+impl ClientKind {
+    fn pick(self, session: &Session) -> reqwest::Client {
+        match self {
+            Self::Plain => session.client.clone(),
+            Self::Stream => session.stream_client.clone(),
+        }
+    }
 }
 
 /// `/csrf-token` 的响应体
@@ -147,7 +192,14 @@ pub struct StApi {
 ///
 /// 把两者绑在一起，任何时刻读到的都一定是**同一代**。
 struct Session {
+    /// 普通请求用：有总超时，卡住就报错。
     client: reqwest::Client,
+    /// 流式请求用：**没有总超时**，只限"多久没收到新数据"。
+    ///
+    /// 与 `client` 共享同一份 cookie jar（同一 `Arc<Jar>`）——
+    /// 两个 client 各自的 jar 会让 CSRF 校验在对的那一只上失败，
+    /// 而症状是"流式请求 403、普通请求正常"，极难查。
+    stream_client: reqwest::Client,
     csrf: Csrf,
     /// 每次真正重连 +1。403 恢复用它判断"别人是不是已经替我重连过"
     epoch: u64,
@@ -163,10 +215,12 @@ impl StApi {
                 detail: "ST 地址为空".to_string(),
             });
         }
+        let (plain, stream) = build_client_pair()?;
         Ok(Self {
             base,
             session: tokio::sync::RwLock::new(Session {
-                client: build_client()?,
+                client: plain,
+                stream_client: stream,
                 csrf: Csrf::Unknown,
                 epoch: 0,
             }),
@@ -210,10 +264,11 @@ impl StApi {
          * 为什么整只换而不是"清 cookie"：reqwest 在 `cookie_store(true)` 时
          * 不暴露清空 jar 的 API。而且"新会话"的正确语义本来就是一份干净 jar。
          */
-        let fresh = build_client()?;
+        let (fresh, fresh_stream) = build_client_pair()?;
         let epoch = {
             let mut session = self.session.write().await;
             session.client = fresh.clone();
+            session.stream_client = fresh_stream;
             session.csrf = Csrf::Unknown;
             session.epoch += 1;
             session.epoch
@@ -281,10 +336,21 @@ impl StApi {
     /// ★ 必须一次读出两者（2026-11-11）。分成两次读会拿到"这一代的 token +
     /// 下一代的 jar"，那正是 403 反复出现的根因 —— 见 `Session` 的注释。
     async fn session_or_connect(&self) -> Result<(reqwest::Client, Csrf), ShellError> {
+        self.session_or_connect_with(ClientKind::Plain).await
+    }
+
+    /// 同 `session_or_connect`，但可以选择要哪一只 client。
+    ///
+    /// 流式请求必须用 `Stream`（没有总超时），否则长回复会在中途被掐断 ——
+    /// 报出来的却是 `error decoding response body`，看上去像网络问题。
+    async fn session_or_connect_with(
+        &self,
+        kind: ClientKind,
+    ) -> Result<(reqwest::Client, Csrf), ShellError> {
         {
             let session = self.session.read().await;
             if session.csrf != Csrf::Unknown {
-                return Ok((session.client.clone(), session.csrf.clone()));
+                return Ok((kind.pick(&session), session.csrf.clone()));
             }
         }
         /*
@@ -294,7 +360,7 @@ impl StApi {
         let seen = self.session.read().await.epoch;
         self.reconnect_if_epoch(seen).await?;
         let session = self.session.read().await;
-        Ok((session.client.clone(), session.csrf.clone()))
+        Ok((kind.pick(&session), session.csrf.clone()))
     }
 
     /// 403 恢复：条件重连，**并发时只重建一次**。
@@ -377,8 +443,9 @@ impl StApi {
         &self,
         path: &str,
         body: &Value,
+        kind: ClientKind,
     ) -> Result<reqwest::Response, ShellError> {
-        let response = self.send_post(path, body).await?;
+        let response = self.send_post(path, body, kind).await?;
         if response.status() != reqwest::StatusCode::FORBIDDEN {
             return Ok(response);
         }
@@ -416,7 +483,7 @@ impl StApi {
          */
         log::info!(target: "st_api", "403 判为会话失效（body 非上游错误形状），重连重试：{path}");
         self.recover_forbidden().await?;
-        let retry = self.send_post(path, body).await?;
+        let retry = self.send_post(path, body, kind).await?;
         if retry.status() != reqwest::StatusCode::FORBIDDEN {
             return Ok(retry);
         }
@@ -451,8 +518,16 @@ impl StApi {
     ///
     /// 不含 403 恢复逻辑 —— 那在 `post_json` 里。分开是为了让"怎么发"
     /// 与"失败了怎么办"各自可读。
-    async fn send_post(&self, path: &str, body: &Value) -> Result<reqwest::Response, ShellError> {
-        let (client, csrf) = self.session_or_connect().await?;
+    ///
+    /// `kind` 决定用哪只 client：流式调用方必须传 `Stream`，
+    /// 否则长回复会被 30 秒总超时掐断（见 `REQUEST_TIMEOUT` 的注释）。
+    async fn send_post(
+        &self,
+        path: &str,
+        body: &Value,
+        kind: ClientKind,
+    ) -> Result<reqwest::Response, ShellError> {
+        let (client, csrf) = self.session_or_connect_with(kind).await?;
         let mut request = client.post(self.url(path)).json(body);
         // 关闭 CSRF 的部署：**不发这个头**（发了反而被拒）
         if let Csrf::Token(token) = csrf {
@@ -486,7 +561,7 @@ impl StApi {
          *
          * 分流逻辑在 `send_post_with_recovery` 里，四个调用点共用。
          */
-        let response = self.send_post_with_recovery(path, &body).await?;
+        let response = self.send_post_with_recovery(path, &body, ClientKind::Plain).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -513,7 +588,7 @@ impl StApi {
             detail: format!("请求体序列化失败：{error}"),
         })?;
 
-        let response = self.send_post_with_recovery(path, &body).await?;
+        let response = self.send_post_with_recovery(path, &body, ClientKind::Plain).await?;
         let status = response.status();
         if !status.is_success() {
             return Err(ShellError::StHttpStatus {
@@ -539,7 +614,7 @@ impl StApi {
             detail: format!("请求体序列化失败：{error}"),
         })?;
 
-        let response = self.send_post_with_recovery(path, &body).await?;
+        let response = self.send_post_with_recovery(path, &body, ClientKind::Plain).await?;
         let status = response.status();
         if !status.is_success() {
             return Err(ShellError::StHttpStatus {
@@ -598,8 +673,13 @@ impl StApi {
          *
          * ★ 流式这条尤其要注意：上游 403 时**绝不能重试** ——
          *   那是一次真实的模型调用，按次计费时重试就是重复扣费。
+         *
+         * ★★★ 这里必须用 `ClientKind::Stream`（2026-11-21）。
+         *   用 Plain 的话，30 秒总超时会在读流中途把连接掐断，
+         *   报出来的是 `error decoding response body` —— 看上去像网络问题，
+         *   实际是我们自己的超时。真机日志：每次生成都恰好 30.1 秒结束。
          */
-        let response = self.send_post_with_recovery(path, &body).await?;
+        let response = self.send_post_with_recovery(path, &body, ClientKind::Stream).await?;
 
         let status = response.status();
         if !status.is_success() {
@@ -616,6 +696,8 @@ impl StApi {
         let mut stream = response.bytes_stream();
         // 跨块的半行缓冲：一个 `data:` 行可能被 TCP 切成两半
         let mut pending = String::new();
+        /* 已收到多少字节 —— 出错时用来判断"是半路断的"还是"一个字节都没来" */
+        let mut received: u64 = 0;
 
         loop {
             let next = futures_util::StreamExt::next(&mut stream).await;
@@ -623,12 +705,37 @@ impl StApi {
             let bytes = match chunk {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    return Err(ShellError::StBadResponse {
-                        detail: format!("读流失败：{error}"),
-                    })
+                    /*
+                     * 读流中断要**说清是哪一种**，否则用户只能看到
+                     * `error decoding response body` 这种底层措辞，
+                     * 而它指向的是"网络坏了"——真正常见的原因其实是别的。
+                     *
+                     * 三类分开：
+                     *
+                     * ```text
+                     *   收到过数据   → 上游/中间层把连接断了（内容多半已经拿到一部分）
+                     *   一个字节没到 → 连上了但对面不说话（超时 / 上游拒绝吐）
+                     * ```
+                     *
+                     * 超时单独判：`is_timeout()` 为真时要明说"等了多久"，
+                     * 因为那不是网速问题，是**上游一直没给新内容**。
+                     */
+                    let detail = if error.is_timeout() {
+                        format!(
+                            "上游 {} 秒没有返回新内容（已收到 {received} 字节）",
+                            STREAM_READ_TIMEOUT.as_secs()
+                        )
+                    } else if received == 0 {
+                        format!("连接已建立，但上游一个字节都没返回：{error}")
+                    } else {
+                        format!("上游中断了响应（已收到 {received} 字节）：{error}")
+                    };
+                    log::warn!(target: "st_api", "读流中断 {path}：{detail}");
+                    return Err(ShellError::StBadResponse { detail });
                 }
             };
 
+            received += bytes.len() as u64;
             pending.push_str(&String::from_utf8_lossy(&bytes));
 
             // 按行处理完整行；最后一段不完整的留在 pending 里
@@ -683,24 +790,63 @@ impl StApi {
     }
 }
 
-/// 造一只 client。`connect()` 每次重连都会调它 —— 新 client = 新 jar。
-fn build_client() -> Result<reqwest::Client, ShellError> {
-    reqwest::Client::builder()
-        // cookie_store 是这套方案的**前提**：cookie 由 jar 持有并自动附着，
-        // 不依赖浏览器。少了它，所有 POST 都会 403（§2.2）。
+/// 造一份新的 client 对（普通 + 流式），**共享同一份 cookie jar**。
+///
+/// ## 为什么要两只
+///
+/// `ClientBuilder::timeout` 是**整个请求**的总时限，包含读完 body。
+/// 普通接口（角色列表、设置读写）用它合适：卡住必须能报错。
+/// 流式生成不行 —— 一次几十秒到几分钟，总时限一定在中途把流掐断。
+///
+/// `read_timeout` 是另一回事：它限的是"两次读到字节之间"的间隔，
+/// 正好对应"上游真挂了"这个要防的情况，而不会误伤长回复。
+///
+/// ## 为什么必须共享 jar
+///
+/// CSRF 令牌与会话 cookie 绑定。两只 client 各建一份 jar 的话，
+/// 流式请求会带着**没有对应 cookie 的 token** → 403。
+/// 而症状是"普通请求正常、只有流式 403"，最难查的那种。
+fn build_client_pair() -> Result<(reqwest::Client, reqwest::Client), ShellError> {
+    let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+    let plain = build_client_with(jar.clone(), Some(REQUEST_TIMEOUT))?;
+    let stream = build_client_with(jar, None)?;
+    Ok((plain, stream))
+}
+
+/// 造一只 client。`total_timeout` 为 `None` 时**不设总超时**（流式用）。
+fn build_client_with(
+    jar: std::sync::Arc<reqwest::cookie::Jar>,
+    total_timeout: Option<Duration>,
+) -> Result<reqwest::Client, ShellError> {
+    let mut builder = reqwest::Client::builder()
+        // cookie 由 jar 持有并自动附着，不依赖浏览器。少了它，所有 POST 都会 403（§2.2）。
         //
         // 实测佐证（2026-10-30）：**即使 CSRF 头完全正确**，只要没有 cookie，
         // ST 仍返回 403。所以 cookie jar 不是"顺手带上"，是能不能用的分界。
-        .cookie_store(true)
-        .timeout(REQUEST_TIMEOUT)
+        //
+        // 用 `cookie_provider` 而不是 `cookie_store(true)`：前者能让我们
+        // **把同一份 jar 交给两只 client**（见 `build_client_pair` 的注释）。
+        .cookie_provider(jar)
+        .connect_timeout(CONNECT_TIMEOUT)
         // 不允许跟随重定向：ST 在未登录时可能 302 到登录页，
         // 跟随过去会把"没权限"变成"拿到一张 HTML 登录页"，
         // 错误信息会变成解析失败 —— 比直接报 403 更难查。
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| ShellError::StUnavailable {
-            detail: format!("构造 HTTP 客户端失败：{error}"),
-        })
+        .redirect(reqwest::redirect::Policy::none());
+
+    builder = match total_timeout {
+        Some(limit) => builder.timeout(limit),
+        /*
+         * 流式：不给总时限，只给"多久没数据"的时限。
+         *
+         * 两个都设的意义：没有 read_timeout 的话，上游挂死会让流永远不结束
+         * （用户看到呼吸点一直转，只能杀进程）；设了它就还能报错。
+         */
+        None => builder.read_timeout(STREAM_READ_TIMEOUT),
+    };
+
+    builder.build().map_err(|error| ShellError::StUnavailable {
+        detail: format!("构造 HTTP 客户端失败：{error}"),
+    })
 }
 
 fn truncate(text: &str, max: usize) -> String {

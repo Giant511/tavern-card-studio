@@ -128,8 +128,19 @@ test('★★★★ 所有 POST 路径都走同一套 403 分流', () => {
    */
   const src = stripComments(read('client/src-tauri/src/st_api.rs'));
 
-  const withRecovery = [...src.matchAll(/send_post_with_recovery\(path, &body\)/g)].length;
-  assert.ok(withRecovery >= 4, `期望至少 4 处走统一分流，实际 ${String(withRecovery)} 处`);
+  /*
+   * 2026-11-21：签名多了第三个参数（`ClientKind`）—— 流式要单独用
+   * 没有总超时的那只 client。判据守的性质没变（都要走统一分流），
+   * 所以这里只把正则放宽到"允许带参数"，并额外核对两条客户端都有人用。
+   */
+  const calls = [...src.matchAll(/send_post_with_recovery\(\s*path,\s*&body,\s*(ClientKind::\w+)\s*\)/g)];
+  assert.ok(calls.length >= 4, `期望至少 4 处走统一分流，实际 ${String(calls.length)} 处`);
+  const kinds = new Set(calls.map((m) => m[1]));
+  assert.ok(
+    kinds.has('ClientKind::Stream'),
+    '流式那条必须传 Stream —— 传 Plain 会被 30 秒总超时掐断',
+  );
+  assert.ok(kinds.has('ClientKind::Plain'), '普通接口要传 Plain');
 
   /* 直接用 send_post 的地方只允许在封装内部自己 */
   const direct = [...src.matchAll(/self\.send_post\(/g)].length;

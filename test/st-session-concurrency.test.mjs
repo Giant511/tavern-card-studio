@@ -74,10 +74,22 @@ test('★★★★★ 一次读出 client 与 csrf，不许分两次读', () => 
    */
   const src = stripComments(read('client/src-tauri/src/st_api.rs'));
 
+  /*
+   * 2026-11-21：多了一个带 `ClientKind` 的变体。
+   *
+   * 流式要单独用那只"没有总超时"的 client，所以入口拆成了两层：
+   * `session_or_connect()` 转调 `session_or_connect_with(kind)`。
+   * **判据守的性质没变**：一次读锁同时拿到 client 与 csrf。
+   */
   assert.match(
     src,
     /async fn session_or_connect\(&self\) -> Result<\(reqwest::Client, Csrf\), ShellError>/,
     '要有一次返回两者的入口',
+  );
+  assert.match(
+    src,
+    /async fn session_or_connect_with\(\s*&self,\s*kind:\s*ClientKind,?\s*\)\s*->\s*Result<\(reqwest::Client, Csrf\), ShellError>/,
+    '带 ClientKind 的变体也要一次返回两者',
   );
 
   /* send_post 必须用它，而不是自己读两次 */
@@ -93,7 +105,7 @@ test('★★★★★ 一次读出 client 与 csrf，不许分两次读', () => 
   const at = src.indexOf('async fn send_post(');
   assert.ok(at > 0, '找不到 send_post 定义');
   const body = src.slice(at, at + 700);
-  assert.match(body, /session_or_connect\(\)/, 'send_post 要一次拿两者');
+  assert.match(body, /session_or_connect_with\(kind\)/, 'send_post 要一次拿两者');
   assert.doesNotMatch(
     body,
     /self\.session\.read\(\)\.await\.client\.clone\(\)[\s\S]{0,200}self\.session\.read\(\)\.await\.csrf/,
