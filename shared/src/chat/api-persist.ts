@@ -181,37 +181,13 @@ export interface ApiConnectionTarget {
   model: string;
   /** 自定义地址（只有 `custom` 源用得上） */
   baseUrl: string;
-  /**
-   * 最大回复长度（`oai_settings.openai_max_tokens`）。
+  /*
+   * ★ 这里曾有 `maxTokens?`，2026-11-21 移除。
    *
-   * ## 为什么必须落进 settings（2026-11-11）
-   *
-   * 用户报：
-   *
-   * > 我的 api 里面的最大回复长度改不了……改完保存之后回去一看发现还是 2048
-   *
-   * 取证结论：这一项**从来没写进 ST 的 settings**。`buildStConnectionPatch`
-   * 只写了 `chat_completion_source` / 模型字段 / `custom_url`，漏了它。
-   *
-   * 后果分两层：
-   *
-   * ```text
-   * ① 用户改了没用 —— 生成时用的是 ST settings 里的值，不是 App 里那个数
-   * ② 更糟：那个值还决定上游的**预扣额度**
-   * ```
-   *
-   * 第 ② 条是真机日志里那串 403 的另一半原因：
-   *
-   * ```text
-   *   403 {"code":"pre_consume_token_quota_failed"}
-   *   = 按 max_tokens 预扣额度时失败
-   * ```
-   *
-   * 也就是说"改不了"和"403"很可能是**同一件事**：值改不小 ⇒ 预扣下不来 ⇒ 拒绝。
-   *
-   * 所以这个字段不是"顺手补一个"，它可能是那条 403 的正解。
+   * 它写入的 `oai_settings.openai_max_tokens` 和「AI 响应配置」页的
+   * 「最大回复长度（Token）」是同一个键。两处入口值还可能不同，
+   * 用户无法判断哪个生效。现在该键只由「AI 响应配置」读写。
    */
-  maxTokens?: number;
 }
 
 /**
@@ -304,25 +280,22 @@ export function buildStConnectionPatch(target: ApiConnectionTarget): Record<stri
   }
 
   /*
-   * 最大回复长度：**所有源共用同一个键**（2026-11-11 补）。
+   * ★ 「最大回复长度」（`openai_max_tokens`）**不再写**（2026-11-21）。
    *
-   * ST 的 `openai.js` 里就是这么读的：
+   * ## 为什么移除
    *
-   * ```js
-   *   chatCompletion.setTokenBudget(userSettings.openai_max_context,
-   *                                 userSettings.openai_max_tokens);
-   * ```
+   * 它和「AI 响应配置 → 最大回复长度（Token）」写的是同一个键。
+   * 两处入口、值还可能不同，用户没法判断哪个生效 —— 用户要求只留一处。
    *
-   * 键名带 `openai` 前缀但它对 custom / deepseek / claude 全都生效 ——
-   * 别按"源"去分支，那会写出一个 ST 根本不读的键。
+   * 现在唯一入口是「AI 响应配置」页，它走 `mutateSettings` 直接读写
+   * `oai_settings.openai_max_tokens`。
    *
-   * ★ 只在拿到**有效正整数**时才写：`undefined` / `NaN` / `0` 一律跳过，
-   *   让 ST 保留它自己的值。写进去一个 `null` 会让它变成字符串，
-   *   而 ST 会拿它去算预扣额度 —— 那比不写更坏。
+   * ## 保留那个键的正确性判据在别处
+   *
+   * 这里的职责是"把**连接**配置写进 ST"（源 / 模型 / 地址）。
+   * 保存连接就不该顺手改回复长度 —— 改模型名把长度重置成默认值，
+   * 是用户没有预期到的副作用。
    */
-  if (typeof target.maxTokens === 'number' && Number.isFinite(target.maxTokens) && target.maxTokens >= 1) {
-    patch['openai_max_tokens'] = Math.trunc(target.maxTokens);
-  }
 
   return patch;
 }
@@ -398,24 +371,11 @@ export function verifyConnectionPersisted(
     }
   }
 
-  /* ④ 最大回复长度（2026-11-11） */
-  if (typeof expected.maxTokens === 'number' && Number.isFinite(expected.maxTokens)) {
-    const want = Math.trunc(expected.maxTokens);
-    const got = o['openai_max_tokens'];
-    /*
-     * ★ 比较要宽容类型：ST 存进去可能是数字，也可能被它转成字符串
-     *   （老版本 settings.json 里见过 `"300"`）。用 `Number(got)` 归一，
-     *   否则每次保存都会报一条假的"没写进去"，用户被反复误导。
-     *
-     * `Number("")` 是 0、`Number(undefined)` 是 NaN —— 两者都不等于 want，
-     * 所以真的没写进去时仍然会报。
-     */
-    if (Number(got) !== want) {
-      problems.push(
-        `最大回复长度没写进去：期望 ${String(want)}，实际 ${String(got)}（字段 openai_max_tokens）`,
-      );
-    }
-  }
+  /*
+   * ★ 不再校验「最大回复长度」（2026-11-21）。
+   *   这个键已迁到「AI 响应配置」页独占，保存连接配置不写它，也就不该核它 ——
+   *   否则每次保存连接都会报一条假的"没写进去"。
+   */
 
   /*
    * ④ key

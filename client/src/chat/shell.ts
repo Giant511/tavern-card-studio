@@ -5451,29 +5451,25 @@ export class AppShell {
    * "Rust 侧的 api 没了"，不清的话后续每次都会立刻失败、永远不重连。
    */
   /**
-   * 从 ST 设置派生采样参数，并**钉上用户在 API 页填的「最大回复长度」**。
+   * 从 ST 设置派生采样参数。
    *
-   * ## 为什么必须有这一个统一入口
+   * ## 为什么要有这一个统一入口
    *
-   * `this.sampling` 有**三处**会从 ST 重新派生（播种、设置页保存、API 页保存）。
-   * 任何一处漏了覆盖，用户的 maxTokens 就被 ST 里的旧值（300）冲掉 ——
-   * 而症状是"界面显示 1200、请求里发 300"，没有任何报错。
+   * `this.sampling` 有**多处**会从 ST 重新派生（播种、设置页保存、API 页保存）。
+   * 各处各自调 `samplingFromSettings()` 会慢慢分叉 —— 统一走这里，
+   * 以后要加新的派生规则只改一处。
    *
-   * 真机实测过：保存 1200 后 logcat 里仍是 `max_tokens=300`，
-   * 就是因为另一处的 `samplingFromSettings()` 在后来的渲染里把我覆盖冲掉了。
+   * ## 为什么只认 ST，不再钉 App 侧的「最大回复长度」（2026-11-21）
    *
-   * ## 为什么以 API 页为准而不是以 ST 为准
+   * 原来这里会拿 `apiState.maxTokens` 覆盖派生值，因为它曾经是「API 连接」页
+   * 那一格的来源。而那一格和「AI 响应配置」写的是同一个
+   * `oai_settings.openai_max_tokens`，两处入口值不同时**前者赢**，
+   * 用户没法判断哪个生效。
    *
-   * ST 的 `openai_max_tokens` 是**引擎全局**设置，用户可能在别处改过；
-   * 而 API 页这一格是他**当着这个模型**填的，意图更明确。
-   * 两处冲突时以意图明确的那一处为准。
+   * 现在该键只由「AI 响应配置」读写，派生值就是唯一真相。
    */
   private deriveSampling(settings: Record<string, unknown>): DerivedSampling {
-    const derived = samplingFromSettings(settings);
-    const want = this.apiState?.maxTokens;
-    return typeof want === 'number' && want > 0
-      ? { ...derived, maxTokens: want }
-      : derived;
+    return samplingFromSettings(settings);
   }
 
   /**
@@ -5684,58 +5680,6 @@ export class AppShell {
     return problems.length === 0 ? null : problems;
   }
 
-  private async writeMaxTokens(value: number): Promise<string | null> {
-    try {
-      /*
-       * 从 **schema 里取那个字段定义**，不要自己拼一个对象。
-       *
-       * `writeField` 要的是 `SettingField`（含 `path`/`kind`/`min`/`max`），
-       * 而 schema 已经有一份权威定义（`SAMPLING_SECTION` 里的「单条回复上限」）。
-       * 自己拼一份的后果是：将来 schema 改了（比如上限从 32000 调整），
-       * 这里还是旧的，而**不会报错** —— 只是夹值夹错了。
-       */
-      const field = SAMPLING_SECTION.fields.find(
-        (f) => f.path.join('.') === 'oai_settings.openai_max_tokens',
-      );
-      if (field === undefined) return '找不到「单条回复上限」这个设置项（schema 变了）';
-
-      const result = await mutateSettings(
-        {
-          getRaw: () => this.withConnection(() => this.bridge.settingsGetRaw()),
-          save: (settings) => this.withConnection(() => this.bridge.settingsSave(settings)),
-        },
-        (current) => writeField(current, field, value),
-      );
-      if (!result.ok) return result.reason;
-      /*
-       * 写成功后把新采样值推给聊天面板 —— 否则下一次生成仍用旧值，
-       * 用户必须重启 App 才能生效。
-       */
-      this.sampling = this.deriveSampling(result.settings);
-      /*
-       * ★★★ 再**强制覆盖一次** maxTokens（2026-11-02）。
-       *
-       * `samplingFromSettings()` 是从 ST 设置派生出来的。如果 ST 那边
-       * 把我们写的值夹掉/丢了（比如它把上限当 "无效值" 忽略），
-       * 派生结果里就不是用户填的数 —— 而**界面显示 800、请求里还是 300**，
-       * 用户看到的现象就是"改了没用"。
-       *
-       * 真机实测过这一点：保存 1200 之后请求仍被 300 截断（frames=302 不变）。
-       * 所以这里不信派生结果，直接把用户的值钉进去。
-       */
-      this.sampling = { ...this.sampling, maxTokens: value };
-      this.chatPanel?.setContext({ sampling: { ...this.sampling } });
-      return null;
-    } catch (error) {
-      /*
-       * 写 ST 失败**不能**让这一次的修改白费 —— 用户填了就该在当前会话生效。
-       * 持久化失败只影响"重启后还在不在"，那是次要的。
-       */
-      this.sampling = { ...this.sampling, maxTokens: value };
-      this.chatPanel?.setContext({ sampling: { ...this.sampling } });
-      return describeBridgeError(error).message;
-    }
-  }
 
   /**
    * 问 ST「哪些 source **真的配了** key」，并据此更新标记（2026-11-07）。
@@ -9673,35 +9617,29 @@ export class AppShell {
             });
 
             /*
-             * ★★★ 把「最大回复长度」写进 ST 设置（2026-11-02）。
+             * ★★★ 「最大回复长度」不再在这里写（2026-11-21 用户决定）。
              *
-             * ## 为什么必须落进 ST，而不是只存在 App 侧
+             * ## 为什么删掉
              *
-             * 请求体里的 `max_tokens` 来自 `samplingFromSettings()`，而它读的是
-             * ST 的 `oai_settings.openai_max_tokens`（出厂 300）。
-             * 只在 App 侧存一个 `maxTokens` 是**不会生效**的 —— 那正是
-             * "改了但没变"的经典形态：界面显示 800、请求里还是 300。
+             * 它和「AI 响应配置」页的「最大回复长度（Token）」**是同一个东西**
+             * ——两处最终都落到 ST 的 `oai_settings.openai_max_tokens`。
+             * 而这一处是"按源"存（localStorage），保存时覆盖 ST 的值。
              *
-             * ## 为什么走 `saveFields` 而不是直接 POST 设置
+             * 于是同一个数字有两个入口、两个存放位置，且这里的优先级更高。
+             * 用户实际遇到的是：
              *
-             * 它内部是 `mutateSettings`：GET → 改一个字段 → 整份 POST。
-             * 直接 POST 是整份覆盖，少一个字段就把用户设置清空了（陷阱 #6）。
+             * ```text
+             *   在「自定义」页填 4096 → 保存 → 值确实进了 ST
+             *   下次再进这一页 → 输入框显示 2048（草稿没从 apiState 回填）
+             *   ⇒ 看起来"没保存"，再点一次保存就把 4096 覆盖成 2048
+             * ```
              *
-             * ## 失败不阻断保存
+             * 用户的判断是对的：**留一处更合理**。所以现在只保留
+             * 「AI 响应配置 → 最大回复长度（Token）」，它直接读写
+             * `openai_max_tokens`，是唯一入口、也是唯一真相。
              *
-             * 连接配置本身已经存成功了；写 ST 失败只影响"长度上限"这一项。
-             * 所以这里只提示、不抛 —— 否则用户会看到"保存失败"但其实源和模型都存好了。
+             * 保存连接配置时**刻意不碰**这个字段 —— 改模型名不该顺手改长度。
              */
-            if (typeof state.maxTokens === 'number') {
-              const here = state.maxTokens;
-              const reason = await this.writeMaxTokens(here);
-              if (reason !== null) {
-                this.options.onNotify?.(
-                  `连接配置已保存，但「最大回复长度」没写进引擎：${reason}`,
-                  'warn',
-                );
-              }
-            }
 
             /*
              * 记下"已保存"给重绘后的页面显示。
