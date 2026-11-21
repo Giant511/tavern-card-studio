@@ -13,6 +13,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
+import com.taverncardstudio.client.MainActivity
 
 /**
  * 让 ST 在 Doze 下活着的唯一机制（v0.1.7 / T15.3）。
@@ -486,10 +487,40 @@ class StService : Service() {
     }
 
     private fun buildNotification(text: String, errorHint: String?): Notification {
+        /*
+         * ★★★ 启动 Intent **显式构造**，不用 `getLaunchIntentForPackage`（2026-11-21）。
+         *
+         * ## 原来那行的两个问题
+         *
+         * ```text
+         *   packageManager.getLaunchIntentForPackage(packageName)
+         * ```
+         *
+         * ① **可能返回 null**：个别 ROM / 被停用的包状态下拿不到启动意图，
+         *    于是 `PendingIntent.getActivity(..., null, ...)` 直接抛
+         *    NullPointerException —— 而这是在构建通知里，抛了通知就不出来。
+         *
+         * ② 拿到的是**桌面启动器**那条 Intent。部分 ROM（同机型 originOS6 /
+         *    Android 16 的同类案例）会给它带上 `FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS`，
+         *    标志会落到任务上 ⇒ 切后台后任务列表里看不到 App。
+         *
+         * 显式构造就没有这两个问题：目标类写死、flag 自己指定，
+         * 且**绝不带** EXCLUDE_FROM_RECENTS。
+         */
         val openIntent = PendingIntent.getActivity(
             this,
             0,
-            packageManager.getLaunchIntentForPackage(packageName),
+            Intent(this, MainActivity::class.java).apply {
+                action = Intent.ACTION_MAIN
+                addCategory(Intent.CATEGORY_LAUNCHER)
+                /*
+                 * NEW_TASK：从服务（非 Activity 上下文）启动 Activity 必须带。
+                 * RESET_TASK_IF_NEEDED：回到任务根，与点桌面图标的行为一致。
+                 *
+                 * 刻意不带：EXCLUDE_FROM_RECENTS、CLEAR_TASK、NEW_TASK 之外的 task 相关位。
+                 */
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+            },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
