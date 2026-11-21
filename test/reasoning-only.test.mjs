@@ -44,13 +44,10 @@ import {
   finalizeOutput,
   startStreaming,
 } from '../shared/dist/chat/stream.js';
-import {
-  DEFAULT_API_STATE,
-  DEFAULT_MAX_TOKENS,
-} from '../client/src/chat/api-page.ts';
 
 const ROOT = join(import.meta.dirname, '..');
 const strip = (t) => t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+const read = (rel) => readFileSync(join(ROOT, rel), 'utf8');
 const apiPage = strip(readFileSync(join(ROOT, 'client/src/chat/api-page.ts'), 'utf8'));
 const shell = strip(readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8'));
 const panel = strip(readFileSync(join(ROOT, 'client/src/chat/chat-panel.ts'), 'utf8'));
@@ -125,33 +122,67 @@ test('★★ 有正文时一切照旧（不许被新分支影响）', () => {
 });
 
 /* ═══════════════════════════════════════════════════════════
-   二、"最大回复长度"必须有界面入口
+   二、「最大回复长度」只能有一个入口
    ═══════════════════════════════════════════════════════════ */
 
-test('★★★ API 页要有「最大回复长度」输入框', () => {
+test('★★★★★ 「最大回复长度」只能有一个入口：AI 响应配置', () => {
   /*
-   * 用户遇到"生成不出内容"时，界面上原来**没有任何旋钮可调** ——
-   * 只能换模型。而这一格正是推理模型的唯一自救入口。
+   * 用户报「自定义接口里的回复长度看起来保存不了」。追下去发现不是保存坏了，
+   * 而是**同一个东西有两个入口**：
+   *
+   *   ① API 连接页   → apiState.maxTokens（localStorage，按源）
+   *   ② AI 响应配置  → oai_settings.openai_max_tokens（ST 设置）
+   *
+   * 而前者在派生采样时**覆盖**后者。两处值不一致时用户无从判断哪个生效，
+   * 更糟的是 API 页每次保存都会顺手把长度改回它自己那份。
+   *
+   * 用户的判断是对的：留一处更合理。保留「AI 响应配置」，
+   * 它直接读写 ST 那个键，是唯一入口也是唯一真相。
    */
-  assert.match(apiPage, /最大回复长度/, '要有这个字段的标签');
-  assert.match(apiPage, /data-role',\s*'max-tokens-input'/, '要能按 data-role 找到它');
-  assert.match(apiPage, /DEFAULT_MAX_TOKENS/, '要有默认值');
+  assert.doesNotMatch(apiPage, /max-tokens-input/, 'API 页不许再有这一格');
+  assert.doesNotMatch(apiPage, /最大回复长度/, 'API 页不许再出现这个标签');
+
+  const schema = read('shared/src/chat/settings-schema.ts');
+  assert.match(schema, /label: '最大回复长度（Token）'/, '「AI 响应配置」要保留唯一入口');
+  assert.match(schema, /'openai_max_tokens'/, '唯一入口要写 ST 的这个键');
 });
 
-test('★★★ 默认值必须足够大（300/800 实测都不够）', () => {
+test('★★★★ 保存连接配置不许顺手改回复长度', () => {
   /*
-   * `oai_settings.openai_max_tokens` 出厂 300：推理模型光思考就吃掉 300，
-   * 正文 0 字（真机实测 302 帧全是思维链）。
-   *
-   * 我第一版改到 800，理由"够装一段思考 + 一段回复" —— **实测打脸**：
-   * 两次同样的配置，思维链分别是 459 字与 2074 字，800 在第二次里
-   * 连思考都装不完。
+   * `buildStConnectionPatch` 只该写「连接」三件套（源 / 模型 / 地址）。
+   * 它曾经还写 `openai_max_tokens`，结果是「只改模型名，长度被重置」。
    */
-  assert.ok(
-    DEFAULT_MAX_TOKENS >= 2048,
-    `默认值 ${String(DEFAULT_MAX_TOKENS)} 太小：实测 2074 字思维链就需要 ~2100 token`,
-  );
-  assert.equal(DEFAULT_API_STATE.maxTokens, DEFAULT_MAX_TOKENS, '默认状态要带上它');
+  const persist = strip(read('shared/src/chat/api-persist.ts'));
+  assert.doesNotMatch(persist, /openai_max_tokens/, '不该再写这个键');
+  assert.doesNotMatch(shell, /writeMaxTokens/, '外壳不该再有写它的方法');
+});
+
+test('★★★ 派生采样不许被 App 侧那份覆盖', () => {
+  /*
+   * 覆盖是「两处入口」能互相打架的根本原因：`deriveSampling()` 本该只反映
+   * ST 设置，而它曾经拿 `apiState.maxTokens` 盖上去 —— 于是 ST 里改的值
+   * 看不见效果。
+   */
+  const at = shell.indexOf('private deriveSampling');
+  assert.ok(at > 0, 'deriveSampling 要存在');
+  const body = shell.slice(at, at + 900);
+  assert.doesNotMatch(body, /apiState/, '不该再读 apiState');
+  assert.match(body, /samplingFromSettings/, '只从 ST 设置派生');
+});
+
+test('★★ 回复长度不许设人为上限（用户报过正常不该有限制）', () => {
+  /*
+   * 原来 App 侧写死 8192，填 100000 会被静默换成默认值 ——
+   * 用户改了不生效，回复写到一半被截断，界面上一句解释都没有。
+   *
+   * 现在这一格归 schema 管，上限只拦明显误触（多按几个零）。
+   */
+  const schema = strip(read('shared/src/chat/settings-schema.ts'));
+  const at = schema.indexOf("path: ['oai_settings', 'openai_max_tokens']");
+  assert.ok(at > 0, 'schema 里要有这一项的 path');
+  const block = schema.slice(at, at + 700);
+  assert.match(block, /max: 1_000_000/, '上限要留到一百万（只拦误触）');
+  assert.doesNotMatch(block, /max: 32_000/, '32k 那道闸必须清掉');
 });
 
 test('★★★ 建议数值要按实际思维链长度算，不能给固定数', () => {
@@ -183,68 +214,6 @@ test('★★★ 建议数值要按实际思维链长度算，不能给固定数'
   assert.ok(a > 459, '建议值要大于思维链本身');
   assert.ok(b > 2074, '建议值要大于思维链本身');
 });
-
-test('★★ 输入值要夹在合理范围（防止手改 localStorage 塞天文数字）', () => {
-  /*
-   * ★ 2026-11-09：原来钉的是 `n >= 256` 与 `n <= 8192` 两个字面量。
-   *
-   * 而用户报「最大回复长度是否有限制？正常这个地方不应该有限制」——
-   * 8192 那道闸就是他改了不生效的真因（填 100000 被静默换成 2048）。
-   *
-   * **判据守的性质没变**：输入值要被夹在合理区间，防止手改 localStorage
-   * 塞进天文数字。只是区间本身变了，而且改成了共享常量（三处共用）。
-   */
-  assert.match(apiPage, /MAX_TOKENS_MIN/, '要有共享下界常量');
-  assert.match(apiPage, /MAX_TOKENS_MAX/, '要有共享上界常量');
-
-  const min = Number(/export const MAX_TOKENS_MIN = ([0-9_]+)/.exec(apiPage)?.[1]?.replace(/_/g, '') ?? '0');
-  const max = Number(/export const MAX_TOKENS_MAX = ([0-9_]+)/.exec(apiPage)?.[1]?.replace(/_/g, '') ?? '0');
-  assert.ok(min >= 1, `下界至少是 1，实际 ${String(min)}`);
-  assert.ok(max >= 1_000_000, `上界不能被限制在模型能力之下，实际 ${String(max)}`);
-
-  /* 三处夹紧都要用常量，不许再出现裸数字 */
-  assert.doesNotMatch(apiPage, /8192|8_192/, '8192 这个夹紧值必须清掉');
-});
-
-test('★★★ 保存时必须落进 ST 设置（否则请求体里还是旧值）', () => {
-  /*
-   * 请求体的 `max_tokens` 由 `samplingFromSettings()` 从 ST 设置派生。
-   * 只在 App 侧存一个数字**不会生效** —— 界面显示 800、请求里还是 300。
-   * 这是最典型的"改了但没变"。
-   */
-  assert.match(shell, /private async writeMaxTokens/, '要有写入 ST 的方法');
-  const at = shell.indexOf('private async writeMaxTokens');
-  const body = shell.slice(at, at + 1600);
-  assert.match(body, /mutateSettings/, '要走 mutateSettings（GET→改→整份 POST）');
-  assert.match(body, /openai_max_tokens/, '要写这个字段');
-  /*
-   * 断言"写完要把新采样推给聊天面板"。接受 `deriveSampling` ——
-   * 它是 `samplingFromSettings` 的包装（统一钉上 maxTokens 的那一个）。
-   * 写死旧名字会在重构后误红，而行为其实没变。
-   */
-  assert.match(
-    body,
-    /deriveSampling|samplingFromSettings/,
-    '写完要把新采样推给聊天面板',
-  );
-  assert.match(body, /setContext\(\{\s*sampling/, '要真的推给面板');
-});
-
-test('★★ 写 max_tokens 失败不许阻断"保存连接配置"', () => {
-  /*
-   * 连接配置本身已经存成功了；长度上限写失败只是这一项没生效。
-   * 抛错会让用户看到"保存失败"，但其实源和模型都存好了 —— 误导。
-   */
-  const at = shell.indexOf('const reason = await this.writeMaxTokens(');
-  assert.ok(at > 0, '要调用 writeMaxTokens 并拿到 reason');
-  const around = shell.slice(at, at + 400);
-  assert.match(around, /onNotify/, '失败了要提示');
-  assert.equal(/throw new Error/.test(around), false, '不许抛（会误导成"保存失败"）');
-});
-
-/* ═══════════════════════════════════════════════════════════
-   三、流式期间要显示思维链（否则气泡一直是空的）
-   ═══════════════════════════════════════════════════════════ */
 
 test('★★★ 正文为空但有思维链时，气泡要显示思考内容', () => {
   /*

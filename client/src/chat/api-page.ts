@@ -96,78 +96,21 @@ export interface ApiPageState {
    * `custom_url` 属于请求体，服务端不读设置）。
    */
   baseUrl: string;
-  /**
-   * 单次回复的最大 token 数（2026-11-02 加）。
+  /*
+   * ★ 「最大回复长度」已从这里移除（2026-11-21）。
    *
-   * ## 为什么必须让用户能改
+   * 它和「AI 响应配置 → 最大回复长度（Token）」是同一个东西：最终都落到
+   * ST 的 `oai_settings.openai_max_tokens`。两处入口、两个存放位置，
+   * 且这里的优先级更高，用户没法判断哪个生效。
    *
-   * 推理模型（`deepseek-v4-pro` 等）会**先输出思维链**再输出正文。
-   * 真机实测：302 帧全是 `reasoning_content`、`content` 一个字没有，
-   * API 后台显示 `510 / 300` —— **300 的预算被思考吃完了**，
-   * 于是正文为空、气泡消失、但钱已经扣了。
-   *
-   * 这个值原来固定在 ST 设置里（`openai_max_tokens`），App 界面没有入口，
-   * 用户遇到"生成不出内容"时**根本没法自救**，只能换模型。
-   *
-   * `undefined` = 没设置过，沿用 ST 的值（默认 300）。
+   * 现在只保留「AI 响应配置」那一处：它直接读写该 ST 设置，
+   * 是唯一入口，也是唯一真相。
    */
-  maxTokens?: number;
-}
-
-/**
- * 回复长度默认值。
- *
- * ## 为什么不是 ST 出厂的 300
- *
- * 300 对非推理模型够用，对推理模型**一定不够**：光思考就能吃掉 300，
- * 正文一个字都留不下（真机实测 302 帧全是思维链）。
- *
- * ## 为什么是 2048 而不是 800
- *
- * 我第一版给 800，理由是"够装一段思考 + 一段回复"。**实测打脸**：
- * 两次同样的配置，思维链分别是 459 字与 2074 字 —— 800 在第二次里
- * 连思考都装不完。
- *
- * 2048 能覆盖常见推理模型的思考量；再大的话普通模型会变得话痨，
- * 而 `stop` 序列与角色卡约束通常会让它在合理长度收住。
- */
-export const DEFAULT_MAX_TOKENS = 2048;
-
-/**
- * 「最大回复长度」允许的区间（2026-11-09）。
- *
- * ## 为什么要有这一对常量
- *
- * 原来这个数在**三个地方各写了一遍 8192**：
- *
- * ```text
- *   input 的 max 属性          max="8192"        （浏览器层面的夹紧）
- *   草稿校验                   n >= 256 && n <= 8192
- *   保存校验                   rawMax >= 256 && rawMax <= 8192
- * ```
- *
- * 三处都是"越界**静默替换**成默认值" —— 用户填 100000 保存后，
- * 界面上看到的是 2048，而**没有任何提示说被改了**。
- *
- * 这就是用户报「最大回复长度是否有限制？正常这个地方不应该有限制」的真因：
- * 他改了，但被夹回去，然后回复写到一半截断。
- *
- * 现在三处共用这一对常量，改一处全动。
- *
- * ## 为什么上限定成一百万
- *
- * 那只是拦明显误触（多按几个零），不构成对任何现役模型的限制 ——
- * Claude 4 / Gemini 2.5 的输出上限只有用户和上游知道，我们不该替他们拍。
- * 与 `shared/src/chat/settings-schema.ts` 的 `max` 保持一致。
- */
-export const MAX_TOKENS_MIN = 1;
-export const MAX_TOKENS_MAX = 1_000_000;
-
+};
 export const DEFAULT_API_STATE: ApiPageState = {
   source: 'openai',
   model: '',
   baseUrl: '',
-  maxTokens: DEFAULT_MAX_TOKENS,
 };
 
 export interface ApiPageCallbacks {
@@ -268,13 +211,10 @@ export function renderApiPage(
   /*
    * 每个源的草稿（切 Tab 不丢）。
    *
-   * ★ `maxTokens` 也在里面 —— 它是**按源**的配置（不同模型适合不同上限），
-   * 不是全局一份。少放进去的表现是"切一次 Tab 就回去 800"。
+   * 只放这一页真正拥有的两个字段：模型名与服务地址。
+   * 「最大回复长度」已划归「AI 响应配置」，不再在这里存草稿。
    */
-  const drafts = new Map<
-    StChatSource,
-    { model: string; baseUrl: string; maxTokens?: number }
-  >();
+  const drafts = new Map<StChatSource, { model: string; baseUrl: string }>();
 
   /**
    * 已输入但**还没保存**的秘钥，按源分开暂存在内存里。
@@ -365,7 +305,6 @@ export function renderApiPage(
    */
   let currentPanelHost: ElLike | null = null;
   let modelInput: HTMLInputElement | null = null;
-  let maxTokensInput: HTMLInputElement | null = null;
   let keyInput: HTMLInputElement | null = null;
   let baseUrlInput: HTMLInputElement | null = null;
   /*
@@ -428,47 +367,6 @@ export function renderApiPage(
     host.append(modelRow);
     modelInput = mi as unknown as HTMLInputElement;
 
-    /*
-     * ── 最大回复长度（2026-11-02 加） ──
-     *
-     * ## 这一格是"推理模型生成不出内容"的**唯一自救入口**
-     *
-     * 真机实测：`deepseek-v4-pro` 输出了 302 帧思维链、0 字正文，
-     * API 后台 `510 / 300` —— 300 的预算被思考吃完了。
-     * 用户当时能做的只有"换个模型"，因为界面上没有这一格。
-     *
-     * ## 为什么用 `number` 且给上下限
-     *
-     * 太小（< 256）连正常回复都装不下；太大（> 8192）会让弱模型
-     * 输出到一半卡死，而且预付费站点可能直接拒绝。夹在 256–8192。
-     */
-    const maxRow = el(doc, 'label', 'nb-field');
-    const maxLabel = el(doc, 'span', 'nb-field-label');
-    maxLabel.textContent = '最大回复长度';
-    const maxInput = el(doc, 'input', 'nb-input') as unknown as HTMLInputElement;
-    maxInput.setAttribute('type', 'number');
-    maxInput.setAttribute('min', '256');
-    maxInput.setAttribute('max', String(MAX_TOKENS_MAX));
-    maxInput.setAttribute('min', String(MAX_TOKENS_MIN));
-    maxInput.setAttribute('step', '64');
-    maxInput.setAttribute('inputmode', 'numeric');
-    maxInput.setAttribute('data-role', 'max-tokens-input');
-    (maxInput as unknown as HTMLInputElement).value = String(
-      draft.maxTokens ?? DEFAULT_MAX_TOKENS,
-    );
-    if (draft.maxTokens === undefined) draft.maxTokens = DEFAULT_MAX_TOKENS;
-    maxInput.addEventListener?.('input', () => {
-      const n = Number.parseInt(String((maxInput as unknown as HTMLInputElement).value ?? ''), 10);
-      /* 非法输入不写进 draft —— 留着上一次有效值，保存时不会变成 NaN */
-      if (Number.isFinite(n) && n >= MAX_TOKENS_MIN && n <= MAX_TOKENS_MAX) draft.maxTokens = n;
-    });
-    const maxHint = el(doc, 'span', 'nb-field-hint');
-    maxHint.textContent =
-      '单次回复的 token 上限。用「会思考的模型」（推理模型）时务必调大，' +
-      '否则思考会把预算吃光、正文为空。默认 2048；若仍提示"只有思考没有正文"，按提示里的数值再加。';
-    maxRow.append(maxLabel, maxInput as unknown as ElLike, maxHint);
-    host.append(maxRow);
-    maxTokensInput = maxInput as unknown as HTMLInputElement;
 
     // ── API key（只写不读） ──
     const keyRow = el(doc, 'label', 'nb-field');
@@ -1074,25 +972,15 @@ export function renderApiPage(
         if (draft !== undefined) draft.baseUrl = rawBaseUrl;
 
         /*
-         * 最大回复长度：从输入框读，读不到就用 draft 里上一次的有效值，
-         * 再不行用默认值 —— **绝不允许传 NaN/undefined 到请求体**，
-         * 那会让上游按它自己的默认（300）跑，用户以为改了其实没改。
-         */
-        const rawMax = maxTokensInput !== null
-          ? Number.parseInt(String(maxTokensInput.value ?? ''), 10)
-          : Number.NaN;
-        const draftMax = draft === undefined ? undefined : draft.maxTokens;
-        const maxTokens = Number.isFinite(rawMax) && rawMax >= MAX_TOKENS_MIN && rawMax <= MAX_TOKENS_MAX
-          ? rawMax
-          : (draftMax ?? DEFAULT_MAX_TOKENS);
-
-        /*
          * 传 `actualSource` 而不是 `currentSource`：落盘那边的
          * `buildStConnectionPatch` 也会做同样的纠正，两处**必须一致** ——
          * 否则会出现"key 存进 custom、settings 里写的还是 deepseek"。
+         *
+         * ★ 不传「最大回复长度」（2026-11-21）：这一页已无该字段，
+         *   保存连接配置**不该顺手改回复长度**。那个值归「AI 响应配置」管。
          */
         await callbacks.onSave(
-          { source: actualSource, model: rawModel, baseUrl: rawBaseUrl, maxTokens },
+          { source: actualSource, model: rawModel, baseUrl: rawBaseUrl },
           rawKey,
         );
         /*

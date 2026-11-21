@@ -457,39 +457,32 @@ test('★★★★★ 超时不许用"世界没能打开"这个标题', () => {
 });
 
 /* ═══════════════════════════════════════════════════════════
-   ⑤ 最大回复长度：API 连接页也有夹紧（用户改的就是这一页）
+   ⑤ 最大回复长度：API 连接页已不再管这一项
    ═══════════════════════════════════════════════════════════ */
 
-test('★★★★★ API 连接页不许再把 maxTokens 夹在 8192', () => {
+test('★★★★★ API 连接页不许再夹紧回复长度（该页已无此字段）', () => {
   /*
-   * 用户报「最大回复长度是否有限制」时，我先只改了
-   * `settings-schema.ts`（AI 响应配置页那份）。
+   * 背景：用户报「最大回复长度是否有限制」时，我先只改了
+   * `settings-schema.ts`（AI 响应配置那份）。**不够** —— 用户真正编辑的是
+   * 「我的 → API 连接」，而它在三处各写了一遍 8192，越界静默替换成默认值。
    *
-   * **不够。** 用户真正编辑的是「我的 → API 连接」这一页，而它在
-   * 三个地方各写了一遍 8192：
+   * 2026-11-21 的进一步决定：这一页那一格**整体删掉**（它和 AI 响应配置
+   * 写的是同一个 `openai_max_tokens`，两处入口只有一处生效）。
+   *
+   * 所以这里钉两件事：
    *
    * ```text
-   *   input 的 max 属性    max="8192"
-   *   草稿校验             n >= 256 && n <= 8192
-   *   保存校验             rawMax >= 256 && rawMax <= 8192
+   *   ① API 页不许再出现 8192 这类硬夹紧（连同共享常量一起删干净）
+   *   ② 唯一入口（schema）的上限只拦"明显误触"，不再替用户拍数
    * ```
-   *
-   * 三处都是"越界**静默替换**成默认值" —— 用户填 100000，保存后界面
-   * 显示 2048，没有任何提示说被改了。这就是"改了不生效"的经典形态。
    */
   const src = stripComments(read('client/src/chat/api-page.ts'));
 
-  /* ① 不许再有裸 8192 */
-  assert.doesNotMatch(src, /8192|8_192/, '8192 这个夹紧值必须清掉');
+  assert.doesNotMatch(src, /8192|8_192/, '8192 这个夹紧值不该再出现');
+  assert.doesNotMatch(src, /MAX_TOKENS_MAX/, '共享常量应随字段一起删除');
 
-  /* ② 三处都要走共享常量 */
-  assert.match(src, /MAX_TOKENS_MIN/, '要有共享下界常量');
-  assert.match(src, /MAX_TOKENS_MAX/, '要有共享上界常量');
-  assert.match(src, /setAttribute\('max', String\(MAX_TOKENS_MAX\)\)/, 'input 的 max 要用常量');
-
-  /* ③ 上界要与 settings-schema 一致（两页不能各说一套） */
-  const maxConst = Number(/export const MAX_TOKENS_MAX = ([0-9_]+)/.exec(src)?.[1]?.replace(/_/g, '') ?? '0');
-  assert.ok(maxConst >= 1_000_000, `API 页上界不能低于一百万，实际 ${String(maxConst)}`);
+  const schema = stripComments(read('shared/src/chat/settings-schema.ts'));
+  assert.match(schema, /max: 1_000_000/, '唯一入口的上限只拦误触');
 });
 
 /* ═══════════════════════════════════════════════════════════

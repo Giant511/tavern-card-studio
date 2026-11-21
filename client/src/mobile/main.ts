@@ -141,18 +141,12 @@ function readApiState(): ApiPageState {
           ? ((parsed as Record<string, unknown>)['baseUrl'] as string)
           : DEFAULT_API_STATE.baseUrl,
       /*
-       * 最大回复长度（2026-11-02 加）。
+       * ★ 不再读 `maxTokens`（2026-11-21）。
        *
-       * 读的时候要**夹范围**：localStorage 是用户能手改的明文，
-       * 一个 `maxTokens: 99999999` 流进请求体会让上游拒绝或挂很久。
+       * 这个键已从 `ApiPageState` 移除：它是「AI 响应配置」页拥有的
+       * `openai_max_tokens` 的影子副本。旧版本存进 localStorage 的那份
+       * **直接丢弃** —— 留着只会让两个值再次分叉。
        */
-      maxTokens: (() => {
-        const raw = (parsed as Record<string, unknown>)['maxTokens'];
-        const n = typeof raw === 'number' ? raw : Number.NaN;
-        return Number.isFinite(n) && n >= 256 && n <= 8192
-          ? n
-          : DEFAULT_API_STATE.maxTokens;
-      })(),
     };
   } catch {
     // 存储被禁（隐私模式）/ 内容坏了：回到默认值，不阻断启动
@@ -315,7 +309,7 @@ async function writeApiState(state: ApiPageState): Promise<void> {
   if (record['source'] !== state.source) mismatch.push('接口源');
   if (record['model'] !== state.model) mismatch.push('模型名');
   if (record['baseUrl'] !== state.baseUrl) mismatch.push('服务地址');
-  if (record['maxTokens'] !== state.maxTokens) mismatch.push('最大回复长度');
+  /* 不再核 `maxTokens`：它已不属于这份配置（见上面的读取处说明） */
   if (mismatch.length > 0) {
     throw new Error(`保存没有生效（${mismatch.join('、')}读回来和写进去的不一致）。`);
   }
