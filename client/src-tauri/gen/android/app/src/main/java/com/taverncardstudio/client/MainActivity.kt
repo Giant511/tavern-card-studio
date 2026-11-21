@@ -1,5 +1,7 @@
 package com.taverncardstudio.client
 
+import android.app.ActivityManager
+import android.app.Application
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -7,7 +9,6 @@ import android.view.WindowInsets
 import android.webkit.WebSettings
 import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
-import android.app.Application
 import com.taverncardstudio.client.stengine.StBridge
 import com.taverncardstudio.client.stengine.StLog
 
@@ -128,6 +129,45 @@ class MainActivity : TauriActivity() {
     super.onCreate(savedInstanceState)
 
     /*
+     * ★★★ 把本任务重新放回「最近任务」（2026-11-21，用户报切后台后任务列表看不到 App）。
+     *
+     * ## 现象
+     *
+     * ```text
+     *   切到后台 → 上滑打开任务列表 → 看不到本 App 的卡片
+     *   ⇒ 只能回桌面点图标才能重新进来
+     * ```
+     *
+     * ## 为什么会出现
+     *
+     * 任务被打了 `FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS`。这个标志**不是我们显式设置**的，
+     * 但会跟着启动入口进来：
+     *
+     * ```text
+     *   ① 通知里的启动 Intent
+     *      原实现用 packageManager.getLaunchIntentForPackage(packageName)，
+     *      拿到的是**桌面启动器**那条 Intent。部分 ROM（实测同类机型 originOS6 /
+     *      Android 16）会给它带上 EXCLUDE_FROM_RECENTS，因为桌面把这种启动当作
+     *      「跳板」而不是「要留在后台的窗口」。
+     *   ② 桌面图标本身
+     *      少数 ROM 的启动跳板会把该标志一并带进主任务。
+     * ```
+     *
+     * 标志一旦落到任务上就**一直有效** —— 之后从哪进都不显示，直到任务被销毁重建。
+     * 这与"重启 App 就好了一阵、过几天又没了"的观感一致。
+     *
+     * ## 为什么用 `setExcludeFromRecents(false)` 兜底
+     *
+     * 我们**无法控制**桌面启动器传什么，也无法保证通知那条 Intent 在所有 ROM 上都干净。
+     * 而 `ActivityManager.AppTask#setExcludeFromRecents` 是任务级开关，能在
+     * 自己的进程里把结果改回来 —— 不管标志是谁带进来的。
+     *
+     * 放在 `onCreate` 与 `onResume` 两处：`onCreate` 覆盖冷启动，
+     * `onResume` 覆盖"从后台回来时才发现被排除"的情况。方法本身幂等。
+     */
+    clearRecentsExclusion("onCreate")
+
+    /*
      * 记 Activity 的进/退后台（2026-11-12）。
      *
      * ## 为什么这条重要
@@ -182,6 +222,49 @@ class MainActivity : TauriActivity() {
        */
       Log.e(TAG, "启动引擎服务失败", error)
     }
+  }
+
+  /**
+   * 确保本任务出现在「最近任务」里（2026-11-21）。
+   *
+   * 见 `onCreate` 里那段注释：任务可能因为启动入口带着
+   * `FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS` 而不出现在任务列表。
+   * 这里逐个任务把它关掉 —— `setExcludeFromRecents(false)` 是任务级开关，
+   * 不关心标志最初是谁带进来的。
+   *
+   * 幂等：已经是 false 时再设一次没有副作用，所以每次 `onResume` 都可以调。
+   *
+   * 失败只记日志不抛：个别 ROM 上 `getAppTasks()` 会抛 SecurityException，
+   * 那不该让 App 起不来 —— 任务列表是体验问题，启动是可用性问题。
+   */
+  private fun clearRecentsExclusion(stage: String) {
+    try {
+      val am = getSystemService(ActivityManager::class.java) ?: return
+      val tasks = am.appTasks
+      if (tasks.isEmpty()) {
+        StLog.w("RECENTS", "$stage：拿不到本应用的任务（任务数为 0）")
+        return
+      }
+      for (task in tasks) {
+        task.setExcludeFromRecents(false)
+      }
+      StLog.i("RECENTS", "$stage：已确保 ${tasks.size} 个任务不排除在最近任务之外")
+    } catch (error: Throwable) {
+      /* 典型是 SecurityException（部分 ROM 限制） */
+      StLog.w("RECENTS", "$stage：设置失败：${error.javaClass.simpleName} ${error.message}")
+    }
+  }
+
+  /**
+   * 每次回到前台都再确认一次任务可见。
+   *
+   * 为什么不能只在 `onCreate`：任务是长期存在的，而"被排除"可能是
+   * 后台期间被系统/启动器改的。`onResume` 是唯一"用户正看着这个界面"的时刻，
+   * 在这里修正最贴近用户预期。
+   */
+  override fun onResume() {
+    super.onResume()
+    clearRecentsExclusion("onResume")
   }
 
   /**
