@@ -366,6 +366,26 @@ export class ChatPanel {
   private stream: StreamState = createStreamState();
   private handle: GenerateHandle | null = null;
   /**
+   * 挂起中的流式渲染（2026-11-21）。
+   *
+   * ## 为什么需要合并
+   *
+   * 上游每吐一个 `data:` 行，Rust 就 emit 一次，前端 `onState` 就调一次
+   * `patchStreamingMessage`。而它内部要**把累积的全文重新跑一遍 markdown
+   * 渲染，再 `innerHTML` 重建整个气泡的 DOM**。
+   *
+   * 于是每帧成本随回复长度线性增长：一千字时还行，三千字时单帧就要十几毫秒，
+   * 而帧间隔只有几毫秒 —— 主线程被渲染占满，显示开始滞后。
+   * 滞后累积到一定程度会一次追上来，看起来就是
+   * 「一秒冒三个字，过一会儿一秒蹦六七个字」。
+   *
+   * 合并到 `requestAnimationFrame`：**一帧最多渲染一次**，
+   * 中间的若干次更新只覆盖状态、不碰 DOM。
+   */
+  private pendingStreamPatch: { index: number; state: StreamState } | null = null;
+  /** 已排队的 rAF 句柄；0 表示没排队 */
+  private streamPatchRaf = 0;
+  /**
    * 是否显示完整思考链（2026-11-05 用户要求）。
    *
    * 由外壳注入、可在运行中改（`setShowReasoning`）。
@@ -2113,8 +2133,14 @@ export class ChatPanel {
         {
           onState: (state) => {
             this.stream = state;
-            // 只更新占位那条的正文，不整表重渲染 —— 否则每一帧都重建整屏 DOM
-            this.patchStreamingMessage(targetIndex, state);
+            /*
+             * 只更新占位那条的正文，不整表重渲染 —— 否则每一帧都重建整屏 DOM。
+             *
+             * 走 `scheduleStreamPatch` 而不是直接调：上游一秒可能吐十几个包，
+             * 直接调就是十几次「全文 markdown 重解析 + innerHTML 重建」。
+             * 合并到一帧一次之后，肉眼看到的是均匀推进，而不是跳字。
+             */
+            this.scheduleStreamPatch(targetIndex, state);
           },
         },
       );
@@ -2125,6 +2151,15 @@ export class ChatPanel {
       thrown = describeBridgeError(error).message;
       this.stream = createStreamState();
     }
+
+    /*
+     * 先把挂起的那一帧画掉再收尾（2026-11-21）。
+     *
+     * `scheduleStreamPatch` 把渲染推迟到下一帧，而 `done` 可能在那一帧之前到 ——
+     * 不主动 flush 的话，屏幕上少最后一段字，落盘的却是完整内容。
+     * 这种"看起来少了一截"最容易被误报成丢消息。
+     */
+    this.flushStreamPatch();
 
     // 收尾
     const output = finalizeOutput(this.stream);
@@ -2320,6 +2355,45 @@ export class ChatPanel {
   }
 
   /** 只更新流式那一条的正文 */
+  /**
+   * 记下最新状态，并安排「本帧画一次」。
+   *
+   * 同一帧内的多次调用只有最后一次生效 —— 这是流式卡顿的修法，
+   * 详见 `pendingStreamPatch` 的注释。
+   *
+   * 没有 `requestAnimationFrame` 时（Node 测试环境）直接画，
+   * 否则状态会永远停在挂起里、一个字都不出来。
+   */
+  private scheduleStreamPatch(index: number, state: StreamState): void {
+    this.pendingStreamPatch = { index, state };
+    if (this.streamPatchRaf !== 0) return;
+
+    const raf = (
+      globalThis as { requestAnimationFrame?: (callback: () => void) => number }
+    ).requestAnimationFrame;
+    if (raf === undefined) {
+      this.flushStreamPatch();
+      return;
+    }
+    this.streamPatchRaf = raf(() => {
+      this.streamPatchRaf = 0;
+      this.flushStreamPatch();
+    });
+  }
+
+  /**
+   * 立刻画出挂起的那一帧。
+   *
+   * ★ 收尾时**必须**调它：`done` 之后 `finalizeOutput` 用的是 `this.stream`，
+   * 而屏幕上可能还挂着上一帧的内容。不清掉会少最后一段字。
+   */
+  private flushStreamPatch(): void {
+    const pending = this.pendingStreamPatch;
+    this.pendingStreamPatch = null;
+    if (pending === null) return;
+    this.patchStreamingMessage(pending.index, pending.state);
+  }
+
   private patchStreamingMessage(index: number, state: StreamState): void {
     if (this.listEl === null) return;
     /*
@@ -2428,10 +2502,30 @@ export class ChatPanel {
         bubble.append(dot);
       }
     } else {
-      bubble.innerHTML = state.text === '' ? '' : renderMessageHtml(state.text, {
-        charName: String(this.ctx.card['name'] ?? ''),
-        userName: this.ctx.userName,
-      });
+      /*
+       * 文本没变就**不碰 DOM**（2026-11-21）。
+       *
+       * 一帧里可能收到多个事件（`reasoning_content` + `content` 各一个），
+       * 合并后正文可能一个字没变。`innerHTML` 赋值会整棵子树重建 ——
+       * 白花的代价是用户选中的文字被清掉、滚动锚点被重置。
+       *
+       * ## 标记为什么挂在 `bubble` 上，而不是面板字段上
+       *
+       * `render()` 会 `replaceChildren()` 重建整个列表，那时旧字段还记着
+       * 上一版文本，于是新气泡会被判成"没变"而**一直空着**。
+       * 挂在元素上就没有这个问题：新元素没有这个属性，必然重画。
+       *
+       * 存"长度 + 尾部片段"而不是全文：属性值太长没好处，
+       * 而流式正文只会往后追加，长度加尾部足以区分。
+       */
+      const stamp = `${state.text.length}:${state.text.slice(-24)}`;
+      if (bubble.getAttribute('data-stream-paint') !== stamp) {
+        bubble.setAttribute('data-stream-paint', stamp);
+        bubble.innerHTML = state.text === '' ? '' : renderMessageHtml(state.text, {
+          charName: String(this.ctx.card['name'] ?? ''),
+          userName: this.ctx.userName,
+        });
+      }
     }
     // 呼吸点跟着状态走（收尾时也要**去掉**，不能只加不删）
     const hasDot = Array.from(bubble.children).some((child) =>
