@@ -29,6 +29,7 @@
 import type { StCardData, StWorldbookEntry } from '../model/sillytavern.js';
 import { activeEntriesInOrder, DEFAULT_SCAN_DEPTH } from '../rules/worldbook-activation.js';
 import type { StChatMessage } from './types.js';
+import { type MemoryEntry, renderMemoryBlock } from '../chat/memory.js';
 
 /** 拼装需要的输入 */
 export interface ContextInput {
@@ -48,6 +49,16 @@ export interface ContextInput {
   random?: () => number;
   /** 是否把 `mes_example` 拼进 system prompt（桌面上有开关，缺省 false） */
   includeExamples?: boolean;
+  /**
+   * 角色级记忆（2026-11-22，v0.2.2）。
+   *
+   * ★ 这条回退路径**也要插**。用户可能还没在 ST 里存过提示词预设，
+   * 那时走的是这里。漏掉的话，没配预设的用户会看到"记忆完全不生效"，
+   * 而界面上一切正常 —— 最难归因的一类。
+   *
+   * 位置与主路径一致：在对话历史之前。
+   */
+  memory?: readonly MemoryEntry[];
 }
 
 /** 拼好的上下文 */
@@ -216,6 +227,17 @@ export function assembleContext(input: ContextInput): AssembledContext {
   const personaDescription = input.persona?.description?.trim() ?? '';
   if (personaDescription !== '') {
     push('system', `【用户人设】\n${applyBasicMacros(personaDescription, charName, userName)}`, false);
+  }
+
+  /*
+   * 角色级记忆（2026-11-22）。
+   *
+   * 位置与主路径（`assembleWithPrompts`）一致：世界书/人设之后、历史之前。
+   * `canTrim = false` —— 记忆是长期资料，预算紧张时该裁历史。
+   */
+  const memoryBlock = renderMemoryBlock(input.memory ?? []);
+  if (memoryBlock !== '') {
+    push('system', memoryBlock, false);
   }
 
   // 历史：跳过系统消息与空正文

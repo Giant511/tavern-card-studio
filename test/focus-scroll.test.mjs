@@ -94,32 +94,82 @@ test('★ 余量是 12px（改它要改这条）', () => {
    二、CSS 侧：避让必须在**页面级**，且只能有一处
    ═══════════════════════════════════════════════════════════ */
 
-test('★★★ 键盘避让写在 .nb-app 上（唯一能真正缩矮的一层）', async () => {
+test('★★★ 键盘避让只写在能真正缩矮的那几层，且同一个盒子不许扣两次', async () => {
   /*
-   * 一路踩过来：写在 `.nb-chat` 只有聊天页跟随；改到 `.nb-page` **完全无效** ——
-   * 它是 `flex: 1` 子项，高度由父容器分配，padding 只把内容压扁
-   * （真机实测 `.nb-scroll` 剩 43px、页面底边 778 一点没动）。
+   * ## 踩过的两个坑
    *
-   * 只有 `position: fixed; inset: 0` 的 `.nb-app` 能靠 padding 真正缩矮。
+   * ```text
+   * ① 写在 `.nb-chat`  → 只有聊天页跟随
+   * ② 改到 `.nb-page`  → **完全无效**，它是 `flex: 1` 子项，高度由父容器分配，
+   *                       padding 只把内容压扁（真机实测 .nb-scroll 剩 43px、
+   *                       页面底边 778 一点没动）
+   * ```
+   *
+   * 能靠 padding 真正缩矮的只有 `position: fixed; inset: 0` 的层。
+   *
+   * ## 为什么现在有三处消费（2026-11-22 扩展）
+   *
+   * 底部面板（记忆/气泡编辑）是 `position: fixed` 的**浮层**，
+   * 定位基准是视口 —— `.nb-app` 的 padding 对它无效。
+   * 所以面板那一族也要扣一次，但**扣的层不同**：
+   *
+   * ```text
+   *   .nb-app           padding-bottom   聊天页（页面在它里面）
+   *   .nb-sheet-mask    padding-bottom   浮层（把自己抬到键盘上方）
+   *   .nb-sheet(-memory) max-height      面板本身不许高过可用区
+   * ```
+   *
+   * ## 唯一真正的错误：同一个盒子扣两次
+   *
+   * 同一层既减 padding 又减 max-height，会**双倍扣**（内容区被压掉两个键盘高）。
+   * 这才是当年"只许出现一次"想守的东西 —— 现在按盒子分别判。
    */
   const { readFileSync } = await import('node:fs');
   const css = readFileSync(new URL('../client/src/chat/chat.css', import.meta.url), 'utf8');
 
-  const appStart = css.indexOf('\n.nb-app {');
-  const appEnd = css.indexOf('\n}', appStart);
-  const appBlock = css.slice(appStart, appEnd);
+  const blockOf = (selector) => {
+    const start = css.indexOf('\n' + selector + ' {');
+    assert.ok(start >= 0, '找不到 ' + selector);
+    const end = css.indexOf('\n}', start);
+    return css.slice(start, end);
+  };
 
+  /* ── 聊天页那一层：仍是 padding ── */
+  const appBlock = blockOf('.nb-app');
   assert.ok(appBlock.includes('--nb-kb-inset-native'), '.nb-app 要消费 Android 注入的键盘高度');
   assert.ok(appBlock.includes('box-sizing: border-box'), '.nb-app 必须 border-box 才能向内压');
 
-  /* 全文件只许一处（父子各扣一次 = 双倍） */
-  const occurrences = css.split('--nb-kb-inset-native, 0px))').length - 1;
-  assert.equal(occurrences, 1, '避让公式只许出现一次，实际 ' + String(occurrences) + ' 次');
+  /* ── 浮层那一层：padding，且必须 border-box ── */
+  const maskBlock = blockOf('.nb-sheet-mask');
+  assert.ok(maskBlock.includes('--nb-kb-inset-native'), '.nb-sheet-mask 要扣键盘高度');
+  assert.ok(maskBlock.includes('box-sizing: border-box'), 'mask 加 padding 必须 border-box');
 
-  /* `.nb-page` 是 flex 子项，写在那里无效 —— 不许回退 */
-  const pageStart = css.indexOf('\n.nb-page {');
-  const pageEnd = css.indexOf('\n}', pageStart);
-  const pageBlock = css.slice(pageStart, pageEnd);
+  /* ── 面板本身：只许用 max-height，不许再 padding ── */
+  for (const selector of ['.nb-sheet', '.nb-sheet--memory']) {
+    const block = blockOf(selector);
+    assert.ok(
+      block.includes('--nb-kb-inset-native'),
+      selector + ' 的 max-height 要按键盘高度收',
+    );
+    assert.ok(
+      !/padding[a-z-]*:\s*[^;]*--nb-kb-inset/.test(block),
+      selector + ' 已经在 mask 上扣过 padding，这里再扣就是双倍',
+    );
+  }
+
+  /* ── 同一个盒子不许同时出现两种扣法 ── */
+  for (const selector of ['.nb-app', '.nb-sheet-mask', '.nb-sheet', '.nb-sheet--memory']) {
+    const block = blockOf(selector);
+    const viaPadding = /padding[a-z-]*:\s*[^;]*--nb-kb-inset/.test(block);
+    const viaMaxHeight = /max-height:\s*[^;]*--nb-kb-inset/.test(block);
+    assert.ok(
+      !(viaPadding && viaMaxHeight),
+      selector + ' 同时用 padding 和 max-height 扣键盘 → 双倍',
+    );
+  }
+
+  /* ── `.nb-page` 是 flex 子项，写在那里无效 —— 不许回退 ── */
+  const pageBlock = blockOf('.nb-page');
   assert.ok(!pageBlock.includes('--nb-kb-inset'), '.nb-page 是 flex 子项，写在那里无效');
 });
 

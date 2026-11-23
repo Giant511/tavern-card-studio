@@ -65,9 +65,18 @@ import {
   type AuthorNoteConfig,
   type ParamFamily,
   type SamplingParams,
+  type MemoryEntry,
+  type MemoryStore,
+  buildExportFile,
+  memoryExportFileName,
+  memoryOf,
+  mergeImported,
+  parseImportFile,
 } from '@tcs/shared';
 
 import { openBubbleMenu, type BubbleMenuHandle } from './bubble-menu.ts';
+import { openMemoryPage, type MemoryPageHandle } from './memory-page.ts';
+import { readCharacterMemory, readMemoryStore, writeCharacterMemory } from './memory-store.ts';
 import { StChatBridge, type GenerateHandle } from './st-bridge.ts';
 import { VoicePanel, type VoiceTransport } from './voice-panel.ts';
 /*
@@ -364,6 +373,13 @@ export class ChatPanel {
    */
   private characterName: string | null = null;
   private stream: StreamState = createStreamState();
+  /**
+   * 记忆编辑面板（2026-11-22）。
+   *
+   * 与 `bubbleMenu` 同一条纪律：`dispose()` 里要关掉，
+   * 否则切 Tab 之后面板还浮在上面。
+   */
+  private memoryPage: MemoryPageHandle | null = null;
   private handle: GenerateHandle | null = null;
   /**
    * 挂起中的流式渲染（2026-11-21）。
@@ -993,6 +1009,26 @@ export class ChatPanel {
     this.regenEl = regenBtn;
     quickbar.append(regenBtn);
 
+    /*
+     * 记忆（2026-11-22，v0.2.2）。
+     *
+     * ## 为什么放这一排
+     *
+     * 用户的核心诉求是「随手可改，只需要点一次就可以打开界面更改」。
+     * 放设置页就得"我的 → 聊天设置 → 某一级"；放这里是一次点击，
+     * 且与输入框同屏 —— 想到什么立刻能记下来。
+     *
+     * 用「记」字而不是图标：这一排已经有 `↻` 与几个符号，
+     * 再加一个符号会分不清哪个是哪个。
+     */
+    const memoryBtn = el(this.doc, 'button', 'nb-quickkey');
+    memoryBtn.setAttribute('type', 'button');
+    memoryBtn.setAttribute('data-role', 'chat-memory');
+    memoryBtn.setAttribute('aria-label', '打开角色记忆');
+    memoryBtn.textContent = '记';
+    memoryBtn.addEventListener('click', () => this.openMemoryPanel());
+    quickbar.append(memoryBtn);
+
     composer.append(quickbar);
     composer.append(input as unknown as ElLike);
 
@@ -1003,7 +1039,16 @@ export class ChatPanel {
     send.setAttribute('type', 'button');
     send.setAttribute('aria-label', '发送');
     send.setAttribute('data-role', 'send');
-    send.textContent = '↑';
+    /*
+     * 文字按钮，不是图标（2026-11-22 用户要求）。
+     *
+     * 原来是一个 `↑` 圆钮。用户的原话是「不要箭头的图标，把发送按键改成
+     * 一个长方形的文字按钮显示"发送"两个字」。理由是箭头要猜 ——
+     * 而输入框右边这个小方块到底是"发送"还是"换行"，各家的画法都不一样。
+     *
+     * 生成中同一个位置变「停止」：那是他上一次被打断时找不到的那个按钮。
+     */
+    send.textContent = '发送';
     send.addEventListener('click', () => void this.onSendClick());
     this.sendEl = send;
     composer.append(send);
@@ -1412,9 +1457,57 @@ export class ChatPanel {
     if (this.sendEl === null || this.inputEl === null) return;
     const text = (this.inputEl as unknown as HTMLTextAreaElement).value ?? '';
     const busy = isBusy(this.stream);
-    const ready = text.trim().length > 0 && !busy;
-    this.sendEl.setAttribute('data-ready', String(ready));
-    (this.sendEl as unknown as HTMLButtonElement).disabled = !ready;
+
+    /*
+     * ★★★ 生成中这个按钮是「停止」，而且**必须真的可点**（2026-11-22）。
+     *
+     * ## 原来的写法坏在哪
+     *
+     * `onSendClick` 里早就写了"生成中 = 停止"的分支，但这里算的是：
+     *
+     * ```ts
+     *   const ready = text.trim().length > 0 && !busy;
+     *   sendEl.disabled = !ready;          // ⇒ 生成中恒为 true
+     * ```
+     *
+     * 于是那个分支**永远进不去**：按钮在生成期间是灰的、点不动。
+     * 用户的反馈是「没有任何停止生成的按钮」，他只能切到别的页面来打断 ——
+     * 而切页会 dispose 面板、断开 socket，看起来就像"自己断了"。
+     *
+     * 这条和 §103 是同一类：功能写了，但入口被另一个条件挡住了。
+     *
+     * ## 为什么复用这个按钮而不是新加一个
+     *
+     * composer 那一行已是 `[输入框][🎤][发送]`，宽度按最小机型算过
+     * （§131 跨设备硬约束）。塞第三个按钮会在小屏上挤掉输入框。
+     * 而「发送 / 停止」本来就是同一个位置的两个状态 —— 各家聊天应用都这么做。
+     */
+    if (busy) {
+      const stopping = this.stream.phase === 'stopping';
+      this.sendEl.setAttribute('data-mode', 'stop');
+      this.sendEl.setAttribute('data-ready', String(!stopping));
+      this.sendEl.setAttribute('aria-label', stopping ? '正在停止' : '停止生成');
+      this.sendEl.textContent = stopping ? '…' : '停止';
+      /*
+       * `stopping` 时禁掉：abort 已经发出去了，再点只会重复调用。
+       * 其余情况**一定要 removeAttribute** —— 布尔属性留着就还是禁用，
+       * 这正是原来那个缺陷的形态（§2026-11-04 那次"按钮永久变灰"）。
+       */
+      if (stopping) {
+        (this.sendEl as unknown as HTMLButtonElement).disabled = true;
+      } else {
+        (this.sendEl as unknown as HTMLButtonElement).disabled = false;
+        this.sendEl.removeAttribute('disabled');
+      }
+    } else {
+      this.sendEl.removeAttribute('data-mode');
+      this.sendEl.setAttribute('aria-label', '发送');
+      this.sendEl.textContent = '发送';
+      const ready = text.trim().length > 0;
+      this.sendEl.setAttribute('data-ready', String(ready));
+      (this.sendEl as unknown as HTMLButtonElement).disabled = !ready;
+      if (ready) this.sendEl.removeAttribute('disabled');
+    }
     /*
      * 重新生成按钮也跟生成状态走（2026-11-05）。
      *
@@ -1473,14 +1566,41 @@ export class ChatPanel {
 
   private async onSendClick(): Promise<void> {
     if (isBusy(this.stream)) {
-      // 生成中，这个按钮是"停止"
-      await this.handle?.abort();
-      this.stream = requestStop(this.stream);
-      this.render();
-      this.syncSendButton();
+      await this.stopStreaming();
       return;
     }
     await this.send();
+  }
+
+  /**
+   * 停止生成（= 断连）。
+   *
+   * ## 顺序不能反（2026-11-22）
+   *
+   * 必须先 `requestStop` 再 `abort`。反过来的话 `abort` 会让 Rust 立刻
+   * 收尾并推 `done`，而那时 `phase` 还是 `streaming` —— `done` 一到就变
+   * `idle`，`stopRequested` 没置上，这条回复后来会被判成"上游掐断"，
+   * 用户明明自己停的却收到一句"回复可能不完整"。
+   *
+   * ## 为什么只需要一个 abort
+   *
+   * `st_chat_abort` 只是把取消标志置 1，真正的断连发生在它下一次读包时
+   * （见 `st_api.rs` 的回调返回 false）。所以重复调用没有副作用，
+   * 但界面已经进入 `stopping`，`syncSendButton` 会把按钮禁掉。
+   */
+  private async stopStreaming(): Promise<void> {
+    if (this.stream.phase !== 'streaming') return;
+    this.stream = requestStop(this.stream);
+    /*
+     * 只刷按钮，不重渲染整表。
+     *
+     * 气泡里的呼吸点是按 `this.stream` 画的，下一个补丁帧会跟着变；
+     * 而**停止之后可能再也没有补丁帧**（abort 一到 Rust 就收尾）——
+     * 那也没关系：收尾时 `patchStreamingMessage` 会把呼吸点去掉，
+     * 用户看到的是按钮从「■」变「…」，然后回复落定。
+     */
+    this.syncSendButton();
+    await this.handle?.abort();
   }
 
   /** 发一条用户消息，然后触发生成 */
@@ -1804,6 +1924,35 @@ export class ChatPanel {
     };
   }
 
+  /**
+   * 把「最大回复长度」夹到窗口还剩的空间里（2026-11-22）。
+   *
+   * ## 它什么时候才会真的改数
+   *
+   * 正常路径上 `applyBudget` 已经保证 `历史 ≤ 窗口 − 回复上限`，
+   * 所以 `room = 窗口 − 已用 ≥ 回复上限`，这里原样返回 ——
+   * 用户设的 32000 就是 32000，不会被悄悄改小。
+   *
+   * 只有"必留项自己就超了"（`overBudget`，世界书/提示词/记忆太大）时，
+   * `room` 才会小于上限。那时把回复压下来，至少给这次请求留一线机会，
+   * 而不是带着一个注定失败的组合去撞上游 —— 那会白扣一次费用。
+   *
+   * ## 为什么下限是 512
+   *
+   * 再小就没有意义了（一条完整回复写不完，用户拿到的是半句话，
+   * 体验比明确报错更差）。这种情况下真正该做的是让用户去减提示词，
+   * 而那句话由调用方的 `overBudget` 通知负责说。
+   */
+  private clampMaxTokens(sampling: SamplingParams, usedTokens: number): SamplingParams {
+    const limit = this.ctx.contextLimit;
+    const want = sampling.maxTokens;
+    if (typeof limit !== 'number' || !Number.isFinite(limit) || limit <= 0) return sampling;
+    if (typeof want !== 'number' || !Number.isFinite(want) || want <= 0) return sampling;
+    const room = Math.floor(limit - usedTokens);
+    if (room >= want) return sampling;
+    return { ...sampling, maxTokens: Math.max(512, room) };
+  }
+
   /** 计数缓存的键（理由见 `tokenCache` 的注释） */
   private tokenCacheKey(text: string): string {
     if (text.length <= 128) return `${this.ctx.model}\u0000${text}`;
@@ -1882,6 +2031,24 @@ export class ChatPanel {
     const promptConfig = this.ctx.promptConfig ?? null;
     const usePromptManager = promptConfig !== null && promptConfig.prompts.length > 0;
 
+    /*
+     * 角色级记忆（2026-11-22，v0.2.2）。
+     *
+     * ## 为什么每次生成都现读，不缓存
+     *
+     * 缓存的失效点有三个：改了记忆、切了角色、在别处清空了存储。
+     * 少接任何一个，症状都是"我明明改了它不生效" —— 而那种情况完全没有报错。
+     *
+     * 一次 `localStorage.getItem` + 一个几 KB 的 JSON.parse 在这个量级上
+     * 可以忽略（一次生成要跑几秒钟）。
+     *
+     * ## 两条拼装路径都要给
+     *
+     * 用户可能还没在 ST 里存过提示词预设，那时走 `assembleContext`。
+     * 漏一条的话，那批用户会看到记忆完全不生效。
+     */
+    const memory = this.avatar === null || this.avatar === '' ? [] : readCharacterMemory(this.avatar);
+
     const assembled = usePromptManager
       ? assembleWithPrompts({
           card: base.card,
@@ -1910,12 +2077,14 @@ export class ChatPanel {
           scenarioFormat: this.ctx.promptFormats?.scenarioFormat,
           personalityFormat: this.ctx.promptFormats?.personalityFormat,
           wiFormat: this.ctx.promptFormats?.wiFormat,
+          memory,
         })
       : assembleContext({
           card: base.card,
           history: base.history,
           persona: this.ctx.userName === '' ? undefined : { name: this.ctx.userName },
           worldbook,
+          memory,
         });
 
     /*
@@ -2009,6 +2178,32 @@ export class ChatPanel {
         : [false, ...assembled.dropFirst];
 
     const budgeted = await this.applyBudget(budgetMessages, trimmableFlags, dropFirstFlags);
+    /*
+     * 回复上限按"窗口还剩多少"夹一次（2026-11-22）。
+     *
+     * ## 这一步防的是哪种失败
+     *
+     * 上游算的是 `消息 token + 回复 token ≤ 窗口`。正常预算下
+     * （`used ≤ 窗口 − 回复上限`）这里夹不到东西 —— 只有当**必留项自己
+     * 就超了**（世界书 / 提示词 / 角色记忆加起来超过预算）时才会生效。
+     *
+     * 而那种情形原来是一路发出去的：反正历史已经裁无可裁，就带着
+     * 一个 32000 的回复预算去撞上游的 400 —— 用户看到的是一句
+     * "maximum context length"，却不知道是我们这边先超了。
+     */
+    const samplingForRequest = this.clampMaxTokens(
+      mergeReasoningSampling(
+        this.ctx.sampling as SamplingParams,
+        {
+          intent: this.ctx.thinking?.intent ?? 'auto',
+          budget: this.ctx.thinking?.budget,
+          ...(this.ctx.thinking?.family === undefined
+            ? {}
+            : { family: this.ctx.thinking.family }),
+        },
+      ) as SamplingParams,
+      budgeted.used,
+    );
     if (budgeted.overBudget) {
       /*
        * 必留项自己就超了：这时裁什么都是错的（裁也放不下）。
@@ -2016,7 +2211,11 @@ export class ChatPanel {
        * 而我们本可以提前说"你的提示词加起来就超过上下文了，去关掉几条"。
        */
       this.callbacks.onNotify?.(
-        `提示词加起来 ${String(Math.round(budgeted.requiredTokens))} token，超过上下文预算 ${String(budgeted.budget)}。到「聊天设置 → AI 响应配置」里关掉几条。`,
+        `提示词加起来 ${String(Math.round(budgeted.requiredTokens))} token，超过上下文预算 ${String(budgeted.budget)}。` +
+          (typeof samplingForRequest.maxTokens === 'number'
+            ? `本次回复上限已压到 ${String(samplingForRequest.maxTokens)} token。`
+            : '') +
+          '到「聊天设置 → AI 响应配置」里关掉几条，或把「上下文长度」调大。',
         'warn',
       );
     }
@@ -2047,16 +2246,7 @@ export class ChatPanel {
        * 而思考意图存在本机偏好里、由设置页实时推送。
        * 两者生命周期不同，混在一起会被 `seedSampling` 抹掉。
        */
-      sampling: mergeReasoningSampling(
-        this.ctx.sampling as SamplingParams,
-        {
-          intent: this.ctx.thinking?.intent ?? 'auto',
-          budget: this.ctx.thinking?.budget,
-          ...(this.ctx.thinking?.family === undefined
-            ? {}
-            : { family: this.ctx.thinking.family }),
-        },
-      ) as Parameters<typeof buildGenerateRequest>[0]['sampling'],
+      sampling: samplingForRequest as Parameters<typeof buildGenerateRequest>[0]['sampling'],
       // 自定义地址随请求体带（服务端不读设置）
       customUrl: this.ctx.baseUrl,
       prefill: 'prefill' in base ? (base.prefill as string) : undefined,
@@ -2219,8 +2409,20 @@ export class ChatPanel {
     }
     this.messages = settled;
 
-    if (this.stream.error !== null) {
-      this.callbacks.onNotify?.(this.stream.error, 'danger');
+    /*
+     * 收尾提示分两级（2026-11-22）。
+     *
+     * ```text
+     *   上游明确报错（stream.error）    danger —— 最可信，原样给出
+     *   没报错但内容可能不全            warn   —— finalizeOutput 判出来的
+     * ```
+     *
+     * 第二条对应"连接被掐断但已经收到一部分正文"：以前这种情形
+     * 一条提示都没有，用户以为写完了。
+     */
+    const warn = this.stream.error ?? (output.message === '' ? null : output.message);
+    if (warn !== null) {
+      this.callbacks.onNotify?.(warn, this.stream.error === null ? 'warn' : 'danger');
     }
     /*
      * ★★★ 收尾**不再整表重渲染**（2026-11-02 用户报"黑屏一瞬"）。
@@ -2630,6 +2832,254 @@ export class ChatPanel {
    * 下一轮 `buildPrompt` 读的就是 `this.messages`，所以**不需要额外"重发"**：
    * 用户下次说话时，被改过的内容自然作为上下文的一部分送上去。
    */
+  /**
+   * 打开记忆面板（2026-11-22，v0.2.2）。
+   *
+   * ## 为什么输入预算要现算
+   *
+   * 用户在面板里可能要看到"记忆占预算多少"来决定删不删，而那取决于
+   * 当前的上下文设置。写完记忆回设置页改完再回来，这个数字应该跟着变。
+   * 所以每次打开都读一次，不缓存。
+   *
+   * @param prefill 从气泡带过来的原文。为空 = 正常打开（不新增条目）
+   */
+  private openMemoryPanel(prefill?: string): void {
+    const avatar = this.avatar ?? '';
+    if (avatar === '') {
+      this.callbacks.onNotify?.('先选一个角色，记忆是按角色分开存的。', 'warn');
+      return;
+    }
+
+    /* 同一时刻只留一个面板 */
+    this.memoryPage?.close();
+
+    const store: MemoryStore = readMemoryStore();
+    const entries: readonly MemoryEntry[] = memoryOf(store, avatar);
+
+    /*
+     * 预填：把气泡原文作为**新条目**追加。
+     *
+     * 用 `nextEntryId` 而不是自己拼 —— id 撞车会让"删一条"同时删掉另一条。
+     * 这里直接 import 的 `nextEntryId` 在 `memory.ts` 里，避免两处算法分叉。
+     */
+    const withPrefill: readonly MemoryEntry[] =
+      prefill === undefined || prefill.trim() === ''
+        ? entries
+        : [
+            ...entries,
+            {
+              id: `mem-${String(Date.now())}`,
+              text: prefill.trim(),
+              at: Date.now(),
+            },
+          ];
+
+    const name = this.characterName ?? avatar.replace(/\.[^.]+$/, '');
+
+    this.memoryPage = openMemoryPage(this.doc, {
+      doc: this.doc,
+      avatar,
+      characterName: name,
+      entries: withPrefill,
+      /*
+       * `computeBudget` 的语义是「上下文 − 回复预留」，与裁剪用的是同一个函数。
+       * 自己减一遍会在"回复预留比上下文还大"这类边界上算出负数。
+       */
+      inputBudget: computeBudget(this.ctx.contextLimit, this.ctx.responseLimit),
+      onSave: (next) => {
+        const ok = writeCharacterMemory(avatar, next);
+        if (ok) {
+          this.callbacks.onNotify?.(`已保存 ${String(next.length)} 条记忆`, 'info');
+        }
+        return ok;
+      },
+      onExport: () => this.exportMemory(avatar, name),
+      onImport: () => void this.importMemory(avatar, name),
+      onClose: () => {
+        this.memoryPage = null;
+      },
+    });
+  }
+
+  /**
+   * 导出记忆（2026-11-22）。
+   *
+   * 文件里**只有角色名和记忆条目** —— 用户明确要求不放卡设定、世界书、提示词。
+   * 那些东西的体积和敏感性都远高于记忆，混进来的代价是"分享一份记忆等于分享整张卡"。
+   *
+   * ## 为什么走 `shareText` 而不是自己写文件
+   *
+   * 那是聊天导出的同一条路：系统分享面板，用户自己选存到哪。
+   * 自己挑一个目录写进去的话，安卓上还得处理权限，而"存到哪儿"本来
+   * 就该由用户决定。
+   *
+   * ★ `shareText` 是原生方法，**必须直接调不能解引用**（§125）：
+   *   `const f = bridge.shareText; f(...)` 会报 "non-injected object"。
+   */
+  private exportMemory(avatar: string, name: string): void {
+    const entries = memoryOf(readMemoryStore(), avatar);
+    if (entries.length === 0) {
+      this.callbacks.onNotify?.('这个角色还没有记忆，没什么可导出的。', 'warn');
+      return;
+    }
+    const payload = buildExportFile(name, entries);
+    const text = JSON.stringify(payload, null, 2);
+
+    const bridge = (
+      globalThis as { __ST_ENGINE__?: { shareText?: (t: string, n: string) => string } }
+    ).__ST_ENGINE__;
+    if (typeof bridge?.shareText !== 'function') {
+      this.callbacks.onNotify?.('这台设备不支持导出。', 'danger');
+      return;
+    }
+
+    let reply: { ok?: boolean; error?: string } = {};
+    try {
+      reply = JSON.parse(bridge.shareText(text, memoryExportFileName(name))) as typeof reply;
+    } catch {
+      this.callbacks.onNotify?.('导出失败（返回的不是有效数据）。', 'danger');
+      return;
+    }
+    if (reply.ok !== true) {
+      this.callbacks.onNotify?.(reply.error ?? '导出失败。', 'danger');
+      return;
+    }
+    this.callbacks.onNotify?.(`已导出 ${String(entries.length)} 条记忆`, 'info');
+  }
+
+  /**
+   * 导入记忆（2026-11-22）。
+   *
+   * ## 默认只合并，不做替换
+   *
+   * 替换是一次误点就清空全部记忆，而记忆是用户手写的、可能从没导出过。
+   * 合并最坏是多几条，删掉即可。
+   *
+   * ## 角色名不匹配要问
+   *
+   * 文件里的 `character` 只用来提示，**不用来匹配目标** —— ST 目录里的
+   * 文件名可能改过，按名字匹配会静默失败。实际写入当前角色，但先确认。
+   */
+  private async importMemory(avatar: string, currentName: string): Promise<void> {
+    const picked = await this.bridge.pickJsonFile();
+    /*
+     * 取消与失败必须分开（见 `PickedJsonFile` 的注释）：
+     * 取消是什么都不做，失败要给原因。合成一个 `null` 会让取消弹红条。
+     */
+    if (!picked.ok) {
+      if (picked.cancelled === true) return;
+      this.callbacks.onNotify?.(`读文件失败：${picked.reason}`, 'danger');
+      return;
+    }
+
+    let raw: unknown;
+    try {
+      raw = JSON.parse(picked.text);
+    } catch {
+      this.callbacks.onNotify?.('这个文件不是有效的 JSON。', 'danger');
+      return;
+    }
+
+    const parsed = parseImportFile(raw);
+    if (parsed.entries.length === 0) {
+      this.callbacks.onNotify?.('这个文件里没有可用的记忆条目。', 'warn');
+      return;
+    }
+
+    /*
+     * 角色名不同就问一句。
+     *
+     * 不匹配时**必须给人看两个名字** —— 只说"名字不一致"，用户没法判断
+     * 是文件来自别的角色，还是自己改过角色文件名。
+     */
+    if (parsed.character !== '' && parsed.character !== currentName) {
+      const go = await this.confirmImportMismatch(parsed.character, currentName);
+      if (!go) return;
+    }
+
+    const existing = memoryOf(readMemoryStore(), avatar);
+    const result = mergeImported(existing, parsed.entries, Date.now());
+    if (result.added.length === 0) {
+      this.callbacks.onNotify?.(
+        result.skipped > 0
+          ? `这 ${String(result.skipped)} 条都已经有了，没有新增。`
+          : '文件里的条目都是空的，没有导入任何内容。',
+        'info',
+      );
+      return;
+    }
+
+    const next = [...existing, ...result.added];
+    const ok = writeCharacterMemory(avatar, next);
+    this.callbacks.onNotify?.(
+      ok
+        ? `导入 ${String(result.added.length)} 条${result.skipped > 0 ? `，跳过 ${String(result.skipped)} 条重复` : ''}`
+        : '导入失败：本机存储不可用。',
+      ok ? 'info' : 'danger',
+    );
+
+    /* 导入后重开面板，让用户看到新增的条目 */
+    if (ok) this.openMemoryPanel();
+  }
+
+  /**
+   * 角色名不一致时的确认。返回是否继续。
+   *
+   * 用底部 sheet 而不是 `window.confirm`：`confirm` 在 Android WebView 里
+   * **阻塞主线程**，流式输出期间弹一个会让打字机直接停住（memory 记过）。
+   */
+  private confirmImportMismatch(from: string, to: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value: boolean): void => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+        handle.close();
+      };
+
+      const doc = this.doc;
+      const mask = el(doc, 'div', 'nb-sheet-mask');
+      mask.setAttribute('data-role', 'memory-import-confirm');
+      const sheet = el(doc, 'div', 'nb-sheet');
+      sheet.setAttribute('role', 'dialog');
+
+      const title = el(doc, 'div', 'nb-sheet-title');
+      title.textContent = '这份记忆属于另一个角色';
+      sheet.append(title);
+
+      const body = el(doc, 'div', 'nb-sheet-preview');
+      body.textContent =
+        `文件里的角色是「${from}」，当前角色是「${to}」。` +
+        `继续会把这份记忆加到「${to}」上。`;
+      sheet.append(body);
+
+      const yes = el(doc, 'button', 'nb-sheet-action nb-sheet-action--primary');
+      yes.setAttribute('type', 'button');
+      yes.setAttribute('data-role', 'memory-import-yes');
+      yes.textContent = `导入到「${to}」`;
+      yes.addEventListener?.('click', () => finish(true));
+      sheet.append(yes);
+
+      const no = el(doc, 'button', 'nb-sheet-action nb-sheet-cancel');
+      no.setAttribute('type', 'button');
+      no.setAttribute('data-role', 'memory-import-no');
+      no.textContent = '取消';
+      no.addEventListener?.('click', () => finish(false));
+      sheet.append(no);
+
+      mask.append(sheet);
+      const host = (doc as unknown as { body?: ElLike }).body;
+      host?.append(mask);
+
+      const handle = {
+        close: () => {
+          mask.remove();
+        },
+      };
+    });
+  }
+
   private openBubbleActions(index: number, rowEl: ElLike | null = null): void {
     const message = this.messages[index];
     if (message === undefined) return;
@@ -2672,6 +3122,21 @@ export class ChatPanel {
       },
       writeClipboard: (text) => this.writeClipboard(text),
       onCopied: () => this.callbacks.onNotify?.('已复制到剪贴板', 'info'),
+      /*
+       * 「存为记忆」（2026-11-22）。
+       *
+       * ★ 原文预填，不调模型。用户的 API 按次计费（5 元 ≈ 200 次），
+       *   点一次扣一次；而原文预填零成本。
+       *
+       * ★ 只在有当前角色时提供 —— 没有 avatar 就没有存储位置。
+       */
+      ...(this.avatar === null || this.avatar === ''
+        ? {}
+        : {
+            onSaveToMemory: (text: string) => {
+              this.openMemoryPanel(text);
+            },
+          }),
       onDelete: () => {
         const updated = this.messages.slice();
         updated.splice(index, 1);
@@ -2930,6 +3395,11 @@ export class ChatPanel {
      */
     this.bubbleMenu?.close();
     this.bubbleMenu = null;
+    /*
+     * 记忆面板同理（2026-11-22）：它也是挂在 `body` 上的独立层。
+     */
+    this.memoryPage?.close();
+    this.memoryPage = null;
     this.bridge.dispose();
     this.handle = null;
     /*

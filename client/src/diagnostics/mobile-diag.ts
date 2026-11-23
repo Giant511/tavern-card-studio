@@ -455,10 +455,36 @@ export function installMobileDiagnostics(): MobileDiagHandle {
   };
 }
 
-/** 版本标签：优先读 WebView 里注入的，读不到就给 unknown（不能让日志崩） */
+/**
+ * 版本标签。
+ *
+ * ## 原来读 `__TCS_VERSION__`，而**没有人写它**（2026-11-22 修正）
+ *
+ * 那份诊断导出一直是 `版本：unknown`。用户第三次发日志时，我拿它判断
+ * "这是哪个构建的包"——`unknown` 等于什么都没说，只能去数日志里有哪些
+ * 诊断行反推，而反推错一次就会改错地方。
+ *
+ * ## 为什么不在这里 import `app-version.ts`
+ *
+ * 那个模块 `import clientPackage from '../../package.json'`，靠 **Vite**
+ * 把 JSON 内联进来。而 Node 的 ESM 对 JSON import 要求 `with { type: 'json' }`，
+ * 直接跑会 `ERR_IMPORT_ATTRIBUTE_MISSING` —— 本文件是被 DOM 判据
+ * （`test/api-page-dom.test.mjs`）间接引入的，一 import 整份判据就崩。
+ * `settings/about-info.ts` 的注释里早就写明了这一点，我这次又踩了一遍。
+ *
+ * ## 现在的做法：读全局，但**保证有写入方**
+ *
+ * `client/src/chat/shell.ts` 启动时写一次：
+ * `globalThis.__TCS_VERSION__ = appVersion()`。
+ *
+ * 这样本文件保持零依赖（Node 里能独立跑），而那个全局不再是"没人管"的。
+ * 判据 `test/mobile-crash-diag.test.mjs` 钉住"必须有写入方"。
+ */
 function readVersionTag(): string {
   const holder = globalThis as { __TCS_VERSION__?: unknown };
-  return typeof holder.__TCS_VERSION__ === 'string' ? holder.__TCS_VERSION__ : 'unknown';
+  return typeof holder.__TCS_VERSION__ === 'string' && holder.__TCS_VERSION__ !== ''
+    ? holder.__TCS_VERSION__
+    : '未知';
 }
 
 /**

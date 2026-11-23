@@ -1,0 +1,14 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.tcs_shell" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- 应用底色 #0c0a14，与 nebula-tokens.css 的 nb abyss 一致。
+             窗口背景必须与它一致，否则最近任务的缩略图合成不上
+             WebView 内容时会露出白色。
+             注意：XML 注释里不能出现连续两个减号，所以这里不写 CSS 变量名。 -->
+        <item name="android:windowBackground">@color/tcs_window_bg</item>
+        <item name="android:statusBarColor">@color/tcs_window_bg</item>
+        <item name="android:navigationBarColor">@color/tcs_window_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <!-- Customize your theme here. -->
+    </style>
+</resources>

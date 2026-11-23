@@ -498,6 +498,30 @@ export const FEATURE_SENTINELS = [
       },
     ],
   },
+  {
+    /*
+     * v0.2.2：生成中断时的提醒（`shared/src/chat/stream.ts` 的 `finalizeOutput`）
+     *
+     * 为什么要盯这句话：它出现的前提是**整条 `sawDone` 链路都在工作**
+     * （Rust 的 `StreamOutcome.saw_done` → 桥的 `done.sawDone` →
+     * `StreamState.sawEnd` → 这个文案）。任何一环被改掉，用户就又回到
+     * "半截回复显示成完整回复"的状态，而那种情形在界面上**看不出来** ——
+     * 只有运维对账时才发现少了一半。
+     *
+     * 同一次改动还有「发送」按钮在生成中变「停止」，但那是两个字、
+     * 过短（`validateRegistry` 要求 ≥4 字符），改由
+     * `test/chat-stop-button.test.mjs` 做结构判据。
+     */
+    feature: 'v0.2.2-生成中断可见',
+    title: '流式生成被上游掐断时明确指出"回复可能不完整"，并提供停止按钮',
+    since: '0.2.2',
+    expect: [
+      {
+        text: '回复可能不完整',
+        where: '上游没发结束标记就断连时，回复落定后的提示条',
+      },
+    ],
+  },
 ];
 
 /** 递归列出目录下所有文件（相对路径，正斜杠） */

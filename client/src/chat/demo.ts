@@ -166,7 +166,8 @@ function boot(): void {
   send.className = 'nb-send';
   send.type = 'button';
   send.setAttribute('aria-label', '发送');
-  send.textContent = '↑';
+  /* 与真面板一致：文字按钮（2026-11-22 改版，见 chat.css 的 `.nb-send` 注释） */
+  send.textContent = '发送';
   send.setAttribute('data-ready', 'false');
   composer.append(send);
 

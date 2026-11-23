@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+      T15.6：语音输入要录音。
+      RECORD_AUDIO 是**运行时权限**（Android 6+），清单里声明只是"我要用"，
+      真正的授予要在代码里 requestPermissions —— 没授权时要给可操作的提示，
+      不能静默失败。
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!--
+      ★★ 2026-11-01 第七批问题二：**这一条不是"可选优化"，缺了它麦克风永远用不了。**
+
+      ## 为什么
+
+      Tauri 生成的 `RustWebChromeClient.androidPermissionsForResources()` 在
+      WebView 请求 `RESOURCE_AUDIO_CAPTURE` 时会**一次请求两个**权限：
+
+      ```kotlin
+      permissionList.add(Manifest.permission.MODIFY_AUDIO_SETTINGS)
+      permissionList.add(Manifest.permission.RECORD_AUDIO)
+      ```
+
+      回调里判的是 `isGranted.values.all { it }` —— **全都要 true**。
+      而"请求一个清单里没声明的权限"Android 直接返回 DENIED（不会弹框），
+      于是 `all{}` 恒为 false ⇒ `request.deny()` ⇒ JS 侧收到 `NotAllowedError`
+      ⇒ UI 报「麦克风权限被拒绝」。
+
+      真机取证（2026-11-01 13:10，RECORD_AUDIO 已 `granted=true`）：
+      ```
+      环境: {"secure":true,"origin":"http://tauri.localhost","hasGetUserMedia":true}
+      getUserMedia: {"ok":false,"name":"NotAllowedError","message":"Permission denied"}
+      ```
+      即：**系统权限已给，App 仍判拒绝** —— 被拒的是那个没声明的权限，
+      不是录音权限本身。
+
+      ## 为什么加清单而不是改代码
+
+      `RustWebChromeClient.kt` 是 Tauri **自动生成**的（文件头写着
+      `THIS FILE IS AUTO-GENERATED. DO NOT MODIFY!!`），改了会被下次构建覆盖。
+      而 `MODIFY_AUDIO_SETTINGS` 的保护级别是 **normal**（安装时自动授予、
+      不弹框），所以声明它没有任何用户可见代价 —— 只是让那批请求能全绿。
+    -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!--
+      T15.3：ST 引擎要跑在前台服务里。
+      两个权限缺一不可：
+        · FOREGROUND_SERVICE —— 声明"我要开前台服务"（Android 9+）
+        · FOREGROUND_SERVICE_SPECIAL_USE —— Android 14+ 要求声明**用途类别**，
+          否则直接抛 ForegroundServiceStartNotAllowedException。
+          我们的用途是"运行用户自己配置的聊天引擎"，属于 specialUse。
+        · POST_NOTIFICATIONS —— Android 13+ 通知要运行时授权，
+          没它前台服务的通知不显示（服务还活着，但用户看不到，反而更困惑）。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- AndroidTV support -->
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+
+    <application
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.tcs_shell"
+        android:extractNativeLibs="true"
+        android:usesCleartextTraffic="${usesCleartextTraffic}"
+        android:networkSecurityConfig="@xml/network_security_config">
+        <!--
+          ★★★ 2026-11-22：任务从「最近任务」里消失的**真正原因**。
+
+          用户报「切到后台后上滑看不到本 App」，装上 0.2.1 的修复后仍不消失。
+          真机日志显示设置本身是成功的：
+
+          ```text
+            10:14:50.892 RECENTS: onUserLeaveHint：已确保 1 个任务不排除在最近任务之外
+            10:14:50.966 LIFE: 退到后台
+            10:14:52.973 BOOT: onDestroy（正常退出）      ← 两秒后 Activity 被销毁
+          ```
+
+          `setExcludeFromRecents(false)` 改了 AMS 的标志，但随后 **Activity 被销毁**。
+          任务里没有活着的 Activity 时，系统会把它从最近任务里移除 —— 卡片就没了。
+          这就是 0.2.1 那个修法治不好的原因：它治的是"标志"，而病灶是"任务被重置"。
+
+          ## 两个属性各管一件事
+
+          · `android:alwaysRetainTaskState="true"`
+            默认是 **false**，意思是系统**可以在某些情况下把任务重置成初始状态**
+            （清空 Activity 栈）。栈一空，任务即被移除。
+            设成 true 之后系统不再自动重置，这是本轮的**主修**。
+
+          · `android:autoRemoveFromRecents="false"`
+            默认也是 false，但显式写出来：最后一个 Activity 结束后，
+            任务**仍然留在**最近任务列表里，直到用户手动划掉。
+            厂商 ROM 常把这个默认值改掉，写死比依赖默认值可靠。
+
+          ## 为什么这两个比 setExcludeFromRecents 更可靠
+
+          `setExcludeFromRecents` 是**运行时 API**，ROM 可以静默忽略（vivo 就忽略了）。
+          而这两个是**清单声明**，在任务创建时由 AMS 读入，不依赖运行时是否被尊重。
+        -->
+        <activity
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
+            android:launchMode="singleTask"
+            android:label="@string/main_activity_title"
+            android:alwaysRetainTaskState="true"
+            android:autoRemoveFromRecents="false"
+            android:excludeFromRecents="false"
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!-- AndroidTV support -->
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          T15.3：ST 引擎前台服务。
+
+          三个属性各有理由，缺一个都会出问题：
+
+          · `foregroundServiceType="specialUse"` —— Android 14+ 必须声明类别。
+            我们不是 mediaPlayback（不放音视频）、不是 location、不是 dataSync
+            （那是"同步用户数据"，我们是**本地跑一个服务**），只能选 specialUse。
+
+          · `<property PROPERTY_SPECIAL_USE_FGS_SUBTYPE>` —— specialUse 还要
+            说明"特殊在哪"，否则上架审核会被追问。这句是给审核看的，
+            但也确实是事实。
+
+          · `android:exported="false"` —— 只有本应用能拉起它。
+            导出出去等于给任何应用一个"启动/停止你引擎"的开关。
+        -->
+        <service
+            android:name=".stengine.StService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="在应用自身进程内运行用户配置的本地聊天引擎（SillyTavern），仅监听回环地址" />
+        </service>
+
+        <provider
+          android:name="androidx.core.content.FileProvider"
+          android:authorities="${applicationId}.fileprovider"
+          android:exported="false"
+          android:grantUriPermissions="true">
+          <meta-data
+            android:name="android.support.FILE_PROVIDER_PATHS"
+            android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

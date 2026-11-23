@@ -799,7 +799,15 @@ test('★★★★★ 正常退出标记必须同步落盘（commit，不是 app
   );
   const at = kt.indexOf('override fun onDestroy()');
   assert.ok(at > 0, '找不到 onDestroy');
-  const body = kt.slice(at, at + 600);
+  /*
+   * ★ 用 `super.onDestroy()` 定尾，不写固定长度（2026-11-22）。
+   *
+   * 原来是 `slice(at, at + 600)`。后来 `onDestroy` 里加了一段销毁取证日志，
+   * `commit()` 被推到 600 字符之外 ⇒ 判据假红。
+   * **判据不该假设函数有多长** —— 按语义边界切，别按字数切。
+   */
+  const endAt = kt.indexOf('super.onDestroy()', at);
+  const body = kt.slice(at, endAt < 0 ? at + 2500 : endAt + 'super.onDestroy()'.length);
 
   assert.match(body, /KEY_CLEAN_EXIT, true\)\.commit\(\)/, '必须用 commit()（同步落盘）');
   assert.doesNotMatch(body, /KEY_CLEAN_EXIT, true\)\.apply\(\)/, '不许用 apply()（异步，会丢）');
@@ -848,4 +856,80 @@ test('★★★★ 有 pagehide 记录也不许断言"正常退出"', () => {
   const src = stripComments(read('client/src/diagnostics/mobile-diag.ts'));
   assert.doesNotMatch(src, /上次会话正常退出/, '不许断言正常退出');
   assert.match(src, /页面隐藏记录/, '改成陈述事实');
+});
+
+/* ═══════════════════════════════════════════════════════════
+   2026-11-22：诊断导出必须能说出自己是哪个构建
+   ═══════════════════════════════════════════════════════════ */
+
+test('★★★★★ 诊断导出不许读一个没人注入的全局当版本', () => {
+  /*
+   * ## 现场
+   *
+   * 用户第三次发来的诊断导出，头部是：
+   *
+   * ```text
+   *   版本：unknown
+   * ```
+   *
+   * 而我要靠这一行判断"装的是哪个构建的包"。`unknown` 等于什么都没说，
+   * 只能去数日志里有哪些诊断行反推 —— 而这一轮我一开始就差点反推错：
+   * 那份日志缺少新加的诊断行，我先怀疑"修复没生效"，实际是装的是上一版。
+   *
+   * ## 根因
+   *
+   * `readVersionTag()` 读 `globalThis.__TCS_VERSION__`，
+   * 而**全仓库没有任何地方给它赋值**（`grep __TCS_VERSION__` 只命中这一处）。
+   *
+   * 项目里本来就有 `settings/app-version.ts` 的 `appVersion()`，
+   * 注释明确写着"设置页要显示它、**诊断导出要写它**、测试要断言它"。
+   */
+  const src = stripComments(read('client/src/diagnostics/mobile-diag.ts'));
+  /* 不许退回英文 unknown —— 那是我看不出是哪个构建的直接原因 */
+  assert.doesNotMatch(src, /'unknown'/, '不许退回 unknown');
+  /* 读全局可以，但那个全局必须有写入方（下一条判据钉住） */
+  assert.match(src, /'未知'/, '读不到时也要给一个人能看懂的值');
+});
+
+test('★★★★ 版本行仍然叫「版本：」并出现在报告里', () => {
+  /*
+   * 改实现不能把输出格式改了 —— 用户会截图，而我按这个前缀找。
+   */
+  const src = stripComments(read('client/src/diagnostics/mobile-diag.ts'));
+  assert.match(src, /版本：\$\{/, '要保留「版本：」这一行');
+});
+
+test('★★★★★ @ts-ignore 那个全局必须有写入方（否则永远是未知）', () => {
+  /*
+   * ## 这条守的是"读一个没人写的全局"这个具体错误
+   *
+   * `readVersionTag()` 读 `globalThis.__TCS_VERSION__`。
+   * 在此之前**全仓库没有一行给它赋值** —— 用户导出的诊断日志头部
+   * 一直是 `版本：unknown`，而那正是我判断"装的是哪个构建"的唯一依据。
+   *
+   * 判据钉两件事：
+   * ```text
+   *   ① mobile-diag 里不许读一个不存在的名字（读的必须是被写过的）
+   *   ② shell.ts 的构造函数里必须赋值
+   * ```
+   *
+   * ★ 为什么不在 mobile-diag 里直接 import 版本模块：
+   *   `settings/app-version.ts` 会 import package.json，靠 Vite 内联；
+   *   Node ESM 要求 `with { type: 'json' }`，一 import 就让引入它的
+   *   DOM 判据整体崩在 `ERR_IMPORT_ATTRIBUTE_MISSING`。
+   */
+  const diag = stripComments(read('client/src/diagnostics/mobile-diag.ts'));
+  const shell = stripComments(read('client/src/chat/shell.ts'));
+
+  if (!diag.includes('__TCS_VERSION__')) return; // 将来改成别的方案就不约束了
+
+  assert.match(
+    shell,
+    /__TCS_VERSION__\s*=\s*appVersion\(\)/,
+    'shell.ts 的构造函数里必须给它赋值',
+  );
+  /* 赋值必须在构造函数里（构造完就可用），不能等到某个页面被打开 */
+  const ctorAt = shell.indexOf('constructor(options: ShellOptions)');
+  const assignAt = shell.indexOf('__TCS_VERSION__ = appVersion()');
+  assert.ok(ctorAt >= 0 && assignAt > ctorAt, '赋值要在构造函数里');
 });

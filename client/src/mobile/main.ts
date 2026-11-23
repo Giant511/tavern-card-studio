@@ -692,6 +692,23 @@ function installFocusScroll(): void {
    * 所以这次改动不会丢事件。
    */
   attachFocusScroll(globalThis.document as unknown as Parameters<typeof attachFocusScroll>[0], () => {
+    /*
+     * ★★★ 底部面板打开时，可见底边取**面板底边**（2026-11-22）。
+     *
+     * 原来只取 `.nb-page` 的 bottom。但记忆面板、气泡编辑菜单这些是
+     * `position: fixed` 的浮层，**不在 `.nb-page` 里** —— 它们的底边
+     * 与页面底边不是同一个位置。
+     *
+     * 而且 `.nb-page` 的 bottom 已经扣过 tabbar 高度
+     * （`.nb-app` 的 padding 里减了 `--nb-tabbar-h`），比真实键盘上沿
+     * 低 56px 左右。对聊天页那是对的（输入栏就在 tabbar 上方），
+     * 但对浮层会**多算 56px 的可见空间** ——
+     * 结果是"以为已经露出来了，其实还差一截"。
+     *
+     * 面板打开时它的底边就是键盘上沿（mask 已扣键盘高度），精确。
+     */
+    const sheet = globalThis.document.querySelector('.nb-sheet');
+    if (sheet !== null) return sheet.getBoundingClientRect().bottom;
     const page = globalThis.document.querySelector('.nb-page');
     if (page !== null) return page.getBoundingClientRect().bottom;
     return globalThis.innerHeight;

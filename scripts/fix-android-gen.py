@@ -603,6 +603,238 @@ def patch_locked_portrait(check_only: bool) -> list[str]:
     return [msg]
 
 
+def patch_retain_task_state(check_only: bool) -> list[str]:
+    """
+    让任务在切到后台后仍留在「最近任务」里（2026-11-22）。
+
+    ## 为什么需要
+
+    用户报「切到后台后上滑看不到本 App」。前两轮的修法都没治到病灶：
+
+    ```text
+      0.2.0  什么都没做
+      0.2.1  加 setExcludeFromRecents(false)
+             ⇒ 真机日志证明**设成功了**（"已确保 1 个任务不排除…"），
+               但两秒后 Activity 被 onDestroy，任务从容器的列表里消失
+      现在   治"任务被重置"本身
+    ```
+
+    真机日志（vivo V2507A / Android 16）：
+
+    ```text
+      10:14:50.892 RECENTS: onUserLeaveHint：已确保 1 个任务不排除在最近任务之外
+      10:14:50.966 LIFE: 退到后台
+      10:14:52.973 BOOT: onDestroy（正常退出）
+    ```
+
+    ## 两个属性的分工
+
+    ```text
+      android:alwaysRetainTaskState="true"
+        默认 false ⇒ 系统**可以**在特定情况下把任务重置成初始状态（清空活动栈）。
+        栈一空，任务即被移出最近任务。这是主修。
+
+      android:autoRemoveFromRecents="false"
+        默认也是 false，但厂商 ROM 常改默认值。显式写死，
+        让"最后一个 Activity 结束后任务仍留在列表里"成为明确契约。
+    ```
+
+    ## 为什么必须在 manifest 而不是运行时
+
+    运行时只有 `AppTask.setExcludeFromRecents()`，它改的是 AMS 里那个
+    "排除标志"。而这两个属性决定的是**任务本身会不会被重置/移除** ——
+    完全不同的两件事，没有运行时 API 能替代。
+
+    ## 为什么写进这个脚本
+
+    `AndroidManifest.xml` 是 **Tauri 生成的**（`tauri android init` 会重建）。
+    不在这里守着，重跑一次 init 就把这两个属性丢回去，而后现象会重新出现，
+    且没有任何报错 —— 正是最难发现的那种。
+    """
+    manifest = GEN / "app" / "src" / "main" / "AndroidManifest.xml"
+    if not manifest.is_file():
+        return [f"[跳过] 没有 {manifest}"]
+
+    text = manifest.read_text(encoding="utf-8")
+
+    # 只认 MainActivity 那一个 <activity ...> 开标签
+    match = re.search(r"<activity\b[^>]*\.MainActivity[^>]*>", text, re.S)
+    if match is None:
+        return ["[跳过] 找不到 MainActivity 的 <activity> 标签（tauri 模板变了？）"]
+
+    tag = match.group(0)
+    has_retain = "android:alwaysRetainTaskState=" in tag
+    has_auto = "android:autoRemoveFromRecents=" in tag
+    has_exclude = "android:excludeFromRecents=" in tag
+    if has_retain and has_auto and has_exclude:
+        return [
+            "[OK] 任务状态已保留"
+            "（alwaysRetainTaskState + autoRemoveFromRecents + excludeFromRecents）"
+        ]
+
+    msg = "[修] 保留任务状态（alwaysRetainTaskState / autoRemoveFromRecents / excludeFromRecents）"
+    if check_only:
+        return [msg]
+
+    additions = ""
+    if not has_retain:
+        additions += 'android:alwaysRetainTaskState="true"\n            '
+    if not has_auto:
+        additions += 'android:autoRemoveFromRecents="false"\n            '
+    if not has_exclude:
+        # 默认就是 false，但显式写出来：厂商 ROM 会改默认值，写死比依赖默认可靠
+        additions += 'android:excludeFromRecents="false"\n            '
+
+    # 插在 name 之前：那个属性一定有（模板里写死的），是最稳的锚点
+    new_tag = tag.replace(
+        'android:name=".MainActivity"',
+        additions + 'android:name=".MainActivity"',
+        1,
+    )
+    if new_tag == tag:
+        return ["[跳过] 找不到插入点（<activity> 里没有 android:name）"]
+
+    manifest.write_text(
+        text[: match.start()] + new_tag + text[match.end() :],
+        encoding="utf-8",
+        newline="\n",
+    )
+    return [msg]
+
+
+def patch_dark_window_background(check_only: bool) -> list[str]:
+    """
+    把窗口背景改成应用自己的深色，避开「最近任务里一片白」。
+
+    ## 现场（2026-11-22 第五轮）
+
+    用户在 vivo 上终于看到任务卡片了，但**内容一片空白**：
+
+    ```text
+    紫色顶栏 + 下面整块白色
+    ```
+
+    ## 真因
+
+    `Theme.tcs_shell` 继承 `Theme.Material3.DayNight.NoActionBar`，
+    而**没有设置 `android:windowBackground`**。Material3 在**亮色模式**下
+    窗口背景是白色。
+
+    而这个 App 的内容几乎全在 WebView 里。WebView 的内容在最近任务的
+    缩略图里**不一定被合成进去**（SurfaceView / 硬件层的老问题）。
+    合成不上时露出来的就是窗口背景 —— 白色。
+
+    所以看到的不是"没有内容"，而是"WebView 那层没进缩略图，
+    露出了底下的白窗口"。
+
+    ## 修法
+
+    把窗口背景设成应用真正的底色 `#0c0a14`（`--nb-abyss`）：
+
+    ```text
+      合成成功 → 正常缩略图
+      合成失败 → 深色卡片，看起来仍然像这个 App，而不是一块白板
+    ```
+
+    顺带把状态栏/导航栏也统一，避免启动瞬间的白色闪一下。
+
+    ## 为什么写进脚本
+
+    `res/values/themes.xml` 是 Tauri 模板产物，`tauri android init` 会重建。
+    在这里守着，重建后自动补回。
+    """
+    themes = [
+        GEN / "app" / "src" / "main" / "res" / "values" / "themes.xml",
+        GEN / "app" / "src" / "main" / "res" / "values-night" / "themes.xml",
+    ]
+
+    marker = "android:windowBackground"
+    results: list[str] = []
+
+    for path in themes:
+        if not path.is_file():
+            results.append(f"[跳过] 没有 {path.relative_to(GEN)}")
+            continue
+
+        text = path.read_text(encoding="utf-8")
+        if marker in text:
+            results.append(f"[OK] {path.parent.name}/themes.xml 已有深色窗口背景")
+            continue
+
+        msg = f"[修] {path.parent.name}/themes.xml 设置深色窗口背景（最近任务缩略图不露白）"
+        if check_only:
+            results.append(msg)
+            continue
+
+        # 在 <style ...> 开标签之后插属性 —— 那里一定存在
+        match = re.search(r'(<style name="Theme\.tcs_shell"[^>]*>)', text, re.S)
+        if match is None:
+            results.append(f"[跳过] {path.parent.name}/themes.xml 找不到 Theme.tcs_shell")
+            continue
+
+        addition = (
+            match.group(1)
+            + "\n"
+            + "        <!-- 应用底色 #0c0a14，与 nebula-tokens.css 的 nb abyss 一致。\n"
+            + "             窗口背景必须与它一致，否则最近任务的缩略图合成不上\n"
+            + "             WebView 内容时会露出白色。\n"
+            + "             注意：XML 注释里不能出现连续两个减号，所以这里不写 CSS 变量名。 -->\n"
+            + '        <item name="android:windowBackground">@color/tcs_window_bg</item>\n'
+            + '        <item name="android:statusBarColor">@color/tcs_window_bg</item>\n'
+            + '        <item name="android:navigationBarColor">@color/tcs_window_bg</item>\n'
+            + '        <item name="android:windowLightStatusBar">false</item>'
+        )
+        path.write_text(
+            text[: match.start()] + addition + text[match.end() :],
+            encoding="utf-8",
+            newline="\n",
+        )
+        results.append(msg)
+
+    # 颜色资源要单独建 —— themes 引用它，缺了会编译失败
+    colors = GEN / "app" / "src" / "main" / "res" / "values" / "colors.xml"
+    if colors.is_file() and "tcs_window_bg" in colors.read_text(encoding="utf-8"):
+        results.append("[OK] colors.xml 已有 tcs_window_bg")
+    else:
+        msg2 = "[修] colors.xml 补 tcs_window_bg"
+        if check_only:
+            results.append(msg2)
+        else:
+            colors.parent.mkdir(parents=True, exist_ok=True)
+            if colors.is_file():
+                """
+                模板自带的 colors.xml 已经有 purple_200 等主题色 —— **不能整份覆盖**
+                （Material3 主题会引用它们）。只在 </resources> 之前插一行。
+                """
+                existing = colors.read_text(encoding="utf-8")
+                if "</resources>" in existing:
+                    line = (
+                        '    <!-- 应用底色，与 nebula-tokens.css 的 nb abyss 一致 -->\n'
+                        '    <color name="tcs_window_bg">#0c0a14</color>\n'
+                    )
+                    colors.write_text(
+                        existing.replace("</resources>", line + "</resources>", 1),
+                        encoding="utf-8",
+                        newline="\n",
+                    )
+                    results.append(msg2)
+                else:
+                    results.append("[跳过] colors.xml 结构不认识，请手工加 tcs_window_bg")
+            else:
+                colors.write_text(
+                    '<?xml version="1.0" encoding="utf-8"?>\n'
+                    "<resources>\n"
+                    '    <!-- 应用底色，与 nebula-tokens.css 的 nb abyss 一致 -->\n'
+                    '    <color name="tcs_window_bg">#0c0a14</color>\n'
+                    "</resources>\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                results.append(msg2)
+
+    return results
+
+
 def patch_version_code_override(check_only: bool) -> list[str]:
     """
     允许构建时用环境变量单独指定 versionCode。
@@ -667,6 +899,8 @@ def main() -> int:
     lines += patch_min_sdk_for_v1(check_only)
     lines += patch_cleartext_loopback(check_only)
     lines += patch_locked_portrait(check_only)
+    lines += patch_retain_task_state(check_only)
+    lines += patch_dark_window_background(check_only)
     lines += patch_version_code_override(check_only)
 
     for line in lines:

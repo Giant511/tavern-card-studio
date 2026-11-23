@@ -126,7 +126,25 @@ export function focusScrollTop(input: FocusScrollInput): number {
  *
  * ★★★ 但"进了表"不等于"它就在滚"（2026-11-06 补，见下）。
  */
-const SCROLLER_SELECTORS = ['.nb-scroll', '.nb-msglist', '.nb-list', '.nb-sheet'] as const;
+const SCROLLER_SELECTORS = [
+  '.nb-scroll',
+  '.nb-msglist',
+  '.nb-list',
+  '.nb-sheet',
+  /*
+   * 记忆面板（2026-11-22）。两个都要：
+   *
+   * ```text
+   *   .nb-memory-list    条目列表本身可滚，里面全是 textarea
+   *   .nb-memory-input   单条输入框内容超出时自己滚（rows 上限 6）
+   * ```
+   *
+   * 漏了的话，键盘弹起时聚焦的输入框可能落在可视区之外 ——
+   * 用户看到的是"点了输入框，但光标在屏幕外面"。
+   */
+  '.nb-memory-list',
+  '.nb-memory-input',
+] as const;
 
 interface ElementLike {
   tagName?: string;

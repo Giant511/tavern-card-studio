@@ -48,7 +48,8 @@ export const STREAM_EVENT = 'tcs://st-stream';
 /** Rust 推上来的一条事件（**只带原始 payload**，语义由 `translateFrame` 解析） */
 type RawStreamEvent =
   | { type: 'frame'; streamId: number; raw: string }
-  | { type: 'done'; streamId: number }
+  /** `sawDone` = 这次字节流里出现过 `[DONE]`（2026-11-22，缺省等价于 true） */
+  | { type: 'done'; streamId: number; sawDone?: boolean }
   | { type: 'error'; streamId: number; message: string };
 
 /** 生成开始后拿到的句柄：`id` 用于 abort，`done` 在结束时 resolve */
@@ -419,7 +420,21 @@ export class StChatBridge {
       }
 
       // done：Rust 侧保证一定发，所以这里一定 settle
-      state = applyStreamEvent(state, { type: 'done' });
+      /*
+       * `sawDone` 必须带过去（2026-11-22）。
+       *
+       * 不带的话前端无法区分"上游写完了"和"连接被掐断"：两种情况在字节流
+       * 层面一模一样（都是 EOF），`finalizeOutput` 只能看到"有正文"就判成功，
+       * 于是半截回复显示成完整回复。
+       *
+       * 只在字段存在时才传：老版本 Rust 不带这个字段，那时要退回"不判中断"。
+       */
+      state = applyStreamEvent(
+        state,
+        typeof payload.sawDone === 'boolean'
+          ? { type: 'done', sawDone: payload.sawDone }
+          : { type: 'done' },
+      );
       callbacks.onState(state);
       gate.resolve?.();
     });

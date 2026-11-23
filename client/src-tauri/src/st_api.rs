@@ -137,6 +137,38 @@ impl ClientKind {
     }
 }
 
+/// 一次流式请求是怎么结束的（2026-11-22）。
+///
+/// ## 为什么不能只返回 `bool`
+///
+/// 原来返回 `bool` 表示"是否被用户停止"。问题在于**连接被掐断与正常发完
+/// 在字节流层面长得一模一样** —— 都是 `bytes_stream().next()` 返回 `None`。
+///
+/// ```text
+///   上游正常发完：... data: [DONE] → 连接关闭
+///   上游超时断流：... 半截正文    → 连接关闭     ← 两者在流层面无差别
+/// ```
+///
+/// 而 TS 侧 `finalizeOutput` 只要看到一点正文就判成功，于是中转站超时
+/// 被"吃"成了一条写了一半的回复 —— 用户看不到任何错误。
+///
+/// 所以必须把"有没有见过 `[DONE]`"带出去。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamOutcome {
+    /// 用户点了停止（回调返回 false）
+    pub stopped: bool,
+    /// 见过 `[DONE]` —— 上游明确表示"发完了"
+    ///
+    /// `false` 且 `stopped == false` 时，说明连接在**没有结束标记**的情况下
+    /// 结束。可能是上游超时、中转站断流，也可能是我们的读超时。
+    /// 上层要据此判断"这条回复可能不完整"。
+    ///
+    /// ★ 有些后端不发 `[DONE]`，只发 `finish_reason`。那种情况这里也是
+    ///   `false`，由 TS 侧结合 `finish_reason` 一起判定 —— 所以**不能**
+    ///   单凭 `saw_done == false` 就报错。
+    pub saw_done: bool,
+}
+
 /// `/csrf-token` 的响应体
 #[derive(Debug, Deserialize)]
 struct CsrfResponse {
@@ -649,10 +681,26 @@ impl StApi {
     /// 发出去的 `stream: true` 决定。加了 header 判断的话，真 ST 上会永远
     /// 走非流式分支，而"看起来也拿到了内容"，非常难发现。
     ///
-    /// ## 返回
+    /// ## 返回 `StreamOutcome` 而不是 `bool`（2026-11-22）
     ///
-    /// `Ok(finish_reason)` —— `finish_reason` 一般拿不到（要解析 payload 才知道），
-    /// 所以通常返回 `None`；由 TS 侧从 `done` 事件里取。
+    /// ## 为什么必须区分"收到 [DONE]"与"连接断了"
+    ///
+    /// 用户报「中转站的错误捕捉不到了，显示不了」。
+    ///
+    /// 原来这里只返回 `bool`（是否被用户停止）。上游超时掐断连接时，
+    /// `bytes_stream` 的 `next()` 返回 `None` —— 那和"正常发完"**一模一样**，
+    /// 于是本函数返回 `Ok(false)`，上层当成正常结束。
+    ///
+    /// 而 TS 侧 `finalizeOutput` 只要看到一点正文就判成功，于是：
+    ///
+    /// ```text
+    ///   中转站 1m49s 超时断流
+    ///   ⇒ 我们收到半截正文，判"成功"
+    ///   ⇒ 用户看到一条写了一半的回复，没有任何错误提示
+    ///   ⇒ 而中转站后台明确记着"响应超时"
+    /// ```
+    ///
+    /// 现在把"有没有见过 `[DONE]`"带出去，上层就能判"这条回复是否完整"。
     ///
     /// 回调返回 `bool`：`false` = 请停止（用户点了停止），本函数会立刻返回。
     pub async fn post_stream<F>(
@@ -660,7 +708,7 @@ impl StApi {
         path: &str,
         body: impl Serialize,
         mut on_payload: F,
-    ) -> Result<bool, ShellError>
+    ) -> Result<StreamOutcome, ShellError>
     where
         F: FnMut(&str) -> bool,
     {
@@ -689,7 +737,7 @@ impl StApi {
             return Err(ShellError::StHttpStatus {
                 path: path.to_string(),
                 status: status.as_u16(),
-                detail: truncate(&text, 300),
+                detail: summarize_error_body(&text),
             });
         }
 
@@ -749,7 +797,10 @@ impl StApi {
                 }
                 // `[DONE]` 是老式 OpenAI 的结束标记
                 if line.trim() == "data: [DONE]" || line.trim() == "[DONE]" {
-                    return Ok(false);
+                    return Ok(StreamOutcome {
+                        stopped: false,
+                        saw_done: true,
+                    });
                 }
 
                 let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line.trim());
@@ -759,7 +810,10 @@ impl StApi {
 
                 if !on_payload(payload) {
                     // 用户点了停止 —— 立刻返回，不再读后面的包
-                    return Ok(true);
+                    return Ok(StreamOutcome {
+                        stopped: true,
+                        saw_done: false,
+                    });
                 }
             }
         }
@@ -773,7 +827,24 @@ impl StApi {
             }
         }
 
-        Ok(false)
+        /*
+         * 走到这里说明 `bytes_stream` 返回了 `None` —— 连接结束。
+         *
+         * ★ 但"连接结束"有两种，必须分开：
+         *
+         * ```text
+         *   见过 [DONE]           ⇒ 上游正常发完（虽然上面会提前 return，这里是兜底）
+         *   没见过 [DONE] 就 EOF  ⇒ 连接被掐断
+         * ```
+         *
+         * 后者的来源不止一种：上游超时、中转站主动断、我们自己的读超时。
+         * 在这里记为 `saw_done = false`，由上层结合 `finish_reason` 判断
+         * "这条回复是否完整"。
+         */
+        Ok(StreamOutcome {
+            stopped: false,
+            saw_done: false,
+        })
     }
 
     /// 探活：能不能连上 ST。
@@ -857,6 +928,74 @@ fn truncate(text: &str, max: usize) -> String {
     format!("{head}…")
 }
 
+/// 把上游的错误响应体压成**一句能读的话**（2026-11-22）。
+///
+/// ## 为什么不能直接把 body 原样交出去
+///
+/// 中转站与各家 API 的 400/500 都是 JSON，原样塞进错误对象的结果是：
+///
+/// ```text
+///   生成失败（400）：{"error":{"message":"This model's maximum context length
+///   is 1048576 tokens. However, you requested 1049987 tokens (665987 in the m
+/// ```
+///
+/// 三重损失：转义符占位置、外层结构毫无信息、**被截断在关键数字之前**。
+/// 而那句话里的数字恰恰是用户唯一能据此调整的依据。
+///
+/// ## 认哪些形状（按覆盖率排序）
+///
+/// ```text
+///   {"error":{"message":"…"}}       OpenAI / DeepSeek / 绝大多数中转站
+///   {"error":"…"}                   有的网关直接给字符串
+///   {"message":"…"}                 少数自研后台
+///   {"error":{"code":"…"}}          只有码时退回原文，至少不丢东西
+///   <html>…</html>                  502 页面，按纯文本截断
+/// ```
+fn summarize_error_body(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    /*
+     * 只解析对象形态。数组/字符串等形状保持原样 ——
+     * `serde_json` 能把 `"abc"` 也解析成功，那会把引号也带进文案里。
+     */
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        // ① `error` 是对象且带 message
+        if let Some(serde_json::Value::Object(inner)) = map.get("error") {
+            if let Some(serde_json::Value::String(message)) = inner.get("message") {
+                if !message.trim().is_empty() {
+                    return truncate(message.trim(), 400);
+                }
+            }
+            // 只有 code / type 时，组合成一句，别只说"失败了"
+            let code = inner
+                .get("code")
+                .or_else(|| inner.get("type"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if !code.is_empty() {
+                return format!("上游报错（{code}），没给具体说明");
+            }
+        }
+        // ② `error` 直接是字符串
+        if let Some(serde_json::Value::String(message)) = map.get("error") {
+            if !message.trim().is_empty() {
+                return truncate(message.trim(), 400);
+            }
+        }
+        // ③ 顶层 `message`
+        if let Some(serde_json::Value::String(message)) = map.get("message") {
+            if !message.trim().is_empty() {
+                return truncate(message.trim(), 400);
+            }
+        }
+    }
+
+    truncate(trimmed, 300)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,8 +1054,13 @@ mod tests {
 
         // ① 建会话
         api.connect().await.expect("connect 应当成功");
+        /*
+         * `csrf` 从 v0.1.10 起并进 `session`（与 client 同一代，见 `Session` 的注释），
+         * 这里跟着改成读 `session`。先取一份克隆再 `matches!`：guard 不能跨 await 持有。
+         */
+        let csrf = api.session.read().await.csrf.clone();
         assert!(
-            matches!(*api.csrf.read().await, Csrf::Token(_) | Csrf::Disabled),
+            matches!(csrf, Csrf::Token(_) | Csrf::Disabled),
             "connect 之后 CSRF 不该还是 Unknown"
         );
 
@@ -985,7 +1129,7 @@ mod tests {
         // 先弄一个**有效的** token（来自另一只会话）
         let other = StApi::new(base.clone()).expect("建 client");
         other.connect().await.expect("取有效 token");
-        let foreign = match &*other.csrf.read().await {
+        let foreign = match &other.session.read().await.csrf {
             Csrf::Token(t) => t.clone(),
             Csrf::Disabled => {
                 // 服务端关了 CSRF：没有"错 token"这个状态，本用例不适用
@@ -997,7 +1141,7 @@ mod tests {
 
         // 新实例：jar 干净，但硬塞一个**不配套**的 token
         let api = StApi::new(base).expect("建 client");
-        *api.csrf.write().await = Csrf::Token(foreign);
+        api.session.write().await.csrf = Csrf::Token(foreign);
 
         // 第一次会 403（token 不属于这只 client 的会话），内部应自动恢复
         let settings: Value = api
@@ -1034,5 +1178,46 @@ mod tests {
             .await
             .expect_err("连不上应当报错");
         assert_eq!(error.code(), "ST_UNAVAILABLE", "实际：{error}");
+    }
+
+    /* ── 上游错误正文压成一句话（2026-11-22） ── */
+
+    #[test]
+    fn 错误正文_抽出_error_message_并保留数字() {
+        let body = r#"{"error":{"message":"This model's maximum context length is 1048576 tokens. However, you requested 1049987 tokens (665987 in the messages, 384000 in the completion).","type":"invalid_request_error"}}"#;
+        let got = summarize_error_body(body);
+        assert!(got.starts_with("This model's maximum context length"), "实际：{got}");
+        assert!(got.contains("1049987"), "数字必须留着，用户靠它调参：{got}");
+        assert!(!got.contains('{'), "外壳 JSON 不该出现在文案里：{got}");
+    }
+
+    #[test]
+    fn 错误正文_error_是字符串也认() {
+        let got = summarize_error_body(r#"{"error":"rate limited"}"#);
+        assert_eq!(got, "rate limited");
+    }
+
+    #[test]
+    fn 错误正文_顶层_message_也认() {
+        let got = summarize_error_body(r#"{"message":"Key 已过期"}"#);
+        assert_eq!(got, "Key 已过期");
+    }
+
+    #[test]
+    fn 错误正文_只有_code_时给一句能读的() {
+        let got = summarize_error_body(r#"{"error":{"code":"invalid_api_key"}}"#);
+        assert!(got.contains("invalid_api_key"), "实际：{got}");
+        assert!(got.starts_with("上游报错"), "实际：{got}");
+    }
+
+    #[test]
+    fn 错误正文_纯文本原样截断() {
+        let got = summarize_error_body("  502 Bad Gateway  ");
+        assert_eq!(got, "502 Bad Gateway");
+    }
+
+    #[test]
+    fn 错误正文_空响应不炸() {
+        assert_eq!(summarize_error_body("   "), "");
     }
 }

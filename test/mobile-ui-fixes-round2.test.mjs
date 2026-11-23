@@ -92,18 +92,52 @@ test('★ 问题四：麦克风与发送按钮的视觉参数必须逐字相同'
    * 更硬的一条：两个按钮并排，圆角 / 底色 / 边框必须一致。
    * 只验"各自有值"会漏掉"一个有值、另一个不同"的情况 ——
    * 那正是用户看到"一个方块一个圆"的原因。
+   *
+   * ## 2026-11-22 改判据：底色不再要求相同
+   *
+   * 用户要求把发送按钮从 `↑` 图标改成写着「发送」的文字按钮，并且
+   * **用底色表达能不能发**（灰=不能发、蓝=能发）。它因此从"图标按钮"
+   * 变成了"主操作按钮"，与麦克风不再是同一个视觉物件 ——
+   * 继续要求两边底色逐字相同，等于逼着主操作按钮不能有自己的状态色。
+   *
+   * 但**形状语言必须仍然一致**：并排挨着的两个控件，圆角与描边
+   * 一旦不同，看起来就是"两个来源的东西拼在一起"（这正是本条判据
+   * 当初要抓的那个观感）。所以留下 checked 的两项：
+   *
+   * ```text
+   *   border-radius   都是 pill
+   *   border          都是 1px solid（颜色可以不同：发送是 transparent）
+   * ```
+   *
+   * 底色那条改成"必须走 token"：灰/蓝两态都取自
+   * `--nb-send-idle-*` / `--nb-send-go-*`，不许写裸色值。
    */
   const source = css();
   const mic = blockOf(source, '.nb-mic-slot');
   const send = blockOf(source, '.nb-send');
 
-  for (const prop of ['border-radius', 'background', 'border']) {
-    assert.equal(
-      propOf(mic, prop),
-      propOf(send, prop),
-      `${prop} 两个按钮必须一致（mic=${propOf(mic, prop)} / send=${propOf(send, prop)}）`,
-    );
-  }
+  assert.equal(
+    propOf(mic, 'border-radius'),
+    propOf(send, 'border-radius'),
+    `圆角必须一致（mic=${propOf(mic, 'border-radius')} / send=${propOf(send, 'border-radius')}）`,
+  );
+
+  const borderWidth = (block) => {
+    const value = propOf(block, 'border');
+    return value === null ? null : value.replace(/\s+var\([^)]*\)|\s+transparent/gi, '').trim();
+  };
+  assert.equal(
+    borderWidth(mic),
+    borderWidth(send),
+    `描边宽度/线型必须一致（mic=${propOf(mic, 'border')} / send=${propOf(send, 'border')}）`,
+  );
+
+  assert.match(
+    propOf(send, 'background') ?? '',
+    /var\(--nb-send-idle-bg\)/,
+    '发送按钮的底色必须走 token（灰/蓝两态在 nebula-tokens.css 的 §1.2b）',
+  );
+  void mic;
 });
 
 /* ═══════════════════════════════════════════════════════════

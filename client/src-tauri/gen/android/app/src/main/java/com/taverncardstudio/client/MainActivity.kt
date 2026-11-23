@@ -45,7 +45,27 @@ class MainActivity : TauriActivity() {
      * 才说明这次会话是干净结束的。中间被杀就永远停在 false。
      */
     private const val KEY_CLEAN_EXIT = "cleanExit"
+
+    /**
+     * 任务数为 0 时的重试间隔（毫秒）。
+     *
+     * 递增是有意的：200ms 覆盖"任务马上就绪"，1500ms 覆盖 Tauri + WebView
+     * 初始化特别慢的机型。三轮全部走完约 2.3 秒。
+     */
+    private val RECENTS_RETRY_DELAYS = longArrayOf(200L, 600L, 1500L)
+
+    /** 通知权限请求码（`onRequestPermissionsResult` 里用它区分） */
+    private const val REQUEST_NOTIFICATIONS = 4001
   }
+
+  /** 重试用的主线程 Handler（`getAppTasks` 必须在主线程调） */
+  private val recentsHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+  /** 下一个待执行的重试；null 表示没有挂起的任务 */
+  private var recentsRetry: Runnable? = null
+
+  /** 已经重试到第几轮（成功或放弃后归零） */
+  private var recentsRetryIndex = 0
 
   override fun onCreate(savedInstanceState: Bundle?) {
     /*
@@ -58,6 +78,29 @@ class MainActivity : TauriActivity() {
      * （窗口 inset 异常），放后面就抓不到那种启动期崩溃。
      */
     StLog.init(this)
+
+    /*
+     * ★★★ 第二条就要记版本号（2026-11-22 第三轮）。
+     *
+     * ## 为什么必须自证版本
+     *
+     * 同一个问题用户报了三轮、发了三份日志，我三次都在**猜"这是哪个构建的包"**：
+     * 靠"日志里有没有某条诊断行"反推。前两份都没有特征，只能得出
+     * "至少是某个提交之后"——这个结论不够用，而且推断错一次就会去修错地方
+     * （这一轮我一开始就差点以为是新包没修好）。
+     *
+     * 记了版本号之后每份日志都自证来源，不用再反推。
+     *
+     * ## 为什么用 BuildConfig
+     *
+     * `VERSION_NAME` / `VERSION_CODE` 是编译期常量，不依赖 Context、
+     * 不会抛异常。`app/build.gradle.kts:131` 已开 `buildConfig = true`。
+     */
+    StLog.i(
+      "BOOT",
+      "版本 ${BuildConfig.VERSION_NAME}（versionCode ${BuildConfig.VERSION_CODE}）",
+    )
+
     StLog.i(
       "BOOT",
       "onCreate 开始：SDK ${Build.VERSION.SDK_INT}，" +
@@ -165,7 +208,37 @@ class MainActivity : TauriActivity() {
      * 放在 `onCreate` 与 `onResume` 两处：`onCreate` 覆盖冷启动，
      * `onResume` 覆盖"从后台回来时才发现被排除"的情况。方法本身幂等。
      */
-    clearRecentsExclusion("onCreate")
+    ensureRecentsVisible("onCreate")
+
+    /*
+     * ★★★ 请求通知权限（2026-11-22 第五轮）。
+     *
+     * ## 现场
+     *
+     * 加上 SERVICE 诊断后，真机日志第一次把这件事说清楚了：
+     *
+     * ```text
+     *   SERVICE: 前台服务启动：通知权限=false SDK=36
+     * ```
+     *
+     * **从来没授权过。** 清单里 `POST_NOTIFICATIONS` 早就声明了，
+     * 但那是"我要用"，不是"已经给我" —— Android 13+ 必须**运行时请求**。
+     *
+     * ## 后果不只是"看不到通知"
+     *
+     * ```text
+     *   ① 引擎的前台服务通知不显示 → 用户不知道引擎在跑，也没法从通知里停
+     *   ② 部分 ROM（vivo 尤其激进）会把"有前台服务但通知不可见"的应用
+     *      当成异常状态处理 —— 这恰好是本次排查一直怀疑的那一类
+     *   ③ Android 14+ 的 FGS 类型申报在通知不可见时更容易被系统回收
+     * ```
+     *
+     * ## 为什么只请求一次、失败也继续
+     *
+     * 权限被拒不该影响 App 能不能用 —— 引擎仍然工作，只是通知不可见。
+     * 所以不阻塞、不重试、不提示二次弹窗（系统自己会处理"拒绝两次就不再弹"）。
+     */
+    requestNotificationPermissionIfNeeded()
 
     /*
      * 记 Activity 的进/退后台（2026-11-12）。
@@ -225,34 +298,302 @@ class MainActivity : TauriActivity() {
   }
 
   /**
-   * 确保本任务出现在「最近任务」里（2026-11-21）。
+   * 确保本任务出现在「最近任务」里（2026-11-21 首次，2026-11-22 修）。
    *
-   * 见 `onCreate` 里那段注释：任务可能因为启动入口带着
-   * `FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS` 而不出现在任务列表。
-   * 这里逐个任务把它关掉 —— `setExcludeFromRecents(false)` 是任务级开关，
-   * 不关心标志最初是谁带进来的。
+   * ## 0.2.1 那版为什么没修好（2026-11-22 用户反馈）
    *
-   * 幂等：已经是 false 时再设一次没有副作用，所以每次 `onResume` 都可以调。
+   * 用户原话：
    *
-   * 失败只记日志不抛：个别 ROM 上 `getAppTasks()` 会抛 SecurityException，
-   * 那不该让 App 起不来 —— 任务列表是体验问题，启动是可用性问题。
+   * > 安装修复版本后很奇怪，退出后还是不在运行列表里面，但是我打开 vivo 系统的
+   * > 隐私空间（本质是一个隔离的系统，类似于多系统这种）里面的软件后再上滑它就又有了
+   *
+   * 只在 `onCreate` / `onResume` 调一次是不够的，具体有两层原因：
+   *
+   * ```text
+   * ① `getAppTasks()` 可能返回空
+   *    它查的是"本应用已存在的任务"。`onCreate` 时任务还在建立过程中，
+   *    Tauri 的初始化又慢（要起 WebView），`onResume` 也常常还拿不到。
+   *    拿不到就静默返回 —— 一次都没设成，而日志里只有一行"任务数为 0"。
+   *
+   * ② 切后台的那一刻没有任何调用
+   *    任务是**在 Activity 停止之后**才被归档进最近任务的。如果厂商 ROM
+   *    在那一步重新套用启动 Intent 的标志，我们之前设的 false 会被覆盖。
+   * ```
+   *
+   * 用户观察到的"打开隐私空间里的软件再回来就出现了"正好对应这两条：
+   * 隐私空间是另一个 Android 用户，来回切换会让本 Activity **销毁重建** ——
+   * 第二次 `onCreate` 时任务已经存在，于是那一次设置成功了。
+   *
+   * ## 现在的做法
+   *
+   * ```text
+   * 时机：onCreate / onResume / onPause / onUserLeaveHint 四处
+   * 重试：任务数为 0 时按 200ms / 600ms / 1500ms 三轮补设
+   * 日志：每次都写明"设了几个任务"或"为什么没设成"
+   * ```
+   *
+   * `onUserLeaveHint` 是 AOSP 里"用户主动离开（按 Home / 上滑）"的钩子，
+   * 比 `onPause` 更贴近"要进最近任务"那一刻，所以两个都挂。
+   *
+   * @param stage 日志里的来源标记，用于区分是哪一处触发
+   * @return 是否设置成功（任务存在且没抛异常）
    */
-  private fun clearRecentsExclusion(stage: String) {
-    try {
-      val am = getSystemService(ActivityManager::class.java) ?: return
+  private fun clearRecentsExclusion(stage: String): Boolean {
+    return try {
+      val am = getSystemService(ActivityManager::class.java)
+      if (am == null) {
+        StLog.w("RECENTS", "$stage：拿不到 ActivityManager")
+        return false
+      }
       val tasks = am.appTasks
       if (tasks.isEmpty()) {
         StLog.w("RECENTS", "$stage：拿不到本应用的任务（任务数为 0）")
-        return
+        return false
       }
       for (task in tasks) {
         task.setExcludeFromRecents(false)
       }
-      StLog.i("RECENTS", "$stage：已确保 ${tasks.size} 个任务不排除在最近任务之外")
+      StLog.i(
+        "RECENTS",
+        "$stage：已确保 ${tasks.size} 个任务不排除在最近任务之外${describeTasks(tasks)}",
+      )
+      true
     } catch (error: Throwable) {
       /* 典型是 SecurityException（部分 ROM 限制） */
       StLog.w("RECENTS", "$stage：设置失败：${error.javaClass.simpleName} ${error.message}")
+      false
     }
+  }
+
+  /**
+   * 把任务的真实状态打出来（2026-11-22 第四轮）。
+   *
+   * ## 为什么必须看 `baseIntent` 而不是 `this.intent`
+   *
+   * `this.intent` 是**本 Activity 收到的那个 Intent**，而最近任务界面读的是
+   * **任务根 Intent**（`RecentTaskInfo.baseIntent`）。两者可能不同：
+   *
+   * ```text
+   *   桌面点图标 → 任务以桌面那条 Intent 为根
+   *   之后我们从通知进入 → 只是给同一个任务追加一条 Intent
+   * ```
+   *
+   * 用户的现象是"任务存在、Activity 没被销毁、也没有 onTaskRemoved，
+   * 但最近任务里就是没有卡片"。这时唯一还能查的就是：
+   * **任务根 Intent 上到底有没有 `FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS`。**
+   *
+   * `setExcludeFromRecents(false)` 会不会真的清掉根 Intent 的标志，
+   * 各家 ROM 实现不一样 —— 这一行日志就是答案。
+   *
+   * ## 另外两个字段的含义
+   *
+   * ```text
+   *   numActivities=0   ⇒ 任务里没有界面（正常应该 ≥1，我们是单 Activity）
+   *   affiliatedTaskId  ⇒ 与别的任务关联时非 -1，那种任务可能被合并显示
+   * ```
+   */
+  private fun describeTasks(tasks: List<ActivityManager.AppTask>): String {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return ""
+    return try {
+      val parts = tasks.map { task ->
+        val info = task.taskInfo
+        val flags = info.baseIntent?.flags ?: 0
+        val excluded = (flags and android.content.Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS) != 0
+        "id=${info.id} 界面数=${info.numActivities} 根Intent带排除位=$excluded"
+      }
+      "（${parts.joinToString("；")}）"
+    } catch (error: Throwable) {
+      /* 拿不到就不影响主流程 —— 这只是诊断 */
+      "（任务详情读取失败：${error.javaClass.simpleName}）"
+    }
+  }
+
+  /**
+   * 请求通知权限（Android 13+）。
+   *
+   * 见 `onCreate` 里的调用点注释：清单声明不等于已授权，
+   * 真机日志证明一直是 `通知权限=false`。
+   *
+   * 只请求一次：被拒之后由系统决定还要不要弹（连续拒绝两次后系统不再弹）。
+   * 我们不重复请求，也不弹自己的引导 —— 通知是辅助信息，
+   * 引擎本身不依赖它。
+   */
+  private fun requestNotificationPermissionIfNeeded() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    val permission = android.Manifest.permission.POST_NOTIFICATIONS
+    if (checkSelfPermission(permission) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+      StLog.i("SERVICE", "通知权限已授予")
+      return
+    }
+    try {
+      StLog.i("SERVICE", "通知权限未授予，请求一次")
+      requestPermissions(arrayOf(permission), REQUEST_NOTIFICATIONS)
+    } catch (error: Throwable) {
+      /* 个别 ROM 上 requestPermissions 会抛；权限失败不影响 App 可用 */
+      StLog.w("SERVICE", "请求通知权限失败：${error.javaClass.simpleName} ${error.message}")
+    }
+  }
+
+  /**
+   * 权限结果只记日志。
+   *
+   * 不在这里做任何引导或重试 —— 用户拒绝是合理选择，
+   * 我们只想知道下一份日志里这个值是什么。
+   */
+  override fun onRequestPermissionsResult(
+    requestCode: Int,
+    permissions: Array<out String>,
+    grantResults: IntArray,
+  ) {
+    super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+    if (requestCode != REQUEST_NOTIFICATIONS) return
+    val granted = grantResults.isNotEmpty() &&
+      grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED
+    StLog.i("SERVICE", "通知权限请求结果：${if (granted) "已授予" else "被拒绝"}")
+  }
+
+  /**
+   * 主动刷新任务卡片（2026-11-22 第四轮）。
+   *
+   * ## 为什么在"标志已经正确"之后还需要这一步
+   *
+   * 第四份日志把这几种可能都排掉了：
+   *
+   * ```text
+   *   12:17:15.396 退到后台
+   *   12:20:03.931 进入前台        ← 中间 2 分 48 秒
+   * ```
+   *
+   * ```text
+   *   · 没有 onDestroy      ⇒ Activity 一直活着，不是"被销毁所以没卡片"
+   *   · 没有 onTaskRemoved  ⇒ 任务没有被 AMS 移除
+   *   · 每次都 "已确保 1 个任务不排除"  ⇒ getAppTasks 有任务、调用没抛异常
+   *   · manifest 三项已在包里
+   * ```
+   *
+   * 而用户的观察是「打开隐私空间里的应用再回来，卡片就出现了」——
+   * 那一步会让最近任务界面**整体重建**。所以问题不在 AMS 的数据，
+   * 而在**启动器的最近任务界面没有刷新**。
+   *
+   * ## 为什么 `setTaskDescription` 能推动刷新
+   *
+   * 它是唯一会影响"最近任务里那个卡片长什么样"的公开 API（标签/图标/配色）。
+   * 系统在它被调用后会更新任务的描述并通知界面重建该卡片。
+   *
+   * 而 `setExcludeFromRecents(false)` 在值本来就是 false 时是**空操作**，
+   * 系统不会因此发出任何变更通知 —— 启动器也就一直不知道要更新。
+   *
+   * ## 为什么传明确的 label
+   *
+   * 不传时系统用 Activity 的 label；我们的 `main_activity_title` 与
+   * `app_name` 不是同一个字符串，卡片上可能显示成别的名字。传一次就固定下来。
+   *
+   * 失败只记日志：这是体验优化，不该影响任何功能。
+   */
+  private fun refreshTaskCard(stage: String) {
+    try {
+      val label = applicationInfo.loadLabel(packageManager)?.toString() ?: "Tavern Card Studio"
+
+      /*
+       * ① **不要**关掉截图预览（2026-11-22 第五轮，撤回上一轮的改动）。
+       *
+       * 上一轮我加了 `setRecentsScreenshotEnabled(false)`，理由是"WebView 截图
+       * 可能失败，露出空白"。用户反馈的结果说明了这个判断错在哪：
+       *
+       * ```text
+       *   卡片出现了，但**一块纯色，完全没有 App 内容**
+       * ```
+       *
+       * 关掉截图之后系统**本来就不截内容**，卡片只能画一个占位块 ——
+       * 那不是"修好了缩略图"，而是"放弃了缩略图"。
+       *
+       * ## 白底的真因在主题，不在这
+       *
+       * `Theme.tcs_shell` 继承 Material3 DayNight，**没设 windowBackground**，
+       * 亮色模式下窗口背景是白色。缩略图里 WebView 那层合成不上时，
+       * 露出来的就是白色 —— 看起来像"没有内容"。
+       * 已在 `res/values/themes.xml` 把窗口背景改成 `#0c0a14`（应用底色）。
+       *
+       * 所以这里恢复系统默认：**让系统真的去截图**。
+       */
+
+      /*
+       * ② 给卡片一个和应用一致的底色。
+       *
+       * 万一缩略图仍然合成不上（WebView + SurfaceView 的老问题），
+       * 卡片至少是深色的、看起来像这个 App，而不是一块白板。
+       *
+       * 色值与应用底色 `--nb-abyss (#0c0a14)` 一致。
+       */
+      @Suppress("DEPRECATION")
+      setTaskDescription(
+        ActivityManager.TaskDescription(label, null, 0xFF0C0A14.toInt()),
+      )
+      StLog.i("RECENTS", "$stage：已刷新任务卡片（label=$label）")
+    } catch (error: Throwable) {
+      StLog.w("RECENTS", "$stage：刷新任务卡片失败：${error.javaClass.simpleName} ${error.message}")
+    }
+  }
+
+  /**
+   * 带重试的版本：任务还没建立就过一会儿再试。
+   *
+   * ## 为什么必须重试
+   *
+   * 见 `clearRecentsExclusion` 的注释：早期拿不到任务是最可能的失效点。
+   * 三轮的间隔是递增的 —— 第一轮 200ms 覆盖"马上就绪"，最后一轮 1500ms
+   * 覆盖"Tauri + WebView 初始化特别慢"的机型。全部走完约 2.3 秒，
+   * 对启动耗时的感知可以忽略。
+   *
+   * ## 为什么重试之间有取消
+   *
+   * 四处调用点会互相覆盖（比如 onResume 紧跟着 onCreate）。不取消上一个
+   * 待执行的 Runnable，就会有几个重试链同时在跑，日志里看不出哪条是有效的。
+   */
+  private fun ensureRecentsVisible(stage: String) {
+    if (clearRecentsExclusion(stage)) {
+      recentsRetryIndex = 0
+      cancelRecentsRetry()
+      return
+    }
+
+    if (recentsRetryIndex >= RECENTS_RETRY_DELAYS.size) {
+      StLog.w(
+        "RECENTS",
+        "$stage：重试 ${RECENTS_RETRY_DELAYS.size} 轮仍拿不到任务，放弃。" +
+          "本机可能限制了 getAppTasks()。",
+      )
+      recentsRetryIndex = 0
+      return
+    }
+
+    val delay = RECENTS_RETRY_DELAYS[recentsRetryIndex]
+    recentsRetryIndex += 1
+    cancelRecentsRetry()
+    val runnable = Runnable {
+      recentsRetry = null
+      /*
+       * 销毁之后不要再碰 Activity —— `getSystemService` 在已销毁的实例上
+       * 虽然能返回对象，但设置一个已经不属于前台的 task 没有意义，
+       * 而且日志会变得难以解读。
+       */
+      if (!isFinishing && !isDestroyed) {
+        ensureRecentsVisible("$stage+${delay}ms")
+      }
+    }
+    recentsRetry = runnable
+    recentsHandler.postDelayed(runnable, delay)
+    StLog.i(
+      "RECENTS",
+      "$stage：任务还没建立，${delay}ms 后重试（第 $recentsRetryIndex 轮）",
+    )
+  }
+
+  /** 撤掉待执行的重试（Activity 销毁时也必须调，否则会持有已销毁的实例） */
+  private fun cancelRecentsRetry() {
+    val pending = recentsRetry ?: return
+    recentsHandler.removeCallbacks(pending)
+    recentsRetry = null
   }
 
   /**
@@ -264,7 +605,51 @@ class MainActivity : TauriActivity() {
    */
   override fun onResume() {
     super.onResume()
-    clearRecentsExclusion("onResume")
+    /*
+     * 回到前台时把重试计数归零：用户可能刚在别处（比如隐私空间）
+     * 让任务重建过，这时的"重新来一轮"是有意义的。
+     */
+    recentsRetryIndex = 0
+    ensureRecentsVisible("onResume")
+    refreshTaskCard("onResume")
+  }
+
+  /**
+   * 用户主动离开（按 Home / 上滑切走）时再确认一次（2026-11-22 新增）。
+   *
+   * ## 为什么这个钩子比 onResume 更对症
+   *
+   * 任务是**在 Activity 停止之后**才被归档进最近任务的。而
+   * `onUserLeaveHint` 是 AOSP 里专门表示"用户主动要离开"的时机
+   * （按 Home、上滑看任务列表），比 `onPause` 还早一步，
+   * 正好赶在归档之前。
+   *
+   * ## 为什么不用返回值
+   *
+   * `onUserLeaveHint` 返回 void，不参与导航决策 —— 我们只借这个时机设置属性。
+   * 不调 `super` 会有副作用（Tauri / Activity 内部依赖它做状态收尾）。
+   */
+  override fun onUserLeaveHint() {
+    super.onUserLeaveHint()
+    ensureRecentsVisible("onUserLeaveHint")
+    refreshTaskCard("onUserLeaveHint")
+  }
+
+  /**
+   * 暂停时再确认一次（2026-11-22 新增）。
+   *
+   * 这是 `onUserLeaveHint` 之外的兜底：那个钩子只在"用户主动离开"时触发，
+   * 而**被别的应用覆盖**（来电、通知全屏、隐私空间切换）不算用户离开，
+   * 那些路径只会走 `onPause`。
+   *
+   * ★ 这里**不重置**重试计数，也不开启新的重试链：马上要进后台了，
+   *   延迟重试在那个状态下没有意义（Activity 已经不可见）。
+   *   所以只做一次即时尝试。
+   */
+  override fun onPause() {
+    super.onPause()
+    clearRecentsExclusion("onPause")
+    refreshTaskCard("onPause")
   }
 
   /**
@@ -597,6 +982,66 @@ class MainActivity : TauriActivity() {
    * 真的被系统杀掉时，我们会以为"上次是正常退出的"，从而漏掉线索。
    */
   override fun onDestroy() {
+    /*
+     * ★ 先撤掉挂起的重试（2026-11-22）。
+     *
+     * 不撤的话 `Handler` 会持有这个已销毁的实例，里面的 Runnable 还会去调
+     * `getSystemService` —— 泄漏一个 Activity，而且日志里会出现
+     * 「销毁之后还在设置任务」的怪记录，让后续归因变难。
+     */
+    cancelRecentsRetry()
+
+    /*
+     * ★★★ 销毁取证（2026-11-22 第二轮）。
+     *
+     * 用户报「装上修过的版本还是不行」，日志里却是：
+     *
+     * ```text
+     *   10:14:50.892 RECENTS: onUserLeaveHint：已确保 1 个任务不排除在最近任务之外
+     *   10:14:50.966 LIFE: 退到后台
+     *   10:14:52.973 BOOT: onDestroy（正常退出）      ← 退后台 2 秒就销毁
+     * ```
+     *
+     * 也就是说 `setExcludeFromRecents(false)` **确实设成功了**，但 Activity
+     * 随后被销毁。任务里没有活着的 Activity 时，系统会把它从最近任务移走 ——
+     * 卡片当然不显示。
+     *
+     * 那三个数字是唯一能区分"谁销毁了它"的凭据：
+     *
+     * ```text
+     *   isFinishing = true    ⇒ 有人（或 ROM）调了 finish()
+     *   isFinishing = false   ⇒ 系统销毁：回收 / 任务被重置 / 配置变更
+     *   任务数 = 0            ⇒ 任务已被移除（卡片消失的直接原因）
+     *   Intent 带排除位        ⇒ 启动入口脏，task 创建时就被排除
+     * ```
+     */
+    run {
+      val finishing = isFinishing
+      /*
+       * `isChangingConfigurations` 区分两种"销毁"：
+       *
+       * ```text
+       *   true  ⇒ 配置变更（旋转/深色模式/字号…）导致的临时重建，正常
+       *   false ⇒ 真的被销毁
+       * ```
+       *
+       * manifest 里已有 `configChanges` 挡住了大部分配置变更，所以这里
+       * 如果出现 true，说明还有没挡住的项 —— 那本身就是一条线索。
+       */
+      val changing = isChangingConfigurations
+      val tasks = try {
+        getSystemService(ActivityManager::class.java)?.appTasks?.size ?: -1
+      } catch (error: Throwable) {
+        -1
+      }
+      val dirtyFlag = (intent?.flags ?: 0) and android.content.Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+      StLog.i(
+        "RECENTS",
+        "onDestroy：isFinishing=$finishing 配置变更=$changing 剩余任务=$tasks " +
+          "Intent带排除位=${dirtyFlag != 0}",
+      )
+    }
+
     /*
      * 顺序也要紧：先落标记，再记日志。
      *

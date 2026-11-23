@@ -56,5 +56,6 @@ export * from './chat-export.js';
 export * from './character-prompts.js';
 export * from './nav.js';
 export * from './author-note.js';
+export * from './memory.js';
 export * from './api-persist.js';
 export * from './persona.js';

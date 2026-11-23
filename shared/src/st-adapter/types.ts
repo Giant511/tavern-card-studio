@@ -269,7 +269,24 @@ export interface StGenerateRequest {
 export type StStreamEvent =
   | { type: 'text'; text: string }
   | { type: 'reasoning'; text: string }
-  | { type: 'done'; finishReason?: string }
+  /**
+   * 收尾。
+   *
+   * `sawDone` 只有**桥**（Rust 侧）会带，`translateFrame` 产出的不带 ——
+   * 两者的含义不同，别混：
+   *
+   * ```text
+   *   帧里的 done（finish_reason / [DONE] / message_stop）
+   *       ⇒ 上游自己说了"我写完了"。这是最强的证据。
+   *   桥的 done（字节流结束，无论怎么结束）
+   *       ⇒ 只说明"连接没了"。sawDone=false 表示从没见过 [DONE]。
+   * ```
+   *
+   * 为什么要两者：很多中转站只发 `finish_reason` 不发 `[DONE]`，
+   * 单看 `sawDone=false` 会把完整回复误判成半截；反过来只有帧的 done
+   * 又分不出"连接被掐断"（那种情况一帧 done 都不会有）。
+   */
+  | { type: 'done'; finishReason?: string; sawDone?: boolean }
   | { type: 'error'; message: string };
 
 /**

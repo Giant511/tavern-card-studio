@@ -449,6 +449,35 @@ class StService : Service() {
         stopSelf()
     }
 
+    /**
+     * 任务被移出「最近任务」时回调（2026-11-22）。
+     *
+     * ## 为什么这条日志很关键
+     *
+     * 用户报「切到后台后上滑看不到本 App」，但「打开系统隐私空间里的应用再回来
+     * 就又能看到」。这两种情况对应**完全不同的原因**，而之前的日志分不开：
+     *
+     * ```text
+     *   A. AMS 真的把任务移除了   ⇒ 卡片不存在，切用户也不会恢复
+     *   B. 任务还在，只是启动器    ⇒ 切用户触发启动器重载，于是又显示出来
+     *      的最近任务界面没显示它
+     * ```
+     *
+     * 用户描述的「切到另一个用户空间再回来就有了」明显更像 B。
+     * 但 B 在应用侧无法直接观测 —— 除非听这个回调：
+     *
+     * ```text
+     *   有 onTaskRemoved 记录  ⇒ A（任务被移除）
+     *   没有这条记录            ⇒ B（任务还在，是启动器没显示）
+     * ```
+     *
+     * 这是唯一能把两者分开的证据，所以必须记。
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        StLog.w("RECENTS", "onTaskRemoved：任务被移出最近任务（用户划掉 / 系统清理）")
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         stopRssRefresh()
         /*
@@ -577,6 +606,34 @@ class StService : Service() {
     }
 
     private fun startForegroundCompat(notification: Notification) {
+        /*
+         * 记一条前台服务状态（2026-11-22）。
+         *
+         * ## 为什么要记
+         *
+         * 排查「任务列表里看不到本 App」时，能查的都查过了：
+         * 任务存在、界面数 1、根 Intent 无排除位、TaskDescription 刷新成功、
+         * manifest 三项都在包内。日志里却**完全没有前台服务的记录** ——
+         * 而常驻通知与前台服务是这个 App 最特殊的地方，vivo 的后台管理
+         * 恰好以激进著称。
+         *
+         * `通知权限` 尤其要紧：Android 13+ 没授权时前台服务的通知不显示，
+         * 服务仍活着但用户看不见。部分 ROM 会把这种状态的应用当作"异常"
+         * 处理。有这一行就能判断是不是那条路。
+         */
+        run {
+            val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            } else {
+                true /* 13 以下不需要运行时授权 */
+            }
+            StLog.i(
+                "SERVICE",
+                "前台服务启动：通知权限=$granted SDK=${Build.VERSION.SDK_INT}",
+            )
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             /*
              * Android 14+ 必须声明 type，否则抛

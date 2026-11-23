@@ -51,6 +51,36 @@ export interface StreamState {
   readonly error: string | null;
   /** 完成原因（`done` 事件带的 finishReason） */
   readonly finishReason: string | null;
+  /**
+   * 收到过"上游写完了"的证据（2026-11-22）。
+   *
+   * 来源有两种，都算：帧里的 `done`（`finish_reason` / `[DONE]` /
+   * `message_stop`），或者桥的 `done` 且 `sawDone !== false`。
+   *
+   * 结束之后它仍是 `false`，就意味着**连接是被掐断的** —— 上游没说完就没了。
+   * 那时正文再长也不能当"完整回复"。
+   */
+  readonly sawEnd: boolean;
+  /**
+   * 这次生成**结束过**（收到 `done` 或 `error`）。
+   *
+   * 与 `sawEnd` 的区别：`ended` 只说"流没了"，`sawEnd` 说"上游说了它写完了"。
+   * 两者一起才能判"是被掐断"：`ended && !sawEnd`。
+   *
+   * ★ 为什么必须有这一条：`finalizeOutput` 也会被"还没结束"的状态调到
+   * （单测、面板提前 dispose、以及将来的重放）。那种情况下 `sawEnd` 同样是
+   * `false`，但**不能**说"上游断开了连接" —— 我们只是不知道后来怎样了。
+   * 判据必须是"结束了、但没见着结束标记"，而不是"没见着结束标记"。
+   */
+  readonly ended: boolean;
+  /**
+   * 用户点过「停止」。
+   *
+   * 单独一个字段而不是复用 `phase === 'stopping'`：`done` 一到 phase 就变
+   * `idle`，之后再判就分不出"他自己停的"与"上游断的"了 ——
+   * 而这两种要给完全不同的话（前者不该报警，后者必须说内容可能不全）。
+   */
+  readonly stopRequested: boolean;
 }
 
 export function createStreamState(): StreamState {
@@ -61,6 +91,9 @@ export function createStreamState(): StreamState {
     chunkCount: 0,
     error: null,
     finishReason: null,
+    sawEnd: false,
+    ended: false,
+    stopRequested: false,
   };
 }
 
@@ -96,16 +129,25 @@ export function applyStreamEvent(state: StreamState, event: StStreamEvent): Stre
     }
     case 'done': {
       if (state.phase === 'failed') return state;
+      /*
+       * `sawDone` 缺省（帧里的 done、以及单测直接发 `{type:'done'}`）都算
+       * "见过收尾" —— 只有桥**明确**说 `false` 才算没见着。
+       * 判据写 `!== false` 而不是 `=== true`：老版本 Rust 不带这个字段，
+       * 那时候不能突然开始报"回复不完整"。
+       */
       return {
         ...state,
         phase: 'idle',
         finishReason: event.finishReason ?? null,
+        ended: true,
+        sawEnd: state.sawEnd || event.sawDone !== false,
       };
     }
     case 'error': {
       return {
         ...state,
         phase: 'failed',
+        ended: true,
         error: event.message,
       };
     }
@@ -119,10 +161,13 @@ export function applyStreamEvent(state: StreamState, event: StStreamEvent): Stre
  *
  * 只有 `streaming` 能进 `stopping` —— 重复点击直接原样返回，
  * 所以连点十次也只会产生一次状态变化（abort 由调用方在状态变化时发一次）。
+ *
+ * `stopRequested` 一旦置上就不再回落：它是"这条回复是人停的"这个**事实**，
+ * 而 `phase` 只是当下的界面状态。
  */
 export function requestStop(state: StreamState): StreamState {
   if (state.phase !== 'streaming') return state;
-  return { ...state, phase: 'stopping' };
+  return { ...state, phase: 'stopping', stopRequested: true };
 }
 
 /** 用户关掉错误提示 / 点重试前的复位。 */
@@ -150,7 +195,48 @@ export function showsCaret(state: StreamState): boolean {
  */
 export function finalizeOutput(state: StreamState): { ok: boolean; text: string; message: string } {
   const text = state.text;
-  if (text.trim().length > 0) return { ok: true, text, message: '' };
+  const hasText = text.trim().length > 0;
+
+  /*
+   * ═══════════════════════════════════════════════════════════
+   * 收尾先分三种"结束方式"，它们的处置完全不同（2026-11-22）
+   * ═══════════════════════════════════════════════════════════
+   *
+   * ```text
+   *   用户点了停止        text 照留，不报警（他自己停的）
+   *   上游没发结束标记    text 照留，但必须说"可能不完整"
+   *   正常收尾            text 照留，什么都不说
+   * ```
+   *
+   * 第二条是这次补的。原来的判定只看 `text.trim().length > 0` ——
+   * 于是"上游写了一半就把连接掐了"会显示成一次成功回复，用户以为
+   * 模型写完了，实际后半段根本不存在。中转站尤其常见：限流、超时、
+   * 上游 502 都可能让字节流在半句话上结束。
+   */
+  if (state.stopRequested) {
+    return hasText
+      ? { ok: true, text, message: '' }
+      : { ok: false, text: '', message: '已停止生成，这次没有拿到内容。重新发一次即可。' };
+  }
+  if (state.ended && !state.sawEnd && state.error === null) {
+    return hasText
+      ? {
+          ok: true,
+          text,
+          message:
+            `回复可能不完整：上游没有发结束标记就断开了连接（已收到 ${String(text.length)} 字）。` +
+            '后面那截没有传过来，可以直接再发一条让它接着写，或点 ↻ 重新生成。',
+        }
+      : {
+          ok: false,
+          text: '',
+          message:
+            '上游在生成过程中断开了连接，这次一个字的正文都没收到。' +
+            '稍后重试；如果每次都在同一处断，多半是中转站那边掐的，换一个接口再试。',
+        };
+  }
+
+  if (hasText) return { ok: true, text, message: '' };
 
   /*
    * ═══════════════════════════════════════════════════════════

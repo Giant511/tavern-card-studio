@@ -1486,32 +1486,83 @@ textarea,
   border-color: var(--nb-nebula-a);
 }
 
+/*
+ * 发送按钮（2026-11-22 改版：文字按钮，不是箭头图标）
+ *
+ * ## 三态，靠背景色区分
+ *
+ * ```text
+ *   不能发（输入框空）   浅灰底 + 灰字
+ *   能发                 蓝底 + 白字（比主题的紫更亮一档）
+ *   生成中               同一个位置变「停止」，蓝底
+ * ```
+ *
+ * ## 为什么不再用 `↑`
+ *
+ * 用户要求：「不要箭头的图标，把发送按键改成一个长方形的文字按钮
+ * 显示"发送"两个字」。`↑` 在别家是"发送"还是"换行"没有统一答案，
+ * 而这个位置**点错代价很大**（换行变发送、半句话就发出去了）。
+ *
+ * ## 为什么宽度是 `min-width` 而不是固定值
+ *
+ * 「发送」两个字 + 左右内边距在最小机型（320 逻辑像素）上要能放下，
+ * 又不能在宽屏上被拉成一条。`min-width` + `padding` 两者都满足，
+ * 且换语言（将来放英文）时不用改 CSS。§131 跨设备硬约束。
+ */
 .nb-send {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: var(--nb-icon-btn);
+  min-width: 64px;
   height: var(--nb-icon-btn);
+  padding: 0 var(--nb-sp-4);
   flex: 0 0 auto;
-  border: 1px solid var(--nb-glass-border);
+  border: 1px solid transparent;
   border-radius: var(--nb-radius-pill);
-  background: var(--nb-surface-2);
-  color: var(--nb-text-1);
-  font-size: var(--nb-fs-20);
+  /* 不能发：中性灰，不带紫调 —— 与蓝态拉开差别（token 见 nebula-tokens.css §1.2b） */
+  background: var(--nb-send-idle-bg);
+  color: var(--nb-send-idle-fg);
+  font-family: inherit;
+  font-size: var(--nb-fs-14);
+  line-height: var(--nb-lh-control);
+  font-weight: 600;
+  white-space: nowrap;
   cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
   transition:
-    opacity var(--nb-dur-micro) var(--nb-ease-out),
+    background-color var(--nb-dur-micro) var(--nb-ease-out),
+    color var(--nb-dur-micro) var(--nb-ease-out),
     transform var(--nb-dur-micro) var(--nb-ease-spring);
 }
 
-/* 发送按钮的强调：**文字/图标**用渐变（设计册 §1.2 第 3 条），底仍是玻璃 */
+/* 能发：蓝底白字（两个色都取自 `--nb-send-go-*`，见 nebula-tokens.css 的 §1.2b） */
 .nb-send[data-ready='true'] {
-  color: var(--nb-nebula-b);
-  border-color: var(--nb-nebula-a);
+  background: var(--nb-send-go-bg);
+  color: var(--nb-send-go-fg);
 }
 
+/*
+ * 生成中：同一个按钮变「停止」。
+ *
+ * `data-ready='false'` 只用于 `stopping`（已经发过 abort），
+ * 那时保持蓝底、压一点亮度 —— 灰掉会让人以为"点了没反应"。
+ */
+.nb-send[data-mode='stop'] {
+  background: var(--nb-send-go-bg);
+  color: var(--nb-send-go-fg);
+}
+
+.nb-send[data-mode='stop'][data-ready='false'] {
+  opacity: 0.7;
+}
+
+/*
+ * 禁用态不再叠透明度。
+ *
+ * 灰态本身就是"不可用"的表达，`opacity: 0.4` 叠上去会让灰字看不清；
+ * 而 `stopping` 那 0.7 已经在上面单独写了。
+ */
 .nb-send:disabled {
-  opacity: 0.4;
   cursor: default;
 }
 
@@ -3425,13 +3476,109 @@ textarea,
   z-index: 70;
   display: flex;
   align-items: flex-end;
+  /*
+   * ★★★ 软键盘避让（2026-11-22，用户报「记忆功能没做键盘适配」）。
+   *
+   * ## 为什么这里必须自己再算一遍
+   *
+   * 聊天页的避让写在 `.nb-app` 的 `padding-bottom` 上（见上面那段长注释）。
+   * 而底部面板是 `position: fixed; inset: 0`，**定位基准是视口** ——
+   * `.nb-app` 的 padding 对它**完全无效**。键盘弹起时面板仍然贴着
+   * 视口底边，下半截直接落在键盘后面。
+   *
+   * 记忆面板里全是 textarea，键盘一弹就盖住正在编辑的那条，
+   * 用户看不到自己在打什么。
+   *
+   * ## 为什么用 `max()` 两个变量
+   *
+   * ```text
+   *   --nb-kb-inset          JS 侧按 visualViewport 算（keyboard-inset.ts）
+   *   --nb-kb-inset-native   Android 侧在键盘动画过程中写（MainActivity）
+   * ```
+   *
+   * 两者各有覆盖不到的时刻（JS 监听的是 resize/scroll，
+   * 原生写的是动画帧），取 `max()` 与 `.nb-app` 那处一致。
+   *
+   * ## 为什么 `box-sizing`
+   *
+   * `inset: 0` 撑满视口，加 padding 若不改成 border-box 会算成
+   * "视口高 + padding" —— 内容盒反而变高，面板顶到屏幕外。
+   */
+  box-sizing: border-box;
+  /*
+   * ★ 两条声明，后一条覆盖前一条（2026-11-22）。
+   *
+   * `max()` 需要 Chrome 79+ / WebView 79+。项目 minSdk 是 24（Android 7），
+   * 那批机器上的 WebView 可能是老版本 —— `max()` 整条失效时，
+   * 只保留前一条 `padding-bottom: 0`，行为退回到"没有键盘避让"
+   * （也就是修之前的样子），**不会更糟**。
+   *
+   * 反过来只写 `max()` 一条的话，老 WebView 上这条属性直接无效，
+   * 而 `.nb-sheet` 的 `max-height` 也可能一起失效 —— 那是新问题。
+   *
+   * 这是 CSS 的标准降级写法：简单值在前，新语法在后。
+   */
+  padding-bottom: 0px;
+  padding-bottom: max(var(--nb-kb-inset, 0px), var(--nb-kb-inset-native, 0px));
   background: rgb(0 0 0 / 52%);
   animation: nb-mask-in var(--nb-dur-micro) var(--nb-ease-out);
 }
 
 .nb-sheet {
   width: 100%;
+  /*
+   * ★★★ 必须 border-box（2026-11-22 实测纠正）。
+   *
+   * `max-height` 默认约束的是**内容盒**，而本元素有
+   * `padding: var(--nb-sp-4)` + `padding-bottom: calc(... + env(...))`
+   * 合计约 33px。不加这条时，真机量到的是：
+   *
+   * ```text
+   *   可用高度（mask 内容盒）      1008
+   *   max-height                   1007   ← 只限内容盒
+   *   内容盒实测                    989    ← 没到上限，不裁
+   *   边框盒 = 989 + padding 33   1022   ← 超出可用 14px
+   *   ⇒ 顶边 = 1008 − 1022 = −14         ← 标题被顶出屏幕
+   * ```
+   *
+   * 那一行 14px 的溢出，**在只看 `computedStyle.maxHeight` 时完全看不出来**
+   * —— 它会显示 1007，看起来一切正常。是 `.verify/kb-avoidance-matrix.mjs`
+   * 量 `getBoundingClientRect()` 才暴露的。
+   */
+  box-sizing: border-box;
+  /*
+   * ## 上限 = min(78vh, 视口高 − 键盘高)
+   *
+   * ### 为什么不用 `100%`（2026-11-22 实测纠正）
+   *
+   * 第一版写的是 `min(78vh, 100%)`，想的是"父容器内容盒已经扣过键盘"。
+   * 无头 Chrome 实测（`.verify/kb-avoidance-matrix.mjs`）：
+   *
+   * ```text
+   *   视口 1408，键盘 400 ⇒ 可用 1008
+   *   min(86vh=1210, 100%=1008) 应该得 1008
+   *   实际 sheet 高 1022 > 1008     ← 百分比没生效
+   *   ⇒ 顶边 = 1008 − 1022 = −14    ← 冲出屏幕
+   * ```
+   *
+   * `max-height` 用百分比时，若解析链上任何一环的高度不是"确定值"，
+   * 百分比会被当成 `auto`。flex 项上这点尤其不可靠。
+   *
+   * 改成显式 `calc(100vh - 键盘高)` —— 与父容器内容盒是同一个基准
+   * （mask 是 `inset: 0`，padding-bottom 就是键盘高），但**不依赖
+   * 百分比解析**。
+   *
+   * ### 为什么写两条
+   *
+   * `min()` / `max()` / `calc()` 里嵌 `max()` 需要 Chrome 79+。
+   * 项目 minSdk 24，老 WebView 上后一条整条失效时会退回第一条 `78vh`——
+   * 也就是"没有键盘避让"，与修之前一致，不会更糟。
+   */
   max-height: 78vh;
+  max-height: min(
+    78vh,
+    calc(100vh - max(var(--nb-kb-inset, 0px), var(--nb-kb-inset-native, 0px)))
+  );
   overflow-y: auto;
   padding: var(--nb-sp-4);
   padding-bottom: calc(var(--nb-sp-4) + env(safe-area-inset-bottom, 0px));
@@ -5495,4 +5642,209 @@ textarea,
   line-height: 1.5;
   word-break: break-all;
   min-height: 0;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   角色级记忆（2026-11-22，v0.2.2）
+   ═══════════════════════════════════════════════════════════ */
+
+/*
+ * 记忆面板比普通 sheet 高一些。
+ *
+ * 普通 `.nb-sheet` 是 78vh，那对"三个按钮"够用；记忆要放多条可编辑框，
+ * 78vh 时列表区被压得很矮，用户得在小窗口里滚。
+ *
+ * ★ 上限同样用 `calc(100vh − 键盘高)` 而不是 `100%` —— 理由见 `.nb-sheet`
+ *   上方那段注释（百分比在 flex 项上的解析不可靠，实测差 14px 就冲出屏幕）。
+ */
+.nb-sheet--memory {
+  display: flex;
+  flex-direction: column;
+  /* 两条：`min()` 失效时退回第一条（老 WebView） */
+  max-height: 86vh;
+  max-height: min(
+    86vh,
+    calc(100vh - max(var(--nb-kb-inset, 0px), var(--nb-kb-inset-native, 0px)))
+  );
+  gap: var(--nb-sp-3);
+}
+
+.nb-memory-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--nb-sp-2);
+}
+
+.nb-memory-title {
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-16);
+  font-weight: 600;
+}
+
+/* 关闭按钮：不要占满一行，固定成一个方块 */
+.nb-memory-head .nb-sheet-action {
+  width: 40px;
+  min-height: 40px;
+  padding: 0;
+  font-size: var(--nb-fs-20);
+  line-height: 1;
+}
+
+/*
+ * 统计区。
+ *
+ * `flex: 0 0 auto` —— 它必须固定，不能被下面的列表挤掉。
+ * 三条提示里最要紧的是"超了多少"与"占比多少"，那是用户决定删不删的依据。
+ */
+.nb-memory-stats {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--nb-sp-3);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-surface-2);
+}
+
+.nb-memory-stats-main {
+  color: var(--nb-text-1);
+  font-size: var(--nb-fs-14);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 超限的数字用红色 —— 与置灰的保存按钮一起表达"现在存不了" */
+.nb-memory-stats-main[data-over='true'] {
+  color: var(--nb-danger);
+  font-weight: 600;
+}
+
+.nb-memory-stats-sub,
+.nb-memory-stats-warn {
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-12);
+  line-height: 1.5;
+}
+
+/* 占比过半：把那一行变红，用户一眼能看见 */
+.nb-memory-stats-sub[data-tone='tight'] {
+  color: var(--nb-danger);
+}
+
+.nb-memory-stats-warn[data-tone='over'] {
+  color: var(--nb-danger);
+}
+
+.nb-memory-stats-warn[data-tone='tight'] {
+  color: var(--nb-danger);
+}
+
+/*
+ * 列表区：唯一可滚的区域。
+ *
+ * `min-height: 0` 是 flex 子项能滚的前提 —— 少了它，子项的最小高度是内容高度，
+ * 整个 sheet 会被撑开而不是在这里滚（与 `.nb-app` 那处同一个理由）。
+ */
+.nb-memory-list {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--nb-sp-2);
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.nb-memory-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--nb-sp-2);
+}
+
+.nb-memory-index {
+  flex: 0 0 auto;
+  min-width: 18px;
+  padding-top: 10px;
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-12);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/*
+ * 记忆输入框。
+ *
+ * ★ 必须 `width: 100%` + `box-sizing: border-box`（memory §118 记过：
+ * `textarea` 的默认宽度来自 `cols`，不加这条就撑不满）。
+ */
+.nb-memory-input {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  padding: 10px var(--nb-sp-3);
+  border: 1px solid var(--nb-glass-border);
+  border-radius: var(--nb-radius-md);
+  background: var(--nb-surface-1);
+  color: var(--nb-text-1);
+  font-family: inherit;
+  font-size: var(--nb-fs-14);
+  line-height: 1.5;
+  box-sizing: border-box;
+  resize: none;
+  overflow-y: auto;
+}
+
+.nb-memory-input:focus {
+  border-color: var(--nb-nebula-a);
+  outline: none;
+}
+
+/* 删按钮：小方块，不抢视觉 */
+.nb-memory-row .nb-sheet-action {
+  flex: 0 0 auto;
+  width: 40px;
+  min-height: 40px;
+  padding: 0;
+  color: var(--nb-danger);
+  font-size: var(--nb-fs-12);
+}
+
+.nb-memory-empty {
+  padding: var(--nb-sp-4);
+  color: var(--nb-text-3);
+  font-size: var(--nb-fs-14);
+  line-height: 1.6;
+  text-align: center;
+}
+
+/*
+ * 底部按钮排。
+ *
+ * `flex: 0 0 auto` + 底部安全区：这一排必须一直可见，
+ * 否则用户改完看不到"保存"在哪。
+ */
+.nb-memory-footer {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--nb-sp-2);
+  padding-bottom: calc(var(--nb-sp-1) + env(safe-area-inset-bottom, 0px));
+}
+
+.nb-memory-footer .nb-sheet-action {
+  flex: 1 1 0;
+  min-height: 44px;
+  font-size: var(--nb-fs-16);
+}
+
+/*
+ * 置灰态。
+ *
+ * ★ 用 `[disabled]` 属性选择器而不是类名：`disabled` 是真的禁用（不触发 click），
+ * 类名只是视觉。两者都上，但语义在属性上。
+ */
+.nb-memory-footer .nb-sheet-action[disabled] {
+  border-color: var(--nb-glass-border);
+  color: var(--nb-text-3);
+  opacity: 0.5;
+  cursor: not-allowed;
 }

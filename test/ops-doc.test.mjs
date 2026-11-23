@@ -65,7 +65,13 @@ const PUBLISHED_DOCS = [
 
 const doc = existsSync(DOC) ? readFileSync(DOC, 'utf8') : '';
 const cli = readFileSync(CLI, 'utf8');
-const gitignore = readFileSync(GITIGNORE, 'utf8');
+/*
+ * `.gitignore` 不随仓库分发（2026-11-24 按用户要求从版本控制移除），
+ * 干净 clone 上没有这个文件。所以这里**不能**无条件读 ——
+ * 模块顶层抛 ENOENT 会让整个文件的所有判据一起崩，看起来像"这些测试全坏了"。
+ * 读不到时留空串，由用到它的那条判据自己跳过。
+ */
+const gitignore = existsSync(GITIGNORE) ? readFileSync(GITIGNORE, 'utf8') : '';
 
 /** 从 cli.ts 的内置帮助里取命令面（唯一来源，不在这里维护第二份清单） */
 function helpCommands() {
@@ -165,7 +171,20 @@ test('安全须知：密码只从 stdin、令牌可轮换、--bundle-root 不能
   assert.match(doc, /按 Ctrl\+C 停止/, '必须说明前台 serve 不是卡住');
 });
 
-test('.gitignore：docs 只放行名单内的文件，其余一律本地', () => {
+test('.gitignore：docs 只放行名单内的文件，其余一律本地', (t) => {
+  /*
+   * `.gitignore` 本身不入库（本仓库的取舍，见文件头的说明）。
+   * 没有它时无从校验这条 —— 但**语义上也不成立**：
+   * 没有忽略规则就没有"放行"这回事，docs 下的内部文档不会被任何规则挡在外面。
+   * 所以跳过，而不是判红。
+   *
+   * ★ 跳过要带理由（`t.skip(msg)`），不能用静默 `return` ——
+   *   静默通过会让人以为"这条守住了"，而实际是没查。
+   */
+  if (gitignore === '') {
+    t.skip('.gitignore 不在工作区（本仓库不跟踪它），跳过放行清单校验');
+    return;
+  }
   const lines = gitignore.split(/\r?\n/).map((line) => line.trim());
 
   // 目录级排除会让所有 `!` 失效 —— 必须排除"目录内容"

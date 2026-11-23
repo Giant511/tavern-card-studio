@@ -1120,6 +1120,28 @@ export class AppShell {
   private pendingChatSave: { messages: StChatMessage[]; avatar: string | null } | null = null;
 
   constructor(options: ShellOptions) {
+    /*
+     * ★★★ 把版本号写进全局，供诊断导出读取（2026-11-22）。
+     *
+     * ## 为什么必须在这里写
+     *
+     * `diagnostics/mobile-diag.ts` 的 `readVersionTag()` 读
+     * `globalThis.__TCS_VERSION__`，而在此之前**全仓库没有地方给它赋值** ——
+     * 于是用户导出的诊断日志头部永远是 `版本：unknown`。
+     *
+     * 那行恰恰是我判断"装的是哪个构建"的唯一依据。这轮排查里它就是
+     * unknown，我只能去数日志里有哪些诊断行反推，还差点反推错
+     * （把"装的是上一版"误判成"修复没生效"）。
+     *
+     * ## 为什么不直接在 mobile-diag 里 import 版本模块
+     *
+     * `settings/app-version.ts` 会 `import package.json`，那靠 Vite 内联；
+     * 而 Node ESM 要求 JSON import 带 `with { type: 'json' }`，
+     * 一 import 就让引入它的 DOM 判据整体崩（`ERR_IMPORT_ATTRIBUTE_MISSING`）。
+     * 在入口写全局，两边的约束都满足。
+     */
+    (globalThis as { __TCS_VERSION__?: string }).__TCS_VERSION__ = appVersion();
+
     this.doc = options.doc;
     this.options = options;
     this.apiState = options.apiState ?? DEFAULT_API_STATE;

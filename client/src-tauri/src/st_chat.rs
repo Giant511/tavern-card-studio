@@ -93,6 +93,11 @@ pub enum StreamEvent {
     Done {
         #[serde(rename = "streamId")]
         stream_id: u64,
+        /// 见过 。 且没被停止 ⇒ 连接中途断了，回复可能不完整
+        ///
+        /// 见  里  的注释。
+        #[serde(rename = "sawDone")]
+        saw_done: bool,
     },
     /// 出错。这里带的是给开发者看的原始信息，界面文案由前端翻译
     Error {
@@ -1339,16 +1344,31 @@ pub async fn st_chat_generate(
         );
 
         match result {
-            Ok(_stopped) => {
+            Ok(outcome) => {
                 /*
                  * 无论是自然结束还是被停止，**都要发 done**。
                  *
                  * 这是前端的"别再转了"信号：不发的话 UI 会永远停在
                  * streaming 状态，那个呼吸圆点一直在转，而用户看不出
                  * "其实已经停了"。
+                 *
+                 * ★ 带上 （2026-11-22）：
+                 *   连接被掐断与正常发完在字节流层面无差别，
+                 *   只有这个标记能让前端区分"完整回复"与"半截回复"。
                  */
-                log::info!(target: "st_generate", "emit done stream_id={stream_id}");
-                let _ = app.emit(STREAM_EVENT, StreamEvent::Done { stream_id });
+                log::info!(
+                    target: "st_generate",
+                    "emit done stream_id={stream_id} stopped={} saw_done={}",
+                    outcome.stopped,
+                    outcome.saw_done
+                );
+                let _ = app.emit(
+                    STREAM_EVENT,
+                    StreamEvent::Done {
+                        stream_id,
+                        saw_done: outcome.saw_done,
+                    },
+                );
             }
             Err(error) => {
                 let _ = app.emit(

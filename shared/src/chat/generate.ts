@@ -881,6 +881,45 @@ export function explainGenerateError(status: number, bodyPreview: string): strin
     return '请求太频繁，或被上游限流了。等一会儿再试。';
   }
   /*
+   * ★★★ 超上下文（2026-11-22，用户报「中转站报 max token 错误」）。
+   *
+   * ## 上游原话长什么样
+   *
+   * ```text
+   *   400 This model's maximum context length is 1048576 tokens.
+   *       However, you requested 1049987 tokens
+   *       (665987 in the messages, 384000 in the completion).
+   * ```
+   *
+   * ## 为什么不能落到兜底分支
+   *
+   * 兜底只截前 120 字，而这句话的**数字全在后半段** ——
+   * 用户拿到的会是一句没有数字、也没有处置办法的英文。
+   * 而这条错误有明确的两种改法（调窗口 / 减历史），说得清就该说清。
+   *
+   * ## 三个数字必须分开报
+   *
+   * ```text
+   *   消息 665987    ⇒ 历史带太多：把「上下文长度」调小，或删旧消息
+   *   回复 384000    ⇒ 「最大回复长度」给太大：降到窗口的 1/4 以内
+   * ```
+   *
+   * 只报总数的话，用户不知道该动哪一个。
+   */
+  if (looksLikeContextOverflow(bodyPreview)) {
+    const nums = parseContextOverflow(bodyPreview);
+    const detail =
+      nums === null
+        ? ''
+        : `（上游算的账：消息 ${nums.messages.toLocaleString('en-US')} + 回复 ${nums.completion.toLocaleString('en-US')} = ${nums.total.toLocaleString('en-US')} token）`;
+    return (
+      `这次请求的总量超过了模型的上限${detail}。\n` +
+      '两个地方会把它顶上去：① 带进上下文的历史太多 —— 到「我的 → API 连接 → 上下文预算」把「上下文长度」调小，它会决定带多少历史；' +
+      '② 「最大回复长度」给得太大 —— 降到窗口的四分之一以内。\n' +
+      '急着继续聊的话，先删掉几条很长的旧消息，或把角色记忆压短，再发一次。'
+    );
+  }
+  /*
    * ★★★ 400 + **裸** `{"error":true}`（2026-11-07，用户真机报的那条）。
    *
    * ## 这个形状是什么
@@ -1045,4 +1084,67 @@ function isBareErrorTrue(bodyPreview: string): boolean {
   const inner = m[1] ?? '';
   if (/message|detail|code|hint|reason/i.test(inner)) return false;
   return /["']?error["']?\s*:\s*true/.test(inner);
+}
+
+/**
+ * 上游是不是在说"超上下文了"（2026-11-22）。
+ *
+ * ## 为什么要单独认
+ *
+ * 这类错误**把数字写在正文里**，而那正是用户唯一能据此调参的东西。
+ * 落到兜底分支只会被截成半句英文（见 `explainGenerateError` 里那段注释）。
+ *
+ * ## 认关键词，不认整句
+ *
+ * 见过三种措辞（OpenAI 官方 / DeepSeek / 中转站转发）：
+ *
+ * ```text
+ *   maximum context length is N tokens
+ *   context_length_exceeded
+ *   This model's maximum context length …
+ *   reduce the length of the messages
+ *   too many tokens / exceeds the maximum
+ * ```
+ *
+ * 认其中任一即可 —— 各家换措辞的频率远高于换语义。
+ */
+export function looksLikeContextOverflow(bodyPreview: string): boolean {
+  const text = bodyPreview.toLowerCase();
+  if (text.includes('context_length_exceeded')) return true;
+  if (text.includes('maximum context length')) return true;
+  if (text.includes('reduce the length of the messages')) return true;
+  if (text.includes('exceeds the maximum') && text.includes('token')) return true;
+  if (text.includes('too many tokens')) return true;
+  return false;
+}
+
+/**
+ * 从超上下文错误里抠出三个数字。
+ *
+ * 原文形状（OpenAI 系，含中转站转发）：
+ *
+ * ```text
+ *   you requested 1049987 tokens (665987 in the messages, 384000 in the completion)
+ * ```
+ *
+ * 抠不到就返回 `null` —— 文案里那半句括注直接不显示，
+ * 不能因为解析失败就编一个数字出来。
+ */
+export function parseContextOverflow(
+  bodyPreview: string,
+): { total: number; messages: number; completion: number } | null {
+  const match =
+    /requested\s+([\d,]+)\s+tokens\s*\(\s*([\d,]+)\s+in the messages?\s*,\s*([\d,]+)\s+in the completion\s*\)/i.exec(
+      bodyPreview,
+    );
+  if (match === null) return null;
+  const toNumber = (raw: string | undefined): number => Number((raw ?? '').replace(/,/g, ''));
+  const total = toNumber(match[1]);
+  const messages = toNumber(match[2]);
+  const completion = toNumber(match[3]);
+  if (!Number.isFinite(total) || !Number.isFinite(messages) || !Number.isFinite(completion)) {
+    return null;
+  }
+  if (total <= 0 || messages <= 0) return null;
+  return { total, messages, completion };
 }

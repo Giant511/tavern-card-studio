@@ -26,8 +26,8 @@ import { el, type DocLike, type ElLike } from './chat-view.ts';
 
 /** 菜单中的一个动作 */
 export interface BubbleAction {
-  /** 稳定标识，方便判据钉住（`edit` / `copy` / `delete`） */
-  id: 'edit' | 'copy' | 'delete';
+  /** 稳定标识，方便判据钉住（`edit` / `copy` / `delete` / `memory`） */
+  id: 'edit' | 'copy' | 'delete' | 'memory';
   label: string;
   /** 危险动作用红色（删除） */
   danger?: boolean;
@@ -51,6 +51,16 @@ export interface BubbleMenuOptions {
    * Tauri / 普通 WebView / 测试 stub 各不一样，写死一种必然在另一种上失效。
    */
   writeClipboard: (text: string) => Promise<boolean>;
+  /**
+   * 「存为记忆」（2026-11-22，v0.2.2）。
+   *
+   * 不传 = 不显示这一项。传了就把当前这条的**原文**交给它，
+   * 由调用方打开记忆面板并预填。
+   *
+   * ★ 不做先调模型总结再存 —— 用户的 API 按次计费（5 元 ≈ 200 次），
+   * 每点一次就扣一次。而原文预填零成本，且用户比模型更清楚哪句要紧。
+   */
+  onSaveToMemory?: (text: string) => void;
   /** 关掉时回调（调用方用来清理引用） */
   onClose?: () => void;
 }
@@ -202,6 +212,26 @@ export function openBubbleMenu(
       },
     },
   ];
+
+  /*
+   * 「存为记忆」（2026-11-22）。
+   *
+   * 放在删除**之前**显示：删除是破坏性动作，位置越靠下越不容易误点。
+   *
+   * 只在调用方提供了回调时才加这一项 —— 没有当前角色（比如还没选卡）时
+   * 存了也没地方去，不如不显示。
+   */
+  if (options.onSaveToMemory !== undefined) {
+    const saveToMemory = options.onSaveToMemory;
+    actions.splice(actions.length - 1, 0, {
+      id: 'memory',
+      label: '存为记忆',
+      run: () => {
+        saveToMemory(options.text);
+        return true;
+      },
+    });
+  }
 
   const list = el(doc, 'div', 'nb-sheet-actions');
   let editBtn: ElLike = list;

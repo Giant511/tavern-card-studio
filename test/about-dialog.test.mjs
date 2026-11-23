@@ -229,7 +229,31 @@ test('★★★ 安卓端样式不许引用不存在的 token', () => {
   const used = [...withoutComments.matchAll(/var\((--nb-[a-z0-9-]+)/g)].map((m) => m[1]);
   const tokens = read('client/src/chat/nebula-tokens.css') + css;
 
-  const missing = [...new Set(used)].filter((v) => !new RegExp(v + '\\s*:').test(tokens));
+  /*
+   * ★ 运行时变量白名单（2026-11-22）。
+   *
+   * 这几个**本来就没有 CSS 声明** —— 值是运行时写进 `documentElement`
+   * 的 inline style，CSS 里只负责消费：
+   *
+   * ```text
+   *   --nb-kb-inset          keyboard-inset.ts（visualViewport）
+   *   --nb-kb-inset-native   MainActivity.kt（WindowInsets.Type.ime）
+   *   --nb-safe-top / -bottom  MainActivity.kt（状态栏 / 导航栏 inset）
+   * ```
+   *
+   * 它们不在白名单里就会被判成"引用不存在的 token" ——
+   * 那是**假报**，而假报多了这条判据就会被关掉。
+   */
+  const RUNTIME_VARS = new Set([
+    '--nb-kb-inset',
+    '--nb-kb-inset-native',
+    '--nb-safe-top',
+    '--nb-safe-bottom',
+  ]);
+
+  const missing = [...new Set(used)].filter(
+    (v) => !RUNTIME_VARS.has(v) && !new RegExp(v + '\\s*:').test(tokens),
+  );
   assert.deepEqual(missing, [], '引用了不存在的 token：' + missing.join(', '));
 });
 

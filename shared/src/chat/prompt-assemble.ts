@@ -39,6 +39,7 @@ import {
   INJECTION_ABSOLUTE,
 } from './prompt-config.js';
 import { type AuthorNoteConfig, shouldInjectAuthorNote } from './author-note.js';
+import { type MemoryEntry, memoryRole, renderMemoryBlock } from './memory.js';
 import type { PersonaPosition } from './persona.js';
 
 /**
@@ -102,6 +103,38 @@ export interface PromptAssembleInput {
    * 插入位置复用 `applyDepthInjections` —— 与 ST 的扩展注入同一条路。
    */
   authorNote?: AuthorNoteConfig;
+  /**
+   * 角色级记忆（2026-11-22，v0.2.2）。
+   *
+   * ## 插在哪
+   *
+   * `chatHistory` 展开**之前**，也就是「角色设定 / 世界书之后、聊天历史之前」：
+   *
+   * ```text
+   *   [system prompt]
+   *   [角色描述 / 人格 / 场景]
+   *   [世界书 before]
+   *   [★ 记忆]        ← 这里
+   *   [对话历史…]
+   *   [当前用户输入]
+   * ```
+   *
+   * ## 为什么不用 `injection.depth` 取一个大值来做
+   *
+   * `applyDepthInjections` 里是 `Math.max(0, messages.length - depth)` ——
+   * 历史短时它会退回 `index = 0`，反而插到 system prompt **前面**。
+   * 用户想要的是"在聊天记录最前面"，不是"在所有提示词之前"。
+   *
+   * ## 顺带的好处
+   *
+   * 位置固定在前 ⇒ 每次请求的前缀稳定 ⇒ 上游的 prompt cache 能命中。
+   * 放在靠近输入处则每次都变。
+   *
+   * 不传 / 空数组 = 不插（与"这个角色没有记忆"等价）。
+   */
+  memory?: readonly MemoryEntry[];
+  /** 记忆以什么身份插入。缺省 system */
+  memoryRole?: PromptRole;
 }
 
 /** 拼好的结果 */
@@ -471,6 +504,17 @@ export function assembleWithPrompts(input: PromptAssembleInput): PromptAssembleR
   let skippedEmpty = 0;
   let depthInjected = 0;
 
+  /*
+   * 记忆（2026-11-22）。算一次的文本，在 `chatHistory` 展开前推入。
+   *
+   * `memInjected` 用于兜底：如果用户的预设里**没有** `chatHistory` 标记位
+   * （极少见但可能，比如把历史删了），循环里就插不到。那种情况下在循环结束后
+   * 补在相对项末尾 —— 总比完全不生效好，而"完全不生效"正是最难发现的那种。
+   */
+  const memBlock = renderMemoryBlock(input.memory ?? []);
+  const memRole: PromptRole = input.memoryRole ?? 'system';
+  let memInjected = false;
+
   const order = input.config.order;
   const byId = new Map(input.config.prompts.map((one) => [one.identifier, one]));
 
@@ -509,6 +553,20 @@ export function assembleWithPrompts(input: PromptAssembleInput): PromptAssembleR
 
     /* 历史标记位：展开成多条 */
     if (prompt.identifier === 'chatHistory') {
+      /*
+       * ★ 记忆插在历史**之前**（2026-11-22）。
+       *
+       * 用户要的是「聊天记录的最前面」。这里就是那个位置：所有提示词槽位
+       * 已经走完，历史还没展开。不是真的插到 messages[0] —— 那会跑到
+       * system prompt 前面，部分模型会当成系统级命令而不是背景资料。
+       *
+       * `canTrim = false`：记忆是用户手写的、要长期生效的资料，
+       * 预算紧张时该裁的是历史，不是记忆（与作者注释一致）。
+       */
+      if (memBlock !== '') {
+        push(memRole, memBlock, false);
+        memInjected = true;
+      }
       const rows = historyToMessages(input, charName, userName);
       if (rows.length === 0) {
         skippedEmpty += 1;
@@ -534,6 +592,17 @@ export function assembleWithPrompts(input: PromptAssembleInput): PromptAssembleR
      */
     push(prompt.role, content, false, prompt.identifier === 'dialogueExamples');
     applied += 1;
+  }
+
+  /*
+   * 记忆兜底：预设里没有 `chatHistory` 标记位时，循环里插不到。
+   *
+   * 这里补一次。位置是**相对项走完之后**，也就是历史本该在的地方。
+   * 不补的话，用户会看到"我明明加了记忆，它完全不生效" —— 而界面上
+   * 一切都显示正常，这是最难归因的一类。
+   */
+  if (memBlock !== '' && !memInjected) {
+    push(memRole, memBlock, false);
   }
 
   /*
