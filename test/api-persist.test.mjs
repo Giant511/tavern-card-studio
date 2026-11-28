@@ -39,10 +39,11 @@ import {
   verifyConnectionPersisted,
 } from '../shared/dist/chat/api-persist.js';
 import { buildGenerateRequest } from '../shared/dist/chat/generate.js';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
-const shellSrc = () => readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+const shellSrc = () => readShellImplNoComments();
 const apiPageSrc = () => readFileSync(join(CHAT_DIR, 'api-page.ts'), 'utf8');
 
 /* ═══════════════════════════════════════════════════════════
@@ -353,7 +354,7 @@ test('★★ 三处都走同一个连接门（不能绕过 withConnection）', (
     '真正写秘钥的那一步要在连接门内部',
   );
 
-  const start = shell.indexOf('private async writeApiConnectionToSt');
+  const start = shell.indexOf('function writeApiConnectionToSt(host: SettingsHost');
   assert.ok(start > 0);
   const block = shell.slice(start, start + 4000);
 
@@ -391,7 +392,7 @@ test('★★★ 没填新 key 时不写 secrets（ST 是追加语义，别灌垃
    * 判据：只有用户**真的填了新 key**（`apiKey !== null` 且非空）才写。
    */
   const shell = shellSrc();
-  const start = shell.indexOf('private async writeApiConnectionToSt');
+  const start = shell.indexOf('function writeApiConnectionToSt(host: SettingsHost');
   assert.ok(start > 0);
   const block = shell.slice(start, start + 2200);
 

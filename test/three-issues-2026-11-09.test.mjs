@@ -24,6 +24,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 
@@ -152,8 +153,8 @@ test('★★★★ 世界书落地失败必须留下原因，不能空 catch', (
    * 后果：卡能用、书没进来、**界面上一个字都没有**。
    * 用户只能猜"是不是这张卡本来就没带世界书"。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
-  const body = methodBody(src, 'private async persistEmbeddedWorldbook');
+  const src = readShellImplNoComments();
+  const body = methodBody(src, 'function persistEmbeddedWorldbook(host: CardHost');
 
   assert.ok(body !== '', '找不到 persistEmbeddedWorldbook');
   assert.match(body, /catch \(error\)/, 'catch 要接住错误对象（不能是空 catch）');
@@ -172,7 +173,7 @@ test('★★★★ 「卡里没有书」与「有书但落地失败」必须分�
    * 混成一句"世界书未导入"会让没有书的卡也弹提示 —— 噪音换消息，
    * 用户很快就不看了。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   assert.match(src, /interface CardWriteResult/, '要有结果类型');
   assert.match(src, /worldbook:\s*'ok'\s*\|\s*'none'\s*\|\s*'failed'/, '三态要分清');
@@ -181,9 +182,9 @@ test('★★★★ 「卡里没有书」与「有书但落地失败」必须分�
 });
 
 test('★★★ 两条导入路径都要把世界书结果说出来', () => {
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
-  for (const fn of ['private async importLocalCard', 'private async importRepoVersion']) {
+  for (const fn of ['function importLocalCard(host: CardHost', 'function importRepoVersion(host: RepoHost']) {
     const body = methodBody(src, fn);
     assert.ok(body !== '', `找不到 ${fn}`);
     assert.match(body, /worldbook === 'failed'/, `${fn} 要把失败说出来`);
@@ -193,7 +194,7 @@ test('★★★ 两条导入路径都要把世界书结果说出来', () => {
    * 成功时也要提一句"含世界书「x」" —— 否则用户不知道书进来了。
    * 这比"没进来"更需要说：静默成功等于放弃一次确认机会。
    */
-  const local = methodBody(src, 'private async importLocalCard');
+  const local = methodBody(src, 'function importLocalCard(host: CardHost');
   assert.match(local, /含世界书/, '成功时要说明书也进来了');
 });
 
@@ -499,13 +500,13 @@ test('★★★★★ 写 key 只能有一个地方（两处都写会让 secrets
    * 现在分工：api-page 写，外壳只回读校验。
    */
   const api = stripComments(read('client/src/chat/api-page.ts'));
-  const shell = stripComments(read('client/src/chat/shell.ts'));
+  const shell = readShellImplNoComments();
 
   /* api-page 必须是写入点 */
   assert.match(api, /await bridge\.writeSecret\(/, 'api-page 要负责写入');
 
   /* shell 的 writeApiConnectionToSt 里不许再调 writeSecret */
-  const at = shell.indexOf('private async writeApiConnectionToSt');
+  const at = shell.indexOf('function writeApiConnectionToSt(host: SettingsHost');
   assert.ok(at > 0, '找不到 writeApiConnectionToSt');
   const body = shell.slice(at, at + 4000);
   assert.doesNotMatch(body, /bridge\.writeSecret\(/, '外壳不该再写一遍 key，否则 secrets 会翻倍');
@@ -526,8 +527,8 @@ test('★★★★★ 写完必须回读确认，不许只信 200', () => {
    * 所以保存流程必须用 `secretPresent()` 确认"引擎读得到"，
    * 而不是假定写成功。
    */
-  const shell = stripComments(read('client/src/chat/shell.ts'));
-  const at = shell.indexOf('private async writeApiConnectionToSt');
+  const shell = readShellImplNoComments();
+  const at = shell.indexOf('function writeApiConnectionToSt(host: SettingsHost');
   assert.ok(at > 0, '找不到 writeApiConnectionToSt');
   const body = shell.slice(at, at + 4000);
 

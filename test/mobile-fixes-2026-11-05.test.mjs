@@ -46,6 +46,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
 
@@ -57,7 +58,7 @@ function stripComments(source) {
 const mainSrc = stripComments(read('client/src/mobile/main.ts'));
 const focusSrc = stripComments(read('client/src/chat/focus-scroll.ts'));
 const panelSrc = stripComments(read('client/src/chat/chat-panel.ts'));
-const shellSrc = stripComments(read('client/src/chat/shell.ts'));
+const shellSrc = readShellImplNoComments();
 const settingsSrc = stripComments(read('client/src/chat/chat-settings.ts'));
 
 /* ═══════════════════════════════════════════════════════════
@@ -144,7 +145,7 @@ test('★★★ 切换仓库类型 = 登出（不许两套登录态并存）', (
    * ★ 谁想再改回"切回去自动恢复"，先解决"两个账号同时在线"这件事。
    */
   const shell = shellSrc;
-  const start = shell.indexOf('private async saveRepoConfig');
+  const start = shell.indexOf('function saveRepoConfig(host: RepoHost');
   assert.ok(start > 0, '找不到 saveRepoConfig');
   const block = shell.slice(start, start + 4200);
 

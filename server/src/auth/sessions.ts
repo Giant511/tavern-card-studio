@@ -151,13 +151,53 @@ export class SessionStore {
     return result.changes > 0;
   }
 
-  /** 吊销某用户的全部会话（改密码 / 禁用账户 / 管理员强制下线时用） */
-  revokeAllForUser(userId: string, reason: string, now = new Date()): number {
+  /**
+   * 吊销某用户的全部会话（改密码 / 禁用账户 / 管理员强制下线时用）。
+   *
+   * @param exceptSessionId 保留这一个会话不吊销。给"退出其它设备"用 ——
+   *   那种场景下把当前设备也踢掉，用户会以为自己被强制登出。
+   *   管理员强制下线**不传**这个参数（就是要全踢）。
+   */
+  revokeAllForUser(
+    userId: string,
+    reason: string,
+    now = new Date(),
+    exceptSessionId?: string,
+  ): number {
     const result = this.handle
       .prepare(
-        'UPDATE sessions SET revoked_at = ?, revoke_reason = ?, updated_at = ? WHERE user_id = ? AND revoked_at IS NULL',
+        `UPDATE sessions SET revoked_at = ?, revoke_reason = ?, updated_at = ?
+          WHERE user_id = ? AND revoked_at IS NULL AND id != ?`,
       )
-      .run(now.toISOString(), reason, now.toISOString(), userId);
+      .run(now.toISOString(), reason, now.toISOString(), userId, exceptSessionId ?? '');
+    return result.changes;
+  }
+
+  /*
+   * 功能
+   * 把同一设备（同 IP + 同 User-Agent）的旧会话吊销，让重新登录不堆设备行。
+   *
+   * 注意事项
+   * 判定只看 IP 与 UA，没有更强的设备标识：同一出口 IP 下两台同版本浏览器
+   * 会被当成同一台，登录时互相顶掉。这是修「每次刷新多一行登录设备」的代价，
+   * 写在 docs/server-developer.md 的会话说明里。
+   *
+   * 踩过的坑
+   * 只在签发新会话前调用。放进 refresh 里，每 15 分钟就会把同设备的其它标签页踢掉。
+   */
+  revokeSameDevice(
+    userId: string,
+    ip: string,
+    userAgent: string,
+    reason = 'replaced',
+    now = new Date(),
+  ): number {
+    const result = this.handle
+      .prepare(
+        `UPDATE sessions SET revoked_at = ?, revoke_reason = ?, updated_at = ?
+          WHERE user_id = ? AND ip = ? AND user_agent = ? AND revoked_at IS NULL`,
+      )
+      .run(now.toISOString(), reason, now.toISOString(), userId, ip, userAgent);
     return result.changes;
   }
 

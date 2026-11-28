@@ -30,12 +30,13 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
 const MOBILE_DIR = join(REPO, 'client', 'src', 'mobile');
 
-const shellSrc = () => readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+const shellSrc = () => readShellImplNoComments();
 const panelSrc = () => readFileSync(join(CHAT_DIR, 'chat-panel.ts'), 'utf8');
 const cssSrc = () => readFileSync(join(CHAT_DIR, 'chat.css'), 'utf8');
 

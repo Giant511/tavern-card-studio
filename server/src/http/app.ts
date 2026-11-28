@@ -20,6 +20,7 @@ import { registerAuthRoutes } from './auth-routes.js';
 import { registerRepoRoutes } from './repo-routes.js';
 import { registerAccountRoutes } from './account-routes.js';
 import { TrustProxyResolver, decideTokenGate } from '../net/trust-proxy.js';
+import { PasswordTicketStore } from '../auth/password-ticket.js';
 import { AuthService } from '../auth/service.js';
 import { LiveRegisterMode } from '../config-live.js';
 import { LoginLimiter, DEFAULT_RATE_LIMIT } from '../auth/login-limit.js';
@@ -193,8 +194,25 @@ function requireAdmin(gate: TokenGate, routeCtx: RouteContext, what: string): vo
   }
 }
 
-/** 审计用：操作者与来源地址（F13.1 要求"审计日志记录操作者"） */
-function auditActor(gate: TokenGate, routeCtx: RouteContext): { actor: string; ip: string | null } {
+/**
+ * 审计用：操作者与来源地址（F13.1 要求"审计日志记录操作者"）。
+ *
+ * ★ `ip` 必须走 `proxyResolver`，不能直接读 `socket.remoteAddress`（2026-11-24）。
+ *
+ * 反代部署下 socket 永远是代理自己的地址（同机反代就是 127.0.0.1），
+ * 于是所有删除/移动/清理事件在审计里都成了"来自 127.0.0.1"——
+ * 这条记录的唯一价值就是"谁从哪干的"，来源写错等于没写。
+ *
+ * 同一个文件里 `clientIp()` 已经是"按来源 IP 判定"的唯一入口
+ * （门禁、限速、令牌失败计数都走它），审计不该是唯一漏网的那条路径。
+ *
+ * @param resolveIp 由 `createApp` 传入 `clientIp`，保证与门禁同口径
+ */
+function auditActor(
+  gate: TokenGate,
+  routeCtx: RouteContext,
+  resolveIp: (ctx: RouteContext) => string,
+): { actor: string; ip: string | null } {
   const identity = gate.identify(routeCtx.req);
   const actor =
     identity === null
@@ -202,7 +220,7 @@ function auditActor(gate: TokenGate, routeCtx: RouteContext): { actor: string; i
       : identity.via === 'legacy'
         ? 'legacy'
         : (identity.username ?? identity.userId ?? 'unknown');
-  const ip = routeCtx.req.socket.remoteAddress ?? null;
+  const ip = resolveIp(routeCtx) || null;
   return { actor, ip };
 }
 
@@ -289,6 +307,13 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
    * 能否注册**永远同源** —— 不会出现"界面显示可注册、提交被拒"的错位。
    */
   const liveRegisterMode = new LiveRegisterMode(ctx.configPath, ctx.config.auth.registerMode);
+  /*
+   * 一次性临时密码（2026-11-25，运维兜底）。
+   *
+   * 运维在面板生成、用户拿「UID + 临时密码」改密码。两者共用同一张表，
+   * 只是实例不同（面板那个开在控制面进程里）。
+   */
+  const passwordTickets = new PasswordTicketStore(ctx.db.handle);
   const authService = new AuthService({
     config: ctx.config,
     users,
@@ -296,6 +321,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     limiter,
     repos,
     invites,
+    tickets: passwordTickets,
     liveRegisterMode: () => liveRegisterMode.current(),
   });
 
@@ -332,6 +358,16 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     repoTokens,
     repos,
     users,
+    /*
+     * 首个账户成为管理员时记一条 warn 事件（2026-11-24）。
+     *
+     * 不在 AuthService 里写：那个类没有 db 依赖，加进去要改它的构造与所有
+     * 测试装配；而这条记录的判据（role === 'admin' && open 模式）在路由层
+     * 就能完整判定。
+     */
+    appendEvent: (event) => {
+      ctx.db.appendEvent(event);
+    },
   });
 
   registerRepoRoutes(router, {
@@ -437,6 +473,46 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
    * 取而代之的门禁是**回环来源检查**。
    */
   router.get('/api/token', (_ctx) => {
+    /*
+     * ★★ 这个端点**不对外暴露响应体**（2026-11-24）。
+     *
+     * ## 为什么单独处理 CORS
+     *
+     * 全部响应默认带 `Access-Control-Allow-Origin: *`（客户端同源/原生通道需要）。
+     * 但 `*` 意味着**任意网页的 JS 都能读到响应体**。而取令牌是 GET、
+     * 不触发预检，同机访问时 socket 就是 127.0.0.1、门禁天然通过：
+     *
+     * ```text
+     *   fetch('http://127.0.0.1:8730/api/token').then(r => r.text())
+     * ```
+     *
+     * 公网页面一行就能拿全局令牌。所以这里把 ACAO 摘掉：
+     * 跨源 JS 读不到（浏览器不给读），而同源页面与原生通道（Tauri IPC /
+     * 安卓 Java 桥）发请求根本不看 CORS。
+     *
+     * ## 配合 Host 校验挡 DNS rebinding
+     *
+     * 攻击者可以让 `evil.com` 解析到 127.0.0.1，此时 Origin/Host 都是 evil.com。
+     * 只摘 ACAO 不够（某些场景下响应仍可能被读），所以再要求 Host 必须是
+     * "本机可识别的名字"。
+     */
+    _ctx.res.removeHeader('Access-Control-Allow-Origin');
+    _ctx.res.removeHeader('Access-Control-Expose-Headers');
+
+    const hostHeader = _ctx.req.headers.host ?? '';
+    if (!isLocalHostHeader(hostHeader)) {
+      throw new AppError(
+        403,
+        'TOKEN_LOCAL_ONLY',
+        `取令牌接口拒绝：Host「${hostHeader}」不是本机名`,
+        {
+          hint:
+            '这个接口只用于本机一键连接。请用 127.0.0.1 / localhost 访问，' +
+            '或在服务器上运行 `tcs-server token show`。',
+        },
+      );
+    }
+
     // 门禁分两层，缺一不可：
     //
     //   1. **有效 IP 必须是回环** —— 令牌不得出本机。
@@ -537,9 +613,21 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
 
   router.get('/api/events', (_ctx) => {
     const limit = queryInt(_ctx.query, 'limit', 50, 1, 500);
+    /*
+     * `account.*` 治理事件只给管理员（2026-11-24）。
+     *
+     * 那些事件没有 `card_id`（注销不针对某张卡），原来靠"card_id IS NULL
+     * 就全体可见"落进所有人的时间线 —— 而它们带的是别人的用户名 / uid /
+     * 操作者 / 来源 IP / 原因。一个只有 `read` 权限的仓库令牌就能拿到全站账户名录。
+     *
+     * 判据：管理员（legacy 或 admin jwt）才放行 `account.*`；
+     * 其余身份只看得到自己可见范围内的卡片事件与运维事件。
+     */
+    const identity = gate.identify(_ctx.req);
+    const includeAdminEvents = identity !== null && identity.role === 'admin';
     sendJson(_ctx.res, 200, {
       // 治理页要能看全站时间线（含跨账户删除），所以这条读也走 readScope
-      items: ctx.cards.events(limit, readScope(gate, _ctx)),
+      items: ctx.cards.events(limit, readScope(gate, _ctx), { includeAdminEvents }),
     });
   });
 
@@ -653,7 +741,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     // 而权限矩阵回归正是靠这一格抓到的（补丁式替换只改了 `scope: ...` 字面量，
     // 漏掉了这种先存进局部变量的写法）。
     const scope = mutationScope(gate, _ctx);
-    const audit = auditActor(gate, _ctx);
+    const audit = auditActor(gate, _ctx, clientIp);
     if (queryBool(_ctx.query, 'hard')) {
       requireAdmin(gate, _ctx, '彻底清除');
       const purged = await ctx.cards.purge(_ctx.params['id']!, { scope, ...audit });
@@ -669,7 +757,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     assertPermission(gate, _ctx, 'delete');
     const result = await ctx.cards.restore(_ctx.params['id']!, {
       scope: mutationScope(gate, _ctx),
-      ...auditActor(gate, _ctx),
+      ...auditActor(gate, _ctx, clientIp),
     });
     sendJson(_ctx.res, 200, result);
   });
@@ -680,7 +768,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     requireAdmin(gate, _ctx, '彻底清除');
     const result = await ctx.cards.purge(_ctx.params['id']!, {
       scope: mutationScope(gate, _ctx),
-      ...auditActor(gate, _ctx),
+      ...auditActor(gate, _ctx, clientIp),
     });
     sendJson(_ctx.res, 200, result);
   });
@@ -694,7 +782,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     }
     const result = await ctx.cards.prune(_ctx.params['id']!, seq, {
       scope: mutationScope(gate, _ctx),
-      ...auditActor(gate, _ctx),
+      ...auditActor(gate, _ctx, clientIp),
     });
     sendJson(_ctx.res, 200, result);
   });
@@ -710,7 +798,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
       // 跨账户移动只允许管理员的 jwt：仓库令牌的边界就是它绑定的仓库，
       // legacy 的可见范围已被降权，两者都不该借这一步扩大范围。
       allowCrossOwner: isAdminJwt(gate, _ctx),
-      ...auditActor(gate, _ctx),
+      ...auditActor(gate, _ctx, clientIp),
     });
     sendJson(_ctx.res, 200, result);
   });
@@ -752,7 +840,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     const declareMime = headerMime !== '' && headerMime.startsWith('image/')
       ? headerMime
       : (optional(_ctx.query, 'mime') ?? headerMime);
-    const actor = auditActor(gate, _ctx);
+    const actor = auditActor(gate, _ctx, clientIp);
 
     const result = await ctx.cards.setFace(_ctx.params['id']!, bytes, declareMime, {
       scope: readScope(gate, _ctx),
@@ -780,7 +868,7 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
 
   router.delete('/api/cards/:id/face', (_ctx) => {
     assertPermission(gate, _ctx, 'write');
-    const actor = auditActor(gate, _ctx);
+    const actor = auditActor(gate, _ctx, clientIp);
     const result = ctx.cards.deleteFace(_ctx.params['id']!, {
       scope: readScope(gate, _ctx),
       actor: actor.actor,
@@ -986,7 +1074,18 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
           pathname === '/api/auth/refresh' ||
           // v0.1.3 / F5 后半：仓库令牌校验。调用方此时正拿着一把尚未被认可的
           // 令牌、没有别的凭证 —— 它本身就是鉴权入口，不能过 TokenGate。
-          pathname === '/api/auth/repo-token');
+          pathname === '/api/auth/repo-token' ||
+          /*
+           * 2026-11-25：用「UID + 临时密码」重置密码。
+           *
+           * 调用方正是**登不上的人** —— 他没有任何凭证可用，过 TokenGate
+           * 就永远走不到这里（第一次实现漏了这一条，表现是"临时密码明明
+           * 是对的却回 401 缺少访问令牌"）。
+           *
+           * 安全性不靠 TokenGate：这里的凭证是「uid + 12 位一次性码」，
+           * 30 分钟过期、用一次即废，而且端点内部有独立的 IP 限速。
+           */
+          pathname === '/api/auth/reset-password');
       // `GET /api/auth/config` 也必须免鉴权（T10.7）：客户端要在**登录框出现之前**
       // 就知道该不该显示「注册」入口。它只回公开的策略（注册模式、版本号），
       // 不含任何账户信息 —— 因此没有信息泄露面。
@@ -1035,4 +1134,59 @@ export function createWorkerHandler(ctx: ServerContext): (req: IncomingMessage, 
     res.setHeader('Access-Control-Expose-Headers', 'ETag, X-TCS-Sha256, X-TCS-Audit-Source, X-TCS-Card-Id');
     void handler(req, res);
   };
+}
+
+/**
+ * Host 头是否是"本机可识别的名字"（2026-11-24）。
+ *
+ * 用途只有一处：`/api/token` 的 DNS rebinding 防线。攻击者可以让自己的域名
+ * 解析到 `127.0.0.1`，此时请求真的打到了本机服务，回环门禁也会通过 ——
+ * 唯一能区分的是 `Host`：它是攻击者的域名，不是本机名。
+ *
+ * 放行的形态：
+ *
+ * ```text
+ *   127.0.0.0/8 任意端口     本机直连的常规写法
+ *   localhost / *.localhost  RFC 6761 保留名
+ *   [::1] / ::1              IPv6 回环（带方括号是 URL 里的正规写法）
+ * ```
+ *
+ * 不放行空 Host：HTTP/1.0 或手工构造的请求可以不带 Host，
+ * 那种情况无法判断目标，按拒绝处理（宁可让 `/api/token` 不可用，
+ * 也不要在无法确认来源时发令牌 —— 用户还可以用 `tcs-server token show`）。
+ */
+export function isLocalHostHeader(hostHeader: string): boolean {
+  const raw = hostHeader.trim();
+  if (raw === '') return false;
+
+  // 去掉端口。IPv6 字面量形如 `[::1]:8730`，先处理方括号
+  let name = raw;
+  if (name.startsWith('[')) {
+    const end = name.indexOf(']');
+    if (end < 0) return false;
+    name = name.slice(1, end);
+    /*
+     * ★ 方括号后面只允许空或 `:端口`（2026-11-24）。
+     *
+     * 漏了这步的话 `[::1].evil.com` 会被解析成 `::1` 而放行 ——
+     * 判据 `token-endpoint-cors.test.mjs` 抓到的就是这个（它先红了一次）。
+     * Host 语法里 IPv6 字面量后面不可能跟域名。
+     */
+    const rest = raw.slice(end + 1);
+    if (rest !== '' && !/^:\d{1,5}$/.test(rest)) return false;
+  } else {
+    const colon = name.lastIndexOf(':');
+    // 只有一个冒号才当"主机:端口"；多个冒号说明是裸 IPv6（如 `::1`）
+    if (colon >= 0 && name.indexOf(':') === colon) name = name.slice(0, colon);
+  }
+  name = name.toLowerCase();
+
+  if (name === 'localhost' || name.endsWith('.localhost')) return true;
+  if (name === '::1') return true;
+  // 127.0.0.0/8 整段
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(name);
+  if (m !== null) {
+    return [m[1], m[2], m[3]].every((part) => Number(part) >= 0 && Number(part) <= 255);
+  }
+  return false;
 }

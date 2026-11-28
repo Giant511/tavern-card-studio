@@ -4,7 +4,8 @@
 
   const TOKEN_KEY = 'tcs.token';
   const state = {
-    token: localStorage.getItem(TOKEN_KEY) || '',
+    /* 启动时同时看 localStorage 与 sessionStorage，见下方 readStoredToken */
+    token: '',
     status: null,
     view: 'overview',
     timer: null,
@@ -137,6 +138,38 @@
     switchView('overview');
   }
 
+  /*
+   * 「记住这台设备」的存储位置。
+   *
+   * ```text
+   *   勾选    localStorage     关掉浏览器再打开也不用重输
+   *   不勾    sessionStorage   关掉标签页即失效（共用电脑时用这个）
+   * ```
+   *
+   * 两处都读：localStorage 优先 —— 勾过选的人不该因为某个残留的
+   * sessionStorage 而看到旧值。
+   */
+  const TOKEN_SESSION_KEY = 'tcs.token.session';
+
+  function readStoredToken() {
+    return localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_SESSION_KEY) || '';
+  }
+
+  function storeToken(token, remember) {
+    if (remember) {
+      localStorage.setItem(TOKEN_KEY, token);
+      sessionStorage.removeItem(TOKEN_SESSION_KEY);
+    } else {
+      sessionStorage.setItem(TOKEN_SESSION_KEY, token);
+      localStorage.removeItem(TOKEN_KEY);
+    }
+  }
+
+  function clearStoredToken() {
+    localStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(TOKEN_SESSION_KEY);
+  }
+
   $('login-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     const token = $('login-token').value.trim();
@@ -144,8 +177,9 @@
     state.token = token;
     try {
       await api('/control/status');
-      localStorage.setItem(TOKEN_KEY, token);
+      storeToken(token, $('login-remember').checked);
       $('login-token').value = '';
+      $('login-hint').textContent = '令牌只保存在本机浏览器里，不会上传到任何地方。';
       await enterApp();
     } catch (error) {
       state.token = '';
@@ -154,11 +188,11 @@
   });
 
   $('logout').addEventListener('click', () => {
-    localStorage.removeItem(TOKEN_KEY);
+    clearStoredToken();
     state.token = '';
     state.status = null;
     stopTimers();
-    showLogin();
+    showLogin('已断开。');
   });
 
   // ── 状态 ─────────────────────────────────────────────
@@ -175,7 +209,7 @@
       status = await api('/control/status');
     } catch (error) {
       if (error.status === 401) {
-        localStorage.removeItem(TOKEN_KEY);
+        clearStoredToken();
         state.token = '';
         stopTimers();
         showLogin('令牌已失效（可能被轮换），请重新输入。');
@@ -226,22 +260,88 @@
     $('svc-stop').disabled = !worker.pid;
     $('svc-restart').disabled = false;
 
-    if (running) void refreshStats();
-    else {
-      $('stat-cards').textContent = '—';
-      $('stat-versions').textContent = '—';
-      $('stat-bytes').textContent = '—';
-      $('stat-blobs').textContent = 'blob —';
+    /*
+     * 全站统计**不跟 worker 走**：控制面直接读库，worker 停着也能给出数量。
+     * 运维场景下「服务停了」正是最需要知道"我手上有多少数据"的时候，
+     * 原来这里一停就全抹成「—」，等于把最该看的信息藏起来了。
+     *
+     * blob 与代理生效情况来自数据面，那两项仍然要 worker 在跑才有。
+     */
+    /*
+     * 统计节流到 10 秒一次。
+     *
+     * `refreshStatus` 每 3 秒跑一次，而统计每次都要开一次 SQLite 连接读几个
+     * COUNT —— 运维数字不需要 3 秒的实时性，开库频率能省则省。
+     */
+    const now = Date.now();
+    if (now - statsFetchedAt >= 10000) {
+      statsFetchedAt = now;
+      void refreshStats().catch(() => {});
     }
+    if (running) void refreshDataPlaneStats();
+    else $('stat-blobs').textContent = 'blob —';
   }
+
+  /**
+   * 总览的全站统计。
+   *
+   * ## 为什么是 `/control/stats` 而不是 `/api/stats`
+   *
+   * `/api/stats` 按**凭证可见范围**过滤（那是客户端的正确语义：没人该从数字
+   * 推出别人有多少张卡）。但面板是运维视图 —— 管理员要看的是这台服务器的总量。
+   *
+   * 之前这里调 `/api/stats`，于是用管理员账户登录后看到的是「我自己 1 张卡」，
+   * 而库里其实有 3 张（另外两张属于普通账户）。数字本身没错，但回答了错误的问题。
+   *
+   * 控制面这条走**读库**，所以 worker 停着也照样有数 —— 运维时更需要知道现状。
+   */
+  /** 上次拉全站统计的时间（毫秒）。见 renderStatus 里的节流 */
+  let statsFetchedAt = 0;
 
   async function refreshStats() {
     try {
-      const stats = await api('/api/stats');
+      const stats = await api('/control/stats');
+      const accounts = stats.accounts || { total: 0, active: 0, disabled: 0 };
+      $('stat-accounts').textContent = String(accounts.total);
+      $('stat-accounts-sub').textContent =
+        accounts.disabled > 0
+          ? `个（${String(accounts.active)} 个正常 · ${String(accounts.disabled)} 个已禁用）`
+          : '个（全部正常）';
       $('stat-cards').textContent = String(stats.cards);
+      $('stat-repos').textContent = String(stats.repos);
       $('stat-versions').textContent = String(stats.versions);
       $('stat-bytes').textContent = fmtBytes(stats.bytes);
-      $('stat-blobs').textContent = `blob ${stats.blobs.count} 个 · ${fmtBytes(stats.blobs.bytes)}`;
+    } catch (error) {
+      /*
+       * 读不到就明说，不显示 0 ——
+       * 「0 张卡」和「读不到」在运维眼里是完全不同的两件事，
+       * 把后者显示成前者会让人以为数据丢了。
+       */
+      $('stat-accounts').textContent = '—';
+      $('stat-accounts-sub').textContent = '读不到统计';
+      $('stat-cards').textContent = '—';
+      $('stat-repos').textContent = '—';
+      $('stat-versions').textContent = '—';
+      $('stat-bytes').textContent = '—';
+      $('stat-blobs').textContent = 'blob —';
+      throw error;
+    }
+  }
+
+  /**
+   * blob 与「已生效代理」来自数据面的 `/api/stats`（控制面不提供这两项）。
+   *
+   * 它们**不是**账户维度的数据：blob 是全局去重存储，代理命中数是配置生效的信号。
+   * 所以即使 `/api/stats` 里的卡片数字按凭证过滤过，这两项仍是全站值，可以照用。
+   *
+   * worker 没跑时它会 503 —— 那种情况保持「—」，不当作错误。
+   */
+  async function refreshDataPlaneStats() {
+    try {
+      const stats = await api('/api/stats');
+      if (stats.blobs) {
+        $('stat-blobs').textContent = `blob ${String(stats.blobs.count)} 个 · ${fmtBytes(stats.blobs.bytes)}`;
+      }
       // 「已生效代理」= 真正匹配上并改写过身份的对端地址数（不是配置条数）。
       // 配置写了但地址写错时，这里会是 0 —— 这正是我们想让管理员看到的信号。
       if (stats.proxy) {
@@ -252,7 +352,7 @@
           : `${hits.length} 个已生效 / 共 ${stats.proxy.entries} 条规则${detail ? ` · ${detail}` : ''}`;
       }
     } catch {
-      /* worker 刚重启时可能短暂失败 */
+      /* worker 没在跑：blob 与代理保持「—」，不是错误 */
     }
   }
 
@@ -1110,7 +1210,8 @@
     try {
       const result = await api('/control/token/rotate', { method: 'POST' });
       state.token = result.token;
-      localStorage.setItem(TOKEN_KEY, result.token);
+      /* 轮换后按当前勾选状态写回：勾着就持久化，没勾就只留本次会话 */
+      storeToken(result.token, $('login-remember').checked);
       state.visibleToken = true;
       $('token-input').value = result.token;
       toast('令牌已轮换，新令牌已填入上方输入框');
@@ -1124,9 +1225,121 @@
   //
   // 这里的请求**不能**复用 api()：那个函数总是带面板的访问令牌，
   // 而治理需要管理员账户的 JWT（全局令牌已被降权，看不到别人账户的卡片）。
-  // 所以单独一个 govApi()，只带治理令牌，并且只放在 sessionStorage。
+  // 所以单独一个 govApi()，只带治理令牌。
+  //
+  // ## 两套存储，各管一件事
+  //
+  // ```text
+  //   sessionStorage  tcs.gov.token     access token（2 小时）。本标签页用，关掉即失效
+  //   localStorage    tcs.gov.remember  refresh token（30 天有效），前端只认 7 天
+  // ```
+  //
+  // 为什么不把 access token 存 localStorage：它 2 小时就过期，存了也没用，
+  // 白白多一个"长期躺在磁盘上的凭证"。
+  //
+  // 为什么用 refresh token 实现免密：它服务端可吊销（踢设备 / 改密码即失效），
+  // 而且换来的 access token 是短效的。比"把密码存起来自动重登"安全得多。
   const GOV_KEY = 'tcs.gov.token';
+  const GOV_REMEMBER_KEY = 'tcs.gov.remember';
+  const GOV_REMEMBER_DAYS = 7;
   let govToken = sessionStorage.getItem(GOV_KEY) || '';
+
+  /**
+   * 读「记住此设备」的现场。过期就地清掉并返回 null。
+   *
+   * 解析失败也清 —— 一份坏掉的 JSON 留在那里只会让每次进页面都失败一次。
+   */
+  function readGovRemember() {
+    let raw = null;
+    try {
+      raw = localStorage.getItem(GOV_REMEMBER_KEY);
+    } catch {
+      return null;
+    }
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed.refreshToken !== 'string' || parsed.refreshToken === '') {
+        localStorage.removeItem(GOV_REMEMBER_KEY);
+        return null;
+      }
+      if (typeof parsed.until !== 'number' || Date.now() >= parsed.until) {
+        localStorage.removeItem(GOV_REMEMBER_KEY);
+        return null;
+      }
+      return parsed;
+    } catch {
+      localStorage.removeItem(GOV_REMEMBER_KEY);
+      return null;
+    }
+  }
+
+  /**
+   * 记下 7 天免密。
+   *
+   * **每次 refresh 之后都要调一次**（服务端会轮换 refresh token），
+   * 否则存的是已作废的那一把，下次续期必然失败。
+   */
+  function saveGovRemember(refreshToken, user) {
+    if (typeof refreshToken !== 'string' || refreshToken === '') return;
+    try {
+      localStorage.setItem(
+        GOV_REMEMBER_KEY,
+        JSON.stringify({
+          refreshToken,
+          until: Date.now() + GOV_REMEMBER_DAYS * 24 * 60 * 60 * 1000,
+          username: user && user.username ? user.username : '',
+          role: user && user.role ? user.role : '',
+        }),
+      );
+    } catch {
+      /* 隐私模式下 localStorage 可能抛 QuotaExceeded —— 免密失效但不影响本次登录 */
+    }
+  }
+
+  function clearGovRemember() {
+    try {
+      localStorage.removeItem(GOV_REMEMBER_KEY);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** 剩余免密天数（给提示文案用） */
+  function govRememberDaysLeft() {
+    const remembered = readGovRemember();
+    if (!remembered) return 0;
+    return Math.max(1, Math.ceil((remembered.until - Date.now()) / (24 * 60 * 60 * 1000)));
+  }
+
+  /**
+   * 用 refresh token 换一个可用的 access token。
+   *
+   * 成功返回 user；失败返回 null 并清掉「记住」的现场 ——
+   * 失败的常见原因是密码改了 / 设备被踢 / 服务端清过会话，
+   * 那些情况下留着旧 refresh token 只会反复失败。
+   */
+  async function govRedeemRemembered() {
+    const remembered = readGovRemember();
+    if (!remembered) return null;
+    try {
+      const result = await govApi('/api/auth/refresh', {
+        method: 'POST',
+        body: JSON.stringify({ refreshToken: remembered.refreshToken }),
+      });
+      govToken = result.accessToken;
+      sessionStorage.setItem(GOV_KEY, govToken);
+      state.govUser = result.user || { username: remembered.username, role: remembered.role };
+      /* 服务端轮换了 refresh token，存回去 */
+      saveGovRemember(result.refreshToken, state.govUser);
+      return state.govUser;
+    } catch {
+      clearGovRemember();
+      govToken = '';
+      sessionStorage.removeItem(GOV_KEY);
+      return null;
+    }
+  }
 
   async function govApi(path, options = {}) {
     const headers = { ...(options.headers || {}) };
@@ -1155,38 +1368,81 @@
   function renderGovGate() {
     $('gov-login-card').hidden = govLoggedIn();
     $('gov-panel').hidden = !govLoggedIn();
-    if (govLoggedIn() && state.govUser) {
-      $('gov-who').textContent = `已登录：${state.govUser.username}（${state.govUser.role === 'admin' ? '管理员' : '普通账户'}）`;
-    }
+    if (!govLoggedIn()) return;
+    const who = state.govUser
+      ? `${state.govUser.username}（${state.govUser.role === 'admin' ? '管理员' : '普通账户'}）`
+      : '（身份读取失败，请点刷新重试）';
+    const days = govRememberDaysLeft();
+    $('gov-who').textContent = days > 0 ? `已登录：${who} · 本设备 ${String(days)} 天免密` : `已登录：${who}`;
+    /*
+     * 记住勾选的现场：上次勾了就把勾选框留成勾上的状态，
+     * 否则用户看到的默认值与实际行为不一致。
+     */
+    $('gov-remember').checked = days > 0;
   }
 
+  /*
+   * 登录进行中。Enter 和按钮点击是两条独立事件，只把按钮 disabled 挡不住
+   * password 框上的 Enter。重复提交会真的建出两条会话，是「每刷新一次多一条」
+   * 的半个来源。
+   */
+  let govLoginBusy = false;
+
   async function govLogin() {
+    if (govLoginBusy) return;
     const username = $('gov-username').value.trim();
     const password = $('gov-password').value;
     if (username === '' || password === '') {
       $('gov-login-msg').textContent = '请填写用户名与密码';
       return;
     }
+    govLoginBusy = true;
     $('gov-login').disabled = true;
     $('gov-login-msg').textContent = '登录中…';
     try {
       // 登录走 worker 的免鉴权端点（不需要面板令牌）
       const result = await govApi('/api/auth/login', {
         method: 'POST',
-        body: JSON.stringify({ username, password }),
+        /*
+         * 同一 IP + 同一浏览器重新登录时，顶掉旧会话。不勾「记住」时每次刷新
+         * 都要重新登录，不顶旧的，设备列表会越刷越长。
+         */
+        body: JSON.stringify({ username, password, reuseDevice: true }),
       });
       govToken = result.accessToken;
-      sessionStorage.setItem(GOV_KEY, govToken);
+      /*
+       * token 放哪，就是「7 天免密」的开关。
+       *
+       * 勾了：进 sessionStorage，刷新本标签页还能用；再靠 localStorage 里的
+       * refresh token 续期，7 天内重开浏览器也不用再输密码。
+       * 没勾：只留在内存里，刷新就回登录卡。两种行为必须真的不同，否则勾不勾
+       * 一个样（用户 2026-11-27 指出）。
+       */
+      if ($('gov-remember').checked) sessionStorage.setItem(GOV_KEY, govToken);
+      else sessionStorage.removeItem(GOV_KEY);
       state.govUser = result.user || { username, role: 'admin' };
+      /*
+       * 勾了「记住此设备 7 天」才存 refresh token。
+       *
+       * 不勾就清掉旧的 —— 否则上一次勾过留下的记录会让"这次没勾"
+       * 依然免密，与用户的意图相反。
+       */
+      if ($('gov-remember').checked) saveGovRemember(result.refreshToken, state.govUser);
+      else clearGovRemember();
       $('gov-password').value = '';
-      $('gov-login-msg').textContent = '';
+      $('gov-login-msg').textContent = $('gov-remember').checked
+        ? `登录成功，${String(GOV_REMEMBER_DAYS)} 天内免密码。`
+        : '登录成功。';
       renderGovGate();
       await loadGovernance();
     } catch (error) {
-      // 失败原因照服务端原话显示（INVALID_CREDENTIALS 之类），不本地化：
-      // 服务端刻意把"用户不存在/密码错/被锁"合并成一句，前端再拆就是帮倒忙
-      $('gov-login-msg').textContent = `登录失败：${error.message}`;
+      /*
+       * 直接显示服务端原话。锁定时它已经给出「账号已锁定，请 N 分钟后再试」；
+       * 前端再包一层会变成「登录失败：登录失败」。
+       */
+      $('gov-login-msg').textContent = error.message;
     } finally {
+      govLoginBusy = false;
       $('gov-login').disabled = false;
     }
   }
@@ -1195,20 +1451,241 @@
     govToken = '';
     state.govUser = null;
     sessionStorage.removeItem(GOV_KEY);
+    /* 退出就是"这台设备不再免密"，两处都清 */
+    clearGovRemember();
+    $('gov-login-msg').textContent = '';
     renderGovGate();
+  }
+
+  /**
+   * 进治理页时的会话准备。
+   *
+   * ```text
+   * 本次标签页已有 access token  → 直接用
+   * 没有，但有未过期的「记住」    → 用 refresh token 换一个
+   * 都没有                        → 显示登录卡
+   * ```
+   *
+   * 之前没有这一步：`state.govUser` 只活在内存在，刷新后虽然 token 还在
+   * （sessionStorage），但"已登录：xxx"变成「—」，看起来像掉线了。
+   */
+  async function ensureGovSession() {
+    if (govToken !== '') {
+      if (state.govUser === null) {
+        /*
+         * 身份不跟 access token 一起落本地，进页面时问一次服务端。
+         *
+         * 以前是从 remember 里回填用户名；没勾免登录时 remember 是 null，界面
+         * 就显示「已登录：（身份已恢复）」，用户只能退出重登才看到名字。现在
+         * 用当前 token 调 /api/auth/me。
+         */
+        try {
+          const me = await govApi('/api/auth/me');
+          const user = me && me.user ? me.user : null;
+          if (user) state.govUser = { username: user.username, role: user.role || me.role };
+        } catch (error) {
+          /*
+           * 401 是 access token 过期：清掉，交给下面的免密续期。断网、5xx 不能
+           * 清 token，否则网络抖一下就被登出；留着，下次进治理页再试。
+           */
+          if (error.status === 401) {
+            govToken = '';
+            sessionStorage.removeItem(GOV_KEY);
+          }
+        }
+      }
+      if (govToken !== '') return true;
+    }
+    const user = await govRedeemRemembered();
+    return user !== null;
   }
 
   async function loadGovernance() {
     if (!govLoggedIn()) return;
-    await Promise.all([loadGovAccounts(), loadGovRepos(), loadGovCards(), loadGovAudit()]);
+    await Promise.all([loadGovSessions(), loadGovAccounts(), loadGovRepos(), loadGovCards(), loadGovAudit()]);
   }
 
+  /**
+   * 登录设备列表（当前登录账户自己的会话）。
+   *
+   * ## 为什么这一块要能"踢"
+   *
+   * 用户改过密码之后，旧设备上的 refresh token 会被服务端连同会话一起吊销，
+   * 所以正常路径不用手动踢。真正需要踢的是两种情况：
+   *
+   * ```text
+   * ① 怀疑某个设备被别人用过（共用电脑、旧手机送人）
+   * ② 某个客户端反复触发限速，想立刻断掉它
+   * ```
+   *
+   * ## 为什么"当前设备"不给踢
+   *
+   * 踢掉自己 = 立刻掉线，而且用户点的时候不会预期到这一点
+   * （他以为在清理别处）。要退出当前设备，用「退出治理」。
+   */
+  async function loadGovSessions() {
+    const body = $('gov-sessions');
+    try {
+      const result = await govApi('/api/account/sessions');
+      const items = result.items || [];
+      if (items.length === 0) {
+        body.replaceChildren(govMessageRow(6, '没有活跃的登录设备'));
+        return;
+      }
+      renderGovTable(body, 6, items, (item) => {
+        const device = describeUserAgent(item.userAgent);
+        const cells = [
+          item.current ? `${device}（当前设备）` : device,
+          item.ip || '—',
+          fmtTime(item.createdAt),
+          fmtTime(item.lastSeenAt),
+          fmtTime(item.expiresAt),
+        ];
+        const action = document.createElement('span');
+        action.className = 'btn-group';
+        if (item.current) {
+          action.append(document.createTextNode('—'));
+        } else {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'btn btn-small btn-danger';
+          button.textContent = '退出';
+          button.dataset.role = 'gov-session-revoke';
+          button.dataset.sessionId = item.id;
+          button.addEventListener('click', async () => {
+            if (!window.confirm(`让这台设备（${device}）立即退出登录？`)) return;
+            try {
+              await govApi(`/api/account/sessions/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+              toast('已让该设备退出');
+              await loadGovSessions();
+            } catch (error) {
+              toast(error.message, true);
+            }
+          });
+          action.append(button);
+        }
+        return { cells, action };
+      });
+    } catch (error) {
+      body.replaceChildren(govMessageRow(6, `读取失败：${error.message}`));
+    }
+  }
+
+  /**
+   * 把 User-Agent 压成一句人话。
+   *
+   * 原样显示一长串 UA 在表格里只能看到前半截，而运维要判断的是
+   * "这是不是我自己的设备"，所以只留能区分平台与客户端的部分。
+   * 认不出来的原样截断 —— 猜错比不猜更糟。
+   */
+  function describeUserAgent(ua) {
+    const raw = typeof ua === 'string' ? ua.trim() : '';
+    if (raw === '') return '未知设备';
+    const lower = raw.toLowerCase();
+    const client = /tcs-shell|tauri|tavern/i.test(raw)
+      ? '桌面客户端'
+      : /taverncardstudio|okhttp/i.test(raw)
+        ? '手机 App'
+        : /edg\//i.test(lower)
+          ? 'Edge'
+          : /chrome\//i.test(lower) && !/edg\//i.test(lower)
+            ? 'Chrome'
+            : /firefox\//i.test(lower)
+              ? 'Firefox'
+              : /safari\//i.test(lower)
+                ? 'Safari'
+                : '其它客户端';
+    const os = /android/i.test(lower)
+      ? 'Android'
+      : /iphone|ipad|ios/i.test(lower)
+        ? 'iOS'
+        : /windows/i.test(lower)
+          ? 'Windows'
+          : /mac os|macintosh/i.test(lower)
+            ? 'macOS'
+            : /linux/i.test(lower)
+              ? 'Linux'
+              : '';
+    return os === '' ? client : `${client} · ${os}`;
+  }
+
+  /**
+   * 账户表最近一次拉到的全量数据（过滤在本地做，见 `renderGovAccounts`）。
+   *
+   * 为什么不在服务端过滤：这张表本来就一次拉全量（≤200 条），本地过滤
+   * 输入即响应、不发请求。服务端过滤要处理分页 + 匹配语义，
+   * 反而更容易出现"搜到了但数据其实不存在"这类问题。
+   */
+  let govAccountItems = [];
+
   async function loadGovAccounts() {
-    const body = $('gov-accounts');
     try {
       const result = await api('/control/accounts?limit=200');
-      const items = result.items || [];
-      renderGovTable(body, 7, items, (item) => {
+      govAccountItems = result.items || [];
+      renderGovAccounts();
+    } catch (error) {
+      govAccountItems = [];
+      $('gov-accounts').replaceChildren(govMessageRow(7, `读取失败：${error.message}`));
+      setAccountFilterHint('', 0);
+    }
+  }
+
+  /** 过滤框的值（每次渲染现读，避免与输入不同步） */
+  function accountFilterValue() {
+    const input = $('gov-account-filter');
+    return typeof input.value === 'string' ? input.value.trim() : '';
+  }
+
+  /**
+   * 按用户名或 uid 过滤。
+   *
+   * ## 为什么只按这两列
+   *
+   * 运维拿到的线索只有"客户报的那个用户名或 uid"：
+   *   · 用户名 —— 用户自己记得的可能就是它（大小写常记错，所以不区分大小写）
+   *   · uid    —— 审计与工单里以它为准，但它是 uuid 形态，眼睛无法匹配
+   * 角色 / 状态那种过滤属于"筛一批"，不是"找一个人"，不在这里做。
+   *
+   * `includes` 而不是 `startsWith`：改名后用户常记得旧名的一部分，
+   * 精确前缀匹配会让人以为"这个账户不存在"。
+   */
+  function filterGovAccounts(items, needle) {
+    if (needle === '') return items;
+    const lower = needle.toLowerCase();
+    return items.filter((item) => {
+      const username = typeof item.username === 'string' ? item.username.toLowerCase() : '';
+      const uid = typeof item.uid === 'string' ? item.uid.toLowerCase() : '';
+      return username.includes(lower) || uid.includes(lower);
+    });
+  }
+
+  /**
+   * 过滤结果提示。
+   *
+   * 「0 条」必须说清是"没有匹配"还是"没有数据" —— 前者要用户改关键词，
+   * 后者说明服务端还没人注册。两种情况看到的都是空表，不说清就会反复搜。
+   */
+  function setAccountFilterHint(needle, shown) {
+    const hint = $('gov-account-filter-hint');
+    if (needle === '') {
+      hint.hidden = true;
+      hint.textContent = '';
+      return;
+    }
+    hint.hidden = false;
+    if (shown === 0) {
+      hint.textContent = `没有匹配「${needle}」的账户。可以只输入用户名或 uid 的一部分。`;
+    } else {
+      hint.textContent = `匹配「${needle}」的账户 ${String(shown)} 个（共 ${String(govAccountItems.length)} 个）。`;
+    }
+  }
+
+  function renderGovAccounts() {
+    const body = $('gov-accounts');
+    const needle = accountFilterValue();
+    const items = filterGovAccounts(govAccountItems, needle);
+    setAccountFilterHint(needle, items.length);
+    renderGovTable(body, 7, items, (item) => {
         const cells = [item.username, item.uid || '—', item.role === 'admin' ? '管理员' : '普通', item.status === 'disabled' ? '已禁用' : '启用', fmtTime(item.createdAt), item.lastLoginAt ? fmtTime(item.lastLoginAt) : '—'];
         const action = document.createElement('span');
         action.className = 'btn-group';
@@ -1250,11 +1727,139 @@
         purgeButton.dataset.accountId = item.id;
         purgeButton.addEventListener('click', () => void govPurgeAccount(item));
         action.append(purgeButton);
+
+        /*
+         * 强制下线（2026-11-25）。
+         *
+         * 与「禁用」的区别：禁用是"以后不许登录"，强制下线是"现在正在用的立即失效"。
+         * 两件事都需要：怀疑账号被盗时先踢下线（不必封号），确认后再禁用。
+         *
+         * 走 govApi 直连 worker 的 /api/accounts/:id/revoke-sessions ——
+         * 那条路径带管理员 JWT，服务端会判 role === 'admin' 并记审计。
+         */
+        const revokeButton = document.createElement('button');
+        revokeButton.type = 'button';
+        revokeButton.className = 'btn btn-small';
+        revokeButton.textContent = '强制下线';
+        revokeButton.dataset.role = 'gov-account-revoke-sessions';
+        revokeButton.dataset.accountId = item.id;
+        revokeButton.addEventListener('click', async () => {
+          if (!window.confirm(`让「${item.username}」的所有设备立即退出登录？`)) return;
+          revokeButton.disabled = true;
+          try {
+            const result = await govApi(
+              `/api/accounts/${encodeURIComponent(item.id)}/revoke-sessions`,
+              { method: 'POST' },
+            );
+            toast(`已让「${item.username}」退出 ${String(result.revoked ?? 0)} 台设备`);
+          } catch (error) {
+            toast(error.message, true);
+          } finally {
+            revokeButton.disabled = false;
+          }
+        });
+        action.append(revokeButton);
+
+        /*
+         * 解除登录锁定（2026-11-25；v0.2.3 改成两维一次清）。
+         *
+         * 限速按用户名记账，任何人对着 admin 错 5 次就能把管理员锁在门外
+         * 10 分钟，反复做就是持续拒绝服务。另一台还登录着的设备可以立刻解开。
+         *
+         * 账户和 IP 必须一起清：`check()` 任一维被锁就拒，五次失败会把两个维度
+         * 都锁上。只清账户，用户仍被 IP 挡住，管理员看到的就是「点了没反应」。
+         * 代价是会顺带放行该地址上别人的失败记录；这些人下次失败会重新记账。
+         */
+        const unlockButton = document.createElement('button');
+        unlockButton.type = 'button';
+        unlockButton.className = 'btn btn-small';
+        unlockButton.textContent = '解除锁定';
+        unlockButton.dataset.role = 'gov-account-unlock-login';
+        unlockButton.dataset.accountId = item.id;
+        unlockButton.addEventListener('click', async () => {
+          unlockButton.disabled = true;
+          try {
+            const result = await govApi(
+              `/api/accounts/${encodeURIComponent(item.id)}/unlock-login`,
+              { method: 'POST', body: JSON.stringify({}) },
+            );
+            /*
+             * `cleared` 是实际清掉的锁定条目数，可能是 0：该账户当时没被锁，
+             * 用户可能记错了，或者已经自动过期。不说清，管理员会以为「点了
+             * 没反应」，然后反复点。
+             *
+             * 账户和 IP 一起清。只清账户时同一出口 IP 还锁着，用户重试登不上，
+             * 看起来就是「解除锁定无效」。
+             */
+            const cleared = Number(result.cleared ?? 0);
+            const clearedIps = Number(result.clearedIps ?? 0);
+            if (cleared === 0) {
+              toast(`「${item.username}」当前没有被锁定，不需要解除`);
+            } else {
+              toast(
+                `已解除「${item.username}」的登录锁定（账户 + ${String(clearedIps)} 条 IP 记录，共 ${String(cleared)} 条）`,
+              );
+            }
+          } catch (error) {
+            toast(error.message, true);
+          } finally {
+            unlockButton.disabled = false;
+          }
+        });
+        action.append(unlockButton);
+
+        /*
+         * 生成一次性临时密码（2026-11-25，运维兜底）。
+         *
+         * ## 流程
+         *
+         * ```text
+         *   运维点这里 → 拿到 "UID + 12 位临时密码"
+         *   运维念给用户（或截图发过去）
+         *   用户在客户端「账户」页选「用临时密码重置」
+         *     → 输入 UID + 临时密码 + 自己的新密码
+         * ```
+         *
+         * ## 为什么不是"运维直接设一个新密码念给他"
+         *
+         * 那样运维就知道了用户的最终密码（等于长期可冒充），而且用户往往
+         * 不会再去改一次。临时密码**不能登录、30 分钟过期、用一次即废**，
+         * 只能拿去做一件事：换成用户自己的密码。
+         *
+         * ## 为什么要把 UID 一起显示
+         *
+         * 用户手上只有"我记得我叫什么"，而凭据要的是 UID。运维点一次就得
+         * 把两样都给全，否则用户还得回头问一次"我的 UID 是多少"。
+         */
+        const ticketButton = document.createElement('button');
+        ticketButton.type = 'button';
+        ticketButton.className = 'btn btn-small';
+        ticketButton.textContent = '临时密码';
+        ticketButton.title = '生成一个 30 分钟有效、只能用一次、只能用来改密码的临时密码';
+        ticketButton.dataset.role = 'gov-account-temp-password';
+        ticketButton.dataset.accountId = item.id;
+        ticketButton.addEventListener('click', async () => {
+          if (!window.confirm(
+            `给「${item.username}」生成一次性临时密码？\n` +
+              '它 30 分钟内有效、只能用一次，且**不能用来登录**，只能用来重置密码。',
+          )) return;
+          ticketButton.disabled = true;
+          try {
+            const result = await api(
+              `/control/accounts/${encodeURIComponent(item.id)}/temp-password`,
+              { method: 'POST' },
+            );
+            showTicketDialog(result);
+          } catch (error) {
+            toast(error.message, true);
+          } finally {
+            ticketButton.disabled = false;
+          }
+        });
+        action.append(ticketButton);
+
         return { cells, action };
-      });
-    } catch (error) {
-      body.replaceChildren(govMessageRow(7, `读取失败：${error.message}`));
-    }
+    });
   }
 
   /**
@@ -1325,6 +1930,49 @@
     $('gov-purge-confirm-username').value = '';
     $('gov-purge-msg').textContent = '';
     purgeTarget = null;
+  }
+
+  /**
+   * 显示一次性临时密码。
+   *
+   * ## 为什么是弹窗而不是 toast
+   *
+   * toast 几秒就消失，而运维需要**复制**它粘到聊天窗口发给用户。
+   * 弹窗里的 input 可以选中、可以一键复制，也给了"关掉就看不到"的提醒位置。
+   *
+   * ## 为什么把 UID 一起给
+   *
+   * 用户手上的凭据是「UID + 临时密码」两件东西。只给密码的话，
+   * 用户还得回头问一次"我的 UID 是多少"—— 而 uid 恰好是用户最不可能记住的
+   * （uuid 形态）。运维点一次就把两样给全。
+   */
+  function showTicketDialog(result) {
+    $('ticket-for').textContent = `账户：${result.username}（${result.uid}）`;
+    $('ticket-uid').value = result.uid;
+    $('ticket-code').value = result.code;
+    const until = result.expiresAt ? fmtTime(result.expiresAt) : '30 分钟后';
+    $('ticket-hint').textContent =
+      `有效期到 ${until}。用户在客户端「账户 → 用临时密码重置」里填 UID 与这串密码，` +
+      '然后设置自己的新密码。它不能用来登录。';
+    $('ticket-overlay').hidden = false;
+    $('ticket-code').select();
+  }
+
+  function closeTicketDialog() {
+    $('ticket-overlay').hidden = true;
+    /* 关掉就把明文从 DOM 里抹掉 —— 免得它留在页面上被后续截图带出去 */
+    $('ticket-code').value = '';
+    $('ticket-uid').value = '';
+  }
+
+  async function copyText(text, label) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(`${label}已复制`);
+    } catch {
+      /* 剪贴板权限被拒时不要静默失败：让用户自己选 */
+      toast('复制失败，请手动选中文本复制', true);
+    }
   }
 
   async function govPurgeAccount(item) {
@@ -1559,6 +2207,43 @@
   });
   $('gov-logout').addEventListener('click', () => govLogout());
   $('gov-refresh').addEventListener('click', () => void loadGovernance());
+  $('gov-sessions-refresh').addEventListener('click', () => void loadGovSessions());
+  /*
+   * 账户过滤：边输入边过滤（本地，不发请求）。
+   *
+   * 用 `input` 而不是 `change` —— `change` 要等失焦才触发，
+   * 用户输完看着表格没变化会以为搜索坏了。
+   */
+  $('gov-account-filter').addEventListener('input', () => renderGovAccounts());
+  $('ticket-close').addEventListener('click', () => closeTicketDialog());
+  $('ticket-done').addEventListener('click', () => closeTicketDialog());
+  $('ticket-copy-both').addEventListener('click', () => {
+    const uid = $('ticket-uid').value;
+    const code = $('ticket-code').value;
+    if (uid === '' || code === '') return;
+    void copyText(`UID：${uid}\n临时密码：${code}`, 'UID 与临时密码');
+  });
+  $('gov-account-filter-clear').addEventListener('click', () => {
+    $('gov-account-filter').value = '';
+    renderGovAccounts();
+    $('gov-account-filter').focus();
+  });
+  $('gov-sessions-revoke-others').addEventListener('click', async () => {
+    /*
+     * 「退出其它设备」保留当前这一台。
+     *
+     * 为什么不逐个踢：用户清理旧设备时通常不知道哪台是哪台
+     * （尤其同一型号的手机），一条命令全清更符合意图。
+     */
+    if (!window.confirm('让除当前设备外的所有设备立即退出登录？')) return;
+    try {
+      const result = await govApi('/api/account/sessions/revoke-all', { method: 'POST' });
+      toast(`已让 ${String(result.revoked ?? 0)} 台设备退出`);
+      await loadGovSessions();
+    } catch (error) {
+      toast(error.message, true);
+    }
+  });
 
   // ── 视图切换 ─────────────────────────────────────────
   const TITLES = {
@@ -1602,7 +2287,15 @@
     if (view === 'api') { state.visibleToken = false; $('token-input').value = '（已隐藏，点击显示）'; }
     if (view === 'governance') {
       renderGovGate();
-      if (govLoggedIn()) void loadGovernance();
+      /*
+       * 先渲染一次（有 token 就直接是面板），再异步补会话 ——
+       * 免密路径要发一次 refresh 请求，不该让页面等它才切过去。
+       */
+      void (async () => {
+        const ok = await ensureGovSession();
+        renderGovGate();
+        if (ok) await loadGovernance();
+      })();
     }
   }
 
@@ -1652,6 +2345,14 @@
   const debugParams = new URLSearchParams(location.search);
   const readParam = (key) => debugParams.get(key) ?? hashParams.get(key);
   const govAutoLogin = readParam('gov') === '1';
+
+  /*
+   * 启动时取回令牌：localStorage（记住设备）优先，其次 sessionStorage（本次会话）。
+   *
+   * 必须在 `if` **之前**赋值 —— `state.token` 原来在对象字面量里直接读
+   * localStorage，加了 sessionStorage 这条分支后就只能在这里统一取。
+   */
+  state.token = readStoredToken();
 
   if (state.token) {
     enterApp()

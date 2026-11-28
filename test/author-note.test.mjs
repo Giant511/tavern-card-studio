@@ -34,6 +34,7 @@ import {
 } from '../shared/dist/chat/author-note.js';
 import { parsePromptConfig } from '../shared/dist/chat/prompt-config.js';
 import { BEHAVIOR_SECTION } from '../shared/dist/chat/settings-schema.js';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
@@ -258,7 +259,7 @@ test('★★ 外壳把作者注释交给了面板（接线不能漏）', () => {
    * 作者注释的读取在 `seedPromptConfig`，传递在 `renderChat` 的 ctx ——
    * 任一处漏了，用户改完注释都不会生效，而界面一切正常。
    */
-  const shell = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+  const shell = readShellImplNoComments();
 
   assert.match(shell, /resolveAuthorNoteConfig\(/, '要读 ST 的 note 配置');
   assert.match(shell, /authorNote: this\.authorNote/, '要传给面板 ctx');
@@ -283,7 +284,7 @@ test('★★★ 启动播种时必须把 authorNote 推给面板（不是只在�
    * 真机诊断（`__tcsPromptProbe__`）当时报 `hasAuthorNote: false` 而
    * `usePromptManager: true`，正是"预设读到了、只有注释这一路断了"。
    */
-  const shell = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+  const shell = readShellImplNoComments();
 
   /* 取 seedPromptConfig 的函数体（到下一个 private 方法为止） */
   const start = shell.indexOf('private async seedPromptConfig');

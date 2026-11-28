@@ -54,6 +54,28 @@ export interface AuthRouteDeps {
    * 显式 `trustProxy` 白名单列 v0.1.3。
    */
   clientIp: (ctx: RouteContext) => string;
+  /**
+   * 审计事件写入（2026-11-24 新增，可选）。
+   *
+   * 只为一件事：**首个账户自动成为管理员**时留一条可追溯的记录。
+   *
+   * 背景（报告 P1-9）：`auth.registerMode=open` 且首次部署时，第一个注册的人
+   * 拿到管理员权限 —— 这个设计本身合理（否则建完没人能管理），但它是"按顺序"
+   * 决定的：部署者晚几分钟注册，控制权就在别人手里。
+   *
+   * 原来的唯一提示是启动时的一条 warning，而且同一配置只打一次
+   * （去重后重启不再提示）。所以事故发生后翻日志也看不出"谁在什么时候
+   * 拿到了管理员"。
+   *
+   * 不给这个依赖时不影响注册（老装配不崩），只是没有那条审计。
+   */
+  appendEvent?: (event: {
+    at: string;
+    level: 'info' | 'warn' | 'error';
+    action: string;
+    cardId: string | null;
+    detail: Record<string, unknown>;
+  }) => void;
 }
 
 /** 把 AuthError 翻译成 HTTP 响应；非 AuthError 原样抛出交给统一错误处理 */
@@ -158,7 +180,34 @@ export function registerAuthRoutes(router: Registrar, deps: AuthRouteDeps): void
         sendJson(ctx.res, 201, { user: toPublicUser(result.user) });
         return;
       }
-      sendJson(ctx.res, 201, tokensPayload(toPublicUser(result.user), result.tokens));
+      /*
+       * 首个账户自动成为管理员时留痕（2026-11-24）。
+       *
+       * 判据是**新账户的 role**，不是"用户总数"—— 后者在并发注册下会漂移，
+       * 而 role 是这条记录本身携带的事实。
+       *
+       * 只在 `open` 模式下记：`invite` / `admin-only` 时管理员是别人授予的，
+       * 不存在"谁抢到第一个"这件事。
+       */
+      if (result.user.role === 'admin' && auth.registerMode === 'open') {
+        deps.appendEvent?.({
+          at: (deps.now?.() ?? new Date()).toISOString(),
+          level: 'warn',
+          action: 'account.bootstrap-admin',
+          cardId: null,
+          detail: {
+            userId: result.user.id,
+            username: result.user.username,
+            ip: deps.clientIp(ctx),
+            note: '自助注册模式下首个账户自动获得管理员权限',
+          },
+        });
+      }
+      sendJson(ctx.res, 201, {
+        ...tokensPayload(toPublicUser(result.user), result.tokens),
+        // 让客户端能直接把这句话显示出来，而不是让用户自己从 role 字段推断
+        ...(result.user.role === 'admin' ? { notice: '你是第一个账户，已获得管理员权限' } : {}),
+      });
     } catch (error) {
       rethrow(error);
     }
@@ -172,6 +221,7 @@ export function registerAuthRoutes(router: Registrar, deps: AuthRouteDeps): void
         password: str(body, 'password'),
         ip: deps.clientIp(ctx),
         userAgent: userAgent(ctx),
+        reuseDevice: body['reuseDevice'] === true,
       });
       sendJson(ctx.res, 200, tokensPayload(toPublicUser(result.user), result.tokens));
     } catch (error) {
@@ -246,6 +296,117 @@ export function registerAuthRoutes(router: Registrar, deps: AuthRouteDeps): void
       });
     });
   }
+
+  /**
+   * 从请求里取账户身份（jwt 专用）。
+   *
+   * 与 `account-routes.ts` 的同名局部函数同一条判据：仓库令牌与 legacy
+   * 全局令牌都没有"这是哪个账户"的身份，改密码/改名对它们无意义 ——
+   * 而如果放行，legacy 令牌会以空 userId 去改一个不存在的账户。
+   */
+  function requireAccountJwt(ctx: RouteContext): AuthContext & { userId: string } {
+    const caller = deps.identify(ctx);
+    if (caller === null) throw new AppError(401, 'UNAUTHORIZED', '需要账户登录');
+    if (caller.via !== 'jwt' || caller.userId === null) {
+      throw new AppError(403, 'FORBIDDEN', '这项操作需要账户登录（仓库令牌与全局令牌都不行）');
+    }
+    return caller as AuthContext & { userId: string };
+  }
+
+  /**
+   * 用「UID + 临时密码」重置密码（2026-11-25，运维兜底）。
+   *
+   * ## 为什么免鉴权
+   *
+   * 调用方正是"登不上的人" —— 他没有任何凭证可用。这里的三要素
+   * （uid / 临时密码 / 新密码）本身就是凭证。
+   *
+   * ## 为什么临时密码不能当密码用
+   *
+   * 它不在 `users.password_hash` 里，`/api/auth/login` 那条路根本不看它。
+   * 也就是说这个端点**只换密码，不发会话** —— 用户改完必须自己登录一次。
+   *
+   * ## 为什么要限速
+   *
+   * 临时密码是 12 位、30 分钟有效、一次即废，本来很难撞。
+   * 但这个端点免鉴权，不限速就等于给了一个可以无限试的入口。
+   * 复用登录那套 `LoginLimiter`（kind 用 `ip`，与登录共用同一个桶）——
+   * 它已经验证过"锁定期间不续期"那套取舍。
+   */
+  router.post('/api/auth/reset-password', async (ctx) => {
+    const body = bodyJson(ctx);
+    const ip = deps.clientIp(ctx);
+    /*
+     * 与登录共用 IP 桶：同一台机器既试密码又试临时密码，本来就该一起计数。
+     * 锁上了就按 429 回，不区分"是哪种尝试"。
+     */
+    const locked = deps.auth.ipLockState(ip);
+    if (locked.locked) {
+      throw new AppError(429, 'TOO_MANY_REQUESTS', '尝试次数过多，请稍后再试', {
+        retryAfterSeconds: locked.retryAfterSeconds,
+      });
+    }
+
+    try {
+      const result = await deps.auth.resetPasswordWithTicket({
+        uid: str(body, 'uid'),
+        code: str(body, 'code'),
+        newPassword: str(body, 'newPassword'),
+      });
+      deps.auth.clearIpFailures(ip);
+      sendJson(ctx.res, 200, { username: result.username, revoked: result.revoked });
+    } catch (error) {
+      /*
+       * 失败才记账。成功时 clean 掉 —— 与登录一致：
+       * 成功一次就把"这人刚才输错过"清零，避免正常用户被自己的手误拖进锁定。
+       */
+      deps.auth.recordIpFailure(ip);
+      rethrow(error);
+    }
+  });
+
+  /**
+   * 自助改密码（2026-11-25）。需要登录 + 当前密码。
+   *
+   * 成功后会**吊销全部会话**（含调用方自己）—— 客户端据 `revoked` 提示
+   * 用户"请用新密码重新登录"。
+   */
+  router.post('/api/account/password', async (ctx) => {
+    const caller = requireAccountJwt(ctx);
+    const body = bodyJson(ctx);
+    try {
+      const result = await deps.auth.changePassword({
+        userId: caller.userId,
+        currentPassword: str(body, 'currentPassword'),
+        newPassword: str(body, 'newPassword'),
+      });
+      sendJson(ctx.res, 200, { ok: true, revoked: result.revoked });
+    } catch (error) {
+      /* 不包这一层，AuthError（403 密码错 / 400 太短）会被当成 500 */
+      rethrow(error);
+    }
+  });
+
+  /**
+   * 自助改用户名（2026-11-25）。需要登录 + 当前密码。
+   *
+   * uid 不变（终身标识），会话不吊销（用户名只用于登录查表）。
+   */
+  router.post('/api/account/username', async (ctx) => {
+    const caller = requireAccountJwt(ctx);
+    const body = bodyJson(ctx);
+    try {
+      const result = await deps.auth.changeUsername({
+        userId: caller.userId,
+        currentPassword: str(body, 'currentPassword'),
+        newUsername: str(body, 'newUsername'),
+      });
+      sendJson(ctx.res, 200, { ok: true, username: result.username, uid: result.uid });
+    } catch (error) {
+      /* 重名 / 形状不合法是 400 + 原话，不是 500 */
+      rethrow(error);
+    }
+  });
 
   router.get('/api/auth/me', (ctx) => {
     const caller = deps.identify(ctx);

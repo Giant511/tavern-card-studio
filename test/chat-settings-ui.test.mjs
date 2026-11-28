@@ -24,11 +24,12 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
 
-const shellSrc = () => readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+const shellSrc = () => readShellImplNoComments();
 const settingsSrc = () => readFileSync(join(CHAT_DIR, 'chat-settings.ts'), 'utf8');
 const panelSrc = () => readFileSync(join(CHAT_DIR, 'chat-panel.ts'), 'utf8');
 
@@ -121,7 +122,7 @@ test('★★ 问题二：外壳必须给 onOpenGroup 赋值（否则点了没反
    * 没接线时它安静地什么也不做，不报错、不告警。
    */
   const src = shellSrc();
-  const cb = functionSource(src, 'private makeSettingsCallbacks');
+  const cb = functionSource(src, 'function makeSettingsCallbacks(host: SettingsHost)');
 
   assert.match(cb, /onOpenGroup:/, `makeSettingsCallbacks 必须给 onOpenGroup 赋值，实际：\n${cb.slice(0, 500)}`);
   assert.match(cb, /this\.chatSettingsRoute\s*=\s*groupId/, 'onOpenGroup 要把路由切到该组');
@@ -178,7 +179,7 @@ test('★ 问题二：返回方向按层走（分组页→菜单→聊天）', (
    * 逐条层级由 `test/back-navigation.test.mjs` 直接单测纯函数。
    */
   const src = shellSrc();
-  const cb = functionSource(src, 'private makeSettingsCallbacks');
+  const cb = functionSource(src, 'function makeSettingsCallbacks(host: SettingsHost)');
 
   assert.match(cb, /this\.goBackOneLevel\(\)/, 'onBack 要走统一入口');
 
@@ -246,7 +247,7 @@ test('★ 问题二：外壳的 loadSettings 失败时返回 null（不是空对
    * 返回 null 才会走上面那条"只给提示"的分支。
    */
   const src = shellSrc();
-  const cb = functionSource(src, 'private makeSettingsCallbacks');
+  const cb = functionSource(src, 'function makeSettingsCallbacks(host: SettingsHost)');
 
   /*
    * 2026-11-01 第五批把这里改成了 if/else 形状（因为要顺手记下失败原因，
@@ -272,7 +273,7 @@ test('★★ 问题二：保存走 mutateSettings，不许直接整份覆盖', (
    * 直接调它少一个字段就把用户设置清空了。
    */
   const src = shellSrc();
-  const cb = functionSource(src, 'private makeSettingsCallbacks');
+  const cb = functionSource(src, 'function makeSettingsCallbacks(host: SettingsHost)');
 
   assert.match(cb, /mutateSettings\(/, '保存必须走 mutateSettings');
   assert.doesNotMatch(

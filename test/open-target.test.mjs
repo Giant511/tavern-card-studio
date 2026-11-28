@@ -29,9 +29,10 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { decideOpenTarget, nameKey } from '../client/src/session/open-target.ts';
+import { readEditorImplNoComments } from './lib/editor-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
-const APP = readFileSync(join(ROOT, 'client/src/editor/app.ts'), 'utf8');
+const APP = readEditorImplNoComments();
 
 /** 去掉注释再匹配 —— 否则解释规则的文字会被当成代码（踩过） */
 const stripComments = (text) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
@@ -137,18 +138,55 @@ test('nameKey：空值三种写法都归一成空串', () => {
    ═══════════════════════════════════════════════════════════ */
 
 /** 取某个方法的函数体（按 `private ... 名字(` 定位到下一个同级 `\n  }`） */
+/**
+ * 切出一个函数/方法的完整源码。
+ *
+ * ★ 2026-11-24：改用「按形态找终点」。
+ *
+ * 前面试过两个都不行：
+ *   · `rest.indexOf('\n  }\n')` —— 类方法专属，模块函数没有这形态
+ *   · 大括号配对 —— 被**返回类型里的 `{`** 骗了：
+ *     `): Promise<{ mode: 'created' } | ...> {` 的第一个 `{` 是类型不是函数体
+ *
+ * 现在按签名形态分支，两种都用**行首缩进**判定结束，不会误命中类型里的 `}`：
+ *   · `function xxx(` → 模块函数，结束是 0 缩进的 `\n}\n`
+ *   · `private xxx(`  → 类方法，结束是 2 缩进的 `\n  }\n`
+ */
 function methodBody(source, signature) {
   const start = source.indexOf(signature);
   assert.notEqual(start, -1, `找不到方法：${signature}`);
+
+  const isModuleFn = signature.startsWith('function ');
   const rest = source.slice(start);
+
+  if (isModuleFn) {
+    /*
+     * 模块函数结束是 0 缩进的 `}`。
+     * 末尾那个函数后面没有换行（文件最后一行），所以要单独认 `\n}` + EOF。
+     */
+    const m = /\n\}\n|\n\}$/.exec(rest);
+    assert.notEqual(m, null, `方法 ${signature} 没有在预期位置结束`);
+    return rest.slice(0, m.index + m[0].length);
+  }
+
   const end = rest.indexOf('\n  }\n');
   assert.notEqual(end, -1, `方法 ${signature} 没有在预期位置结束`);
-  return rest.slice(0, end);
+  return rest.slice(0, end + '\n  }\n'.length);
 }
 
 test('★★★ JSON 打开路径走 openArrivedCard（不再直接 replaceCard）', () => {
-  const openCard = stripComments(methodBody(APP, 'private async openCard(): Promise<void> {'));
-  assert.match(openCard, /this\.openArrivedCard\(parsed\.card,\s*path\)/, 'JSON 打开必须走判定');
+  const openCard = stripComments(methodBody(APP, 'function openCard(host: OpenHost): Promise<void> {'));
+  /*
+     * 2026-11-24：三个函数搬到 open-actions.ts 后互相调用，
+     * 形态从 `this.openArrivedCard(a, b)` 变成 `openArrivedCard(host, a, b)`
+     * （normalizeReceiver 只归一位移符，不拆参数）。
+     * 判据钉"调了它、且传的是卡与路径"，不钉参数位置。
+     */
+  assert.match(
+    openCard,
+    /openArrivedCard\((?:this|host),\s*parsed\.card,\s*path\)/,
+    'JSON 打开必须走判定',
+  );
   assert.ok(
     !/this\.replaceCard\(parsed\.card\)/.test(openCard),
     '不许直接 replaceCard —— 那会把当前卡整个换掉（就是这次的 bug）',
@@ -156,8 +194,8 @@ test('★★★ JSON 打开路径走 openArrivedCard（不再直接 replaceCard�
 });
 
 test('★★★ PNG 卡打开路径走 openArrivedCard（设封面的分支除外）', () => {
-  const png = stripComments(methodBody(APP, 'private async openPngCard(path: string, cardsDir: string)'));
-  assert.match(png, /this\.openArrivedCard\(parsed\.card,\s*path\)/, 'PNG 卡必须走判定');
+  const png = stripComments(methodBody(APP, 'function openPngCard(host: OpenHost, path: string, cardsDir: string)'));
+  assert.match(png, /openArrivedCard\((?:this|host),\s*parsed\.card,\s*path\)/, 'PNG 卡必须走判定');
   assert.ok(!/this\.replaceCard\(parsed\.card\)/.test(png), '不许直接 replaceCard');
   /*
    * 纯图片（bare）分支保持"设为当前卡封面"—— 那不是"打开一张卡"，
@@ -167,7 +205,7 @@ test('★★★ PNG 卡打开路径走 openArrivedCard（设封面的分支除�
 });
 
 test('★★★ TXT 打开路径走 openTextCard（它自己判同名）', () => {
-  const openCard = stripComments(methodBody(APP, 'private async openCard(): Promise<void> {'));
+  const openCard = stripComments(methodBody(APP, 'function openCard(host: OpenHost): Promise<void> {'));
   /*
    * 不用正则（`/\.txt$/i` 这种写法在正则字面量里会把 `/` 当成结束符）。
    * 判断顺序即可：`.txt` 分支必须出现在 `openTextCard(` 之前，且两者挨得近。
@@ -191,7 +229,7 @@ test('★★★ openTextCard 自己判同名，并把结论交给导入', () => 
 
 test('★★★ openArrivedCard：覆盖前切标签 + 新建时沿用卡里的 cardId', () => {
   const body = stripComments(
-    methodBody(APP, 'private async openArrivedCard('),
+    methodBody(APP, 'function openArrivedCard(host: OpenHost, '),
   );
   assert.match(body, /if \(target\.sessionId !== this\.activeId\) this\.activateSession\(/, '覆盖前要切过去');
   assert.match(
@@ -208,9 +246,10 @@ test('★★★ 覆盖有未保存修改的同名卡必须先问（否则静默�
    * 旧版"打开即替换"本来就有这个洞，只是用户学会了先保存。现在覆盖只在
    * **同名**时发生，反倒更容易意外触发（以为在开新标签，结果撞上同名）。
    */
-  const body = stripComments(methodBody(APP, 'private async openArrivedCard('));
+  const body = stripComments(methodBody(APP, 'function openArrivedCard(host: OpenHost, '));
   assert.match(body, /victim\.dirty/, '要先看目标标签是否有未保存修改');
-  assert.match(body, /await this\.confirmOverwrite\(/, 'dirty 时必须走确认');
+  /* 2026-11-24：confirmOverwrite 搬到 dialogs.ts，调用形态变成直接调函数 */
+  assert.match(body, /confirmOverwrite\(/, 'dirty 时必须走确认');
   assert.match(
     body,
     /return \{ mode: 'cancelled'/,
@@ -220,8 +259,8 @@ test('★★★ 覆盖有未保存修改的同名卡必须先问（否则静默�
 
 test('★★ 取消覆盖时调用方不许继续做副作用（PNG 来源 / 状态栏）', () => {
   for (const sig of [
-    'private async openCard(): Promise<void> {',
-    'private async openPngCard(path: string, cardsDir: string)',
+    'function openCard(host: OpenHost): Promise<void> {',
+    'function openPngCard(host: OpenHost, path: string, cardsDir: string)',
   ]) {
     const body = stripComments(methodBody(APP, sig));
     assert.match(
@@ -234,12 +273,12 @@ test('★★ 取消覆盖时调用方不许继续做副作用（PNG 来源 / 状
 
 test('★★ 导入 TXT 的内部函数不许自己改落点（避免两套判定）', () => {
   const body = stripComments(
-    methodBody(APP, 'private async importCardTextFile(\n    fileName: string,'),
+    methodBody(APP, 'function importCardTextFile(host: OpenHost, \n  fileName: string,'),
   );
   /*
    * `importCardTextFile` 是"把文本写进**当前**会话"的执行者。
    * 它若也去判同名，就会与 `openTextCard` 形成两套判定 —— 迟早分叉。
    */
   assert.ok(!/decideOpenTarget/.test(body), '落点判定只许在 openTextCard 一处');
-  assert.match(body, /this\.session\.replaceCard\(this\.arriveCard\(decision\.card\)\)/, '它只负责写进当前卡');
+  assert.match(body, /replaceCard\(this\.arriveCard\(decision\.card\)\)/, '它只负责写进当前卡');
 });

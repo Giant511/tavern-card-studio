@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 
 import { parsePromptConfig } from '../shared/dist/chat/prompt-config.js';
 import { setPromptEnabled } from '../shared/dist/chat/prompt-toggle.js';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
@@ -161,7 +162,7 @@ test('★★★ 入口必须真的接上（漏了就是"页面上没这个按钮
    * 界面上看不到、点了没反应，而测试全绿。
    * 本项目已经犯过 6 次（memory §90.6）。
    */
-  const shell = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+  const shell = readShellImplNoComments();
 
   assert.match(shell, /onOpenPrompts: \(\) => \{/, '外壳必须给这个回调');
   assert.match(shell, /this\.chatSettingsRoute = 'prompts'/, '要能路由到那一页');
@@ -182,7 +183,7 @@ test('★★★ 开关必须真的写回 ST（不是只改内存）', () => {
    * 这就是"判据看错了对象"：它答的是"代码里有没有这句话"，
    * 而不是"这个函数有没有写回"。两个意思差得很远。
    */
-  const shell = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+  const shell = readShellImplNoComments();
 
   /*
    * ★ 2026-11-07 改：断言对象从 `savePromptToggle` 换成 `mutatePromptPreset`。
@@ -195,7 +196,7 @@ test('★★★ 开关必须真的写回 ST（不是只改内存）', () => {
    *   ① 真正的写回必须在那个公共函数里
    *   ② 开关那条路必须真的调它（不许自己再实现一份）
    */
-  const start = shell.indexOf('private async mutatePromptPreset');
+  const start = shell.indexOf('function mutatePromptPreset(host: PromptHost');
   assert.ok(start > 0, '找不到 mutatePromptPreset');
 
   /* 取到下一个方法边界（下一个 `private async ` / `private render` 之前） */
@@ -212,9 +213,14 @@ test('★★★ 开关必须真的写回 ST（不是只改内存）', () => {
   assert.match(block, /bridge\.presetSave\(/, '这个函数里必须写回预设');
 
   /* ② 开关那条路必须是**委托**，不是自己又写一遍 */
-  const toggleStart = shell.indexOf('private async savePromptToggle');
+  /*
+   * 锚点与终点都要认搬家后的形态（2026-11-24）：
+   * 函数在 prompt-actions.ts，终点是下一个 `export` 而不是 `\n  /**`。
+   */
+  const toggleStart = shell.indexOf('function savePromptToggle(host: PromptHost');
   assert.ok(toggleStart > 0, '找不到 savePromptToggle');
-  const toggleBlock = shell.slice(toggleStart, shell.indexOf('\n  /**', toggleStart + 10));
+  const toggleEnd = shell.indexOf('\nexport ', toggleStart + 10);
+  const toggleBlock = shell.slice(toggleStart, toggleEnd < 0 ? undefined : toggleEnd);
   assert.match(
     toggleBlock,
     /mutatePromptPreset\(\(body, config\) =>\s*setPromptEnabled\(/,
@@ -232,9 +238,9 @@ test('★★★ 写回后必须重新解析（否则聊天还用旧开关）', (
    *   推给面板。所以"重新解析"与"推给面板"之间的链路长了一环，
    *   这一环漏接的表现是**本角色的定制被静默清掉**。
    */
-  const shell = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+  const shell = readShellImplNoComments();
   /* 同上：重新解析现在在公共链路里 */
-  const block = shell.slice(shell.indexOf('private async mutatePromptPreset'));
+  const block = shell.slice(shell.indexOf('function mutatePromptPreset(host: PromptHost'));
 
   assert.match(block, /parsePromptConfig\(next\.body\)/, '写完要重新解析');
   assert.match(block, /this\.globalPromptConfig = fresh/, '解析结果要落到全局那份（不是合成结果）');

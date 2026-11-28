@@ -19,10 +19,18 @@
 
 import type { ServerConfigFile } from '../config.js';
 import { isRegisterMode } from '../config-live.js';
-import type { ErrorCode } from '../errors.js';
+import { AppError, type ErrorCode } from '../errors.js';
 import { LoginLimiter, DEFAULT_RATE_LIMIT, type LockState } from './login-limit.js';
-import { hashPassword, needsRehash, verifyPassword, verifyPasswordDummy, CREDENTIALS_REJECTED } from './password.js';
+import {
+  assertPasswordPolicy,
+  hashPassword,
+  needsRehash,
+  verifyPassword,
+  verifyPasswordDummy,
+  CREDENTIALS_REJECTED,
+} from './password.js';
 import { SessionStore } from './sessions.js';
+import type { PasswordTicketStore } from './password-ticket.js';
 import { signJwt } from './jwt.js';
 import { UserStore, assertUsernameShape, normalizeUsername, type UserRow } from '../storage/users.js';
 import type { RepoStore } from '../storage/repos.js';
@@ -42,6 +50,29 @@ export const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
  */
 export const REGISTRATION_REJECTED =
   '无法完成注册：请确认用户名符合规则（3–32 个字符，字母或数字开头，可用字母、数字、下划线、连字符、点）且未被占用';
+
+/**
+ * 临时密码被拒时**唯一**的一句话（2026-11-25）。
+ *
+ * 「uid 不存在」「码错了」「码过期」「码用过」「账户已注销」全用这一句 ——
+ * 否则这个免鉴权端点就是**枚举 uid 的探针**：攻击者能靠不同的错误消息
+ * 分辨"这个 uid 存在吗"。
+ */
+const TICKET_REJECTED = 'UID 或临时密码不正确，或临时密码已过期 / 已使用';
+
+/**
+ * 密码策略校验，把 `PasswordPolicyError` 翻成 `AuthError`。
+ *
+ * 为什么要转：那个错误是普通 Error，不转会被统一错误处理当成程序故障回 500，
+ * 而"密码太短"完全是用户能自己改对的事 —— 该是 400 + 一句人话。
+ */
+function assertPasswordPolicyOrThrow(plain: string): void {
+  try {
+    assertPasswordPolicy(plain);
+  } catch (error) {
+    throw new AuthError('BAD_REQUEST', (error as Error).message, 400);
+  }
+}
 
 export class AuthError extends Error {
   constructor(
@@ -95,6 +126,13 @@ export interface AuthServiceOptions {
    * 于是"面板上点开放"立刻生效，不需要重启。
    */
   liveRegisterMode?: () => ServerConfigFile['auth']['registerMode'];
+  /**
+   * 一次性临时密码（2026-11-25）。
+   *
+   * 给了就注册「UID + 临时密码 → 改密码」那条路径。不给时该端点报
+   * `SERVICE_UNAVAILABLE` —— 而不是退化成"跳过校验"。
+   */
+  tickets?: PasswordTicketStore;
   /** 注入时钟，便于测试过期/锁定 */
   now?: () => Date;
 }
@@ -107,6 +145,7 @@ export class AuthService {
   private readonly now: () => Date;
   private readonly repos: RepoStore | null;
   private readonly invites: InviteStore | null;
+  private readonly tickets: PasswordTicketStore | null;
   private readonly liveRegisterMode: (() => ServerConfigFile['auth']['registerMode']) | null;
 
   constructor(options: AuthServiceOptions) {
@@ -117,6 +156,7 @@ export class AuthService {
     this.now = options.now ?? (() => new Date());
     this.repos = options.repos ?? null;
     this.invites = options.invites ?? null;
+    this.tickets = options.tickets ?? null;
     this.liveRegisterMode = options.liveRegisterMode ?? null;
   }
 
@@ -184,6 +224,17 @@ export class AuthService {
     password: string;
     ip: string;
     userAgent: string;
+    /**
+     * 功能：同一设备（IP + UA）重新登录时，先把旧会话标记 `replaced`，
+     *   再签发新会话。
+     *
+     * 注意事项：只有管理面板传这个参数。桌面端与移动端不传：它们正常持有
+     *   refresh token，重复登录是用户的显式动作，多会话符合「登录设备」的原意。
+     *
+     * 踩过的坑：面板未勾「记住」时每次刷新都会重新登录，不顶掉旧会话的话，
+     *   登录设备每刷新一次多一行（2026-11-27 用户报的 P2）。
+     */
+    reuseDevice?: boolean;
   }): Promise<{ user: UserRow; tokens: IssuedTokens }> {
     const keys = { ip: input.ip, account: normalizeUsername(input.username ?? '') };
     const lock: LockState = this.limiter.check(keys, this.now());
@@ -201,10 +252,25 @@ export class AuthService {
     }
 
     if (lock.locked) {
-      // 锁定期间：即便密码正确也拒绝，且**响应与密码错一致**（不返回 retryAfter）
       this.limiter.recordFailure('ip', keys.ip, this.now());
       if (keys.account) this.limiter.recordFailure('account', keys.account, this.now());
-      throw new AuthError('INVALID_CREDENTIALS', CREDENTIALS_REJECTED, 401);
+      /*
+       * 功能：锁定期间直接回 423 ACCOUNT_LOCKED，文案说明是锁定而不是密码错。
+       *
+       * 注意事项：密码正确也拒绝。哈希必须在判 lock 之前算完（见上），
+       *   否则锁定态会比密码错快 20ms，等于广播锁定状态。
+       *
+       * 踩过的坑：旧行为复用 INVALID_CREDENTIALS，用户输对密码仍看到
+       *   「用户名或密码不正确」，只能反复试到 10 分钟后自动解锁，
+       *   既不知道要等多久，也不知道该找管理员。
+       */
+      const retryAfterSeconds = Math.max(1, Math.ceil(lock.retryAfterMs / 1000));
+      const minutes = Math.max(1, Math.ceil(retryAfterSeconds / 60));
+      const byAccount = keys.account ? this.limiter.state('account', keys.account, this.now()) : null;
+      const message = byAccount && byAccount.locked
+        ? `账号已锁定，请 ${String(minutes)} 分钟后再试，或联系管理员解除锁定`
+        : `登录尝试过于频繁，请 ${String(minutes)} 分钟后再试`;
+      throw new AuthError('ACCOUNT_LOCKED', message, 423, { retryAfterSeconds });
     }
 
     if (!user || !passwordOk) {
@@ -231,6 +297,9 @@ export class AuthService {
       }
     }
 
+    if (input.reuseDevice === true) {
+      this.sessions.revokeSameDevice(user.id, input.ip, input.userAgent, 'replaced', this.now());
+    }
     const tokens = this.issue(user, { ip: input.ip, userAgent: input.userAgent });
     return { user, tokens };
   }
@@ -446,12 +515,160 @@ export class AuthService {
   }
 
   /** 改密码 / 禁用时踢掉所有会话 */
-  revokeAll(userId: string, reason: string): number {
-    return this.sessions.revokeAllForUser(userId, reason, this.now());
+  /**
+   * 吊销某账户的全部会话。
+   *
+   * @param exceptSessionId 保留这一个（"退出其它设备"用）。管理员强制下线不传。
+   */
+  revokeAll(userId: string, reason: string, exceptSessionId?: string): number {
+    return this.sessions.revokeAllForUser(userId, reason, this.now(), exceptSessionId);
   }
 
   me(userId: string): UserRow | null {
     return this.users.findById(userId);
+  }
+
+  /**
+   * 免鉴权端点的限速门面（2026-11-25）。
+   *
+   * 路由不该直接操作 `LoginLimiter` —— 它的 `check` 要 ip + account 两个 key，
+   * 而"重置密码"只有 ip 可用。包一层的另一个原因是：以后若要给这类端点
+   * 换一套更严的阈值，只改这里。
+   */
+  ipLockState(ip: string): { locked: boolean; retryAfterSeconds: number } {
+    const state = this.limiter.state('reset-ip', ip, this.now());
+    return { locked: state.locked, retryAfterSeconds: Math.ceil(state.retryAfterMs / 1000) };
+  }
+
+  /** 记一次失败尝试（见 `ipLockState`） */
+  recordIpFailure(ip: string): void {
+    this.limiter.recordFailure('reset-ip', ip, this.now());
+  }
+
+  /** 成功时清零，避免正常用户被自己的手误拖进锁定 */
+  clearIpFailures(ip: string): void {
+    this.limiter.clearKind('reset-ip', ip);
+  }
+
+  /**
+   * 用户自助改密码（2026-11-25）。
+   *
+   * ## 为什么要旧密码
+   *
+   * 没有旧密码校验，任何拿到「已登录设备」的人都能把密码改掉并把主人踢下线 ——
+   * 那是账号被永久夺走的路径。旧密码是"你确实是本人"的最短证明。
+   *
+   * ## 为什么改完要吊销全部会话（含当前）
+   *
+   * 用户改密码的动机通常是"怀疑泄露"。保留当前会话没有安全收益，
+   * 却会出现"改了密码但别的设备还在用旧 refresh token 续期"。
+   * 所以全踢，用户用新密码重新登录一次 —— 客户端界面把这件事提前说清。
+   */
+  async changePassword(input: {
+    userId: string;
+    currentPassword: string;
+    newPassword: string;
+  }): Promise<{ revoked: number }> {
+    const user = this.users.findById(input.userId);
+    if (user === null) throw new AuthError('UNAUTHORIZED', '账户不存在', 401);
+
+    assertPasswordPolicyOrThrow(input.newPassword);
+    if (input.newPassword === input.currentPassword) {
+      throw new AuthError('BAD_REQUEST', '新密码不能与当前密码相同', 400);
+    }
+
+    const ok = await verifyPassword(user.password_hash, input.currentPassword);
+    if (!ok) throw new AuthError('FORBIDDEN', '当前密码不正确', 403);
+
+    const hash = await hashPassword(input.newPassword);
+    this.users.setPassword(user.id, hash);
+    const revoked = this.sessions.revokeAllForUser(user.id, 'password-change', this.now());
+    return { revoked };
+  }
+
+  /**
+   * 用户自助改用户名（2026-11-25）。
+   *
+   * ## 为什么也要密码
+   *
+   * 改用户名会让"日志里的旧名"与"现在的名"对不上，属于身份变更。
+   * 顺手拿到设备的人不该能做这件事 —— 与改密码同一条理由。
+   *
+   * ## uid 不变
+   *
+   * 这是整个设计的关键：用户名可改，uid 是终身标识（审计、工单、运维
+   * 定位都以它为准）。客户端界面上要把这句话说出来。
+   */
+  async changeUsername(input: {
+    userId: string;
+    currentPassword: string;
+    newUsername: string;
+  }): Promise<{ username: string; uid: string }> {
+    const user = this.users.findById(input.userId);
+    if (user === null) throw new AuthError('UNAUTHORIZED', '账户不存在', 401);
+
+    const ok = await verifyPassword(user.password_hash, input.currentPassword);
+    if (!ok) throw new AuthError('FORBIDDEN', '密码不正确', 403);
+
+    /*
+     * `setUsername` 抛的是 `UserExistsError` / 普通 Error（形状不合法），
+     * 它们不是 AuthError —— 不转就会被统一错误处理当成程序故障回 500。
+     * "重名"是用户能自己改对的事，必须是 400 + 原话。
+     */
+    let next: UserRow;
+    try {
+      next = this.users.setUsername(user.id, input.newUsername);
+    } catch (error) {
+      throw new AuthError('BAD_REQUEST', (error as Error).message, 400);
+    }
+    /*
+     * 不改密码，所以**不需要**踢会话：用户名只用于登录时查表，
+     * 已有会话绑的是 user_id。踢掉会让用户"只改了个名字就被登出"。
+     */
+    return { username: next.username, uid: next.uid };
+  }
+
+  /**
+   * 用「UID + 临时密码」重置密码（2026-11-25，运维兜底）。
+   *
+   * ## 临时密码只能做这一件事
+   *
+   * 它**不是密码**：`users.password_hash` 完全没被它替换，也不产生会话。
+   * 用户拿它来这里换一个新密码，票据随即作废。
+   *
+   * ## 失败一律同一句话
+   *
+   * 「uid 不存在」「码错了」「码过期了」「码用过了」全回同一句 ——
+   * 否则这个免鉴权端点就是**枚举 uid 的探针**。
+   */
+  async resetPasswordWithTicket(input: {
+    uid: string;
+    code: string;
+    newPassword: string;
+  }): Promise<{ username: string; revoked: number }> {
+    const tickets = this.tickets;
+    if (tickets === null) {
+      throw new AuthError('SERVICE_UNAVAILABLE', '临时密码功能未启用', 503);
+    }
+
+    assertPasswordPolicyOrThrow(input.newPassword);
+
+    const ticket = tickets.redeem({ uid: input.uid, code: input.code, now: this.now() });
+    if (ticket === null) {
+      throw new AuthError('UNAUTHORIZED', TICKET_REJECTED, 401);
+    }
+
+    const user = this.users.findById(ticket.user_id);
+    if (user === null) {
+      /* 账户在票据有效期内被注销：票据已经核销，这里只回报同一句 */
+      throw new AuthError('UNAUTHORIZED', TICKET_REJECTED, 401);
+    }
+
+    const hash = await hashPassword(input.newPassword);
+    this.users.setPassword(user.id, hash);
+    /* 改完踢掉全部会话：与自助改密码同一个理由 */
+    const revoked = this.sessions.revokeAllForUser(user.id, 'password-reset-via-ticket', this.now());
+    return { username: user.username, revoked };
   }
 }
 

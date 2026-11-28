@@ -193,6 +193,42 @@ export class UserStore {
     if (result.changes === 0) throw new UserNotFoundError(id);
   }
 
+  /**
+   * 改用户名（2026-11-25，运维代改：用户忘了自己的账号名）。
+   *
+   * ## 三件事必须一起做
+   *
+   * ```text
+   * ① 校验形状       与注册同一条规则（assertUsernameShape）
+   * ② 改 username_key 唯一性靠它（索引 idx_users_username_key）
+   * ③ 查重            大小写/首尾空格视为同一个名字（normalizeUsername）
+   * ```
+   *
+   * 只改 `username` 而漏掉 `username_key`，会出现"改名后登录不上"——
+   * 登录是按 key 查的（`findByUsernameKey`），那是极难查的故障。
+   *
+   * ## 为什么不做"最后一个管理员"保护
+   *
+   * 改名不会让人失去管理能力（他还是那个 admin 行），与禁用/降级不同。
+   * 唯一要防的是撞名，那已经在 ③ 处理。
+   */
+  setUsername(id: string, username: string, now = new Date().toISOString()): UserRow {
+    const next = username.trim();
+    assertUsernameShape(next);
+    const key = normalizeUsername(next);
+
+    const current = this.findById(id);
+    if (current === null) throw new UserNotFoundError(id);
+
+    const existing = this.findByUsernameKey(key);
+    if (existing !== null && existing.id !== id) throw new UserExistsError(next);
+
+    this.handle
+      .prepare('UPDATE users SET username = ?, username_key = ?, updated_at = ? WHERE id = ?')
+      .run(next, key, now, id);
+    return { ...current, username: next, username_key: key, updated_at: now };
+  }
+
   setStatus(id: string, status: UserStatus, now = new Date().toISOString()): void {
     const user = this.findById(id);
     if (!user) throw new UserNotFoundError(id);

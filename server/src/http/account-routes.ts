@@ -373,4 +373,192 @@ export function registerAccountRoutes(router: Registrar, deps: AccountRouteDeps)
       retentionDays: AUDIT_RETENTION_DAYS,
     });
   });
+
+  // ══════════════════════════════════════════════════════════
+  // 登录设备与会话（2026-11-24）
+  //
+  // 这一段把 `SessionStore` 的三个方法接上真实调用点。它们此前**没有任何
+  // 调用者**，而文档把"设备列表""改密码踢下线"写成了既有功能（报告 P2-3）：
+  //
+  // ```text
+  //   listActive(userId)        设备列表 —— 原来只在测试里被调过
+  //   revoke(id) / revokeAll    踢下线 —— 同上
+  //   prune()                   清理过期会话 —— 没有定时器调它，sessions 只增不减
+  // ```
+  //
+  // 三条路径分开：**看自己的**、**踢自己的**、**踢别人的**。前两条走账户 JWT，
+  // 第三条必须管理员。判据见 `test/session-management.test.mjs`。
+  // ══════════════════════════════════════════════════════════
+
+  /**
+   * 当前用户的活跃会话（"登录设备"列表）。
+   *
+   * 只返回**还活着**的会话（未吊销且未过期）。已吊销的不列 —— 那是"历史记录"，
+   * 与"我现在登录在哪几台设备上"是两个问题。真要查历史得看审计事件。
+   */
+  router.get('/api/account/sessions', (ctx) => {
+    const caller = requireAccountJwt(ctx, deps);
+    const now = deps.now?.() ?? new Date();
+    const rows = deps.sessions.listActive(caller.userId, now);
+
+    sendJson(ctx.res, 200, {
+      items: rows.map((row) => ({
+        id: row.id,
+        createdAt: row.created_at,
+        lastSeenAt: row.last_seen_at,
+        expiresAt: row.expires_at,
+        ip: row.ip,
+        userAgent: row.user_agent,
+        /** 是不是发起这次请求的那台设备 —— 界面上要能区分"当前设备" */
+        current: row.id === caller.sessionId,
+      })),
+    });
+  });
+
+  /**
+   * 登出指定设备（只能踢自己的）。
+   *
+   * 「不存在」与「不是你的」回同一个 404：与卡片 scope 同一条纪律 ——
+   * 如果"别人的会话"回 403、"不存在的"回 404，攻击者就能拿它当探针
+   * 枚举会话 id。会话 id 是 uuid，本来猜不到，但没必要留这个面。
+   */
+  router.delete('/api/account/sessions/:id', (ctx) => {
+    const caller = requireAccountJwt(ctx, deps);
+    const id = ctx.params['id'] ?? '';
+    if (id === '') throw new AppError(400, 'BAD_REQUEST', '缺少会话 id');
+
+    const target = deps.sessions.findById(id);
+    if (target === null || target.user_id !== caller.userId) {
+      throw new AppError(404, 'NOT_FOUND', '没有这个会话');
+    }
+
+    const revoked = deps.sessions.revoke(id, 'logout-device');
+    // 踢自己当前那台 = 登出。客户端拿到 `self: true` 应当回登录页而不是刷新列表
+    sendJson(ctx.res, 200, { id, revoked, self: id === caller.sessionId });
+  });
+
+  /**
+   * 退出所有**其它**设备（保留当前会话）。
+   *
+   * 语义刻意是"保留当前"：用户点这个按钮的诉求是"把别处的登录踢掉"，
+   * 顺手把自己也踢掉会让他以为操作失败（页面立刻要求重新登录）。
+   * 想连自己一起退，用登出即可。
+   */
+  router.post('/api/account/sessions/revoke-all', (ctx) => {
+    const caller = requireAccountJwt(ctx, deps);
+    const revoked = deps.sessions.revokeAllForUser(
+      caller.userId,
+      'revoke-others',
+      deps.now?.() ?? new Date(),
+      caller.sessionId ?? undefined,
+    );
+    deps.logger.warn('session.revoke-others', {
+      userId: caller.userId,
+      username: caller.username,
+      revoked,
+      ip: deps.clientIp(ctx),
+    });
+    sendJson(ctx.res, 200, { revoked });
+  });
+
+  /**
+   * 管理员强制某账户全部下线。
+   *
+   * 为什么这条必须有：账户被盗时，改密码不是万能的（攻击者手里的 refresh token
+   * 还能续期）。只有把会话全部吊销才能立刻断掉 —— 这也是 `revokeAllForUser`
+   * 的原始用途。
+   *
+   * 不排除任何会话（全踢）。管理员自己如果踢的是自己，会被一起登出 ——
+   * 这是正确行为，不该特殊照顾。
+   */
+  router.post('/api/accounts/:id/revoke-sessions', (ctx) => {
+    const caller = requireAccountJwt(ctx, deps);
+    if (caller.role !== 'admin') {
+      throw new AppError(403, 'ADMIN_ONLY', '强制下线仅管理员可用');
+    }
+    const target = deps.users.findById(ctx.params['id'] ?? '');
+    if (target === null) throw new AppError(404, 'NOT_FOUND', '账户不存在');
+
+    const revoked = deps.sessions.revokeAllForUser(
+      target.id,
+      'admin-revoke',
+      deps.now?.() ?? new Date(),
+    );
+    deps.db.appendEvent({
+      at: (deps.now?.() ?? new Date()).toISOString(),
+      level: 'warn',
+      action: 'account.revoke-sessions',
+      cardId: null,
+      detail: {
+        targetUserId: target.id,
+        targetUsername: target.username,
+        actor: caller.username ?? caller.userId,
+        ip: deps.clientIp(ctx),
+        revoked,
+      },
+    });
+    sendJson(ctx.res, 200, { id: target.id, username: target.username, revoked });
+  });
+
+  /**
+   * 管理员解除某账户的登录锁定（`LoginLimiter.unlock` 的调用点）。
+   *
+   * ## 为什么需要
+   *
+   * 限速规则是"5 次失败锁 10 分钟"，而且**账户维度**是按用户名记的。
+   * 所以任何人只要对着 `admin` 这个名字错 5 次，就能把管理员锁在门外 10 分钟 ——
+   * 反复做就是持续拒绝服务（`recordFailure` 里"锁定期间不续期"的取舍挡住了
+   * 无限延长，但挡不住"每 10 分钟锁一次"）。
+   *
+   * 解药就是这条：有另一台还登录着的设备（或另一个管理员）可以立刻解开。
+   *
+   * ## 两个维度一起解（v0.2.3 修正）
+   *
+   * `check()` 的判定是"IP 与账户**任一**被锁即拒"。五次失败会把两个维度都
+   * 锁上；只解账户的话，用户重试仍被 IP 那条挡住，表现就是「管理员点了解除，
+   * 用户还是登不上」。面板因此改成与 CLI 同口径：账户维度加上**全部** IP
+   * 记录一起清。
+   *
+   * `login_attempts` 按 `(kind, key)` 存，账户名与 IP 之间没有关联字段，
+   * 没法只清"这个账户失败过的 IP"；管理员做这个动作的诉求是让人能登进来，
+   * 被误放的 IP 会在下一次攻击时重新被限速记账。
+   */
+  router.post('/api/accounts/:id/unlock-login', (ctx) => {
+    const caller = requireAccountJwt(ctx, deps);
+    if (caller.role !== 'admin') {
+      throw new AppError(403, 'ADMIN_ONLY', '解除登录锁定仅管理员可用');
+    }
+    const target = deps.users.findById(ctx.params['id'] ?? '');
+    if (target === null) throw new AppError(404, 'NOT_FOUND', '账户不存在');
+
+    // 与 `AuthService.login` 记账时同一个 key 口径（normalizeUsername）
+    const key = normalizeUsername(target.username);
+    const clearedAccount = deps.limiter.unlock('account', key);
+    const clearedIps = deps.limiter.unlockAllOfKind('ip');
+    const cleared = clearedAccount + clearedIps;
+
+    deps.db.appendEvent({
+      at: (deps.now?.() ?? new Date()).toISOString(),
+      level: 'warn',
+      action: 'account.unlock-login',
+      cardId: null,
+      detail: {
+        targetUserId: target.id,
+        targetUsername: target.username,
+        actor: caller.username ?? caller.userId,
+        ip: deps.clientIp(ctx),
+        cleared,
+        clearedAccount,
+        clearedIps,
+      },
+    });
+
+    sendJson(ctx.res, 200, {
+      id: target.id,
+      username: target.username,
+      cleared,
+      clearedAccount,
+      clearedIps,
+    });
+  });
 }

@@ -12,6 +12,8 @@ import { Decoration, type DecorationSet } from '@codemirror/view';
 import {
   computeHighlightSpans,
   renderInlineHtml,
+  safeColorValue,
+  scopeCss,
   type CompiledHighlightRule,
   type HighlightContext,
   type HighlightRuleFile,
@@ -129,20 +131,29 @@ export function applySchemeStyles(scheme: HighlightRuleFile): void {
    */
   const theme = scheme.theme;
   if (theme) {
-    const vars = [`--tcs-fg:${theme.foreground}`, `--tcs-bg:${theme.background}`];
-    if (theme.caret) vars.push(`--tcs-caret:${theme.caret}`);
-    if (theme.selectionBackground) vars.push(`--tcs-selection:${theme.selectionBackground}`);
+    /*
+     * ★ 逐值过 `safeColorValue`（2026-11-24）。
+     *
+     * 这里是颜色值的**第三处**拼接点（另两处是 `renderInlineHtml` 的 style 属性
+     * 与 shared 的 `scopeCss`）。这些字符串进的是 `<style>` 的 CSS 文本，
+     * 一个 `}` 就能跳出规则块注入任意声明 —— 比属性注入更隐蔽。
+     *
+     * 不在这里各写一套白名单：共用 shared 的同一个函数，避免三条防线分叉。
+     */
+    const vars = [
+      `--tcs-fg:${safeColorValue(theme.foreground, 'inherit')}`,
+      `--tcs-bg:${safeColorValue(theme.background, 'transparent')}`,
+    ];
+    if (theme.caret) vars.push(`--tcs-caret:${safeColorValue(theme.caret, 'auto')}`);
+    if (theme.selectionBackground) {
+      vars.push(`--tcs-selection:${safeColorValue(theme.selectionBackground, 'transparent')}`);
+    }
     lines.push(`.cm-host, .preview { ${vars.join(';')} }`);
   }
 
   for (const scope of scheme.scopes) {
-    const decls = [`color:${scope.color}`];
-    if (scope.backgroundColor) decls.push(`background-color:${scope.backgroundColor}`);
-    if (scope.bold) decls.push('font-weight:600');
-    if (scope.italic) decls.push('font-style:italic');
-    if (scope.underline) decls.push('text-decoration:underline');
-    if (scope.strikethrough) decls.push('text-decoration:line-through');
-    lines.push(`.tcs-hl-${scope.id}{${decls.join(';')}}`);
+    // 声明串复用 shared 的 `scopeCss`：与预览/导出走同一份实现
+    lines.push(`.tcs-hl-${scope.id}{${scopeCss(scope)}}`);
   }
 
   let styleNode = document.getElementById('tcs-scheme-style') as HTMLStyleElement | null;

@@ -23,11 +23,12 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
 
-const shellSrc = () => readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+const shellSrc = () => readShellImplNoComments();
 const panelSrc = () => readFileSync(join(CHAT_DIR, 'chat-panel.ts'), 'utf8');
 
 test('★★★ 面板要真的按配置拼装（不是只把配置存起来）', () => {
@@ -86,10 +87,24 @@ test('★★ 切换预设后要重新解析提示词（否则换了预设提示�
    * 这种半生效最难归因：用户会以为模型不稳定。
    */
   const src = shellSrc();
-  const applyBlock = src.slice(src.indexOf('apply: async (name)'));
+  const applyAt = src.indexOf('apply: async (name)');
+  assert.ok(applyAt >= 0, '找不到 apply');
 
-  const samplingAt = applyBlock.indexOf('this.chatPanel?.setContext({ sampling:');
-  const promptAt = applyBlock.indexOf('promptConfig: this.promptConfig');
+  /*
+   * ★ 窗口收到「下一个回调名」为止（2026-11-24）。
+   *
+   * 原来写成 `src.slice(applyAt)` —— 一直切到文件尾。当时碰巧把
+   * `renderChat()` 里的 `promptConfig: this.promptConfig` 框了进来，
+   * 于是判据"通过"，但它查的根本不是 apply 里的代码。
+   * apply 搬到 settings-sections.ts 之后窗口里没有 renderChat 了，才暴露。
+   *
+   * 现在钉的是 apply 自己更新提示词的那一句：重算 promptFormats 并推给面板。
+   */
+  const applyEnd = src.indexOf('importFile: async', applyAt);
+  const applyBlock = src.slice(applyAt, applyEnd < 0 ? undefined : applyEnd);
+
+  const samplingAt = applyBlock.indexOf('setContext({ sampling:');
+  const promptAt = applyBlock.indexOf('setContext({ promptFormats:');
   assert.ok(samplingAt > 0, '切换后要更新采样');
   assert.ok(promptAt > 0, '切换后也要更新提示词配置');
   assert.ok(promptAt > samplingAt, '两处都该在 apply 成功分支里（顺序上提示词在后）');

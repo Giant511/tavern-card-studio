@@ -31,6 +31,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
 
@@ -39,7 +40,7 @@ function stripComments(source) {
 }
 
 const pageSrc = stripComments(read('client/src/chat/repo-page.ts'));
-const shellSrc = stripComments(read('client/src/chat/shell.ts'));
+const shellSrc = readShellImplNoComments();
 const css = read('client/src/chat/chat.css');
 
 /* ═══════════════════════════════════════════════════════════
@@ -64,17 +65,17 @@ test('★★★★ 四态齐备且挂在外壳上（切页面不丢）', () => {
   }
 
   /* 外壳必须有这三个字段（状态 / 说明 / 时间戳） */
-  assert.match(shellSrc, /private repoLink: RepoLinkState = 'unknown'/, '外壳要有 repoLink 字段');
-  assert.match(shellSrc, /private repoLinkDetail = ''/, '外壳要有 linkDetail');
-  assert.match(shellSrc, /private repoLinkCheckedAt = 0/, '外壳要有 linkCheckedAt');
+  assert.match(shellSrc, /^  link: RepoLinkState;$/m, '外壳要有 repoLink 字段');
+  assert.match(shellSrc, /^  linkDetail: string;$/m, '外壳要有 linkDetail');
+  assert.match(shellSrc, /^  linkCheckedAt: number;$/m, '外壳要有 linkCheckedAt');
 
   /* 而且必须是**字段**，不能是方法局部变量 */
-  const fieldAt = shellSrc.indexOf('private repoLink: RepoLinkState');
+  const fieldAt = shellSrc.indexOf('link: RepoLinkState');
   assert.ok(fieldAt > 0, '找不到 repoLink 字段声明');
 });
 
 test('★★★ 状态要传给页面（否则指示灯永远是灰的）', () => {
-  const at = shellSrc.indexOf('private repoStatus()');
+  const at = shellSrc.indexOf('function repoStatus(host: RepoHost)');
   assert.ok(at > 0, '找不到 repoStatus()');
   const body = shellSrc.slice(at, at + 900);
 
@@ -108,7 +109,7 @@ test('★★★★★ 401 必须算「在线」（连上 ≠ 登录）', () => {
    * 判据：判在线的条件是 `status > 0`（拿到了 HTTP 状态码），
    * 不是 `response.ok`（那会排除掉 401/403）。
    */
-  const at = shellSrc.indexOf('private async probeRepoLink()');
+  const at = shellSrc.indexOf('function probeRepoLink(host: RepoHost)');
   assert.ok(at > 0, '找不到 probeRepoLink()');
   const body = shellSrc.slice(at, at + 2600);
 
@@ -125,7 +126,7 @@ test('★★★★ 探测要打最轻的端点，不许拉卡片列表', () => {
    *
    * 探测必须轻，否则"亮个灯"就变成一次真实加载。
    */
-  const at = shellSrc.indexOf('private async probeRepoLink()');
+  const at = shellSrc.indexOf('function probeRepoLink(host: RepoHost)');
   const body = shellSrc.slice(at, at + 2600);
 
   assert.match(body, /\/version/, '探测要打 /version');
@@ -139,7 +140,7 @@ test('★★★ 地址没填好 ≠ 离线', () => {
    * 这时给 `offline` 是错的 —— 用户会去查网络，而实际要做的是**把地址填上**。
    * 所以保留 `unknown` 并写明原因。
    */
-  const at = shellSrc.indexOf('private async probeRepoLink()');
+  const at = shellSrc.indexOf('function probeRepoLink(host: RepoHost)');
   const body = shellSrc.slice(at, at + 2600);
 
   assert.match(
@@ -181,7 +182,7 @@ test('★★★★★ 切回来要先有内容（缓存列表 + 静默刷新）'
    * ③ 状态用 `null` 区分"还没拉"与"拉到了是空的"。
    */
   /* ① 一级：仓库列表缓存 */
-  assert.match(shellSrc, /private repoReposCache: RepoRow\[\] = \[\]/, '外壳要缓存仓库列表');
+  assert.match(shellSrc, /^  reposCache: RepoRow\[\];$/m, '外壳要缓存仓库列表');
   assert.match(pageSrc, /onCachedRepos: \(\) => RepoRow\[\]/, '回调要声明 onCachedRepos');
   assert.match(pageSrc, /const cachedRepos = callbacks\.onCachedRepos\(\)/, '进页面要同步取缓存');
   assert.match(pageSrc, /paintRepos\(host, cachedRepos\)/, '有缓存要先画出来');
@@ -190,12 +191,12 @@ test('★★★★★ 切回来要先有内容（缓存列表 + 静默刷新）'
   /* ② 二三级：状态由外壳持有，进页面前就准备好 */
   assert.match(
     shellSrc,
-    /private repoCardsState: RepoCardRow\[\] \| null = null/,
+    /^  cardsState: RepoCardRow\[\] \| null;$/m,
     '二级的卡片状态要挂在外壳上',
   );
   assert.match(
     shellSrc,
-    /private repoVersionsState: RepoVersionRow\[\] \| null = null/,
+    /^  versionsState: RepoVersionRow\[\] \| null;$/m,
     '三级的版本状态要挂在外壳上',
   );
 
@@ -342,7 +343,7 @@ test('★★★★ 登录态要传到指示灯（否则永远显示「已连接�
   );
   assert.match(pageSrc, /linkLabel\(state, loggedIn\)/, '要参与文案计算');
 
-  const loginAt = shellSrc.indexOf('private async repoLoginWith');
+  const loginAt = shellSrc.indexOf('function repoLoginWith(host: RepoHost');
   assert.ok(loginAt > 0, '找不到 repoLoginWith');
   const loginBody = shellSrc.slice(loginAt, loginAt + 3000);
   assert.match(
@@ -364,7 +365,7 @@ test('★★★★ 换了服务端要作废旧连通结论', () => {
    *
    * 所以切换 origin / kind 时必须清回 `unknown`。
    */
-  const at = shellSrc.indexOf('private async saveRepoConfig');
+  const at = shellSrc.indexOf('function saveRepoConfig(host: RepoHost');
   assert.ok(at > 0, '找不到 saveRepoConfig');
   const body = shellSrc.slice(at, at + 5200);
 

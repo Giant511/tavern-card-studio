@@ -21,6 +21,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 import {
   emptyPersonaState,
@@ -116,7 +117,7 @@ test('★★★★★ 切角色与冷启动都要对齐人设', () => {
    *
    * 漏掉冷启动的话，重进 App 还是"上一个人设"。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   /*
    * ★ 数的是 `this.applyPersonaForCharacter(` —— 定义处写的是
@@ -125,7 +126,7 @@ test('★★★★★ 切角色与冷启动都要对齐人设', () => {
    */
   const calls = [...src.matchAll(/this\.applyPersonaForCharacter\(/g)].length;
   assert.ok(calls >= 2, `切角色与冷启动两处都要调，实际 ${String(calls)} 处`);
-  assert.match(src, /private applyPersonaForCharacter\(/, '要有这个方法的定义');
+  assert.match(src, /function applyPersonaForCharacter\(host: PersonaHost/, '要有这个方法的定义');
 });
 
 test('★★★★★ 缩略图清理必须修在 writeCardToLibrary 内部（两条导入路径共用）', () => {
@@ -135,9 +136,9 @@ test('★★★★★ 缩略图清理必须修在 writeCardToLibrary 内部（�
    *
    * 仓库下载与本地导入都走 `writeCardToLibrary`，修在那里才不会漏第三条路。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
-  const at = src.indexOf('private async writeCardToLibrary');
+  const at = src.indexOf('function writeCardToLibrary(host: CardHost');
   assert.ok(at > 0, '找不到 writeCardToLibrary');
   const body = src.slice(at, at + 5000);
 

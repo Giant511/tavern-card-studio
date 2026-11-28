@@ -17,6 +17,7 @@ import {
   type AuthPolicy,
   type AuthUser,
   AuthClientError,
+  resetPasswordWithTicket,
 } from './auth-client.ts';
 import { authErrorMessage, isNetworkFailure, registerHint, shouldShowRegister } from './policy.ts';
 import {
@@ -64,7 +65,7 @@ export interface LoginDialogDeps {
   connectRepoToken?: typeof connectWithRepoToken;
 }
 
-type Mode = 'login' | 'register' | 'repo-token';
+type Mode = 'login' | 'register' | 'repo-token' | 'reset';
 
 export class LoginDialog {
   private readonly overlay: HTMLDivElement;
@@ -85,6 +86,13 @@ export class LoginDialog {
   private readonly submitButton: HTMLButtonElement;
   private readonly registerButton: HTMLButtonElement;
   private readonly repoTokenButton: HTMLButtonElement;
+  /** 「用临时密码重置」（2026-11-25，运维兜底）的入口按钮 */
+  private readonly resetButton: HTMLButtonElement;
+  /** 重置模式的三件套：uid / 临时密码 / 新密码 */
+  private readonly resetField: HTMLElement;
+  private readonly resetUidInput: HTMLInputElement;
+  private readonly resetCodeInput: HTMLInputElement;
+  private readonly resetPasswordInput: HTMLInputElement;
   private readonly cancelButton: HTMLButtonElement;
 
   private mode: Mode = 'login';
@@ -183,6 +191,67 @@ export class LoginDialog {
     this.repoTokenField = tokenField;
     this.repoTokenField.hidden = true;
 
+    /*
+     * 兜底重置（2026-11-25）。
+     *
+     * ## 为什么必须在登录界面里
+     *
+     * 用户"忘了密码"时**没有登录态**，进不了任何账户面板 ——
+     * 把入口放在账户设置里等于放在他够不到的地方。
+     *
+     * ## 为什么是三件套而不是"输入临时密码登录"
+     *
+     * 临时密码**不能登录**（服务端设计如此：它不产生会话）。它只能换一个
+     * 新密码。所以这里一次收齐三个值：谁（uid）、凭什么（临时密码）、
+     * 换成什么（新密码）。
+     *
+     * ## 为什么 uid 要写在提示里
+     *
+     * 用户通常记不住 uid（`usr_` 开头的一串）。界面上明说"问运维要"，
+     * 比让他在那儿猜自己是不是把用户名记错了要好。
+     */
+    const resetField = el('div', 'auth-reset');
+    resetField.dataset['role'] = 'auth-reset-fields';
+    resetField.hidden = true;
+
+    const uidField = el('label', 'field');
+    uidField.append(el('span', 'field-label', 'UID'));
+    this.resetUidInput = el('input', 'input');
+    this.resetUidInput.type = 'text';
+    this.resetUidInput.autocomplete = 'off';
+    this.resetUidInput.spellcheck = false;
+    this.resetUidInput.placeholder = 'usr_…（向运维索取，在你的「账户」里也能看到）';
+    this.resetUidInput.dataset['role'] = 'auth-reset-uid';
+    uidField.append(this.resetUidInput);
+
+    const codeField = el('label', 'field');
+    codeField.append(el('span', 'field-label', '临时密码'));
+    this.resetCodeInput = el('input', 'input');
+    this.resetCodeInput.type = 'text';
+    this.resetCodeInput.autocomplete = 'off';
+    this.resetCodeInput.spellcheck = false;
+    this.resetCodeInput.setAttribute('autocapitalize', 'characters');
+    this.resetCodeInput.placeholder = '12 位临时密码（运维生成，30 分钟内有效）';
+    this.resetCodeInput.dataset['role'] = 'auth-reset-code';
+    codeField.append(this.resetCodeInput);
+
+    const newPwField = el('label', 'field');
+    newPwField.append(el('span', 'field-label', '新密码'));
+    this.resetPasswordInput = el('input', 'input');
+    this.resetPasswordInput.type = 'password';
+    this.resetPasswordInput.autocomplete = 'new-password';
+    this.resetPasswordInput.placeholder = '至少 8 个字符';
+    this.resetPasswordInput.dataset['role'] = 'auth-reset-new-password';
+    newPwField.append(this.resetPasswordInput);
+
+    const resetHint = el('p', 'field-hint');
+    resetHint.textContent =
+      '临时密码只能用一次、30 分钟后失效，而且不能用来登录 —— 它只能换一个新密码。' +
+      '换好之后用新密码登录。';
+
+    resetField.append(uidField, codeField, newPwField, resetHint);
+    this.resetField = resetField;
+
     // 错误区常驻（不用 alert）：服务端文案可能较长，也可能包含可执行的下一步，
     // 用户需要能反复读，而不是一关就没了。
     this.errorBox = el('p', 'auth-error');
@@ -190,7 +259,7 @@ export class LoginDialog {
     this.errorBox.dataset['role'] = 'auth-error';
     this.errorBox.setAttribute('role', 'alert');
 
-    body.append(this.hint, userField, passField, inviteField, tokenField, this.errorBox);
+    body.append(this.hint, userField, passField, inviteField, tokenField, this.resetField, this.errorBox);
 
     const foot = el('div', 'modal-foot');
     this.cancelButton = el('button', 'btn', '取消');
@@ -224,12 +293,26 @@ export class LoginDialog {
     this.repoTokenButton.dataset['role'] = 'auth-repo-token-entry';
     this.repoTokenButton.addEventListener('click', () => this.toggleRepoTokenMode());
 
+    /*
+     * 第四入口：用临时密码重置（2026-11-25）。
+     *
+     * 与注册/令牌并列而不是塞进某个下拉：忘记密码的人此刻很急躁，
+     * 多一层折叠就多一次放弃。文案写「忘记密码？」而不是「用临时密码重置」——
+     * 前者的语义是"我的处境"，后者是"这个功能的实现"，用户找的是前者。
+     */
+    this.resetButton = el('button', 'btn ghost', '忘记密码？');
+    this.resetButton.type = 'button';
+    this.resetButton.dataset['role'] = 'auth-reset-entry';
+    this.resetButton.title = '用运维提供的「UID + 临时密码」设置新密码';
+    this.resetButton.addEventListener('click', () => this.toggleResetMode());
+
     this.submitButton = el('button', 'btn primary', '登录');
     this.submitButton.type = 'button';
     this.submitButton.dataset['role'] = 'auth-submit';
     this.submitButton.addEventListener('click', () => void this.submit());
 
     foot.append(
+      this.resetButton,
       this.repoTokenButton,
       this.registerButton,
       el('span', 'foot-note', ''),
@@ -356,22 +439,41 @@ export class LoginDialog {
     if (this.mode === 'repo-token') this.repoTokenInput.focus();
   }
 
+  /** 第四入口的开关：进入/离开「用临时密码重置」模式 */
+  private toggleResetMode(): void {
+    this.setMode(this.mode === 'reset' ? 'login' : 'reset');
+    this.clearError();
+    if (this.mode === 'reset') this.resetUidInput.focus();
+  }
+
   private setMode(mode: Mode): void {
     this.mode = mode;
     const isRepoToken = mode === 'repo-token';
-    this.title.textContent = mode === 'login' ? '登录' : mode === 'register' ? '注册新账户' : '使用仓库令牌连接';
-    this.submitButton.textContent = mode === 'login' ? '登录' : mode === 'register' ? '创建账户' : '连接';
+    const isReset = mode === 'reset';
+    this.title.textContent =
+      mode === 'login' ? '登录'
+        : mode === 'register' ? '注册新账户'
+          : isRepoToken ? '使用仓库令牌连接'
+            : '重置密码';
+    this.submitButton.textContent =
+      mode === 'login' ? '登录' : mode === 'register' ? '创建账户' : isRepoToken ? '连接' : '设置新密码';
     this.passwordInput.autocomplete = mode === 'register' ? 'new-password' : 'current-password';
 
     // 三入口的按钮文案随模式变：当前模式的那个变成"返回登录"
     this.registerButton.textContent = mode === 'register' ? '返回登录' : '注册新账户';
     this.repoTokenButton.textContent = isRepoToken ? '返回账户登录' : '使用仓库令牌连接';
     this.repoTokenButton.dataset['active'] = isRepoToken ? '1' : '0';
+    this.resetButton.textContent = isReset ? '返回登录' : '忘记密码？';
+    this.resetButton.dataset['active'] = isReset ? '1' : '0';
 
-    // 用户名/密码与令牌互斥显示：混在一起会让人以为"令牌也是一种密码"
-    this.usernameField.hidden = isRepoToken;
-    this.passwordField.hidden = isRepoToken;
+    /*
+     * 三个字段组互斥显示：用户名/密码、令牌、重置三件套。
+     * 混在一起会让人以为"令牌也是一种密码"，或者"临时密码可以当密码填"。
+     */
+    this.usernameField.hidden = isRepoToken || isReset;
+    this.passwordField.hidden = isRepoToken || isReset;
     this.repoTokenField.hidden = !isRepoToken;
+    this.resetField.hidden = !isReset;
 
     /*
      * 邀请码：**只在注册态 + invite 模式**显示（v0.1.7）。
@@ -389,9 +491,13 @@ export class LoginDialog {
     this.inviteField.hidden = !needsInvite;
     if (!needsInvite) this.inviteCodeInput.value = '';
 
-    this.registerButton.hidden = isRepoToken ? true : !shouldShowRegister(this.policy, this.deps.session.user);
+    this.registerButton.hidden = isRepoToken || isReset ? true : !shouldShowRegister(this.policy, this.deps.session.user);
 
-    if (isRepoToken) {
+    if (isReset) {
+      this.hint.textContent =
+        '忘记密码时用这里：向运维索取「UID + 临时密码」，在这里设置自己的新密码。' +
+        '临时密码不能用来登录，换好密码后正常登录即可。';
+    } else if (isRepoToken) {
       this.hint.textContent =
         '仓库令牌只能访问它绑定的那一个仓库，权限由签发人决定（读 / 写 / 回滚）。' +
         '账户密码不会被使用，也不会保存在这台设备上。';
@@ -438,6 +544,21 @@ export class LoginDialog {
     this.errorBox.classList.remove('ok');
   }
 
+  /**
+   * 成功提示（绿色框）。
+   *
+   * 在同一个错误区里显示一句成功文案。调用方必须先 clearError，否则上一次的
+   * 红字会被覆盖成绿字。
+   *
+   * 踩过的坑：临时密码重置成功后调 showError('')，留下一个空的粉色框。
+   * 用户看到一个提示框却没有任何字，比不显示更让人怀疑操作失败。
+   */
+  private showOk(message: string): void {
+    this.errorBox.hidden = false;
+    this.errorBox.classList.add('ok');
+    this.errorBox.textContent = message;
+  }
+
   private async submit(): Promise<void> {
     if (this.busy) return;
     if (this.blockedReason !== null) {
@@ -446,6 +567,10 @@ export class LoginDialog {
     }
     if (this.mode === 'repo-token') {
       await this.submitRepoToken();
+      return;
+    }
+    if (this.mode === 'reset') {
+      await this.submitReset();
       return;
     }
     const username = this.usernameInput.value.trim();
@@ -523,6 +648,60 @@ export class LoginDialog {
    * 账户登录失败只换一句文案，而令牌连接成功后要**切换凭证路径**
    * （清账户令牌、写入仓库绑定），这是一件有副作用的事，值得单独一段。
    */
+  /**
+   * 用「UID + 临时密码」重置密码（2026-11-25）。
+   *
+   * 成功后**不自动登录**：服务端刻意不发令牌（临时密码不能换来会话），
+   * 所以这里把界面切回登录态、清空输入，让用户用新密码登一次。
+   *
+   * 自动登录也能做（拿新密码再调一次 login），但那多一次请求、多一处
+   * 失败可能，而且"刚设完密码又自动登进去"会让用户不确定自己记没记住它。
+   */
+  private async submitReset(): Promise<void> {
+    const uid = this.resetUidInput.value.trim();
+    const code = this.resetCodeInput.value.trim();
+    const newPassword = this.resetPasswordInput.value;
+    if (uid === '' || code === '' || newPassword === '') {
+      this.showError('请填写 UID、临时密码与新密码。');
+      return;
+    }
+    if (newPassword.length < 8) {
+      this.showError('新密码至少 8 个字符。');
+      this.resetPasswordInput.focus();
+      return;
+    }
+
+    this.setBusy(true);
+    this.clearError();
+    try {
+      const result = await resetPasswordWithTicket(this.deps.getServerUrl?.() ?? '', {
+        uid,
+        code,
+        newPassword,
+      });
+      this.resetUidInput.value = '';
+      this.resetCodeInput.value = '';
+      this.resetPasswordInput.value = '';
+      this.setMode('login');
+      /*
+       * 回填用户名：服务端在成功响应里给了 username（不是敏感信息 —— 
+       * 能拿对 uid + 临时密码的人本来就是本人）。省得他再想一次"我叫什么"。
+       */
+      if (result.username !== '') this.usernameInput.value = result.username;
+      this.passwordInput.value = '';
+      this.showOk('密码已重置，请用新密码登录。');
+      this.deps.notify(
+        `密码已重置${result.username === '' ? '' : `（${result.username}）`}，请用新密码登录。`,
+        'ok',
+      );
+      this.passwordInput.focus();
+    } catch (error) {
+      this.showError((error as Error).message);
+    } finally {
+      this.setBusy(false);
+    }
+  }
+
   private async submitRepoToken(): Promise<void> {
     const serverUrl = this.deps.getServerUrl?.() ?? '';
     const raw = this.repoTokenInput.value;

@@ -26,6 +26,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 /*
  * ★ 必须用 `fileURLToPath`，不能用 `URL.pathname`。
@@ -206,7 +207,7 @@ test('★★ 问题三：「我的」页要真的**挂上**语音入口（不只
    *
    * 改成：必须能找到**调用点**（`append(this.renderVoiceSection())`）。
    */
-  const src = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+  const src = readShellImplNoComments();
 
   /*
    * 判据：在 **`renderMe()` 内部**找到那条 `scroller.append(...)`，
@@ -262,7 +263,7 @@ test('★ 问题三：语音区块的展开状态记在外壳，不记在页面�
    * 展开状态若记在页面内部对象里，切一次 Tab 再回来就变回收起 ——
    * 用户会以为"点了没生效"。
    */
-  const src = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+  const src = readShellImplNoComments();
   assert.match(
     src,
     /private\s+voiceExpanded/,
@@ -293,7 +294,7 @@ test('★ 问题三：语音区块收起时不留 DOM', () => {
    *
    * 所以断言要写成"走 renderAccordion + renderAccordion 自身会清空"两段。
    */
-  const src = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+  const src = readShellImplNoComments();
 
   const defStart = src.indexOf('private renderVoiceSection');
   assert.notEqual(defStart, -1, '找不到 renderVoiceSection 的定义');

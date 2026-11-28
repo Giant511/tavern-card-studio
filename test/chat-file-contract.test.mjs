@@ -48,6 +48,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const read = (p) => readFileSync(join(ROOT, p), 'utf8');
@@ -135,7 +136,7 @@ test('★★★★★ 改名后要记 ST 返回的 sanitizedFileName，不是用
    *
    * 用户上一次报的「记录没了」，其中一个成因就是这个形状的错配。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('onRename: async (id, newName) =>');
   assert.ok(at > 0, '找不到 onRename');
   const end = src.indexOf('\n      },', at);
@@ -143,10 +144,11 @@ test('★★★★★ 改名后要记 ST 返回的 sanitizedFileName，不是用
 
   assert.match(body, /sanitizedFileName/, '要读 ST 回传的权威名');
   assert.match(body, /const finalName = /, '要有一个"最终名字"变量');
-  assert.match(body, /this\.chatFileName = finalName/, '指针记最终名');
+  /* ★ 不绑定 `this.` 前缀（2026-11-24 搬家后是 `host.`）—— 判据钉的是"指针被赋成 finalName" */
+  assert.match(body, /\.chatFileName = finalName/, '指针记最终名');
 
   /* 否定：不许把用户原文直接写进指针 */
-  assert.doesNotMatch(body, /this\.chatFileName = trimmed/, '不许记用户原文');
+  assert.doesNotMatch(body, /\.chatFileName = trimmed/, '不许记用户原文');
 
   /*
    * ★★★ 还要钉"finalName 真的是从 sanitized 来的"（2026-11-15，变异验证抓到）。
@@ -165,12 +167,12 @@ test('★★★★★ 改名后要记 ST 返回的 sanitizedFileName，不是用
 });
 
 test('★★★★★ 改名还要同步面板与快照（否则下次保存写回旧名）', () => {
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('onRename: async (id, newName) =>');
   const end = src.indexOf('\n      },', at);
   const body = src.slice(at, end < 0 ? at + 3000 : end);
 
-  assert.match(body, /chatSnapshot = \{ \.\.\.this\.chatSnapshot, fileName: finalName \}/, '要改快照的 fileName');
+  assert.match(body, /chatSnapshot = \{ \.\.\.[\w.]*chatSnapshot, fileName: finalName \}/, '要改快照的 fileName');
 
   /*
    * 面板同步的方式在 2026-11-15 从 `setMessages` 换成了 `openChatFile`。
@@ -195,7 +197,7 @@ test('★★★★ 空名字要拦在本地（ST 会把它变成 .jsonl 隐藏�
    * `path.parse('.jsonl').name` 是 `.jsonl` 本身（点开头的隐藏文件）。
    * 用户此后既在列表里看不见它，也没法删 —— 只能靠文件管理器。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('onRename: async (id, newName) =>');
   const end = src.indexOf('\n      },', at);
   const body = src.slice(at, end < 0 ? at + 3000 : end);
@@ -218,7 +220,7 @@ test('★★★★★ 重名要提前判，别让用户对着 "HTTP 400" 猜', (
    * 列表就在手上，所以本地先判一次重名；判重必须排除自己
    * （把「A」改成「A」不该报错 —— 用户可能只改了首尾空格）。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('onRename: async (id, newName) =>');
   const end = src.indexOf('\n      },', at);
   const body = src.slice(at, end < 0 ? at + 3000 : end);
@@ -287,7 +289,7 @@ test('★★★★★ 改名后必须按新名字重新打开一次（只是改�
    *
    * ⇒ 所以改完必须**真的读一次**。读成功才算办完，读失败要当场出声。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('onRename: async (id, newName) =>');
   const end = src.indexOf('\n      },', at);
   const body = src.slice(at, end < 0 ? at + 5000 : end);
@@ -302,11 +304,12 @@ test('★★★★★ "是不是当前这段"要同时看指针与快照', () =>
    * 只看 `chatFileName` 会漏掉"指针为 null 但快照有内容"的状态，
    * 而那正是上一次恢复失败后留下的样子。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('const wasCurrent = ');
   const line = src.slice(at, src.indexOf(';', at));
 
-  assert.match(line, /this\.chatFileName === id/, '要看指针');
+  // ★ 不绑定 `this.` 前缀（2026-11-24 搬家后是 `host.`）
+  assert.match(line, /\.chatFileName === id/, '要看指针');
   assert.match(line, /chatSnapshot\?\.fileName === id/, '也要看快照');
 });
 
@@ -318,7 +321,7 @@ test('★★★★ 快照的 fileName 不许再用空串表示"没有"', () => {
    *
    * 语义要用 `null`。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   assert.doesNotMatch(src, /fileName: ''\s*,\s*\n\s*messages:/, '不许用空串占位');
   assert.match(src, /fileName: string \| null/, '类型要允许 null');
 });
@@ -344,7 +347,7 @@ test('★★★★★ 首选名读不到时要回退到"列表里最新的"，�
    * 改名场景下这必然触发：改名删掉了旧名字的文件，而 localStorage
    * 里还留着旧名字。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('const first = preferred ??');
   assert.ok(at > 0, '找不到首选名解析');
   const end = src.indexOf('await new Promise((resolve) => setTimeout(resolve, 2000))', at);
@@ -374,7 +377,7 @@ test('★★★★★ 会话指针每次落盘都要留痕', () => {
    * ⇒ 落盘时记一行：avatar / fileName / hasSnap。
    * 恢复时记：首选名、来源（preferred 还是 findLatest）、命中还是未命中、回退结果。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   const persistAt = src.indexOf('private persistSession(');
   assert.ok(persistAt > 0, '找不到 persistSession');
@@ -409,7 +412,7 @@ test('★★★★★ 恢复期间一律不许写盘（不只是不许建档）'
    * 原来的闸写在 `chatFileName === null` 的分支里，只防"建新文件"，
    * 没防"覆盖旧文件" —— 而后者才是丢数据的动作。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('private handleChatChanged');
   assert.ok(at > 0, '找不到 handleChatChanged');
   const end = src.indexOf('\n  private ', at + 10);
@@ -457,13 +460,13 @@ test('★★★★★ 没读过文件时不许拿"只有开场白"的内容去�
    *
    * 不误伤：发第一句（有 user）、恢复成功（指纹有值）、新建对话（自己生成名字）。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('private handleChatChanged');
   const end = src.indexOf('\n  private ', at + 10);
   const body = src.slice(at, end < 0 ? at + 6000 : end);
 
   assert.match(body, /const hasUserMessage = /, '要算"有没有用户消息"');
-  assert.match(body, /this\.lastSavedFingerprint === null/, '要用"没读过"作为条件');
+  assert.match(body, /(?:this|host)\.lastSavedFingerprint === null/, '要用"没读过"作为条件');
   assert.match(body, /!hasUserMessage/, '要要求"只有开场白"');
   assert.match(body, /跳过保存（开场白未覆盖）/, '跳过要留痕（否则又是一次定不了案）');
 
@@ -481,7 +484,7 @@ test('★★★★★ 保存成功与读回都要记条数', () => {
    * 用户这次直接说「气泡出来了但记录没进文件」—— 这句话本来应该
    * 一条日志就能证实或推翻。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   const saveAt = src.indexOf('private async persistChat');
   const saveBody = src.slice(saveAt, src.indexOf('\n  }', saveAt));

@@ -23,6 +23,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { readShellImpl } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
@@ -91,8 +92,15 @@ test('★★★ 代码必须保留（用户说"作为后续功能加进去"）',
     assert.ok(src.includes(`${field}:`), `${field} 回调定义被删了`);
   }
 
-  /* 外壳里的实现也要在 */
-  const shell = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+  /*
+   * 外壳里的实现也要在。
+   *
+   * ★ 用拼接版（2026-11-24）：三个回调的实现随 `makeActionsCallbacks`
+   *   搬到了 `actions-callbacks.ts`。只读 shell.ts 会报"实现被删了"，
+   *   而实现得好好的 —— 那正是这条判据最不该出现的误报
+   *   （它守的是"用户要求保留的功能别被删"）。
+   */
+  const shell = readShellImpl();
   for (const field of ['onAiAssist', 'onContinueWriting', 'onConvertToGroup']) {
     assert.ok(shell.includes(`${field}:`), `shell 里的 ${field} 实现被删了`);
   }

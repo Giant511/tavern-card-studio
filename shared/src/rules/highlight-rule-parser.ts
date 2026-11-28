@@ -38,7 +38,19 @@ const ID_PATTERN = /^[a-z0-9][a-z0-9._-]{1,63}$/;
 // 独立的错误消息见 validateScope —— 这里只保证放行集合与 CSS 安全字符集一致。
 const SCOPE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
-const COLOR_PATTERN = /^(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\)|[a-zA-Z]{3,20})$/;
+/*
+ * ★ 颜色值会被**原样拼进 `style` 属性**（`scopeCss` → `style="${style}"`），
+ * 所以这里不只是"格式校验"，它同时是**注入防线**（2026-11-24）。
+ *
+ * 原正则 `rgba?\([^)]+\)` 的字符类是"除右括号以外的一切"，于是
+ * `rgba(a" onmouseover="alert&#40;1&#41;")` 能通过校验 → 属性逃逸。
+ * 现在把括号内收窄为数值表达式允许的字符（数字 / 点 / 百分号 / 逗号 /
+ * 空格 / 斜杠 / 加减号），引号、分号、反斜杠、尖括号一律不在集合里。
+ *
+ * 命名颜色仍有 `[a-zA-Z]{3,20}` 一支，它不含任何特殊字符。
+ */
+const COLOR_PATTERN =
+  /^(#[0-9a-fA-F]{3,8}|rgba?\(\s*[0-9.%,\s/+-]+\s*\)|hsla?\(\s*[0-9.%,\s/+-degra]+\)|[a-zA-Z]{3,20})$/;
 const FLAGS_PATTERN = /^[gimsu]*$/;
 // 板块部分从 BLOCK_ID_ALTERNATION 派生（v0.1.3）：写死清单会在加板块时漏改，
 // appliesTo 里写了新板块却被校验拒收，而用户看到的是"这条配色规则没生效"。

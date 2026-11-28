@@ -19,6 +19,7 @@ import { test } from 'node:test';
 
 import { makeReasoningSection, isReasoningEffortField } from '../client/src/chat/reasoning-section.ts';
 import { previewReasoningPlan } from '../shared/dist/chat/generate.js';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
 
@@ -480,14 +481,14 @@ test('★★★★ 保存时要把「推理强度」一起提交（它在组件�
 });
 
 test('★★★★ 外壳必须把 thinking 回调接上（否则整块不渲染）', () => {
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   assert.match(src, /thinking: \{\s*initialIntent:/, 'callbacks.thinking 要赋值');
   assert.match(src, /computePreview: \(intent, budget, family\) =>/, '要注入预览计算器（三参：含手选族）');
   assert.match(src, /previewReasoningPlan\(\{/, '内部必须调 shared 的实现，不许自己算');
 });
 
 test('★★★★ 面板必须收到思考意图（否则设置白改）', () => {
-  const shell = stripComments(read('client/src/chat/shell.ts'));
+  const shell = readShellImplNoComments();
   assert.match(shell, /this\.chatPanel\?\.setThinking\(state\.intent, state\.budget, state\.family\)/);
 
   const panel = stripComments(read('client/src/chat/chat-panel.ts'));
@@ -903,7 +904,7 @@ test('★★★★★ 「哪些源配了 key」必须问 ST，不能只信本地
    * 追溯：ST 的 `SECRET_KEYS` 命名是 `api_key_<source>`，
    * 所以按前缀剥即可，不必维护映射表。
    */
-  const shell = read('client/src/chat/shell.ts');
+  const shell = readShellImpl();
   assert.match(shell, /refreshKeyPresence/, '要有"问 ST 要真相"的方法');
   assert.match(shell, /this\.bridge\.secretPresent\(\)/, '要真的调那个桥方法');
   assert.match(shell, /api_key_/, '要按 ST 的命名规律剥前缀');
@@ -939,8 +940,15 @@ test('★★★★★ 「问不到」不等于「都没配」（失败时不许�
   );
   assert.match(rust, /StBadResponse/, '解析失败要报 StBadResponse');
 
-  const shell = read('client/src/chat/shell.ts');
-  const fn = shell.slice(shell.indexOf('private async refreshKeyPresence'), shell.indexOf('private async withConnection'));
+  const shell = readShellImpl();
+  /*
+   * 终点改为「下一个 export」（2026-11-24 搬家后）。原终点 `private async withConnection`
+   * 留在壳里，与本函数不在同一段文本 —— 不换的话 slice 会一路切到文件尾。
+   */
+  const fnAt = shell.indexOf('function refreshKeyPresence(host: SettingsHost)');
+  assert.ok(fnAt >= 0, '找不到 refreshKeyPresence');
+  const fnEnd = shell.indexOf('\nexport ', fnAt + 10);
+  const fn = shell.slice(fnAt, fnEnd < 0 ? undefined : fnEnd);
   assert.match(fn, /catch\s*\{/, '要 catch');
   assert.match(fn, /return;/, 'catch 里要直接返回、不清标记');
   /* 关键：赋值只能在成功路径上 */

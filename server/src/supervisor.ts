@@ -15,6 +15,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { connect } from 'node:net';
+import type Database from 'better-sqlite3';
 import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -30,6 +31,7 @@ import {
 } from './config.js';
 import { API_VERSION, SERVER_VERSION, configSummary } from './context.js';
 import { isRegisterMode } from './config-live.js';
+import { CONTROL_HOP_HEADER, CONTROL_HOP_VALUE } from './net/trust-proxy.js';
 import { AppError, toAppError } from './errors.js';
 import { writeApplicationEvent } from './eventlog.js';
 import {
@@ -46,6 +48,8 @@ import { Db } from './storage/db.js';
 import { certsBackupDir, ensureSelfSigned } from './tls/certificate.js';
 import { inspectTlsInputs, resolveTlsPath, tlsSecurityBanners, type TlsInputCheck } from './tls/panel.js';
 import { UserStore } from './storage/users.js';
+import { PasswordTicketStore } from './auth/password-ticket.js';
+import { assertPasswordPolicy, hashPassword } from './auth/password.js';
 import {
   INVITE_MAX_USES,
   INVITE_MAX_VALIDITY_MS,
@@ -351,6 +355,52 @@ export async function startSupervisor(loaded: LoadedConfig, options: SupervisorO
     sendJson(_ctx.res, 200, { status: 'ok', role: 'supervisor', pid: process.pid, worker: controller.status().state });
   });
 
+  /**
+   * 全站运营统计（面板「总览」的数据源）。
+   *
+   * ## 为什么不用数据面的 `/api/stats`
+   *
+   * 那个端点按**凭证可见范围**过滤（`scopeFromIdentity`），那是客户端的正确语义：
+   * 没人该从统计数字推出别人有多少张卡。但面板是**运维视图** ——
+   * 管理员要看的是这台服务器上总共有多少账户、多少张卡、多少个仓库。
+   *
+   * 之前面板直接调 `/api/stats`，于是用管理员账户登录后看到的是「我自己 1 张卡」，
+   * 而库里其实有 3 张（另外两张属于普通账户）—— 数字没错，但回答了错误的问题。
+   *
+   * ## 为什么不走 worker
+   *
+   * 与 `/control/accounts` 同一个理由：worker 可能已经停了（面板的「停止」
+   * 按钮真的会停它），而"这台机器上有多少数据"不该因为数据面停摆就看不到。
+   * 直接以只读方式开 state.db —— WAL 允许多进程并发读。
+   *
+   * ## 口径
+   *
+   * 全部**不含已删除**（`deleted_at IS NOT NULL` 的卡与仓库不计）。
+   * 版本数与字节数是历史累积：它们是运维关心的"磁盘会长到多大"，
+   * 与"当前有多少张卡"是两个维度。账户的 `disabled` 单独给出，
+   * 因为"注册了多少人"和"多少人在用"对管理员是两个问题。
+   */
+  router.get('/control/stats', (_ctx) => {
+    sendJson(
+      _ctx.res,
+      200,
+      withDb(config.dataDir, (db) => {
+        const one = (sql: string): number => (db.prepare(sql).get() as { n: number }).n;
+        return {
+          accounts: {
+            total: one('SELECT COUNT(*) AS n FROM users'),
+            active: one("SELECT COUNT(*) AS n FROM users WHERE status = 'active'"),
+            disabled: one("SELECT COUNT(*) AS n FROM users WHERE status <> 'active'"),
+          },
+          cards: one('SELECT COUNT(*) AS n FROM cards WHERE deleted_at IS NULL'),
+          repos: one('SELECT COUNT(*) AS n FROM repos WHERE deleted_at IS NULL'),
+          versions: one('SELECT COUNT(*) AS n FROM versions'),
+          bytes: one('SELECT COALESCE(SUM(byte_size), 0) AS n FROM versions'),
+        };
+      }),
+    );
+  });
+
   router.get('/control/status', (_ctx) => {
     const worker = controller.status();
     sendJson(_ctx.res, 200, {
@@ -469,6 +519,82 @@ export async function startSupervisor(loaded: LoadedConfig, options: SupervisorO
     } catch (error) {
       if (error instanceof AppError) throw error;
       // 「最后一个管理员」这类业务规则不是程序崩溃，回 400 并把话原样带出去
+      throw new AppError(400, 'BAD_REQUEST', (error as Error).message);
+    }
+  });
+
+  /*
+   * ── 运维兜底：一次性临时密码（2026-11-25）─────────────────
+   *
+   * 用户的场景：「用户忘记密码，联系运维」，而兜底方式定为
+   * **运维提供 UID + 临时密码，临时密码只能用于改密码时的认证**。
+   *
+   * ## 为什么不是"运维直接设一个新密码念给他"
+   *
+   * 那样运维就知道了用户的最终密码（等于长期可冒充），而且用户往往
+   * 不会再去改一次。临时密码的价值在于**它会失效、且不能用来登录**：
+   *
+   *     登录 / 调 API    ✘ 不行（它不产生会话）
+   *     改密码           ✔ 唯一用途
+   *     用一次           ✘ 用完即废
+   *     过期             ✘ 30 分钟后失效
+   *
+   * ## 为什么在控制面而不是数据面
+   *
+   * 数据面那条改密码要求**管理员账户的 JWT**，而"忘了密码的人"完全可能
+   * 就是唯一的管理员 —— 那时候没有任何账户能登录，数据面这条路是死的。
+   * 控制面用**面板令牌**（`config.json` 的 `auth.token`），运维手上一定有，
+   * 而且不依赖 worker 是否在跑。与 `/control/accounts/:id/status` 同一条理由。
+   *
+   * ## 审计
+   *
+   * 每一次生成都写 `account.issue-temp-password`，带操作者 IP。
+   * 事后能查"谁在什么时候给谁发过临时密码"。
+   */
+
+  router.post('/control/accounts/:id/temp-password', (_ctx) => {
+    const id = _ctx.params['id'] ?? '';
+    try {
+      const issued = withTickets(config.dataDir, (users, tickets) => {
+        const row = users.findById(id);
+        if (row === null) return null;
+        const ticket = tickets.issue({
+          userId: row.id,
+          uid: row.uid,
+          createdBy: 'panel-token',
+          createdIp: socketIp(_ctx.req),
+        });
+        return { ...ticket, username: row.username };
+      });
+      if (issued === null) throw new AppError(404, 'NOT_FOUND', '账户不存在');
+
+      appendAuditEvent(config.dataDir, {
+        at: new Date().toISOString(),
+        level: 'warn',
+        action: 'account.issue-temp-password',
+        cardId: null,
+        actor: 'panel-token',
+        ip: socketIp(_ctx.req),
+        detail: {
+          targetUserId: id,
+          targetUsername: issued.username,
+          uid: issued.uid,
+          expiresAt: issued.expiresAt,
+        },
+      });
+      logger.warn('supervisor.account.issue-temp-password', { id, username: issued.username });
+      sendJson(_ctx.res, 200, {
+        /**
+         * 明文只在这里出现一次 —— 前端提示"关掉就看不到了"。
+         * 服务端只留哈希，事后无从取回（这是刻意的，见 password-ticket.ts）。
+         */
+        code: issued.code,
+        uid: issued.uid,
+        username: issued.username,
+        expiresAt: issued.expiresAt,
+      });
+    } catch (error) {
+      if (error instanceof AppError) throw error;
       throw new AppError(400, 'BAD_REQUEST', (error as Error).message);
     }
   });
@@ -1116,13 +1242,46 @@ function proxy(req: IncomingMessage, res: ServerResponse, config: ServerConfigFi
     }
   };
 
+  /*
+   * ★ 转发时必须标注真实来源（2026-11-24）。
+   *
+   * ## 原来为什么是洞
+   *
+   * 这里原本只重写 `host`。worker 看到的对端永远是 `127.0.0.1`、且没有代理头，
+   * 于是 `/api/token` 的回环门禁判定为"本机直连"，**无凭证返回全局令牌**。
+   * 面板一旦监听在局域网地址，`curl http://<LAN-IP>:8731/api/token` 就能接管整机。
+   *
+   * ## 现在的做法
+   *
+   * ```text
+   *   ① 删掉客户端带来的同名内部头   —— 否则外部可以自己写一个冒充控制面
+   *   ② 写内部标记                    —— worker 据此认出"这一跳是面板"
+   *   ③ 用真实 socket 地址**覆盖** XFF —— 不追加，因为客户端给的值不可信
+   * ```
+   *
+   * 第 ③ 条是关键：`X-Forwarded-For` 直接赋值为对端地址，而不是在客户端
+   * 给的值后面追加。追加的写法会被"客户端自带一个 127.0.0.1"骗过。
+   */
+  const forwardedFor =
+    (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '') || 'unknown';
+  const headers: Record<string, string | string[] | undefined> = {
+    ...req.headers,
+    host: `${target.hostname}:${target.port}`,
+  };
+  delete headers[CONTROL_HOP_HEADER];
+  headers[CONTROL_HOP_HEADER] = CONTROL_HOP_VALUE;
+  headers['x-forwarded-for'] = forwardedFor;
+  // 这两个头由 worker 自己判断，控制面不代传，避免"两套说法"的解析差分
+  delete headers['forwarded'];
+  delete headers['x-real-ip'];
+
   const upstream = httpRequest(
     {
       host: target.hostname,
       port: Number(target.port),
       method: req.method,
       path: req.url,
-      headers: { ...req.headers, host: `${target.hostname}:${target.port}` },
+      headers,
     },
     (upstreamRes) => {
       finished = true;
@@ -1163,6 +1322,74 @@ function withUsers<T>(dataDir: string, run: (users: UserStore) => T): T {
   } finally {
     db.close();
   }
+}
+
+/**
+ * 功能
+ * 以只读方式短开一个库连接，直接跑裸 SQL。
+ *
+ * 注意事项
+ * 与 `withUsers` 同构（每次请求开/关）。这里不构造任何 Store ——
+ * 面板的运营统计只需要几个 `COUNT(*)`，为此包一层仓储反而多一层要维护的接口。
+ *
+ * 踩过的坑
+ * 无。
+ */
+function withDb<T>(dataDir: string, run: (db: Database.Database) => T): T {
+  const db = new Db(join(dataDir, 'state.db'));
+  try {
+    return run(db.handle);
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * 生成临时密码要同时用到 users（查 uid / username）与 password_tickets。
+ *
+ * 为什么不用 `withUsers` 再开一次：那会在两个连接里读同一个库，
+ * 而 uid 与 user_id 必须来自同一行 —— 分两次读之间用户若被改名，
+ * 票据就会挂到错的 uid 上。一个连接，语义才干净。
+ */
+function withTickets<T>(
+  dataDir: string,
+  run: (users: UserStore, tickets: PasswordTicketStore) => T,
+): T {
+  const db = new Db(join(dataDir, 'state.db'));
+  try {
+    return run(new UserStore(db.handle), new PasswordTicketStore(db.handle));
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * 控制面看到的对端地址。
+ *
+ * 不读 `X-Forwarded-For`：控制面通常直接暴露给管理员，客户端给的头不可信；
+ * 要信代理头得先有受信代理清单（数据面那套），控制面没有那套配置。
+ * 审计记错来源比记一个"猜的"更糟。
+ */
+/**
+ * 追加一条审计事件（写 `state.db` 的 events 表）。
+ *
+ * 用 `Db` 包装类而不是裸 `Database` —— `appendEvent` 是包装类上的方法，
+ * 它负责补 `card_owner_id` 等派生列。裸 handle 没有这些。
+ */
+function appendAuditEvent(
+  dataDir: string,
+  event: Parameters<Db['appendEvent']>[0],
+): void {
+  const db = new Db(join(dataDir, 'state.db'));
+  try {
+    db.appendEvent(event);
+  } finally {
+    db.close();
+  }
+}
+
+function socketIp(req: IncomingMessage): string {
+  return (req.socket.remoteAddress ?? '').replace(/^::ffff:/, '') || 'unknown';
 }
 
 /**

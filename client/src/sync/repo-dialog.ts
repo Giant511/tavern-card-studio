@@ -49,6 +49,13 @@ export interface RepoDialogDeps {
   notify: (message: string, kind?: 'ok' | 'warn' | 'bad' | 'info') => void;
   /** 401 时先试续期，返回 false 表示要回登录界面 */
   onUnauthorized?: () => Promise<boolean>;
+  /**
+   * 用户名改了（2026-11-25）。
+   *
+   * 外壳的账户按钮上写着用户名，不同步的话它还是旧名字 ——
+   * 用户会以为改名没生效。
+   */
+  onAccountChanged?: () => void;
 }
 
 const SCOPE_OPTIONS: Array<{ value: string; label: string; hint: string }> = [
@@ -255,6 +262,7 @@ export class RepoDialog {
     }
 
     this.noteEl.textContent = '仓库名在账户内唯一；上传时可以选择目标仓库，默认仓库已预选。';
+
     try {
       this.repos = await listRepos(config);
     } catch (error) {

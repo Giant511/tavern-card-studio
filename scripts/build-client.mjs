@@ -230,7 +230,13 @@ step(7, '出厂件校验（解开 MSI，审计里面那个 exe）');
  */
 const SHELL_STRINGS = [
   'x-frame-options',        // 剥 XFO：面板 iframe 才显示得出来
-  'frame-ancestors',        // 剥 CSP 的那条指令
+  'content-security-policy',// 剥 CSP 的头名
+  /*
+   * 不用 `frame-ancestors` 当判据。它在 Rust 里只作为 starts_with 的常量参与比较，
+   * MSVC LTO 会把它折成立即数，出厂件里搜不到整串。2026-11-27 实测：构建树 exe
+   * 0 命中，但剥 CSP 的行为有 Rust 测试守着。头名是运行时真正要匹配的字符串，
+   * 不会被折掉。
+   */
   'SameSite=None',          // 会话 cookie 跨站可发：否则卡在「正在初始化…」
   /*
    * 自签证书修复（2026-11-17）。这三条是**壳侧**的，都在 Rust 里，
@@ -247,19 +253,23 @@ const SHELL_STRINGS = [
 ];
 const shipped = auditMsiShellAssets(bundleMsi, DIST, { strings: SHELL_STRINGS });
 if (shipped.skipped) die(`无法审计出厂件：${shipped.reason}`);
-if (!shipped.ok) {
+/*
+ * 两类缺失分开报。资源键缺失是「前端没内嵌进去」，壳侧字符串缺失是「壳是旧版」。
+ * 混成一句会把前端的 0/24 说成壳的问题，排查时先看错方向（2026-11-27 踩过）。
+ */
+if (shipped.missing.length > 0) {
   die(
     `MSI 内的 exe 缺 ${shipped.missing.length}/${shipped.checked} 个资源键` +
       `（例：${shipped.missing.slice(0, 3).join('、')}）—— 出厂件里的前端不是当前这一版`,
   );
 }
-ok(`MSI 内的 exe 内嵌了全部 ${shipped.checked} 个 dist 资源键`);
 if (shipped.missingStrings.length > 0) {
   die(
     `MSI 内的 exe 缺 ${shipped.missingStrings.length}/${SHELL_STRINGS.length} 个壳侧关键字符串` +
       `（${shipped.missingStrings.join('、')}）—— 这个包的壳不是带修复的那一版`,
   );
 }
+ok(`MSI 内的 exe 内嵌了全部 ${shipped.checked} 个 dist 资源键`);
 ok(`壳侧关键字符串 ${SHELL_STRINGS.length}/${SHELL_STRINGS.length} 命中`);
 note(`出厂件 exe ${shipped.exeBytes} 字节 sha256 ${shipped.exeSha256.slice(0, 16)}…`);
 const treeSha = createHash('sha256').update(readFileSync(EXE)).digest('hex');

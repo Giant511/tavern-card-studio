@@ -203,16 +203,10 @@ test('运行状态探测：真实 http 服务可达即"运行中"，关掉即"�
     response.end('sillytavern');
   });
 
-  // 需求写死 8000；被占用时退到临时端口（同一段探测逻辑，判据不变）
-  let port = 8000;
-  const started = await new Promise((resolve) => {
-    server.once('error', () => resolve(false));
-    server.listen(8000, '127.0.0.1', () => resolve(true));
-  });
-  if (!started) {
-    port = 0;
-    await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
-  }
+  // 用临时端口，不占 8000：本机可能正跑着 SillyTavern（0.0.0.0:8000），
+  // Windows 允许再绑 127.0.0.1:8000，关掉自己的监听后对方的进程仍会应答，
+  // 判据就会假红。探测逻辑与端口无关，默认地址另在文件末尾断言。
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const actualPort = server.address().port;
   const baseUrl = `http://127.0.0.1:${actualPort}`;
 

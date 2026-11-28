@@ -28,6 +28,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
+import { readEditorImplNoComments } from './lib/editor-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 
@@ -114,14 +115,19 @@ test('★★ 到达流程对开场白仍然生效（两个格式互补，不是�
 
 // ── ② 客户端两个入口必须把两个格式都传下去 ────────────────────
 
-const APP_SOURCE = readFileSync(join(ROOT, 'client/src/editor/app.ts'), 'utf8');
+const APP_SOURCE = readEditorImplNoComments();
 
 test('★★★ arriveCard 必须把对话示例格式传给到达流程（静态判据）', () => {
   /*
    * `arriveCard` 是三条到达路径（服务器取回 / 打开本地文件 / 导入 TXT）
    * 的唯一汇合点。少传一个参数就退回"转换被冲掉"，而且不报错。
    */
-  const body = /private arriveCard\(card: UnifiedCard\): UnifiedCard \{([\s\S]*?)\n  \}/.exec(APP_SOURCE);
+  /* 2026-11-24：arriveCard 搬到 landing.ts，形态与终点都变了。两种都认。 */
+  const body =
+    /private arriveCard\(card: UnifiedCard\): UnifiedCard \{([\s\S]*?)\n  \}/.exec(APP_SOURCE) ??
+    /function arriveCard\(host: LandingHost, card: UnifiedCard\): UnifiedCard \{([\s\S]*?)\n\}/.exec(
+      APP_SOURCE,
+    );
   assert.notEqual(body, null, '找不到 arriveCard');
   assert.match(
     body[1],
@@ -153,12 +159,16 @@ test('★★★ 导入字段板块预设后必须启用它（静态判据）', (
    * 修法是导入成功后走 `selectFieldPreset` —— 它把重指 / 重算视图 / 重检 /
    * 持久化 / 状态栏说明一次做全。
    */
-  const body = /private importFieldPresetText\(block: FieldPresetBlock, text: string\)([\s\S]*?)\n  \}/.exec(
-    APP_SOURCE,
-  );
-  assert.notEqual(body, null, '找不到 importFieldPresetText');
+  /*
+   * 2026-11-24：函数搬到 import-actions.ts，形态从类方法变成
+   * `export function importFieldPresetText(host, block, text)`。
+   * 判据钉的是"导入成功后调了 selectFieldPreset"，与它写成方法还是函数无关。
+   */
+  const at = APP_SOURCE.indexOf('function importFieldPresetText(');
+  assert.ok(at >= 0, '找不到 importFieldPresetText');
+  const body = APP_SOURCE.slice(at, APP_SOURCE.indexOf('\nexport ', at + 10));
   assert.match(
-    body[1],
+    body,
     /this\.selectFieldPreset\(block,\s*outcome\.id\)/,
     '导入成功后必须 selectFieldPreset(block, outcome.id)，否则同 id 覆盖等于没做',
   );

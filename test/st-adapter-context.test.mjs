@@ -252,7 +252,17 @@ test('扫描深度只看最近 N 条（默认 4）', () => {
   });
   // 「龙」在最早期，超出默认深度 → 不激活
   assert.equal(result.worldbookUsed.length, 0);
-  assert.equal(DEFAULT_SCAN_DEPTH, 4);
+  /*
+   * 缺省值必须与 ST 源码同口径（2026-11-24 核对 1.19.0）：
+   *
+   *   world-info.js:69   export let world_info_depth = 2;    ← scan_depth
+   *   world-info.js:96   export const DEFAULT_DEPTH = 4;     ← 条目级插入位置
+   *
+   * 原来这里钉的是 4（把条目级 depth 当成了扫描深度），
+   * 结果比 ST 多扫一倍消息：本不该触发的条目被激活，上下文比 ST 里长一截，
+   * 而两侧都不报错。
+   */
+  assert.equal(DEFAULT_SCAN_DEPTH, 2, 'ST 的 scan_depth 缺省是 2 条，不是 4（4 是条目级 depth）');
 });
 
 test('人设进 system 而不是伪装成 user 消息', () => {

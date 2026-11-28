@@ -105,11 +105,13 @@ function splitOnce(text) {
   return at < 0 ? [text, undefined] : [text.slice(0, at), text.slice(at + 1)];
 }
 
-/** 从 cli.ts 的"未知操作"报错里取 user / service 的子动作清单 */
+/** 从 cli.ts 的子命令帮助表里取 user / service 的子动作清单 */
 function subActions(prefix) {
-  const match = new RegExp(`未知的 ${prefix} 操作：[^（(]*[（(]([^）)]+)[）)]`).exec(cli);
-  assert.ok(match, `cli.ts 里找不到 ${prefix} 的未知操作报错，请同步本守卫`);
-  return match[1].split('/').map((item) => item.trim()).filter(Boolean);
+  const names = [];
+  const pattern = new RegExp(`\\['${prefix} ([a-z]+)`, 'g');
+  for (const match of cli.matchAll(pattern)) names.push(match[1]);
+  assert.ok(names.length > 0, `cli.ts 里找不到 ${prefix} 的子命令表，请同步本守卫`);
+  return names;
 }
 
 test('文件存在，且带"随版本更新"的维护约定', () => {

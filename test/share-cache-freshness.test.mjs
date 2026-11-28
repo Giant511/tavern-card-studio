@@ -41,13 +41,19 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const read = (p) => readFileSync(join(ROOT, p), 'utf8');
 
-/** 去注释（判定源码文本时必须做，否则注释会骗判据） */
-const stripComments = (text) =>
-  text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+/*
+ * 去注释用共享实现（2026-11-24）。
+ *
+ * 本地这版是正则，字符串里出现「斜杠+星号」时会吃掉后面的代码 ——
+ * 而 `card-actions.ts` 里恰好给 `pickFileBytes` 传了带这个标记的 MIME 串。
+ * 共享版是状态机，会跳过字符串。
+ */
+import { readShellImplNoComments as sharedShellSource } from './lib/shell-source.mjs';
 
 /** 取两个语义锚点之间的一段（不用固定字符窗口，见 §149.4） */
 function between(code, startNeedle, endNeedle) {
@@ -58,7 +64,7 @@ function between(code, startNeedle, endNeedle) {
   return code.slice(at, end);
 }
 
-const shell = stripComments(read('client/src/chat/shell.ts'));
+const shell = readShellImplNoComments();
 
 /* ═══════════════════════════════════════════════════════════
    一、写卡收口（防止将来新增第四处写卡漏掉清缓存）
@@ -93,7 +99,13 @@ test('★★★★★ 全文件只有 writeCardPng 一处直接写卡', () => {
 });
 
 test('★★★★★ 写卡成功后必须作废这张卡的分享缓存', () => {
-  const seg = between(shell, 'private async writeCardPng(', 'private async prefetchForShare(');
+  /*
+   * writeCardPng 已搬到 card-actions.ts，且是那个文件的**最后一个**函数，
+   * 所以直接切到文件尾即可（没有"下一个成员"可当终点锚）。
+   */
+  const pngAt = shell.indexOf('function writeCardPng(host: CardHost');
+  assert.ok(pngAt >= 0, '找不到 writeCardPng');
+  const seg = shell.slice(pngAt);
 
   const writeAt = seg.indexOf('writeCharacterPng');
   const deleteAt = seg.indexOf('this.shareCache.delete(avatar)');

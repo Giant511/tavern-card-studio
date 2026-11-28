@@ -463,6 +463,86 @@ export const VERIFY_INVENTORY = [
   },
 
   {
+    file: 'scripts/verify-account-recovery.mjs',
+    status: 'live-browser',
+    run: 'npm run build:server && node scripts/verify-account-recovery.mjs',
+    why:
+      '账户找回全链路：运维生成一次性临时密码 → 用户拿「UID + 临时密码」改密码 → ' +
+      '桌面端自助改名/改密码。核心是**反向断言**：拿临时密码去 /api/auth/login 必须 401 ' +
+      '（如果那条能过，"临时密码"就是一把长期密码，整个设计作废）。' +
+      '桌面端改密码后断言旧 refresh 立即 401 —— 改密码不踢会话是经典漏洞',
+    evidence:
+      '2026-11-25 修复后 35/35 通过。阴性对照：让 redeem 不标记 used_at（可重复使用）' +
+      ' → "同一枚不能重复使用"立即红，且后续连锁失败（密码被别人改掉）',
+    coveredBy: 'test/account-recovery.test.mjs（29 条静态：入口、字段齐全、UID 复制+提示、' +
+      '临时密码存哈希/一次性/过期、拒绝原因合并、白名单、独立限速、运维不许直接改密码）',
+  },
+
+  {
+    file: 'scripts/verify-account-security.mjs',
+    status: 'live-browser',
+    run: 'npm run build:server && node scripts/verify-account-security.mjs',
+    why:
+      '专项安全检查（用户要求"注意安全"）：临时密码能不能登录 / 跨 uid 用 / 过期后还能用 / ' +
+      '重复用 / 暴力猜码是否有 IP 限速 / 无身份能否改别人账户 / 仓库令牌与全局令牌能否改密码 / ' +
+      '改密码后旧凭证是否真失效 / 密码太短是否 400 而不是 500 / 审计是否可追溯 / 票据原文是否落盘',
+    evidence:
+      '2026-11-25 修复后 29/29 通过。★ 过程中发现并修掉一个真实缺陷：' +
+      '重置端点最初与登录共用 IP 限速桶，导致"同事登录失败"把正在重置密码的人一起锁掉 —— ' +
+      '改为独立的 reset-ip 维度',
+    coveredBy: 'test/account-recovery.test.mjs 里的密码/ticket 约束条目（静态）+ 本脚本（动态）',
+  },
+
+  {
+    file: 'scripts/verify-gov-sessions.mjs',
+    status: 'live-browser',
+    run: 'npm run build:server && node scripts/verify-gov-sessions.mjs',
+    why:
+      '全站管理页面的端到端：会话管理那 5 个端点做完后只有 API，用户明确否掉了' +
+      '「全用 URL」的方案（这是运维界面）。所以判据必须是**点按钮能成事**：' +
+      '点「强制下线」后目标账户的 refresh 立即 401；先真造出密码错误锁定，' +
+      '再点「解除锁定」，再用正确密码登一次 —— 只画按钮不接端点也会"看起来有功能"，' +
+      '所以最后一步必须真登录',
+    evidence:
+      '2026-11-25 修复后 16/16 通过。两个阴性对照：' +
+      '① 强制下线只画按钮不接端点 → 会话仍 HTTP 200，一条红；' +
+      '② 设备列表不标「当前设备」 → 界面会误给"退出自己"的按钮，一条红',
+    coveredBy: 'test/desktop-voice-and-gov-sessions.test.mjs（12 条静态：区块存在、按钮接端点、当前设备不给踢、cleared=0 提示）',
+  },
+
+  {
+    file: 'scripts/verify-panel-overview.mjs',
+    status: 'live-browser',
+    run: 'npm run build:server && node scripts/verify-panel-overview.mjs',
+    why:
+      '管理面板总览的两件事：① 统计是**全站**的（不是"我这个账号可见的那一片"）' +
+      '② 刷新 / 新标签页不用重新登录。两件都是"改回去不会报错、只是数字和体验悄悄变差"的' +
+      '那类缺陷，所以必须有真浏览器判据。脚本造三个账户各一张卡，断言总览显示 3 而不是 1；' +
+      '对照组同时断言 /api/stats 仍按凭证过滤（证明两者语义确实不同）',
+    evidence:
+      '2026-11-25 修复后 18/18 通过。两个阴性对照：' +
+      '① 统计改回 /api/stats → 总览显示 0（管理员自己那张都不在其中），两条红；' +
+      '② 勾选不落盘 → 免密相关的四条红',
+    coveredBy: 'test/panel-overview-and-remember.test.mjs（17 条静态：口径、存储位置、过期、轮换、退出清理）',
+  },
+
+  {
+    file: 'scripts/verify-p110-undo.mjs',
+    status: 'live-browser',
+    run: 'npm run build:ui && node scripts/verify-p110-undo.mjs',
+    why:
+      'P1-10 撤销随折叠丢失的端到端验收。缺陷是「折叠 → 展开 → Ctrl+Z 没反应」，' +
+      '所以判据只能是**真键盘事件之后编辑器里的文本**，不能靠读源码或读 State。' +
+      '脚本点真实块头折叠/展开（不直接调 collapse/expand 函数），发 CDP 键盘事件输入与 Ctrl+Z。' +
+      '同时断言「折叠后编辑器 DOM 真的消失」—— 否则折叠只是 hidden、编辑器没销毁，' +
+      '撤销本来就不会丢，探针会通过但什么都没证明',
+    evidence:
+      '2026-11-25 修复后 8/8 通过；把 expand 的复用分支改成 null（还原修复前行为）重跑，' +
+      '⑤ 两条红、报「差 6 字符」（正好是输入的 ZZTEST）—— 阴性对照确认判据能分辨两种实现',
+    coveredBy: 'test/undo-survives-collapse.test.mjs（12 条：真 CodeMirror state 的撤销行为 + 复用决策 + 接线）',
+  },
+
+  {
     file: 'scripts/verify-ui-copy.mjs',
     status: 'offline',
     run: 'node scripts/verify-ui-copy.mjs .',

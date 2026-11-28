@@ -33,6 +33,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 import {
   localCardId,
@@ -69,8 +70,20 @@ function stripComments(source) {
 function methodBody(source, signature) {
   const at = source.indexOf(signature);
   if (at < 0) return '';
-  const next = source.indexOf('\n  private ', at + signature.length);
-  return source.slice(at, next < 0 ? source.length : next);
+  /*
+   * 收边要认两种形态（2026-11-24）：
+   *   类内方法     下一个 `\n  private `
+   *   拆出去的函数  下一个 `\nexport `
+   *
+   * 只认前者的话，从 card-actions.ts 里切出的"方法体"会一直延伸到文件尾，
+   * 于是后面 `writeCardPng` 实现里的 `bridge.writeCharacterPng` 也被算进来，
+   * 报「不许绕过收口直接写卡」—— 而 writeCardToLibrary 自己没那个调用。
+   */
+  const from = at + signature.length;
+  const candidates = [source.indexOf('\n  private ', from), source.indexOf('\nexport ', from)]
+    .filter((i) => i >= 0);
+  const next = candidates.length > 0 ? Math.min(...candidates) : source.length;
+  return source.slice(at, next);
 }
 
 /**
@@ -92,8 +105,8 @@ function fixture(name) {
   return new Uint8Array(readFileSync(join(FIXTURES, name)));
 }
 
-const shellSrc = stripComments(read('client/src/chat/shell.ts'));
-const shellRaw = read('client/src/chat/shell.ts');
+const shellSrc = readShellImplNoComments();
+const shellRaw = readShellImpl();
 
 /* ═══════════════════════════════════════════════════════════
    一、文件解析：PNG 卡 / 裸 PNG / JSON / 垃圾
@@ -242,8 +255,8 @@ test('★★★★ 本地导入与仓库下载共用同一套落盘，不另写'
    * —— 这个项目已经栽过好几次"零件都对、装配错了"。
    */
   for (const fnName of [
-    'private async importRepoVersion',
-    'private async importLocalCard',
+    'function importRepoVersion(host: RepoHost',
+    'function importLocalCard(host: CardHost',
   ]) {
     const body = methodBody(shellSrc, fnName);
     assert.ok(body !== '', `找不到 ${fnName}`);
@@ -268,8 +281,8 @@ test('★★★★ allowCreate 与 overwrite 必须成对反传', () => {
    * 传反会立刻暴露，但前提是这里真的写成 `!overwrite`。
    * 写成 `overwrite` 就是"该新建时去覆盖上一张同名卡" —— 不可逆。
    */
-  const body = methodBody(shellSrc, 'private async writeCardToLibrary');
-  assert.ok(body !== '', '找不到 private async writeCardToLibrary');
+  const body = methodBody(shellSrc, 'function writeCardToLibrary(host: CardHost');
+  assert.ok(body !== '', '找不到 writeCardToLibrary');
 
   /*
    * ★ 2026-11-16：落盘收口到 `writeCardPng()`（它负责作废分享缓存），
@@ -285,8 +298,8 @@ test('★★★★ allowCreate 与 overwrite 必须成对反传', () => {
 });
 
 test('★★ 世界书先落地、卡后写（顺序反了会留下指向空书的卡）', () => {
-  const body = methodBody(shellSrc, 'private async writeCardToLibrary');
-  assert.ok(body !== '', '找不到 private async writeCardToLibrary');
+  const body = methodBody(shellSrc, 'function writeCardToLibrary(host: CardHost');
+  assert.ok(body !== '', '找不到 writeCardToLibrary');
 
   const worldAt = body.indexOf('persistEmbeddedWorldbook(');
   const buildAt = body.indexOf('buildPngCard(');
@@ -303,7 +316,7 @@ test('★★ 世界书先落地、卡后写（顺序反了会留下指向空书�
    ═══════════════════════════════════════════════════════════ */
 
 test('★★★★ 本地导入会覆盖时先弹确认，仓库下载不弹', () => {
-  const body = methodBody(shellSrc, 'private async resolveCardPlacement');
+  const body = methodBody(shellSrc, 'function resolveCardPlacement(host: CardHost');
   assert.ok(body !== '', '找不到 private async resolveCardPlacement');
 
   /* 确认要以 overwrite 为条件，不是每次都弹 */
@@ -312,20 +325,20 @@ test('★★★★ 本地导入会覆盖时先弹确认，仓库下载不弹', (
   assert.match(body, /if \(!go\) return null/, '取消要能中止（返回 null）');
 
   /* 两个调用点参数相反 */
-  const localAt = shellSrc.indexOf('private async importLocalCard');
+  const localAt = shellSrc.indexOf('function importLocalCard(host: CardHost');
   const localBody = shellSrc.slice(localAt, localAt + 3000);
   assert.match(localBody, /confirmOverwrite: true/, '本地导入要确认');
 
-  const repoAt = shellSrc.indexOf('private async importRepoVersion');
+  const repoAt = shellSrc.indexOf('function importRepoVersion(host: RepoHost');
   const repoBody = shellSrc.slice(repoAt, repoAt + 2000);
   assert.match(repoBody, /confirmOverwrite: false/, '仓库下载是权威版本，不确认');
 });
 
 test('★★★ 确认框挂在 root，不挂 pageHost（否则换页时 Promise 永不 resolve）', () => {
-  const body = methodBody(shellSrc, 'private async confirmOverwriteCard');
-  assert.ok(body !== '', '找不到 private async confirmOverwriteCard');
+  const body = methodBody(shellSrc, 'function confirmOverwriteCard(host: CardHost');
+  assert.ok(body !== '', '找不到 confirmOverwriteCard');
 
-  assert.match(body, /const host = this\.root/, '要挂在稳定的外壳上');
+  assert.match(body, /const root = this\.root/, '要挂在稳定的外壳上');
   assert.match(body, /data-role', 'card-import-confirm'/, '弹层要有 data-role');
   assert.match(body, /data-role', 'card-import-confirm-ok'/, '覆盖按钮');
   assert.match(body, /data-role', 'card-import-confirm-cancel'/, '取消按钮');
@@ -341,8 +354,8 @@ test('★★ 选文件读的是 ArrayBuffer，不是文本', () => {
    * 导入卡与选封面只差一个 accept 字符串，其余（隐藏 input、change/cancel
    * 双保险、60 秒超时、finally remove）完全一样。写两遍必然漏一处。
    */
-  const body = methodBody(shellSrc, 'private async pickFileBytes');
-  assert.ok(body !== '', '找不到 private async pickFileBytes');
+  const body = methodBody(shellSrc, 'function pickFileBytes(host: CardHost');
+  assert.ok(body !== '', '找不到 pickFileBytes');
 
   /*
    * `readAsText` 读 PNG 会把二进制掰成文本，写进角色目录就是一个坏文件，
@@ -360,7 +373,7 @@ test('★★ 选文件读的是 ArrayBuffer，不是文本', () => {
    ═══════════════════════════════════════════════════════════ */
 
 test('★★★ 导入按钮有三态与四条文案', () => {
-  const body = methodBody(shellSrc, 'private async importLocalCard');
+  const body = methodBody(shellSrc, 'function importLocalCard(host: CardHost');
   assert.ok(body !== '', '找不到 private async importLocalCard');
 
   assert.match(body, /runBusy\(/, '复用三态按钮，不另写一份');
@@ -397,7 +410,7 @@ test('★★ 开场页的空态也指向具体入口（原来指的是不存在�
    ═══════════════════════════════════════════════════════════ */
 
 test('★★★★ JSON 卡导入时问封面，PNG 卡不问', () => {
-  const body = methodBody(shellSrc, 'private async importLocalCard');
+  const body = methodBody(shellSrc, 'function importLocalCard(host: CardHost');
   assert.ok(body !== '', '找不到 private async importLocalCard');
 
   /*
@@ -419,8 +432,8 @@ test('★★★★ 没有封面时按卡名生成，而不是塞统一的默认�
    * 为什么这条重要：选角色列表**显示头像**。所有没有封面的卡长得一模一样
    * 的话，用户只能靠名字分辨 —— 等于把"有没有封面"变成了"能不能认出自己的卡"。
    */
-  const body = methodBody(shellSrc, 'private async writeCardToLibrary');
-  assert.ok(body !== '', '找不到 private async writeCardToLibrary');
+  const body = methodBody(shellSrc, 'function writeCardToLibrary(host: CardHost');
+  assert.ok(body !== '', '找不到 writeCardToLibrary');
 
   assert.match(body, /base: Uint8Array \| null/, 'base 要允许 null（用 null 表示没图）');
   assert.match(body, /faceFromName\(/, '没图时按卡名生成');
@@ -435,7 +448,7 @@ test('★★★★ 没有封面时按卡名生成，而不是塞统一的默认�
 });
 
 test('★★★ 仓库下载也走同一条封面逻辑（它也曾经全是同一张图）', () => {
-  const body = methodBody(shellSrc, 'private async importRepoVersion');
+  const body = methodBody(shellSrc, 'function importRepoVersion(host: RepoHost');
   assert.ok(body !== '', '找不到 private async importRepoVersion');
 
   /*
@@ -525,10 +538,10 @@ test('★★★ 换封面用 canvas 缩成方形，且不依赖 CompressionStrea
 });
 
 test('★★ 封面提问框挂在 root（换页不会让 Promise 悬空）', () => {
-  const body = methodBody(shellSrc, 'private async askCardFace');
+  const body = methodBody(shellSrc, 'function askCardFace(host: CardHost');
   assert.ok(body !== '', '找不到 private async askCardFace');
 
-  assert.match(body, /const host = this\.root/, '要挂在稳定的外壳上');
+  assert.match(body, /const root = this\.root/, '要挂在稳定的外壳上');
   assert.match(body, /data-role', 'card-face-ask'/, '弹层要有 data-role');
   assert.match(body, /data-role', 'card-face-pick'/, '选图按钮');
   assert.match(body, /data-role', 'card-face-default'/, '用默认按钮');
@@ -546,7 +559,7 @@ test('★★ 导入卡与选封面共用同一个选文件实现', () => {
    * 两处只差 accept 字符串。复制一份的话，将来修超时或修 remove 会漏一处
    * —— 本项目对"写两遍"的后果有过明确结论（见 busy-button 与 runBusy）。
    */
-  const importBody = methodBody(shellSrc, 'private async importLocalCard');
+  const importBody = methodBody(shellSrc, 'function importLocalCard(host: CardHost');
   assert.ok(importBody !== '', '找不到 private async importLocalCard');
   assert.match(importBody, /pickFileBytes\('image\/png,application\/json/, '导入卡要传卡片的 accept');
 
@@ -557,7 +570,7 @@ test('★★ 导入卡与选封面共用同一个选文件实现', () => {
    * 当成注释开头，一直吞到下一个「星号+斜杠」—— 这行代码在剥过注释的
    * 源码里整段消失，断言永远找不到它（而实际上代码是对的）。
    */
-  const faceBodyRaw = methodBody(shellRaw, 'private async pickFaceImage');
+  const faceBodyRaw = methodBody(shellRaw, 'function pickFaceImage(host: CardHost');
   assert.ok(faceBodyRaw !== '', '找不到 private async pickFaceImage');
   assert.match(faceBodyRaw, /pickFileBytes\('image\/\*'\)/, '选封面要传图片的 accept');
 
@@ -571,7 +584,7 @@ test('★★ 导入卡与选封面共用同一个选文件实现', () => {
    * ★ 那份老实现确实也是重复（同一个隐藏 input + change/cancel + 超时），
    *   但改它要动世界书导入，不在本次范围。已记进 PLAN 的待办。
    */
-  const defs = (shellSrc.match(/private async pickFileBytes\(/g) ?? []).length;
+  const defs = (shellSrc.match(/function pickFileBytes\(host: CardHost/g) ?? []).length;
   assert.equal(defs, 1, 'pickFileBytes 应只定义一次，实际 ' + defs + ' 次');
 
   const calls = (shellSrc.match(/await this\.pickFileBytes\(/g) ?? []).length;

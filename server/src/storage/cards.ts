@@ -1218,6 +1218,7 @@ export class CardService {
   events(
     limit: number,
     scope: CardScope = ALL_CARDS,
+    options: { includeAdminEvents?: boolean } = {},
   ): Array<{
     id: number;
     at: string;
@@ -1229,7 +1230,7 @@ export class CardService {
     actor: string | null;
     ip: string | null;
   }> {
-    return this.db.listEvents(limit, scope).map((row) => ({
+    return this.db.listEvents(limit, scope, options).map((row) => ({
       id: row.id,
       at: row.at,
       level: row.level,

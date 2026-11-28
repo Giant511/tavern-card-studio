@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 
@@ -44,15 +45,15 @@ test('★★★★★ 读角色卡失败必须重试（引擎首启要 7–57 �
    * 而 `restoreLatestChat` 每轮都 `ensureConnected()` —— 等引擎就绪的机制
    * 一直存在，只是没用在读卡上。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   assert.match(
     src,
-    /private async loadCharacterCardWithRetry/,
+    /function loadCharacterCardWithRetry\(host: CardHost/,
     '要有带重试的读卡入口',
   );
 
-  const at = src.indexOf('private async loadCharacterCardWithRetry');
+  const at = src.indexOf('function loadCharacterCardWithRetry(host: CardHost');
   const body = src.slice(at, at + 1200);
 
   assert.match(body, /ensureConnected\(\)/, '每轮重试前要先确保连上引擎');
@@ -66,7 +67,7 @@ test('★★★★★ 冷启动与切角色都要用带重试的读卡', () => {
    * 两条路都会撞上"引擎没起"：冷启动（mount 时引擎刚拉起来）
    * 与切角色（用户随时可能切）。只要有一条漏了，那条路上就永远没有开场白。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   const calls = [...src.matchAll(/loadCharacterCardWithRetry\(/g)].length;
   assert.ok(
@@ -98,7 +99,7 @@ test('★★★★ 卡读到就要重绘，不许等历史（等 60 秒空屏）
    * 把重绘排在它后面 ⇒ 用户对着"没有开场白"的空屏等一分钟。
    * 而开场白只需要卡，不需要历史。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   for (const marker of ['const gotCard = await this.loadCharacterCardWithRetry']) {
     const at = src.indexOf(marker);
@@ -124,9 +125,9 @@ test('★★★★★ 下载导入要用仓库卡面当底图（不是永远首�
    * 后果：仓库里精心画的卡面，下载下来是一个字 —— 正是 v0.1.8 当初说
    * 要避免的"所有卡长得一样"。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
-  const at = src.indexOf('private async importRepoVersion');
+  const at = src.indexOf('function importRepoVersion(host: RepoHost');
   assert.ok(at > 0, '找不到 importRepoVersion');
   const body = src.slice(at, at + 3000);
 
@@ -141,8 +142,8 @@ test('★★★★ 没有背景时要提示用户（不能静默用首字封面�
    * 用户明确要求："如果无背景提示用户选背景或者生成背景"。
    * 不说的话，用户会以为"下载坏了" —— 而其实仓库里那张卡本来就没配图。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
-  const at = src.indexOf('private async importRepoVersion');
+  const src = readShellImplNoComments();
+  const at = src.indexOf('function importRepoVersion(host: RepoHost');
   const body = src.slice(at, at + 3600);
 
   assert.match(body, /if \(face === null\)/, '要对"没有卡面"单独分支');
@@ -227,8 +228,8 @@ test('★★★★★ 背景转码失败必须报出来，不许静默退回首�
    *
    * 吞掉失败比失败本身更坏：失败还能查，静默只能猜。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
-  const at = src.indexOf('private async importRepoVersion');
+  const src = readShellImplNoComments();
+  const at = src.indexOf('function importRepoVersion(host: RepoHost');
   assert.ok(at > 0);
   const body = src.slice(at, at + 4000);
 
@@ -249,7 +250,7 @@ test('★★★★★ 转码的长边要能限小（4096 的 canvas 在手机上
   assert.match(conv, /maxEdge: number = FACE_MAX_EDGE/, '要有可覆盖的长边上限');
   assert.match(conv, /scaledSize\(originalWidth, originalHeight, maxEdge\)/, '缩放要用参数而不是常量');
 
-  const shell = stripComments(read('client/src/chat/shell.ts'));
+  const shell = readShellImplNoComments();
   assert.match(
     shell,
     /convertToPng\(\s*face\.bytes,[\s\S]{0,120}?1024,/,
@@ -298,7 +299,7 @@ test('★★★★★ 切角色必须先清空 loadedCard（否则新角色用�
    *   ① 切角色那段里有 `this.loadedCard = {}`
    *   ② 它在 `renderPage()` **之前**（顺序反了就白清）
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   const at = src.indexOf('this.lastSavedFingerprint = null;');
   assert.ok(at > 0, '找不到切角色清状态的位置');
@@ -351,7 +352,7 @@ test('★★★★★ 下载写卡后必须让 ST 的缩略图失效（两层缓
    * ST 磁盘那层不清 ⇒ App 重新请求拿到的还是旧字节；
    * App 内存那层不清 ⇒ 这一会话根本不重新请求。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   /*
    * ★ 2026-11-11 改过定位：第一版只修在**仓库下载那个调用点**，于是用户
@@ -360,7 +361,7 @@ test('★★★★★ 下载写卡后必须让 ST 的缩略图失效（两层缓
    * 现在修在 `writeCardToLibrary` **内部**（两条导入路径共用），
    * 判据也跟着落到那里。
    */
-  const at = src.indexOf('private async writeCardToLibrary');
+  const at = src.indexOf('function writeCardToLibrary(host: CardHost');
   assert.ok(at > 0, '找不到 writeCardToLibrary');
   const nextPrivate = src.indexOf('\n  private ', at + 10);
   const body = src.slice(at, nextPrivate < 0 ? src.length : nextPrivate);

@@ -26,6 +26,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
 
@@ -33,7 +34,7 @@ function stripComments(source) {
   return source.replace(/\/\*[\s\S]*?\*\//g).replace(/^\s*\/\/[^\n]*$/gm, '');
 }
 
-const shellSrc = stripComments(read('client/src/chat/shell.ts'));
+const shellSrc = readShellImplNoComments();
 const importSrc = read('shared/src/repo/card-import.ts');
 const worldSrc = read('shared/src/repo/embedded-worldbook.ts');
 const mainSrc = stripComments(read('client/src/mobile/main.ts'));
@@ -135,7 +136,7 @@ test('★★★★★ writeCharacterPng 的 allowCreate 必须跟着 overwrite �
    * 现在只看两件事：**导入那条调用存在**，且第 4 参是对某个 overwrite 取反。
    * 开场白保存那条传 `false` 是合法的（只改现有卡），所以先定位到导入那条。
    */
-  const at = shellSrc.indexOf('private async writeCardToLibrary(');
+  const at = shellSrc.indexOf('function writeCardToLibrary(host: CardHost');
   assert.ok(at > 0, '找不到 writeCardToLibrary');
   const block = shellSrc.slice(at, at + 3600);
   /*
@@ -434,7 +435,7 @@ test('★★★★ 世界书要在**写卡之前**落地（书名要先定下来
    * 才碰巧通过 —— 那是判据的缺陷，不是代码的结构。
    * 一改成严格函数体就露馅了，顺手改对。
    */
-  const body = methodBody(shellSrc, 'private async writeCardToLibrary');
+  const body = methodBody(shellSrc, 'function writeCardToLibrary(host: CardHost');
   assert.ok(body !== '', '找不到 writeCardToLibrary');
 
   const worldAt = body.indexOf('this.persistEmbeddedWorldbook');
@@ -453,7 +454,7 @@ test('★★★ 世界书落地失败不许阻断导入', () => {
    * 卡本身已经能用了，世界书是加分项。阻断会让用户连卡都拿不到 ——
    * 那比"世界书没进来"糟得多。
    */
-  const at = shellSrc.indexOf('private async persistEmbeddedWorldbook');
+  const at = shellSrc.indexOf('function persistEmbeddedWorldbook(host: CardHost');
   assert.ok(at > 0, '找不到 persistEmbeddedWorldbook');
   const body = shellSrc.slice(at, at + 2600);
 
@@ -477,7 +478,7 @@ test('★★★★ 世界书重名不许覆盖别人的书', () => {
    *
    * 所以：先查列表，重名就加序号。
    */
-  const at = shellSrc.indexOf('private async persistEmbeddedWorldbook');
+  const at = shellSrc.indexOf('function persistEmbeddedWorldbook(host: CardHost');
   const body = shellSrc.slice(at, at + 2600);
 
   assert.match(body, /listWorldbookNames/, '要先查已有世界书');
@@ -502,7 +503,7 @@ test('★★★★★ 读不到世界书列表时不许当成"空表"（否则�
    *   ① 函数本身三态：失败回 `null`，不许回 `[]`
    *   ② 调用方见到 `null` 就停手，不许继续 import
    */
-  const at = shellSrc.indexOf('private async listWorldbookNames');
+  const at = shellSrc.indexOf('function listWorldbookNames(host: CardHost)');
   assert.ok(at > 0, '找不到 listWorldbookNames');
   const decl = shellSrc.slice(at, at + 200);
   assert.match(decl, /Promise<string\[\] \| null>/, '签名要三态');
@@ -523,7 +524,7 @@ test('★★★★★ 读不到世界书列表时不许当成"空表"（否则�
     'catch 要返回 null 而不是空数组',
   );
 
-  const callerAt = shellSrc.indexOf('private async persistEmbeddedWorldbook');
+  const callerAt = shellSrc.indexOf('function persistEmbeddedWorldbook(host: CardHost');
   assert.ok(callerAt > 0);
   const caller = shellSrc.slice(callerAt, callerAt + 3000);
   assert.match(
@@ -534,7 +535,7 @@ test('★★★★★ 读不到世界书列表时不许当成"空表"（否则�
 });
 
 test('★★★ 世界书落地失败不许阻断导入（null 回退也不许弹错）', () => {
-  const at = shellSrc.indexOf('private async persistEmbeddedWorldbook');
+  const at = shellSrc.indexOf('function persistEmbeddedWorldbook(host: CardHost');
   const body = shellSrc.slice(at, at + 3000);
   /* 跳过世界书是静默的：那里不许出现通知调用 */
   assert.ok(!/notify\(/.test(body), '世界书失败不许弹通知（用户会以为角色没导进去）');

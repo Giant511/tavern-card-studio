@@ -26,6 +26,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 import {
   applyCharacterPrompts,
@@ -209,7 +210,7 @@ test('★★★ 合成结果与直接 apply 完全一致（不许在这里长第
  * 用 `blankComments` 而不是 `stripComments`：下面几条判据失败时会报行号，
  * 而报出的行号必须是**真文件中**的行号（见上面 `blankComments` 的注释）。
  */
-const shellSrc = blankComments(read('client/src/chat/shell.ts'));
+const shellSrc = blankComments(readShellImpl());
 
 /** 数一个模式在源码里出现几次（带行号，失败时能直接跳过去看） */
 function occurrences(src, pattern) {
@@ -250,8 +251,14 @@ test('★★★★★ `this.promptConfig` 全文件只有一个写入点', () =>
   );
 
   /* 且那唯一一次必须就在 rebuildPromptConfig 里面（不是别的方法里恰好也只写一次） */
-  const rebuilt = shellSrc.slice(shellSrc.indexOf('private rebuildPromptConfig('));
-  const body = rebuilt.slice(0, rebuilt.indexOf('\n  }'));
+  /*
+   * 切片收到「下一个 export」（2026-11-24 搬家后：函数在 prompt-actions.ts，
+   * 终点不再是 `\n  }` 这种类内方法结尾）。
+   */
+  const rebuiltAt = shellSrc.indexOf('function rebuildPromptConfig(host: PromptHost)');
+  assert.ok(rebuiltAt >= 0, '找不到 rebuildPromptConfig');
+  const rebuiltEnd = shellSrc.indexOf('\nexport ', rebuiltAt + 10);
+  const body = shellSrc.slice(rebuiltAt, rebuiltEnd < 0 ? undefined : rebuiltEnd);
   assert.match(body, /this\.promptConfig = merged/, '唯一写入点要在 rebuildPromptConfig 内');
   assert.match(body, /combineGlobalAndCharacter\(/, '要经合成函数，不能绕过');
 });
@@ -270,7 +277,7 @@ test('★★★★★ `this.loadedCard` 全文件只有一个写入点（必须�
       writes.map((one) => `第 ${String(one.line)} 行`).join('、'),
   );
 
-  const adopt = shellSrc.slice(shellSrc.indexOf('private adoptLoadedCard('));
+  const adopt = shellSrc.slice(shellSrc.indexOf('function adoptLoadedCard(host: CardHost'));
   const body = adopt.slice(0, adopt.indexOf('\n  }'));
   assert.match(body, /this\.loadedCard = card/, '收卡要在这个方法里');
   assert.match(
@@ -290,9 +297,9 @@ test('★★★★ `loadCharacterCard` 的四条分支全部走 adoptLoadedCard'
    * 将来加了第五条失败分支（例如超时），只要它也用 adopt 就是对的，
    * 判据不该因为数字变化而假红。
    */
-  const start = shellSrc.indexOf('private async loadCharacterCard(');
+  const start = shellSrc.indexOf('function loadCharacterCard(host: CardHost');
   assert.ok(start > 0, '找不到 loadCharacterCard');
-  const body = shellSrc.slice(start, shellSrc.indexOf('private adoptLoadedCard(', start));
+  const body = shellSrc.slice(start, shellSrc.indexOf('function adoptLoadedCard(host: CardHost', start));
 
   assert.doesNotMatch(
     body,
@@ -332,8 +339,10 @@ test('★★★★ 重算之后必须把结果推给面板（不推 = 面板一�
    * 本项目最反复的缺陷类型：算对了、存对了，就是没推给消费者。
    * 作者注释那条（§130）就是"实现存在，但接在了错的函数里"。
    */
-  const start = shellSrc.indexOf('private rebuildPromptConfig(');
-  const body = shellSrc.slice(start, shellSrc.indexOf('\n  }', start));
+  const start = shellSrc.indexOf('function rebuildPromptConfig(host: PromptHost)');
+  assert.ok(start >= 0, '找不到 rebuildPromptConfig');
+  const endAt = shellSrc.indexOf('\nexport ', start + 10);
+  const body = shellSrc.slice(start, endAt < 0 ? undefined : endAt);
   assert.match(
     body,
     /this\.chatPanel\?\.setContext\(\{ promptConfig: merged \}\)/,

@@ -18,6 +18,8 @@ import { createServer as createHttpsServer, type Server as HttpsServer } from 'n
 import { readFileSync } from 'node:fs';
 import type { RequestListener, Server as HttpServer } from 'node:http';
 
+import { resolveTlsPath } from './paths.js';
+
 import {
   ensureSelfSigned,
   expiryWarningText,
@@ -110,7 +112,21 @@ export async function prepareTlsMaterial(options: PrepareOptions): Promise<Prepa
   }
 
   // custom
-  const info = await validateCustomCertificate(config.certPath, config.keyPath);
+  /*
+   * ★ 相对路径按 **dataDir** 解析（2026-11-24）。
+   *
+   * 原来直接把 `config.certPath` 交给 `readFileSync` / `validateCustomCertificate`，
+   * 相对路径就按**进程 cwd** 解析。而面板检查（`inspectTlsInputs`）用的是 dataDir。
+   *
+   * 后果是"面板说可用、服务起不来"：Windows 服务装好后的 cwd 是
+   * `C:\Windows\System32`，用户填的相对路径在那里找不到。启动失败信息还指向证书内容，
+   * 而真正的问题是路径口径。
+   *
+   * 现在两处共用 `resolveTlsPath`，口径只有一份。
+   */
+  const certPath = resolveTlsPath(options.dataDir, config.certPath);
+  const keyPath = resolveTlsPath(options.dataDir, config.keyPath);
+  const info = await validateCustomCertificate(certPath, keyPath);
   const warnings: string[] = [];
   if (info.daysUntilExpiry < 30) {
     warnings.push(
@@ -127,8 +143,9 @@ export async function prepareTlsMaterial(options: PrepareOptions): Promise<Prepa
 
   return {
     material: {
-      cert: readFileSync(config.certPath, 'utf8'),
-      key: readFileSync(config.keyPath, 'utf8'),
+      // 与上面的校验用同一份解析结果，避免"校验过的是 A 文件、读的是 B 文件"
+      cert: readFileSync(certPath, 'utf8'),
+      key: readFileSync(keyPath, 'utf8'),
     },
     info,
     warnings,

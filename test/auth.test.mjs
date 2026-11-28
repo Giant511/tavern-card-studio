@@ -113,22 +113,24 @@ test('T10.4 时序：用户不存在与密码错耗时同量级', async () => {
     const realTimes = [];
     const dummyTimes = [];
     for (let i = 0; i < 5; i += 1) {
+      // 每轮换一个 IP：同一 IP 累积到 5 次失败会触发锁定，后续抛 ACCOUNT_LOCKED，
+      // 时序比较要的是"哈希路径一致"，不是"锁定行为"。
+      const ip = `10.1.1.${String(i)}`;
       let t = process.hrtime.bigint();
       await expectAuthError(
-        env.auth.login({ username: 'alice', password: `wrong-${String(i)}`, ip: IP, userAgent: UA }),
+        env.auth.login({ username: 'alice', password: `wrong-${String(i)}`, ip, userAgent: UA }),
         'INVALID_CREDENTIALS',
       );
       realTimes.push(Number(process.hrtime.bigint() - t) / 1e6);
 
       t = process.hrtime.bigint();
       await expectAuthError(
-        env.auth.login({ username: `ghost-${String(i)}`, password: 'whatever', ip: IP, userAgent: UA }),
+        env.auth.login({ username: `ghost-${String(i)}`, password: 'whatever', ip, userAgent: UA }),
         'INVALID_CREDENTIALS',
       );
       dummyTimes.push(Number(process.hrtime.bigint() - t) / 1e6);
     }
 
-    // 每次失败都会累加限速计数 —— 这里只关心时间，忽略锁定影响（两次都同样被锁）
     const median = (list) => [...list].sort((a, b) => a - b)[Math.floor(list.length / 2)];
     const real = median(realTimes);
     const dummy = median(dummyTimes);
@@ -206,7 +208,7 @@ test('T10.4 枚举：注册时"用户名已占用"与"格式不合规"共用同�
 // 3. 锁定流程
 // ══════════════════════════════════════════════════════════
 
-test('T10.4 锁定：同账户 5 次失败后锁 10 分钟，且响应与密码错一致', async () => {
+test('T10.4 锁定：同账户 5 次失败后锁 10 分钟，再试报 ACCOUNT_LOCKED', async () => {
   const env = fresh();
   try {
     const user = await makeUser(env, 'carol', 'carol-password-1');
@@ -231,14 +233,17 @@ test('T10.4 锁定：同账户 5 次失败后锁 10 分钟，且响应与密码�
     assert.equal(lockedState.locked, true, '第 5 次失败后应当锁定');
     assert.ok(lockedState.retryAfterMs > 9 * 60 * 1000, `锁定应接近 10 分钟，实际 ${String(lockedState.retryAfterMs)}ms`);
 
-    // 关键：**用正确密码**再试，也必须被拒，且错误与密码错完全一致
+    // 关键：**用正确密码**再试，也必须被拒；锁定要单独报，不再冒充密码错
     const correctDuringLock = await expectAuthError(
       env.auth.login({ username: 'carol', password: 'carol-password-1', ip: IP, userAgent: UA }),
-      'INVALID_CREDENTIALS',
+      'ACCOUNT_LOCKED',
     );
-    assert.equal(correctDuringLock.status, 401);
-    assert.equal(correctDuringLock.message, '用户名或密码不正确', '锁定期响应文案必须与密码错一致');
-    assert.equal(correctDuringLock.details, undefined, '不能泄露 retryAfter 之类的锁定信息');
+    assert.equal(correctDuringLock.status, 423);
+    assert.match(correctDuringLock.message, /账号已锁定/);
+    assert.match(correctDuringLock.message, /分钟/);
+    assert.notEqual(correctDuringLock.message, '用户名或密码不正确', '锁定不能继续冒充密码错');
+    const retryAfter = Number(correctDuringLock.details?.retryAfterSeconds);
+    assert.ok(retryAfter > 540 && retryAfter <= 600, `retryAfterSeconds 应接近 600，实际 ${String(retryAfter)}`);
 
     // 用户在锁定期间没拿到会话
     assert.equal(env.sessions.listActive(user.id, env.now()).length, 0);
@@ -271,11 +276,13 @@ test('T10.4 锁定：按 IP 也生效（换账户名照样被拦）', async () =
     const ipState = env.limiter.check({ ip: '10.0.0.9', account: 'dave' }, env.now());
     assert.equal(ipState.locked, true, '同 IP 连续 5 次失败应当锁定，哪怕每次用户名都不同');
 
-    // 该 IP 上的任何一个正确账户也被拦
-    await expectAuthError(
+    // 该 IP 上的任何一个正确账户也被拦（IP 维度锁，没有账户锁定文案）
+    const byIp = await expectAuthError(
       env.auth.login({ username: 'dave', password: 'dave-password-1', ip: '10.0.0.9', userAgent: UA }),
-      'INVALID_CREDENTIALS',
+      'ACCOUNT_LOCKED',
     );
+    assert.equal(byIp.status, 423);
+    assert.match(byIp.message, /频繁|锁定/);
     // 另一个 IP 不受影响
     const other = await env.auth.login({ username: 'erin', password: 'erin-password-1', ip: '10.0.0.10', userAgent: UA });
     assert.ok(other.tokens.accessToken);
@@ -302,7 +309,7 @@ test('T10.4 锁定：已锁期间的失败不延长锁定（防拒绝服务）',
       env.advance(60 * 1000);
       await expectAuthError(
         env.auth.login({ username: 'frank', password: 'wrong', ip: IP, userAgent: UA }),
-        'INVALID_CREDENTIALS',
+        'ACCOUNT_LOCKED',
       );
     }
     const after = env.limiter.check({ ip: IP, account: 'frank' }, env.now());

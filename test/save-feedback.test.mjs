@@ -31,13 +31,14 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const read = (rel) => readFileSync(join(ROOT, rel), 'utf8');
 
 const apiPage = read('client/src/chat/api-page.ts');
 const voicePage = read('client/src/chat/voice-settings.ts');
-const shell = read('client/src/chat/shell.ts');
+const shell = readShellImpl();
 const chatPanel = read('client/src/chat/chat-panel.ts');
 const main = read('client/src/mobile/main.ts');
 

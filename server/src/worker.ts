@@ -12,6 +12,7 @@ import type { LoadedConfig } from './config.js';
 import { createContext, type ServerContext } from './context.js';
 import { createWorkerHandler } from './http/app.js';
 import { warmUpPasswordHashing } from './auth/password.js';
+import { SessionStore } from './auth/sessions.js';
 import { AUDIT_RETENTION_DAYS, pruneAuditEvents } from './account/purge.js';
 import { PLAINTEXT_BANNER } from './tls/server.js';
 import { TlsRuntime } from './tls/runtime.js';
@@ -226,12 +227,47 @@ export async function startWorker(loaded: LoadedConfig): Promise<RunningWorker> 
   auditTimer.unref();
   runAuditSweep();
 
+  /**
+   * 过期会话清理（2026-11-24）。
+   *
+   * `sessions` 表只增不减：每次登录新建一行，吊销只是写 `revoked_at`。
+   * 没有清理就会一直长 —— 长期运行的服务端每几个月就要多几万行，
+   * 而 `listActive` / 每次请求的会话校验都会扫这张表。
+   *
+   * 保留 7 天宽限（`SessionStore.prune` 的默认值），让"最近被踢下线的设备"
+   * 还能在列表里显示原因 —— 用户第二天回来问"我怎么被登出了"时查得到。
+   *
+   * 间隔与审计清理一样取 6 小时：两者都是"按天计"的保留期，
+   * 运维看日志时两条记录挨着，好对照。
+   *
+   * ★ 这里 new 一个 `SessionStore` 而不是从 context 拿：它只持有
+   *   `db.handle`、没有任何实例状态，与 `createApp` 里那个操作的是同一张表。
+   *   为它往 `ServerContext` 加一个字段，会让"会话表操作入口"出现两个来源。
+   */
+  const sessionPrune = (): void => {
+    try {
+      const removed = new SessionStore(context.db.handle).prune();
+      if (removed > 0) {
+        context.logger.info('session.prune', { removed });
+      }
+    } catch (error) {
+      // 与其它清理任务同一条原则：失败不该影响服务可用性，记一条 warn 下一轮再试
+      context.logger.warn('session.prune.failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+  const sessionTimer = setInterval(sessionPrune, 6 * 60 * 60 * 1000);
+  sessionTimer.unref();
+  sessionPrune();
+
   let closing = false;
   const close = async (): Promise<void> => {
     if (closing) return;
     closing = true;
     clearInterval(trashTimer);
     clearInterval(auditTimer);
+    clearInterval(sessionTimer);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     clearInterval(tlsWatchTimer);
     await tlsRuntime.close();

@@ -21,6 +21,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const CHAT_DIR = join(ROOT, 'client', 'src', 'chat');
@@ -396,7 +397,7 @@ function inRanges(ranges, offset) {
 /* ── 走查 7：空状态不许是"暂无数据" ── */
 
 test('★ 走查 7：空状态都给了"人话 + 下一步"', () => {
-  const shell = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+  const shell = readShellImplNoComments();
   const view = readFileSync(join(CHAT_DIR, 'chat-view.ts'), 'utf8');
 
   /*

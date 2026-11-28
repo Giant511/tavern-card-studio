@@ -17,15 +17,30 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
-const APP = readFileSync(new URL('../client/src/editor/app.ts', import.meta.url), 'utf8');
+import { readEditorImplNoComments } from './lib/editor-source.mjs';
+
+/*
+ * 2026-11-24：换成共享入口。原来直接读 app.ts —— 于是 wireAccount 搬到
+ * wiring.ts 之后这条判据就报"没找到方法"，而它守的规则（账户装配不碰本地会话）
+ * 完全没被破坏。
+ */
+const APP = readEditorImplNoComments();
 const SESSION = readFileSync(new URL('../client/src/auth/session.ts', import.meta.url), 'utf8');
 
-/** 切出某个方法的源码（从标记处到下一个 2 空格缩进的 private/async 成员） */
+/**
+ * 切出某个函数的源码。
+ *
+ * 两种形态都认：
+ *   · 类方法 `private xxx(` → 到下一个 2 空格缩进的成员
+ *   · 模块函数 `function xxx(` → 到下一个 `export `
+ */
 function methodBody(source, marker) {
   const start = source.indexOf(marker);
   assert.ok(start >= 0, `没找到方法：${marker}`);
   const rest = source.slice(start + marker.length);
-  const nextMembers = ['\n  private ', '\n  public ', '\n  // ──'].map((token) => rest.indexOf(token));
+  const nextMembers = ['\n  private ', '\n  public ', '\n  // ──', '\nexport '].map((token) =>
+    rest.indexOf(token),
+  );
   const candidates = nextMembers.filter((index) => index > 0);
   const end = candidates.length > 0 ? Math.min(...candidates) : rest.length;
   return rest.slice(0, end);
@@ -53,7 +68,8 @@ test('T10.7 结构守卫：401 处理不触碰任何本地会话', () => {
 });
 
 test('T10.7 结构守卫：账户装配不触碰任何本地会话', () => {
-  const body = methodBody(APP, 'private wireAccount()');
+  /* 搬家后形态是 `function wireAccount(host: WireHost)` */
+  const body = methodBody(APP, 'function wireAccount(');
   for (const token of FORBIDDEN) {
     assert.equal(body.includes(token), false, `wireAccount 里出现了 ${token}`);
   }

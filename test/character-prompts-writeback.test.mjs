@@ -38,6 +38,7 @@ import {
   clearOverride,
 } from '../shared/dist/chat/index.js';
 import { parseStCardText, stringifyStCard } from '../shared/dist/index.js';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const read = (p) => readFileSync(join(ROOT, p), 'utf8');
@@ -436,7 +437,7 @@ test('★★★★ 跨设备：切换条不写死宽度（§131 硬约束）', (
    四、接线（按作用域分流）
    ═══════════════════════════════════════════════════════════ */
 
-const shellSrc = read('client/src/chat/shell.ts');
+const shellSrc = readShellImpl();
 const shellCode = stripComments(shellSrc);
 
 /**
@@ -520,7 +521,7 @@ test('★★★★ 删除在角色作用域下的语义不同（全局条目不�
    * 而在角色作用域下用户看到的"删除"按钮长一样 ——
    * 所以必须拒绝并给替代方案（关掉它）。
    */
-  const seg = between(shellCode, 'private async deletePromptById', 'private async mutatePromptPreset');
+  const seg = between(shellCode, 'function deletePromptById(host: PromptHost', 'function mutatePromptPreset(host: PromptHost');
   assert.match(seg, /promptScope === 'character'/, '要按作用域分流');
   assert.match(seg, /removeOwnPrompt/, '特有项可以删');
   assert.match(seg, /会影响所有角色/, '删全局条目要说清后果');
@@ -536,7 +537,7 @@ test('★★★★ 写回用当前状态重读 PNG，不用内存副本', () => 
    * 判据钉"写回函数体内有重新读 PNG 的那一句"，而不是钉顺序
    * （钉顺序会被无关重构弄红）。
    */
-  const seg = between(shellCode, 'private async saveCharacterPrompts', 'private async restoreCharacterPrompts');
+  const seg = between(shellCode, 'function saveCharacterPrompts(host: PromptHost', 'function restoreCharacterPrompts(host: PromptHost)');
 
   assert.match(seg, /this\.bridge\.characterPng\(avatar\)/, '要重读 PNG');
   assert.match(seg, /parsePngCard/, '要解析 PNG');
@@ -560,7 +561,7 @@ test('★★★★ 写回用当前状态重读 PNG，不用内存副本', () => 
 });
 
 test('★★★★ 写盘成功后才更新内存（失败不许让界面显示已保存）', () => {
-  const seg = between(shellCode, 'private async saveCharacterPrompts', 'private async restoreCharacterPrompts');
+  const seg = between(shellCode, 'function saveCharacterPrompts(host: PromptHost', 'function restoreCharacterPrompts(host: PromptHost)');
   /* 落盘收口之后，这一句代表"写盘"这件事（见上面那条判据的说明） */
   const writeAt = seg.indexOf('this.writeCardPng(');
   const memAt = seg.indexOf('this.characterPrompts = isCharacterPromptsEmpty');

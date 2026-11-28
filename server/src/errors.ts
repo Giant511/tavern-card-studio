@@ -34,9 +34,14 @@ export type ErrorCode =
   | 'CARD_DELETED'
   // T10.4 账户与认证的专用码。
   //
-  // 为什么登录失败只用一个码：`INVALID_CREDENTIALS` 同时覆盖"用户不存在"、
-  // "密码错"、"账户锁定中"三种情况 —— 如果分成三个码，客户端或日志一泄露
-  // 就等于把账户存在性/锁定状态广播出去。需求明确要求这三者对外不可区分。
+  // 登录失败分两种对外码（2026-11-27 起）：
+  //   功能：INVALID_CREDENTIALS 只覆盖「用户不存在 / 密码错」；
+  //         ACCOUNT_LOCKED 单独报锁定，带 Retry-After。
+  //   注意事项：INVALID_CREDENTIALS 内部仍不区分「不存在」与「密码错」，
+  //         否则用户名就成了可枚举的探针；ACCOUNT_LOCKED 只有连续失败的人
+  //         能看到，且不泄露账户是否存在。
+  //   踩过的坑：旧版把锁定并进 INVALID_CREDENTIALS，用户输对密码也看到
+  //         「密码不正确」，不知道该等 10 分钟还是找管理员。
   //
   //   REGISTRATION_CLOSED   —— 服务端关了自助注册（明确拒绝，不伪装成功）
   //   REGISTRATION_REJECTED —— 注册失败（用户名占用/格式不合规/密码不合规，共用）
@@ -52,6 +57,7 @@ export type ErrorCode =
   | 'INVITE_REQUIRED'
   | 'INVITE_INVALID'
   | 'INVALID_CREDENTIALS'
+  | 'ACCOUNT_LOCKED'
   | 'REGISTRATION_CLOSED'
   | 'REGISTRATION_REJECTED'
   | 'ACCOUNT_DISABLED'

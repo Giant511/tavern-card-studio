@@ -43,6 +43,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 
@@ -59,7 +60,7 @@ test('★★★★★ 写入前后要比对 active secret 的 id（唯一可靠�
    * 值读不回来，只能靠 id 变化。少了这一步，界面就只能靠"名字在不在"
    * 判断成功 —— 而那正是「改了多次、次次显示已保存、实际一次没进去」的原因。
    */
-  const shell = stripComments(read('client/src/chat/shell.ts'));
+  const shell = readShellImplNoComments();
 
   const at = shell.indexOf('writeSecret: (key: string, value: string)');
   assert.ok(at > 0, '找不到 writer.writeSecret 定义');

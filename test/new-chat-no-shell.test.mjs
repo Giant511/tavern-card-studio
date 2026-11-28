@@ -44,6 +44,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const read = (p) => readFileSync(join(ROOT, p), 'utf8');
@@ -65,7 +66,7 @@ function methodBody(src, marker) {
    ═══════════════════════════════════════════════════════════ */
 
 test('★★★★★ 「开始新聊天」不许调 saveAs / 不许写空文件', () => {
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const body = methodBody(src, 'onNewChat: async () => {');
 
   /*
@@ -78,16 +79,16 @@ test('★★★★★ 「开始新聊天」不许调 saveAs / 不许写空文件
 });
 
 test('★★★★★ 「开始新聊天」要清指针 + 让面板注入开场白', () => {
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const body = methodBody(src, 'onNewChat: async () => {');
 
   /* 指针三件套都要清，否则会写进上一段 */
-  assert.match(body, /this\.chatFileName = null/, '要清文件名');
-  assert.match(body, /this\.chatSnapshot = null/, '要清快照');
-  assert.match(body, /this\.lastSavedFingerprint = null/, '要清指纹');
+  assert.match(body, /(?:this|host)\.chatFileName = null/, '要清文件名');
+  assert.match(body, /(?:this|host)\.chatSnapshot = null/, '要清快照');
+  assert.match(body, /(?:this|host)\.lastSavedFingerprint = null/, '要清指纹');
 
   /* 面板要真的被清空 + 注入开场白（不是只改外壳状态） */
-  assert.match(body, /this\.chatPanel\?\.newChat\(/, '要让面板真的清空并注入开场白');
+  assert.match(body, /(?:this|host)\.chatPanel\?\.newChat\(/, '要让面板真的清空并注入开场白');
 
   /*
    * ★ 顺序：先清指针，再调 newChat。
@@ -121,7 +122,7 @@ test('★★★★★ 读失败时 openChatFile 必须把指针清成 null', () 
    * 这是缺陷②的核心：面板说"没文件"、外壳说"文件叫 X"。
    * 两个答案并存时，用户看到的是"打开了一段没有内容的对话"。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const body = methodBody(src, 'private async openChatFile(');
 
   assert.match(body, /const loaded = .*loadChat\(/, '要用返回值判断');
@@ -147,7 +148,7 @@ test('★★★★ 打开失败要留在文件列表页，别跳走', () => {
    * 原来不管成没成都 `chatSettingsRoute = null` 跳回聊天页。
    * 于是"哪一条没读出来"这个信息丢了，用户还得重新进列表才知道。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('onOpen: async (id) =>');
   assert.ok(at > 0, '找不到 onOpen');
   const end = src.indexOf('\n      },', at);
@@ -155,7 +156,15 @@ test('★★★★ 打开失败要留在文件列表页，别跳走', () => {
 
   assert.match(body, /if \(!loaded\) return/, '失败要提前返回');
   const guard = body.indexOf('if (!loaded) return');
-  const navigate = body.indexOf('this.chatSettingsRoute = null');
+  /*
+   * ★ 不绑定 `this.` 前缀（2026-11-24）。这段回调搬到了 `files-callbacks.ts`，
+   * 里面的状态访问都变成了 `host.` —— 写死 `this.chatSettingsRoute` 会让判据
+   * 报"守卫要在跳转之前"，而实际顺序没变。
+   *
+   * 判据要钉的是**顺序**（先判失败、再跳转），不是"用哪个变量名访问"。
+   */
+  const navigate = body.search(/\.chatSettingsRoute\s*=\s*null/);
+  assert.ok(navigate > 0, '找不到跳转（.chatSettingsRoute = null）');
   assert.ok(guard < navigate, '守卫要在跳转之前');
 });
 
@@ -168,7 +177,7 @@ test('★★★★★ saveAs 不许接受空内容（它是唯一的"新建文�
    * 新文件名不覆盖任何东西，所以空内容不会丢数据 —— 只会攒垃圾。
    * 而上游每多一个调用点就漏一次，所以判据钉在**最靠近副作用**的地方。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('const saveAs = async (');
   assert.ok(at > 0, '找不到 saveAs');
   const end = src.indexOf('\n    };', at);

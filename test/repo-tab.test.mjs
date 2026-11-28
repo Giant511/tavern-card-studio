@@ -28,6 +28,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const read = (rel) => readFileSync(join(REPO, rel), 'utf8');
@@ -41,7 +42,6 @@ function stripComments(source) {
 }
 
 const REPO_PAGE = 'client/src/chat/repo-page.ts';
-const SHELL = 'client/src/chat/shell.ts';
 
 /* ═══════════════════════════════════════════════════════════
    一、一页到底（本轮核心变化）
@@ -65,7 +65,7 @@ test('★★★ 服务端配置不再是独立页（已合并进仓库页）', (
     'repo-config-page.ts 应该已删除（配置已合并进 repo-page）',
   );
 
-  const shell = stripComments(read(SHELL));
+  const shell = readShellImplNoComments();
   assert.doesNotMatch(shell, /renderRepoConfigPage/, 'shell 里不该还有独立配置页');
   assert.doesNotMatch(shell, /repoConfigOpen/, '不该还有"配置页是否打开"这个状态');
 });
@@ -193,8 +193,8 @@ test('★★★ 注册成功后自动登录', () => {
    *
    * 但 `tokens === null` 的情况（`admin-only` 模式替人建号）不能假装成功。
    */
-  const shell = stripComments(read(SHELL));
-  const start = shell.indexOf('private async repoRegisterWith');
+  const shell = readShellImplNoComments();
+  const start = shell.indexOf('function repoRegisterWith(host: RepoHost');
   assert.ok(start > 0, '找不到注册方法');
   const block = shell.slice(start, start + 2400);
 
@@ -227,10 +227,10 @@ test('★★★ 注册与登录都带"页面刚给的配置"', () => {
    * 用户可能是"刚改完地址就点登录"。外壳手里若还是上一次保存的地址，
    * 请求会打到旧机器 —— 而界面上显示的是新地址，用户会以为新地址没生效。
    */
-  const shell = stripComments(read(SHELL));
+  const shell = readShellImplNoComments();
 
-  assert.match(shell, /repoLoginWith\(\s*config,/, '登录方法要接收配置');
-  assert.match(shell, /repoRegisterWith\(\s*config,/, '注册方法要接收配置');
+  assert.match(shell, /this\.repoLoginWith\(\s*config,/, '登录方法要接收配置');
+  assert.match(shell, /this\.repoRegisterWith\(\s*config,/, '注册方法要接收配置');
   assert.match(shell, /await this\.saveRepoConfig\(config\)/, '连接前先同步配置');
 });
 
@@ -281,8 +281,8 @@ test('★★★ 换服务端不许沿用旧令牌（2026-11-05 从"清空"改成
    *   ① 要比较前后 origin（不比较就不知道该读哪一格）
    *   ② 新 origin 的登录态必须**从存储里读**，不许沿用内存里那份旧 token
    */
-  const shell = stripComments(read(SHELL));
-  const start = shell.indexOf('private async saveRepoConfig');
+  const shell = readShellImplNoComments();
+  const start = shell.indexOf('function saveRepoConfig(host: RepoHost');
   assert.ok(start > 0, '找不到保存配置的方法');
   const block = shell.slice(start, start + 2600);
 
@@ -359,7 +359,7 @@ test('★★★ 仓库页里一次 fetch 都不许有', () => {
 });
 
 test('★★★ 外壳复用既有三个客户端模块', () => {
-  const src = read(SHELL);
+  const src = readShellImpl();
   assert.match(src, /from '\.\.\/auth\/auth-client\.ts'/, '要复用 auth-client');
   assert.match(src, /from '\.\.\/sync\/server-sync\.ts'/, '要复用 server-sync');
 });
@@ -369,7 +369,7 @@ test('★★★ 外壳复用既有三个客户端模块', () => {
    ═══════════════════════════════════════════════════════════ */
 
 test('★★★ 上传读 PNG 里的卡数据，body 是原文', () => {
-  const src = stripComments(read(SHELL));
+  const src = readShellImplNoComments();
   const start = src.indexOf('onUpload: async');
   assert.ok(start > 0, '找不到 onUpload');
   const block = src.slice(start, start + 2200);
@@ -389,7 +389,7 @@ test('★★★ 每个仓库调用都注入原生 fetch', () => {
    * 真机实测：这个 WebView 里 fetch 完全不可用（连 127.0.0.1 都失败）。
    * 漏一处的表现是"某个功能报连不上"，其它功能正常 —— 极难定位。
    */
-  const src = stripComments(read(SHELL));
+  const src = readShellImplNoComments();
 
   for (const fn of [
     'apiLogin',
@@ -419,7 +419,7 @@ test('★★★ 只对用户确认过的 origin 关证书校验', () => {
   assert.match(src, /setInsecureOrigins/, '要有白名单入口');
   assert.match(src, /insecureOrigins\.has\(originOf\(url\)\)/, '要按 origin 判定而不是全局');
 
-  const shellSrc = stripComments(read(SHELL));
+  const shellSrc = readShellImplNoComments();
   assert.match(shellSrc, /this\.repoConfig\.ackedPlainOrigin/, '要用明文确认记录');
   assert.match(shellSrc, /this\.repoConfig\.trustedCertOrigins/, '要用证书信任记录');
 });
@@ -477,17 +477,17 @@ test('★★★ 邀请码说明引用共享常量，不硬编码', () => {
    ═══════════════════════════════════════════════════════════ */
 
 test('★★★ 保存配置要报告"登录态是否真被清掉"', () => {
-  const src = stripComments(read(SHELL));
+  const src = readShellImplNoComments();
   assert.match(
     src,
-    /private async saveRepoConfig\(next: RepoConfigState\): Promise<boolean>/,
+    /function saveRepoConfig\(host: RepoHost, next: RepoConfigState\): Promise<boolean>/,
     '返回值要能区分"有没有清掉登录态"',
   );
   assert.match(src, /const hadAuth = this\.repoAuth\.accessToken !== ''/, '要判是否本来登录着');
 });
 
 test('★★★ 配置变化只在登录态被清掉时重画整页', () => {
-  const src = stripComments(read(SHELL));
+  const src = readShellImplNoComments();
   const from = src.indexOf('onConfigChange: async (next) =>');
   assert.ok(from > 0, '找不到 onConfigChange');
   const block = src.slice(from, src.indexOf('onLogin: async', from));

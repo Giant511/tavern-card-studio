@@ -18,11 +18,12 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
 
-const shellSrc = () => readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+const shellSrc = () => readShellImplNoComments();
 const cssSrc = () => readFileSync(join(CHAT_DIR, 'chat.css'), 'utf8');
 
 /** 取出某个函数的**完整源码片段**（从声明起，按大括号配平到函数结束） */
@@ -59,7 +60,7 @@ test('★ 问题一：两个一级收纳项都走同一个 renderAccordion', () 
 
   assert.match(src, /private\s+renderAccordion\(/, '必须有通用的收纳项构造函数');
 
-  const api = functionSource(src, 'private renderApiSection');
+  const api = functionSource(src, 'function renderApiSection(host: SettingsHost)');
   const voice = functionSource(src, 'private renderVoiceSection');
 
   assert.match(api, /this\.renderAccordion\(/, `API 条目必须用通用组件，实际：${api.slice(0, 200)}`);

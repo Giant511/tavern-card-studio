@@ -42,6 +42,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const SRC = 'client/src/chat/persona-page.ts';
 
@@ -152,7 +153,7 @@ test('★★★★ 「默认人设」文案要短（用户明确要求）', () =
    * 原来那 10 个字「不设人设（用默认名）」是全列表最长的一条，
    * 逼着面板按它算宽度、窄屏上还要换行。
    */
-  const shell = stripComments(read('client/src/chat/shell.ts'));
+  const shell = readShellImplNoComments();
   assert.match(shell, /label: '默认人设'/, '末位选项文案应是「默认人设」');
   assert.ok(
     !shell.includes('不设人设（用默认名）'),
@@ -166,7 +167,7 @@ test('★★★ 文案必须同时说明"这是用默认名"（短，但别丢�
    * 这里只钉它出现在"末位追加"的位置上，防止有人把它挪到别处
    * （比如当成某个真实人设的名字）。
    */
-  const shell = stripComments(read('client/src/chat/shell.ts'));
+  const shell = readShellImplNoComments();
   const at = shell.indexOf("label: '默认人设'");
   const before = shell.slice(Math.max(0, at - 300), at);
   assert.match(before, /value: ''/, '「默认人设」必须对应空值（= 不绑定任何人设）');

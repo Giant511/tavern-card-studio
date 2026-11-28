@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -21,11 +21,38 @@ import {
 } from '@tcs/shared';
 
 const ROOT = join(import.meta.dirname, '..');
-const TEMP = 'D:/Desktop/桌面文件/temp';
 
-/** 用户那份中文格式预设（真实文件，不手搓） */
+/**
+ * 用户那份中文格式预设（真实文件，不手搓）。
+ *
+ * ## 为什么允许缺失（2026-11-24）
+ *
+ * 这份文件在作者机器上，**不在仓库里**（含用户私有内容，不适合入库）。
+ * 原来无条件 `readFileSync`，于是干净 clone / CI 上 13 条用例全红，
+ * 报的是 `ENOENT`，看起来像"代码坏了"（报告 P1-5）。
+ *
+ * ## 为什么不用内置格式替代
+ *
+ * 这些用例断言的正是**这套中文预设的特有语法**（`【条目0：甲】`、`常驻：`）。
+ * 换成内置格式后连条目都解析不出来（marker 不一样），断言会变成"测 fixture"
+ * 而不是"测用户的预设"—— 那种绿是假的。所以缺失时 SKIP 并说明原因。
+ *
+ * 想在本机跑这 13 条：把预设文件放到下面这个路径，或用
+ * `TCS_WORLDBOOK_PRESET` 环境变量指向它。
+ */
+const TEMP = process.env.TCS_WORLDBOOK_PRESET ?? 'D:/Desktop/桌面文件/temp';
+const PRESET_FILE = join(TEMP, '幻梦AI世界书格式预设.json');
+const hasUserPreset = existsSync(PRESET_FILE);
+
+/** 缺文件时的跳过理由（写清"怎么让它跑起来"，而不是一句"跳过"） */
+const SKIP_REASON = `需要用户那份中文预设：${PRESET_FILE}（可用 TCS_WORLDBOOK_PRESET 指定目录）`;
+
+/** 带 skip 条件的 test：文件不在就显式跳过，不静默通过也不报假红 */
+const userPresetTest = (name, fn) => test(name, { skip: !hasUserPreset && SKIP_REASON }, fn);
+
 function userPreset(overrides = {}) {
-  const raw = JSON.parse(readFileSync(join(TEMP, '幻梦AI世界书格式预设.json'), 'utf8'));
+  if (!hasUserPreset) throw new Error(SKIP_REASON);
+  const raw = JSON.parse(readFileSync(PRESET_FILE, 'utf8'));
   return parseWorldbookPreset({ ...raw, format: { ...raw.format, ...overrides } }).preset;
 }
 
@@ -36,19 +63,19 @@ const BUILTIN = DEFAULT_WORLDBOOK_FORMAT;
 // 1. parseBool 认 是/否
 // ─────────────────────────────────────────────────────────────
 
-test('常驻：是 → constant=true（中文布尔标签）', () => {
+userPresetTest('常驻：是 → constant=true（中文布尔标签）', () => {
   const preset = userPreset({ labelMap: { ...userPreset().format.labelMap, constant: '常驻' } });
   const r = parseWorldbookTextWith('【条目0：甲】\n常驻：是\n内容：正文', preset.format);
   assert.equal(r.entries[0]?.constant, true, '`是` 没被识别成 true');
 });
 
-test('常驻：否 → constant=false', () => {
+userPresetTest('常驻：否 → constant=false', () => {
   const preset = userPreset({ labelMap: { ...userPreset().format.labelMap, constant: '常驻' } });
   const r = parseWorldbookTextWith('【条目0：甲】\n常驻：否\n内容：正文', preset.format);
   assert.equal(r.entries[0]?.constant, false);
 });
 
-test('英文与数字写法仍然有效（true/false/1/0/yes/no/on/off）', () => {
+userPresetTest('英文与数字写法仍然有效（true/false/1/0/yes/no/on/off）', () => {
   const preset = userPreset({ labelMap: { ...userPreset().format.labelMap, constant: '常驻' } });
   const pairs = [
     ['true', true],
@@ -68,7 +95,7 @@ test('英文与数字写法仍然有效（true/false/1/0/yes/no/on/off）', () =
   }
 });
 
-test('认不出的值 → warning 且**不猜**（constant 保持缺省）', () => {
+userPresetTest('认不出的值 → warning 且**不猜**（constant 保持缺省）', () => {
   /*
    * `真/假` 刻意不认（需求明确"不得猜"）。猜错的代价比报错大：
    * `常驻：假` 若被当成 true，条目会变成常驻，而用户以为它是关键词条目。
@@ -82,7 +109,7 @@ test('认不出的值 → warning 且**不猜**（constant 保持缺省）', () 
   }
 });
 
-test('bad-value 的文案里给出可写值（否则用户不知道能写什么）', () => {
+userPresetTest('bad-value 的文案里给出可写值（否则用户不知道能写什么）', () => {
   const preset = userPreset({ labelMap: { ...userPreset().format.labelMap, constant: '常驻' } });
   const r = parseWorldbookTextWith('【条目0：甲】\n常驻：也许\n内容：正文', preset.format);
   const message = r.issues.find((issue) => issue.code === 'bad-value')?.message ?? '';
@@ -90,14 +117,14 @@ test('bad-value 的文案里给出可写值（否则用户不知道能写什么�
   assert.match(message, /true\/false/);
 });
 
-test('不写常驻字段时行为不变（constant 缺省 undefined ⇒ 审计按 false 处理）', () => {
+userPresetTest('不写常驻字段时行为不变（constant 缺省 undefined ⇒ 审计按 false 处理）', () => {
   const preset = userPreset();
   const r = parseWorldbookTextWith('【条目0：甲】\n内容：正文', preset.format);
   assert.equal(r.entries[0]?.constant, undefined);
   assert.equal(r.issues.filter((issue) => issue.severity === 'error').length, 0);
 });
 
-test('是/否 在**内置**格式下同样有效（不是只给自定义预设开的例外）', () => {
+userPresetTest('是/否 在**内置**格式下同样有效（不是只给自定义预设开的例外）', () => {
   const r = parseWorldbookTextWith('@@ENTRY 0\nconstant: 是\n@@CONTENT\n正文\n@@END 0', BUILTIN);
   assert.equal(r.entries[0]?.constant, true);
 });
@@ -106,13 +133,13 @@ test('是/否 在**内置**格式下同样有效（不是只给自定义预设�
 // 3. cleanInlineName 迭代剥离
 // ─────────────────────────────────────────────────────────────
 
-test('用户样本：「…」】 → 去掉成对引号与孤立尾符', () => {
+userPresetTest('用户样本：「…」】 → 去掉成对引号与孤立尾符', () => {
   const preset = userPreset();
   const r = parseWorldbookTextWith('【条目0：「西奥核心关系逻辑」】\n内容：正文', preset.format);
   assert.equal(r.entries[0]?.name, '西奥核心关系逻辑');
 });
 
-test('回归矩阵：NAME_PAIRS 每一对都能剥干净', () => {
+userPresetTest('回归矩阵：NAME_PAIRS 每一对都能剥干净', () => {
   const preset = userPreset();
   const pairs = [
     ['【', '】'],
@@ -142,7 +169,7 @@ test('回归矩阵：NAME_PAIRS 每一对都能剥干净', () => {
   }
 });
 
-test('内部括号绝不能被剥（`设定（草稿）` 那对括号是名字的一部分）', () => {
+userPresetTest('内部括号绝不能被剥（`设定（草稿）` 那对括号是名字的一部分）', () => {
   const preset = userPreset();
   for (const name of ['设定（草稿）', '设定(草稿)', '甲【乙】丙', 'A「B」C', '（前）后', '前（后）']) {
     const r = parseWorldbookTextWith(`【条目0：${name}】\n内容：正文`, preset.format);
@@ -150,13 +177,13 @@ test('内部括号绝不能被剥（`设定（草稿）` 那对括号是名字�
   }
 });
 
-test('多层包裹能剥干净（【「名字」】）', () => {
+userPresetTest('多层包裹能剥干净（【「名字」】）', () => {
   const preset = userPreset();
   const r = parseWorldbookTextWith('【条目0：【「名字」】】\n内容：正文', preset.format);
   assert.equal(r.entries[0]?.name, '名字');
 });
 
-test('退化输入不会留下空字符串名字（宁可没名字，也不要 name: ""）', () => {
+userPresetTest('退化输入不会留下空字符串名字（宁可没名字，也不要 name: ""）', () => {
   const preset = userPreset();
   /*
    * `【条目0：【】】` 的行内剩余是 `【】】` —— 剥到底只剩括号，剥完就是空。
@@ -177,7 +204,7 @@ test('退化输入不会留下空字符串名字（宁可没名字，也不要 n
 // 2. when exists / absent（在规则引擎层验，见 rule-condition 测试）
 // ─────────────────────────────────────────────────────────────
 
-test('schema 里登记了 exists / absent（否则 additionalProperties:false 会拒绝）', () => {
+userPresetTest('schema 里登记了 exists / absent（否则 additionalProperties:false 会拒绝）', () => {
   const schema = JSON.parse(
     readFileSync(join(ROOT, 'rules/schema/platform-rule.schema.json'), 'utf8'),
   );

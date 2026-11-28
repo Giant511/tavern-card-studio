@@ -29,6 +29,7 @@ import {
   parseEngineStatus,
 } from '../shared/dist/chat/engine-status.js';
 import { buildGenerateRequest } from '../shared/dist/chat/generate.js';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CLIENT = join(REPO, 'client/src');
@@ -159,7 +160,7 @@ test('★★ 问题一/三：外壳必须真的调 bridge.connect（此前全库
    * `StChatBridge.connect()` 定义在 st-bridge.ts:78，**没有任何调用方**。
    * 于是 Rust 侧 `StChatState.api` 恒为 None ⇒ 所有命令返回 StUnavailable。
    */
-  const shell = codeOnly(read('chat/shell.ts'));
+  const shell = readShellImplNoComments();
 
   assert.match(shell, /await this\.bridge\.connect\(/, '必须真的调用 connect');
   assert.match(shell, /private async ensureConnected/, '要有连接门');
@@ -167,7 +168,7 @@ test('★★ 问题一/三：外壳必须真的调 bridge.connect（此前全库
 });
 
 test('★★ stBaseUrl 不许再是死字段', () => {
-  const shell = codeOnly(read('chat/shell.ts'));
+  const shell = readShellImplNoComments();
   const uses = [...shell.matchAll(/this\.options\.stBaseUrl/g)];
   assert.ok(uses.length >= 1, 'stBaseUrl 必须被读取（此前只声明、从不使用）');
 });
@@ -176,7 +177,7 @@ test('★ 连接门要包住读设置、写设置、播种、拉角色', () => {
   /*
    * 只在某一处过连接门是不够的 —— 别处仍然会拿到 StUnavailable。
    */
-  const shell = codeOnly(read('chat/shell.ts'));
+  const shell = readShellImplNoComments();
 
   const gated = [...shell.matchAll(/this\.withConnection\(/g)].length;
   assert.ok(gated >= 4, `至少要包住四处（实际 ${String(gated)} 处）`);
@@ -186,7 +187,7 @@ test('★ 连接门要包住读设置、写设置、播种、拉角色', () => {
 });
 
 test('★ ST_UNAVAILABLE 要清掉连接标记（否则永远不重连）', () => {
-  const shell = codeOnly(read('chat/shell.ts'));
+  const shell = readShellImplNoComments();
   assert.match(
     shell,
     /described\.code === 'ST_UNAVAILABLE'[\s\S]{0,80}this\.connected = false/,
@@ -372,7 +373,7 @@ test('★★ 选卡器不许再硬编码返回 null', () => {
    * `onPickCharacter: async () => null` ⇒ 点「选择角色」什么都不会发生。
    * 卡落库了也选不到 —— 这是用户报的现象的另一半。
    */
-  const shell = codeOnly(read('chat/shell.ts'));
+  const shell = readShellImplNoComments();
 
   assert.doesNotMatch(
     shell,
@@ -388,7 +389,7 @@ test('★★ 选卡器的两条关闭路径都要 resolve promise', () => {
    * （第二次点击的 promise 排队等第一次）。这类"点一次能用、第二次没反应"
    * 最容易被当成玄学。
    */
-  const shell = codeOnly(read('chat/shell.ts'));
+  const shell = readShellImplNoComments();
   const resolves = [...shell.matchAll(/resolve\?\.\(/g)];
   assert.ok(resolves.length >= 2, `选中与返回都要 resolve（实际 ${String(resolves.length)} 处）`);
 });
@@ -582,7 +583,7 @@ test('★★ 选中的角色必须由外壳持有（面板会被重建）', () =
    *
    * 修法：结果记在外壳（与 voiceExpanded / chatSettingsRoute 同一条纪律）。
    */
-  const shell = codeOnly(read('chat/shell.ts'));
+  const shell = readShellImplNoComments();
 
   assert.match(shell, /private selectedCharacter:/, '选择结果要记在外壳');
   assert.match(
@@ -614,7 +615,7 @@ test('★★ 保存成功后必须有可见反馈（重绘会把 status 换掉�
    * 失败路径反而看得到（抛错就不会重绘）——
    * **成功没提示、失败有提示**这种不对称，用户会以为点了没成功。
    */
-  const shell = codeOnly(read('chat/shell.ts'));
+  const shell = readShellImplNoComments();
   const apiPage = codeOnly(read('chat/api-page.ts'));
 
   assert.match(shell, /pendingApiNotice/, '外壳要记一条重绘后显示的提示');

@@ -63,6 +63,7 @@ import {
   shouldKeepTypedValue,
 } from '../shared/dist/voice/key-field.js';
 import { buildGenerateRequest } from '../shared/dist/chat/generate.js';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 
@@ -256,9 +257,9 @@ test('★★★★★ 核对不能只在"这次填了 key"时做', () => {
    *
    * 判据：核对块**不被 `apiKey !== null` 包住**。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
-  const at = src.indexOf('private async writeApiConnectionToSt');
+  const at = src.indexOf('function writeApiConnectionToSt(host: SettingsHost');
   assert.ok(at > 0, '找不到 writeApiConnectionToSt');
   const nextPrivate = src.indexOf('\n  private ', at + 10);
   const body = src.slice(at, nextPrivate < 0 ? src.length : nextPrivate);
@@ -289,7 +290,7 @@ test('★★★★★ 没填 key 时文案要说清后果和下一步', () => {
   /*
    * 只说"没有 key"不够 —— 用户不知道该干什么。必须给出**动作**。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('这个接口还没有可用的秘钥');
   assert.ok(at > 0, '要有"没有可用秘钥"这条提示');
   const around = src.slice(at, at + 300);

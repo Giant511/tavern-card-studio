@@ -27,6 +27,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { parentRouteOf } from '../shared/dist/chat/nav.js';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
@@ -93,7 +94,7 @@ test('★★★ 各页的返回按钮统一走 goBackOneLevel（不再各写各�
    * 判据：除了「进入」某个页面（`onOpenXxx` / `onManageFiles` / 齿轮按钮），
    * 所有 `onBack` 里不许再出现写死的路由赋值。
    */
-  const src = readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+  const src = readShellImplNoComments();
 
   /* 抓出所有 `onBack: () => { ... }` 的块 */
   const blocks = [...src.matchAll(/onBack: \(\) => \{([\s\S]*?)\n      \},/g)];

@@ -41,6 +41,7 @@ import { test } from 'node:test';
 
 import { NEW_PROMPT_DRAFT } from '../shared/dist/chat/prompt-edit.js';
 import { assembleWithPrompts } from '../shared/dist/chat/prompt-assemble.js';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const read = (p) => readFileSync(join(ROOT, p), 'utf8');
@@ -206,6 +207,6 @@ test('★★★★ 外壳把面板诊断接到 App 日志', () => {
    * 漏了这一行的后果：日志里那条 `[装配]` 永远不会出现 ——
    * 而那正好是排查时最需要的证据。
    */
-  const shell = stripComments(read('client/src/chat/shell.ts'));
+  const shell = readShellImplNoComments();
   assert.match(shell, /onDiag: \(message\) => diagNote\('note', message\)/, '要把面板诊断接到 diagNote');
 });

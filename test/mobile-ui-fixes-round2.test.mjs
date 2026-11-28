@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 /*
  * 不能用 `URL.pathname`：仓库路径含中文（`D:\Claw\代码开发\...`），
@@ -32,7 +33,7 @@ const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
 
 const css = () => readFileSync(join(CHAT_DIR, 'chat.css'), 'utf8');
-const shellSrc = () => readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+const shellSrc = () => readShellImplNoComments();
 
 /** 取出某个选择器的第一段声明块（`{` 到最近的 `}`） */
 function blockOf(source, selector) {

@@ -68,7 +68,7 @@ function fakeStore(initial = EMPTY_AUTH, sink = { saved: [] }) {
   };
 }
 
-function makeSession({ initial, api, now = NOW, skew, store } = {}) {
+function makeSession({ initial, api, now = NOW, skew, store, saveRefreshToken } = {}) {
   const usedStore = store ?? fakeStore(initial);
   const usedApi = api ?? fakeApi();
   const phases = [];
@@ -78,6 +78,8 @@ function makeSession({ initial, api, now = NOW, skew, store } = {}) {
     serverUrl: () => 'http://127.0.0.1:8730',
     now: () => now,
     ...(skew === undefined ? {} : { refreshSkewMs: skew }),
+    // 不传时保持默认（false = 不落盘长期凭证），见 AuthSessionDeps.saveRefreshToken
+    ...(saveRefreshToken === undefined ? {} : { saveRefreshToken }),
     onPhaseChange: (phase) => phases.push(phase),
     api: usedApi,
   });
@@ -260,18 +262,55 @@ test('T10.7 登录成功：落盘账户四键 + 清空仓库令牌五键，进�
    * 它防的是"登录去碰卡片会话状态"（sessions/closeSession/markSaved），
    * 而不是"多写了一个认证相关的键"。
    */
+  /*
+   * ★ 2026-11-24：`refreshToken` **不再是落盘键之一**。
+   *
+   * 它会被 `AuthSession.persist` 摘掉（默认不写长期凭证）。这条断言因此
+   * 从九个键变成八个。语义上的"登录成功要清掉仓库令牌"完全不变。
+   *
+   * 要恢复落盘行为需显式构造 `{ saveRefreshToken: true }` —— 见本文件末尾
+   * 那条反向用例，它保证"开关还在、打开后确实会写"。
+   */
   assert.deepEqual(Object.keys(store.sink.saved.at(-1)).sort(), [
     'accessExpiresAt',
     'accessToken',
     'authUser',
-    'refreshToken',
     'repoToken',
     'repoTokenExpiresAt',
     'repoTokenRepoId',
     'repoTokenRepoName',
     'repoTokenScopes',
   ]);
+  // 内存里仍然有：不落盘 ≠ 不能用
+  assert.notEqual(session.refreshToken, '');
   assert.deepEqual(phases, ['authenticated']);
+});
+
+test('★★★★★ refresh token 默认不落盘（长期凭证不进明文配置）', async () => {
+  /*
+   * 客户端的凭证与配置一起明文写在 `client-config.json`，没有 DPAPI / keyring。
+   * access token 2 小时就过期，落盘的收益大于风险；而 refresh token 能**无限续期**，
+   * 同机任意进程读走就等于永久接管账户。
+   *
+   * 所以默认不写它，代价是重启要重新登录。
+   */
+  const { session, store } = makeSession();
+  await session.login('alice', 'pw');
+  const saved = store.sink.saved.at(-1);
+  assert.equal('refreshToken' in saved, false, `refreshToken 被写进了配置：${JSON.stringify(Object.keys(saved))}`);
+  // 但不能因此把令牌丢掉 —— 本次运行还得靠它续期
+  assert.notEqual(session.refreshToken, '');
+});
+
+test('★★★★ 显式打开开关时才落盘（并且确实写得进去）', async () => {
+  /*
+   * 只测"默认不写"的判据在"永远不写"的实现上也会绿 —— 那样开关就是个摆设。
+   * 这条反向验证保证 `saveRefreshToken` 真的起作用。
+   */
+  const { session, store } = makeSession({ saveRefreshToken: true });
+  await session.login('alice', 'pw');
+  const saved = store.sink.saved.at(-1);
+  assert.equal('refreshToken' in saved, true, '开关打开了却没写 refreshToken');
 });
 
 test('T10.7 admin-only 注册：服务端不给令牌时不改登录态', async () => {
@@ -301,8 +340,16 @@ test('T10.7 登出：服务端失败也清本地（不把用户困在"登出失�
   assert.equal(session.refreshToken, '');
   const last = store.sink.saved.at(-1);
   assert.equal(last.authUser, null);
-  // 关键：只写这四个键，没有任何"清理本地会话"的字段
+  /*
+   * 关键：只写这四个键，没有任何"清理本地会话"的字段。
+   *
+   * ★ 2026-11-24：`refreshToken` 在这里**必须出现**，值为空串。
+   *   默认不落盘只针对"写新令牌"；清空是另一回事 —— 老版本可能已经把
+   *   refresh token 写进过配置文件，不显式写空串覆盖的话，它就一直留在盘上，
+   *   用户以为注销干净了，实际凭证还在。
+   */
   assert.deepEqual(Object.keys(last).sort(), ['accessExpiresAt', 'accessToken', 'authUser', 'refreshToken']);
+  assert.equal(last.refreshToken, '', '注销必须显式清空磁盘上的 refreshToken');
 });
 
 test('T10.7 登录态只写自己的键：整个过程不会出现越界字段（不去碰卡片会话）', async () => {

@@ -18,6 +18,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const SETTINGS = 'client/src/chat/chat-settings.ts';
 
@@ -83,7 +84,7 @@ test('★★★★ 思考的即时写入链路必须还在（别为了修提示�
    * 修的是"话"，不是"行为"。如果顺手把自动保存去掉、改成只靠保存按钮，
    * 那聊天面板会用到旧值 —— 反而更糟。
    */
-  const shell = stripComments(read('client/src/chat/shell.ts'));
+  const shell = readShellImplNoComments();
   const onChangeAt = shell.indexOf('onChange: (state) => {');
   assert.ok(onChangeAt > 0);
   const block = shell.slice(onChangeAt, onChangeAt + 600);

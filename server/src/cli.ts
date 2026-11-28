@@ -30,10 +30,11 @@ import {
 } from './config.js';
 import { SERVER_VERSION } from './context.js';
 import { hashPassword } from './auth/password.js';
+import { LoginLimiter } from './auth/login-limit.js';
 import { migrateRepos, migrateToFirstAccount, planMigration } from './auth/migrate.js';
 import { RepoStore } from './storage/repos.js';
 import { Db } from './storage/db.js';
-import { adoptOrphanCards, countOrphanCards, UserStore } from './storage/users.js';
+import { adoptOrphanCards, countOrphanCards, normalizeUsername, UserStore } from './storage/users.js';
 import { selfCheckCommand } from './selfcheck.js';
 import { cleanupCommand } from './uninstall-cleanup.js';
 import { startSupervisor } from './supervisor.js';
@@ -182,8 +183,9 @@ function printHelp(): void {
       `  config show|path      打印配置 / 配置路径\n` +
       `  token show|rotate     查看 / 轮换访问令牌\n` +
       `  service install|uninstall|start|stop|status [--dry-run]\n` +
-      `  user list|add|passwd|enable|disable|migrate|adopt|repos\n` +
-      `                        账户与仓库管理（migrate 是升级必经的第一步）\n` +
+      `  user list|add|passwd|unlock|enable|disable|migrate|adopt|repos\n` +
+      `                        账户与仓库管理（migrate 是升级必经的第一步；\n` +
+      `                        unlock 解除登录锁定，账户与 IP 两个维度一起清）\n` +
       `  version               版本信息\n` +
       `  selfcheck             离线自检：真跑一遍运行时依赖（argon2/x509/sqlite/git）\n` +
       `  cleanup [--dry-run]   卸载清理：按白名单删安装目录里的运行期残留（日志留痕）\n\n` +
@@ -203,6 +205,61 @@ function printHelp(): void {
       `未知选项会被拒绝（退出码 2）—— 不会被当成"启动服务"，\n` +
       `因为那会让一个拼写错误变成后台起了一个真服务并写出配置文件。\n`,
   );
+}
+
+/*
+ * 功能
+ * 子命令写错时的提示：红字点名错在哪，再列出可用操作与最常用的一条示例。
+ *
+ * 注意事项
+ * 只在 stderr 是 TTY 时上色；被管道/日志采集时保留纯文本，否则会写进
+ * 一堆 `\x1b[31m` 转义，日志里看起来像乱码。
+ *
+ * 踩过的坑
+ * 旧版只说「未知的 user 操作：unl（list/add/...）」：用户知道错了，但不知道
+ * 正确的 `unlock` 长什么样，只能去翻文档。所以这里把每个操作的用法写全。
+ */
+const USER_SUBCOMMAND_HELP: ReadonlyArray<readonly [string, string, string]> = [
+  ['user list', '列出当前所有用户名', 'tcs-server user list'],
+  ['user add <用户名>', '新建账户，密码从标准输入读', 'tcs-server user add alice'],
+  ['user passwd <用户名>', '重设密码，密码从标准输入读', 'tcs-server user passwd alice'],
+  ['user unlock <用户名>', '解除登录锁定：账户维度与全部 IP 记录一起清', 'tcs-server user unlock alice'],
+  ['user enable <用户名>', '重新启用被停用的账户', 'tcs-server user enable alice'],
+  ['user disable <用户名>', '停用账户（不删除数据）', 'tcs-server user disable alice'],
+  ['user adopt <用户名>', '把无归属的历史卡片划给该账户', 'tcs-server user adopt alice'],
+  ['user migrate [用户名]', '建首账户并接管历史卡片（升级必经）', 'tcs-server user migrate admin'],
+  ['user repos [add]', '查看仓库，或为账户新建仓库', 'tcs-server user repos add alice 默认仓库'],
+];
+
+const SERVICE_SUBCOMMAND_HELP: ReadonlyArray<readonly [string, string, string]> = [
+  ['service install', '注册 Windows 服务', 'tcs-server service install'],
+  ['service uninstall', '卸载 Windows 服务', 'tcs-server service uninstall'],
+  ['service start', '启动服务', 'tcs-server service start'],
+  ['service stop', '停止服务', 'tcs-server service stop'],
+  ['service restart', '重启服务', 'tcs-server service restart'],
+  ['service status', '查看服务状态', 'tcs-server service status'],
+];
+
+function writeUnknownSubcommand(
+  prefix: 'user' | 'service',
+  action: string,
+  table: ReadonlyArray<readonly [string, string, string]>,
+): number {
+  const names = table
+    .map(([usage]) => usage.split(' ')[1] ?? '')
+    .filter((name) => name !== '' && !name.startsWith('<') && !name.startsWith('['));
+  const firstLine = `未知的 ${prefix} 操作：${action}（${names.join('/')}）\n`;
+  if (process.stderr.isTTY) {
+    process.stderr.write(`\x1b[31m${firstLine}\x1b[0m`);
+  } else {
+    process.stderr.write(firstLine);
+  }
+  process.stderr.write('可用操作：\n');
+  for (const [usage, description] of table) {
+    process.stderr.write(`  ${usage.padEnd(30)}${description}\n`);
+  }
+  process.stderr.write(`示例：${table[0]?.[2] ?? `tcs-server ${prefix} help`}\n`);
+  return 2;
 }
 
 function printConfig(config: ServerConfigFile, path: string): void {
@@ -318,8 +375,7 @@ function serviceCommand(action: string, loaded: LoadedConfig, dryRun: boolean): 
     case 'status':
       return sc(['query', name], dryRun);
     default:
-      process.stderr.write(`未知的 service 操作：${action}（install/uninstall/start/stop/restart/status）\n`);
-      return 2;
+      return writeUnknownSubcommand('service', action, SERVICE_SUBCOMMAND_HELP);
   }
 }
 
@@ -415,6 +471,62 @@ async function runUserCommand(
       return 0;
     }
 
+    /*
+     * 解除登录锁定（2026-11-24）。
+     *
+     * 文档从 v0.1.3 起就写着"管理员着急可以手工解锁（tcs-server 的运维命令）"，
+     * 但那个命令**一直没有实现**（`server-cmd.md` 里也查不到）——
+     * 属于报告 P2-3 点出的"文档把不存在的功能写成既有功能"。
+     *
+     * 为什么除了 HTTP 端点还要留这条：
+     *
+     * ```text
+     *   面板端点  POST /api/accounts/:id/unlock-login   要求调用者自己是登录态
+     *   本命令    直接改库                               要求能登进这台机器
+     * ```
+     *
+     * 两种"进不去"都要覆盖：管理员自己被锁时，他可能**没有任何可用会话**
+     * （唯一那台设备被锁在同一出口 IP 后面），此时只剩命令行这条路。
+     *
+     * 同时清两个维度：命令行的使用者是机器管理员，他能物理登进这台机器，
+     * 不存在"解了 IP 就等于放行攻击者"的问题 —— 反而是只解账户会让用户
+     * 从同一出口再试时仍被拒。
+     */
+    if (action === 'unlock') {
+      const username = options.positional[2];
+      if (!username) {
+        process.stderr.write('用法：tcs-server user unlock <用户名>\n');
+        return 2;
+      }
+      const user = users.findByUsername(username);
+      if (!user) {
+        process.stderr.write(`用户「${username}」不存在\n`);
+        return 1;
+      }
+      const limiter = new LoginLimiter(db.handle);
+      const key = normalizeUsername(user.username);
+      const byAccount = limiter.unlock('account', key);
+
+      /*
+       * 功能：清掉 IP 维度的全部锁定记录；CLI 与面板解锁都调这个方法。
+       *
+       * 注意事项：不按账户精确匹配。`login_attempts` 只存 `(kind, key)`，
+       *   IP 与账户名之间没有关联字段；误放的地址下次失败会重新记账。
+       *
+       * 踩过的坑：面板只清账户维度时，同一出口 IP 仍锁着，用户重试还是
+       *   登不上，管理员看到的就是「解除锁定无效」。
+       */
+      const byIp = limiter.unlockAllOfKind('ip');
+
+      process.stdout.write(
+        `已解除「${user.username}」的登录锁定：账户维度 ${String(byAccount)} 条，IP 维度 ${String(byIp)} 条\n`,
+      );
+      if (byAccount === 0 && byIp === 0) {
+        process.stdout.write('（本来就没有锁定记录，无需处理）\n');
+      }
+      return 0;
+    }
+
     if (action === 'disable' || action === 'enable') {
       const username = options.positional[2];
       if (!username) {
@@ -506,10 +618,7 @@ async function runUserCommand(
       return 0;
     }
 
-    process.stderr.write(
-      `未知的 user 操作：${action}（list/add/passwd/enable/disable/adopt/migrate/repos）\n`,
-    );
-    return 2;
+    return writeUnknownSubcommand('user', action, USER_SUBCOMMAND_HELP);
   }
 }
 
@@ -684,6 +793,19 @@ export async function main(argv: readonly string[]): Promise<number> {
     return 0;
   }
 
+  /*
+   * 功能：未知命令先向 stderr 报错，再打印帮助，退出码 2。
+   *
+   * 注意事项：红色只在 stderr 是 TTY 时加；管道与 CI 日志里 ANSI 转义是噪音。
+   *
+   * 踩过的坑：旧版直接 printHelp，一大屏用法把「我敲错了」淹掉，
+   *   用户只能自己猜是命令名拼错还是参数不支持。
+   */
+  const red = process.stderr.isTTY === true;
+  process.stderr.write(
+    `${red ? '\x1b[31m' : ''}未知命令：${options.command}${red ? '\x1b[0m' : ''}\n` +
+      '可用命令见下方帮助。\n\n',
+  );
   printHelp();
   return 2;
 }

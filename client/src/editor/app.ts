@@ -80,6 +80,9 @@ import {
   totalLength,
   type EditorBlockSnapshot,
 } from './block-doc';
+import { byId } from './dom-id';
+import { hasDebugParams } from './debug-keys';
+import type { DemoHost } from './demo-actions';
 import { BlockEditor, type EditorIssue } from './block-editor';
 import { createPromptsPanel, type PromptsPanel } from './prompts-panel';
 import { promptsWithinLimits } from '../session/card-prompts';
@@ -120,6 +123,7 @@ import { ExportDialog } from '../export/export-dialog';
 import { buildExportAsync, checkWorldbookExportSafety } from '../export/export-card';
 import { SyncDialog } from '../sync/sync-dialog';
 import { CardsDialog } from '../sync/cards-dialog';
+import { AccountDialog } from '../sync/account-dialog';
 import { RepoDialog } from '../sync/repo-dialog';
 import { listRepos } from '../sync/repo-client';
 import type { RepoTokenContext } from '../sync/repo-select';
@@ -202,65 +206,115 @@ import { TabBar, type TabItem } from '../session/tab-bar';
 import { generateCardId, readCardIdFromCard, withCardId } from '../session/card-id';
 import { decideOpenTarget } from '../session/open-target';
 import { collectDirtyNames, installUnloadGuard } from '../session/unload-guard';
+import {
+  askSaveFormat,
+  previewSaveFormatDialog,
+  saveCard,
+  savePngWithGuard,
+  resolveSaveFace as resolveFaceForSave,
+  saveSessionToDisk,
+  type SaveHost,
+} from './save-actions';
+import { describeError, firstIssue, readCardIdFromCardJson } from './error-text';
+import { bytesToBase64 } from '../chat/share-card';
+import { el } from './dom';
+import type { BlockRuntime } from './block-runtime';
+import {
+  applyScopeGating,
+  buildWorldbookActions,
+  collapse,
+  createBlock,
+  expand,
+  onBlockChange,
+  type BlockHost,
+} from './block-actions';
+import {
+  refreshAccountButton,
+  refreshBlockBadges,
+  refreshNameHint,
+  refreshRulesLabel,
+  refreshStats,
+  refreshTokenAfterSave,
+  switchHighlight,
+  switchPlatform,
+  type RefreshHost,
+} from './ui-refresh';
+import {
+  applyDemoWorldbook,
+  runCollapseRoundTrip,
+  runPreviewScenario,
+  type PreviewHost,
+} from './preview-scenarios';
+import { restorePresetSelection, type PresetRestoreHost } from './preset-restore';
+import {
+  wireAccount,
+  wireNameEditor,
+  wireSettings,
+  type WireHost,
+} from './wiring';
+import {
+  importCardTextFile,
+  openArrivedCard,
+  openCard,
+  openCardInfo,
+  openPngCard,
+  type OpenHost,
+} from './open-actions';
+import {
+  buildStPushArtifact,
+  ensureStPane,
+  runArrivalDemo,
+  runAuditDemo,
+  type StPushHost,
+} from './st-push';
+import {
+  applyRemoteText,
+  arriveCard,
+  pullFaceFromServer,
+  type LandingHost,
+} from './landing';
+import {
+  autoProbe,
+  currentSyncConfig,
+  offerCertTrust,
+  repoClientConfig,
+  repoTokenContext,
+  type ConnHost,
+} from './connection';
+import {
+  applyLibraryItem,
+  loadPresetLibrary,
+  type LibraryHost,
+} from './library-actions';
+import { confirmClose, confirmOverwrite, locateStCharactersDir } from './dialogs';
+import {
+  fieldPresetsOf,
+  importFieldPresetText,
+  importHighlightText,
+  importPlatformText,
+  importTxtPresetText,
+  importWorldbookFile,
+  importWorldbookPresetText,
+  pickAndImportWorldbook,
+  rememberPreset,
+  type ImportHost,
+} from './import-actions';
 
-import sampleCardJson from '../../../test/fixtures/sample-card.json';
 
-// ── DOM 助手（typed + 无 innerHTML）────────────────────────────
-function el<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  className?: string,
-  text?: string,
-): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
 
-function byId<T extends HTMLElement>(id: string): T {
-  const node = document.getElementById(id);
-  if (!node) throw new Error(`缺少 DOM 节点 #${id}`);
-  return node as T;
-}
 
-interface BlockRuntime {
-  snapshot: EditorBlockSnapshot;
-  section: HTMLElement;
-  body: HTMLElement;
-  host: HTMLElement;
-  preview: HTMLElement;
-  badge: HTMLElement;
-  editor: BlockEditor | null;
-  expanded: boolean;
-  previewOn: boolean;
-}
 
 /**
- * 取证用的"自定义写法"世界书预设（v0.1.6 / 缺陷一）。
+ * 编辑器主类。
  *
- * 与 `DEFAULT_WORLDBOOK_FORMAT`（`@@ENTRY` / `@@CONTENT` / `@@END`）是**两套完全
- * 不同的标记**，这正是现场的分叉来源：卡里的世界书是按标准写法存的，而用户
- * 把预设换成了这种写法 ⇒ 旧代码渲染用前者、解析用后者，一个标记都认不出来。
+ * ★ 为什么要导出（2026-11-24）：`debug-params.ts` 需要它的类型来调那些
+ * `*ForDemo` 方法。导出只是把类型放出来，**不改变任何封装边界** ——
+ * 那些方法本来就声明成 public（它们要被调试入口按名字调用）。
  *
- * 放在源码里而不是夹具文件里：它只是一套**格式参数**，不含任何用户内容。
+ * 调用方向是单向的：`app.ts` 动态 import `debug-params.ts`，
+ * `debug-params.ts` 只 `import type` 本文件（编译后擦除，运行时不构成环）。
  */
-const ARRIVAL_DEMO_PRESET = {
-  schemaVersion: 1,
-  id: 'demo-custom-worldbook',
-  name: '自定义写法示例',
-  version: '1.0.0',
-  format: {
-    entryOpen: '【条目{id}：',
-    entryClose: '【条目{id}结束】',
-    contentMark: '内容：',
-    fieldPrefix: '',
-    entrySeparator: '\n\n',
-    listSeparator: ', ',
-    idPrefix: '条目',
-  },
-};
-
-class EditorApp {
+export class EditorApp {
   /**
    * 当前编辑会话。**所有卡片状态（卡数据、文件路径、脏标记、规则选择）都从这里读**，
    * 不再散落在 EditorApp 的字段上。
@@ -335,6 +389,8 @@ class EditorApp {
   /** TXT 角色卡 / 世界书导入对话框（T10.9） */
   private importDialog: ImportDialog | null = null;
   private repoDialog: RepoDialog | null = null;
+  /** 账户面板：身份、登录设备、我的卡片、改名改密码、退出（v0.2.3） */
+  private accountDialog: AccountDialog | null = null;
   /**
    * 上次选过的上传仓库（T10.8）。
    *
@@ -498,7 +554,7 @@ class EditorApp {
      * 用户导入的预设是"并进候选列表"，内置那份得先到位，同 id 才能正确覆盖。
      * 这里会顺带恢复上次选中的六类预设（config 里的 id）。
      */
-    await this.loadPresetLibrary();
+    await loadPresetLibrary(this.libraryHost());
     // 配色来自高亮方案本体（规则资产），不写死在样式表里
     applySchemeStyles(this.rules.highlightFile);
     if (this.rules.warnings.length > 0) {
@@ -513,7 +569,7 @@ class EditorApp {
     // 右上角「规则」标签要在这里刷一次。
     // 之前只在"切换规则/预设"时刷，于是启动后它一直停在 HTML 里的初始文案
     // 「规则加载中…」—— 明明已经加载完了（2026-10-22 截图核对时发现）。
-    this.refreshRulesLabel();
+    refreshRulesLabel(this.refreshHost());
 
     // T6.5：审计面板要在首次校验前就位，否则第一次报告会无处渲染
     this.auditPanel = new AuditPanel(
@@ -521,7 +577,7 @@ class EditorApp {
         onLocate: (issue) => this.locateIssue(issue),
         onFocusBlock: (blockId) => {
           const runtime = this.blocks.find((block) => block.snapshot.id === blockId);
-          if (runtime) this.expand(runtime, true);
+          if (runtime) expand(this.blockHost(), runtime, true);
         },
       },
       byId('audit-panel'),
@@ -558,14 +614,14 @@ class EditorApp {
     });
 
     this.wireToolbar();
-    this.wireNameEditor();
+    wireNameEditor(this.wireHost());
     this.wireShortcuts();
-    this.wireSettings();
+    wireSettings(this.wireHost());
     this.wireRules();
     this.wireCardInfo();
     void this.loadCardDefaults();
     this.wireExportAndSync();
-    this.wireAccount();
+    wireAccount(this.wireHost());
     this.wireImport();
 
     // 未落盘会话的离开拦截（T9.14）。
@@ -592,7 +648,7 @@ class EditorApp {
     // 「预览打开期间仍可输入」拿不到 `.cm-content` —— 三条断言一起失败。
     // 当时快照抓的是空工作台，这个错位一直没暴露出来（2026-10-25 修）。
     const previewMode = new URLSearchParams(location.search).get('preview');
-    if (previewMode !== null) await this.runPreviewScenario(previewMode);
+    if (previewMode !== null) await runPreviewScenario(this.previewHost(), previewMode);
 
     /*
      * 截图/验收入口（v0.1.4 / T12.5）：`?exportFace=1&faceDemo=library|source`
@@ -618,7 +674,7 @@ class EditorApp {
      */
     const wbDemo = exportFaceParams.get('wbDemo');
     if (wbDemo === 'foreign' || wbDemo === 'good') {
-      this.applyDemoWorldbook(wbDemo);
+      applyDemoWorldbook(this.previewHost(), wbDemo);
     }
 
     if (exportFaceParams.get('exportFace') === '1') {
@@ -656,7 +712,7 @@ class EditorApp {
      * 只打开格式选择框，让截图能证明三种选项与禁用态渲染正确。
      */
     if (exportFaceParams.get('saveFormatDemo') === '1') {
-      void this.previewSaveFormatDialog(exportFaceParams.get('saveFormatPng') === 'off');
+      void previewSaveFormatDialog(this.saveHost(), exportFaceParams.get('saveFormatPng') === 'off');
     }
 
     /*
@@ -691,7 +747,7 @@ class EditorApp {
          * 点完把结论写进状态栏，截图可读、--dump-dom 也能断言。
          */
         if (exportFaceParams.get('collapseRoundTrip') === '1') {
-          void this.runCollapseRoundTrip();
+          void runCollapseRoundTrip(this.previewHost());
         }
       });
     }
@@ -708,7 +764,7 @@ class EditorApp {
      */
     const auditDemo = exportFaceParams.get('auditDemo');
     if (auditDemo === 'before' || auditDemo === 'after') {
-      void this.runAuditDemo(auditDemo);
+      void runAuditDemo(this.stPushHost(), auditDemo);
     }
 
     /*
@@ -719,7 +775,7 @@ class EditorApp {
      */
     const arrivalDemo = exportFaceParams.get('arrivalDemo');
     if (arrivalDemo === 'before' || arrivalDemo === 'after') {
-      void this.runArrivalDemo(arrivalDemo);
+      void runArrivalDemo(this.stPushHost(), arrivalDemo);
     }
 
     /*
@@ -734,7 +790,7 @@ class EditorApp {
     if (exportFaceParams.get('cardInfo') === '1') {
       // 等一帧：示例卡是异步载入的，立刻开会读到空卡
       requestAnimationFrame(() => {
-        this.openCardInfo();
+        openCardInfo(this.openHost());
       });
     }
 
@@ -795,8 +851,8 @@ class EditorApp {
       if (username !== '' && password !== '' && this.authSession !== null) {
         try {
           await this.authSession.login(username, password);
-          this.refreshAccountButton();
-          this.applyScopeGating();
+          refreshAccountButton(this.refreshHost());
+          applyScopeGating(this.blockHost());
         } catch {
           /* 登录失败时面板会如实显示"需要先登录"，截图即可暴露问题 */
         }
@@ -817,8 +873,8 @@ class EditorApp {
       if (username !== '' && password !== '' && this.authSession !== null) {
         try {
           await this.authSession.login(username, password);
-          this.refreshAccountButton();
-          this.applyScopeGating();
+          refreshAccountButton(this.refreshHost());
+          applyScopeGating(this.blockHost());
           this.settings?.refreshIdentity();
         } catch {
           /* 登录失败时弹窗会显示"读不到统计"，截图即可暴露问题 */
@@ -852,54 +908,7 @@ class EditorApp {
    */
   private certAsking = false;
 
-  private async offerCertTrust(serverUrl: string): Promise<void> {
-    if (this.certAsking) return;
-    /* 已经确认过的 origin 不再问（autoProbe 会带 allowInvalidCert 直接成功） */
-    if (isOriginCertAcked(this.certAckedOrigins, serverUrl)) return;
 
-    this.certAsking = true;
-    try {
-      const origin = serverUrl.trim();
-      const proceed = await askConfirm(
-        `这个服务器的证书没通过系统校验（多半是自签证书）。\n\n` +
-          `这意味着无法确认对面真的是这台服务器 —— 中间的任何人都有可能冒充它，` +
-          `看到你的账号、令牌和卡片内容。\n\n` +
-          `目标：${origin}\n\n` +
-          `如果这是你自己部署的服务，可以继续；继续后不会再问这个地址。`,
-        '这个服务器的证书不受信任',
-      );
-      if (!proceed) {
-        this.setStatus('已取消：证书不受信任，同步保持不可用（本地功能不受影响）', 'warn');
-        return;
-      }
-
-      this.certAckedOrigins = withCertAckedOrigin(this.certAckedOrigins, serverUrl);
-      /*
-       * 落盘失败也要继续重试 —— 用户已经点了确认，这一次能连上；
-       * 只是下次启动会再问一遍。静默失败而不重试才是更糟的选择
-       * （他会觉得"点了确认还是连不上"）。
-       */
-      try {
-        await configPatch({ certAckedOrigins: this.certAckedOrigins });
-      } catch {
-        this.setStatus('已确认证书风险（本次有效，但没能存进配置，下次启动会再问一次）', 'warn');
-      }
-
-      const accountToken = this.authSession?.accessToken ?? '';
-      const result = await probeServer({
-        serverUrl,
-        token: accountToken !== '' ? accountToken : this.settingsToken,
-        allowInvalidCert: true,
-      });
-      this.applyConnection(result);
-      this.setStatus(
-        result.reachable ? '已连上（证书未经系统校验，已按你的确认继续）' : `仍然连不上：${result.message}`,
-        result.reachable ? 'ok' : 'warn',
-      );
-    } finally {
-      this.certAsking = false;
-    }
-  }
 
   // ── 规则与预设（T6.2 / T6.3）─────────────────────────────
   //
@@ -909,22 +918,7 @@ class EditorApp {
   //   · 选择预设 → 只改导出格式（标题/顺序），**原文不动**；
   //   · 应用预设 → 唯一重排入口，走 plan → 确认 → applyPresetPlan。
   /** 设置保存后重新读取 token，并重新探测（地址可能变了） */
-  private async refreshTokenAfterSave(): Promise<void> {
-    try {
-      const config = await configGet();
-      this.settingsToken = config.token;
-      this.authServerUrl = config.serverUrl;
-      // 与 autoProbe 同一套优先级：账户令牌 > legacy 全局令牌
-      const accountToken = this.authSession?.accessToken ?? '';
-      const result = await probeServer({
-        serverUrl: config.serverUrl,
-        token: accountToken !== '' ? accountToken : config.token,
-      });
-      this.applyConnection(result);
-    } catch {
-      // 浏览器模式读不到配置，忽略
-    }
-  }
+
 
   // ── 卡片信息（v0.1.6）──────────────────────────────────────
   //
@@ -947,7 +941,7 @@ class EditorApp {
       onSaveAsDefaults: (info) => this.storeCardDefaults(info),
       logError: (line) => this.crashLogger?.record('error', new Error(line), this.sessionSummary()),
     });
-    button.addEventListener('click', () => this.openCardInfo());
+    button.addEventListener('click', () => openCardInfo(this.openHost()));
   }
 
   /**
@@ -974,13 +968,7 @@ class EditorApp {
   }
 
   /** 打开卡片信息对话框（按钮与调试入口共用同一条路） */
-  openCardInfo(): void {
-    if (!this.hasSession) {
-      this.setStatus('先打开或新建一张卡', 'warn');
-      return;
-    }
-    this.cardInfoDialog?.open();
-  }
+
 
   /**
    * 把卡片信息写回当前会话。
@@ -995,7 +983,7 @@ class EditorApp {
       return;
     }
     this.setStatus('已更新卡片信息（记得保存或导出）', 'ok');
-    this.refreshStats();
+    refreshStats(this.refreshHost());
     this.scheduleValidate(0);
   }
 
@@ -1040,11 +1028,11 @@ class EditorApp {
       getState: () => this.dialogState(),
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
 
-      onPlatformChange: (id) => this.switchPlatform(id),
-      onHighlightChange: (id) => this.switchHighlight(id),
+      onPlatformChange: (id) => switchPlatform(this.refreshHost(), id),
+      onHighlightChange: (id) => switchHighlight(this.refreshHost(), id),
       onPresetSelect: (id) => {
         this.selectPresetById(id);
-        this.refreshRulesLabel();
+        refreshRulesLabel(this.refreshHost());
       },
       onPresetApply: (presetId, plan) => {
         const preset = this.rules?.presets.find((item) => item.id === presetId);
@@ -1055,15 +1043,15 @@ class EditorApp {
         this.commitPresetApply(preset, plan);
       },
 
-      importPlatformText: (text) => this.importPlatformText(text),
-      importHighlightText: (text) => this.importHighlightText(text),
-      importTxtPresetText: (text) => this.importTxtPresetText(text),
-      importWorldbookPresetText: (text) => this.importWorldbookPresetText(text),
+      importPlatformText: (text) => importPlatformText(this.importHost(), text),
+      importHighlightText: (text) => importHighlightText(this.importHost(), text),
+      importTxtPresetText: (text) => importTxtPresetText(this.importHost(), text),
+      importWorldbookPresetText: (text) => importWorldbookPresetText(this.importHost(), text),
       onWorldbookPresetSelect: (id) => this.selectWorldbookPreset(id),
-      importGreetingPresetText: (text) => this.importFieldPresetText('initial-scene', text),
+      importGreetingPresetText: (text) => importFieldPresetText(this.importHost(), 'initial-scene', text),
       onGreetingPresetSelect: (id) => this.selectFieldPreset('initial-scene', id),
       exportGreetingPreset: (id) => this.exportFieldPresetById('initial-scene', id),
-      importChatExamplePresetText: (text) => this.importFieldPresetText('chat-examples', text),
+      importChatExamplePresetText: (text) => importFieldPresetText(this.importHost(), 'chat-examples', text),
       onChatExamplePresetSelect: (id) => this.selectFieldPreset('chat-examples', id),
       exportChatExamplePreset: (id) => this.exportFieldPresetById('chat-examples', id),
 
@@ -1083,6 +1071,9 @@ class EditorApp {
         preset: this.rules?.preset ?? null,
         // 初始场景预设决定"多条开场白用哪个分隔行回写"（v0.1.3 追加项一）
         greetingFormat: this.greetingFormat().format,
+        // 对话示例预设决定 `mes_example` 的说话人写法与轮次称呼（2026-11-24 补）。
+        // 与上传 payload 用同一个函数取，避免"仓库里的和导出的不一样"。
+        chatExamplesFormat: this.chatExamplesFormat(),
         // 世界书格式（v0.1.5 / G4）：导出闸门要按**同一份**预设重解析，
         // 否则会把用户那份自定义格式误判成"解析失败"并阻止导出
         worldbookFormat: this.worldbookPreset.format,
@@ -1134,8 +1125,8 @@ class EditorApp {
        * 复用 `autoProbe()` 而不是新写一条探测：它已经是"读配置 → probeServer →
        * applyConnection"的唯一实现，多写一份必然与它分叉（比如漏掉账户令牌优先）。
        */
-      onReprobe: () => this.autoProbe(),
-      getConfig: () => this.currentSyncConfig(),
+      onReprobe: () => autoProbe(this.connHost()),
+      getConfig: () => currentSyncConfig(this.connHost()),
       // 上传内容与「导出 JSON」同一份，保证服务端字节与本地可复现
       getPayload: () => {
         const preset = this.rules?.preset ?? null;
@@ -1176,7 +1167,7 @@ class EditorApp {
         this.session.noteFaceUploaded(sha256);
       },
       onRemoteTextApplied: (text, version, remoteSeq, context) => {
-        this.applyRemoteText(text, version.seq, remoteSeq, context);
+        applyRemoteText(this.landingHost(), text, version.seq, remoteSeq, context);
       },
       // 同步面板里一键连接成功后，把结论交回 App：
       // 顶栏指示与三个同步入口的启用状态都读 this.connection，必须同步更新，
@@ -1197,7 +1188,7 @@ class EditorApp {
         // 这里不能"返回那一个仓库让它显示出来"：一个只有一个选项的下拉
         // 会让人以为还能选别的。
         if (this.authSession?.isRepoTokenMode === true) return [];
-        const config = this.repoClientConfig();
+        const config = repoClientConfig(this.connHost());
         if (!config) return [];
         return listRepos(config);
       },
@@ -1208,7 +1199,7 @@ class EditorApp {
       },
       onOpenRepos: () => void this.repoDialog?.open(),
       // 令牌模式下的仓库名与能力（面板用来显示"仓库令牌模式 · X"与置灰按钮）
-      getRepoTokenContext: () => this.repoTokenContext(),
+      getRepoTokenContext: () => repoTokenContext(this.connHost()),
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
     });
 
@@ -1227,199 +1218,7 @@ class EditorApp {
   // 硬边界：**登录态的任何变化都不触碰本地会话**。标签、未保存内容、当前编辑位置
   // 属于本地工作，与云端身份无关；这条不是靠调用方记得，而是这几处代码里
   // 根本没有 `sessions` / `closeSession` / `markSaved` 之类的调用。
-  private wireAccount(): void {
-    const session = new AuthSession({
-      load: async () => {
-        const config = await configGet();
-        return {
-          accessToken: config.accessToken,
-          refreshToken: config.refreshToken,
-          accessExpiresAt: config.accessExpiresAt,
-          authUser: config.authUser,
-          // 仓库令牌模式（v0.1.3 / F5 后半）：重启后要能恢复 ——
-          // 否则"把令牌交给另一台设备"这件事在每次开机后都要重做一遍
-          repoToken: config.repoToken,
-          repoTokenRepoId: config.repoTokenRepoId,
-          repoTokenRepoName: config.repoTokenRepoName,
-          repoTokenScopes: config.repoTokenScopes,
-          repoTokenExpiresAt: config.repoTokenExpiresAt,
-        };
-      },
-      save: async (patch) => {
-        // 只写这四个键：`configPatch` 是按 key 合并的，不会动规则/目录等设置
-        await configPatch(patch);
-      },
-      serverUrl: () => (this.authServerUrl.trim() === '' ? null : this.authServerUrl.trim()),
-      /*
-       * 登录态变化的**所有**来源都从这里经过：登录框、bootstrap 恢复、
-       * 静默续期成功、401 后恢复失败回匿名、登出。
-       *
-       * 第一版只刷新账户按钮 —— 于是"静默续期成功"这条路径上，账户按钮已经是
-       * authenticated，而顶栏胶囊与同步提示还停在"未登录"（截图验收时发现）。
-       * 连接本身没变，只是凭证变了，所以用现有 connection 重新 apply 一次即可。
-       */
-      onPhaseChange: () => {
-        this.refreshAccountButton();
-        if (this.connection) this.applyConnection(this.connection);
-      },
-    });
-    this.authSession = session;
 
-    this.loginDialog = new LoginDialog({
-      session,
-      getPolicy: () => session.fetchPolicy(),
-      // 登录只需要地址，不需要任何令牌（免鉴权端点：login/register/refresh/config）
-      getServerUrl: () => this.connection?.url ?? this.authServerUrl,
-      notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
-      onAuthenticated: () => {
-        // 换了令牌 → 必须重探一次，否则顶栏还停在旧状态，
-        // 用户会以为登录没成功
-        this.refreshAccountButton();
-        void this.autoProbe();
-        /*
-         * 立刻按现有连接信息重算一次界面文案。
-         *
-         * `autoProbe()` 是一次网络往返，回来之前顶栏与同步提示还是**上一轮探测**的
-         * 结论（探针实测：登录成功、会话已是 authenticated，提示却仍写
-         * "未登录：登录后可同步"）。连接本身没变，只是凭证变了 ——
-         * 用已有的 `connection` 重新 apply 一次就能立刻纠正，不必等探测。
-         */
-        if (this.connection) this.applyConnection(this.connection);
-        // 静默续期由 AuthSession 自己接管（refresh 单飞，见 session.ts），
-        // 这里补第 4 条要求的另一半：**登录成功即拉一次「我的卡片」**，
-        // 用户点开面板时不用再等一轮。
-        void this.cardsDialog?.preload();
-      },
-      /*
-       * 仓库令牌连接成功（v0.1.3 / F5 后半）。
-       *
-       * 与 onAuthenticated 同一套动作：重画顶栏 → 重探 → 立刻按现有连接重算文案。
-       * 多出来一步 `applyScopeGating()`：这个模式下按钮要按 scope 置灰，
-       * 而 applyConnection 只负责把按钮**全部置为可用**（那是账户路径的语义）。
-       */
-      onRepoTokenConnected: () => {
-        this.refreshAccountButton();
-        this.applyScopeGating();
-        if (this.connection) this.applyConnection(this.connection);
-        void this.autoProbe();
-      },
-    });
-
-    this.cardsDialog = new CardsDialog({
-      getConfig: () => this.currentSyncConfig(),
-      /*
-       * 必须是 `mode === 'account'`，不能只看 `accessToken !== ''`（v0.1.3 / F5 后半）。
-       *
-       * 仓库令牌模式下 `session.accessToken` 返回的是**令牌原文**（那是让既有同步链路
-       * 零改动的关键），所以旧的判据会把令牌模式误判成"账户已登录"，
-       * 于是卡片列表里会显示「登出」按钮、还会打出"账户隔离"的说明 ——
-       * 而这两件事在令牌模式下都不成立。
-       */
-      isAccountLogin: () => session.mode === 'account',
-      // T10.8：服务端说"已隔离"就不再提示未隔离（避免永远为真的免责声明）
-      isIsolationEnforced: () => this.connection?.isolationEnforced ?? null,
-      onPick: (cardId) => {
-        // 复用同步面板：点卡片 = 看它的版本历史
-        this.syncDialog?.open();
-        this.syncDialog?.selectCard(cardId);
-      },
-      notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
-      // 「移动…」要选目标仓库：列表由仓库客户端现取（不缓存 —— 用户可能刚在
-      // 仓库面板里新建过一个，缓存会让它在这里看不到）
-      getRepos: async () => {
-        /*
-         * 仓库管理只认**账户** access 令牌（仓库令牌与 legacy 都调不了 /api/repos
-         * 的管理动作，服务端会 403）。
-         *
-         * 这里必须显式挡掉令牌模式：`repoClientConfig()` 读的是
-         * `authSession.accessToken`，而那个 getter 在令牌模式下返回的是令牌原文
-         * （这样既有同步链路才能零改动地按令牌寻址）。不挡的话，
-         * 「我的卡片」里点「移动…」会拿 tcr_ 去调 /api/repos，得到 403。
-         */
-        if (this.authSession?.isRepoTokenMode === true) return [];
-        const config = this.repoClientConfig();
-        if (!config) return [];
-        return listRepos(config);
-      },
-      getRepoTokenContext: () => this.repoTokenContext(),
-      onUnauthorized: () => this.handleUnauthorized(),
-      onLogout: async () => {
-        // 仓库令牌模式的"退出" = 退出该模式（不吊销令牌 —— 它可能还在别的设备上用）
-        const wasRepoToken = session.isRepoTokenMode;
-        await session.logout();
-        if (wasRepoToken) {
-          this.setStatus('已退出仓库令牌模式：上传/同步不再可用（本地编辑不受影响）', 'info');
-        } else {
-          this.setStatus('已登出：后续同步将使用全局令牌（若有）', 'info');
-        }
-        this.refreshAccountButton();
-        this.applyScopeGating();
-        void this.autoProbe();
-      },
-    });
-
-    byId<HTMLButtonElement>('btn-account').addEventListener('click', () => void this.openAccountEntry());
-
-    /*
-     * 注销账户（v0.1.3 / F3）。
-     *
-     * 三个回调各自的分工：
-     *   · `getStats` 走 `/api/account/summary` —— 服务端算，与真正删除同一口径；
-     *     失败时返回 null，弹窗会**明说"读不到统计"**而不是显示 0。
-     *   · `onConfirm` 交给 AuthSession（它负责调接口并在成功后清本地登录态）。
-     *   · `onDeleted` 负责把界面恢复到"未登录"：顶栏、按钮置灰、探测重跑。
-     *
-     * 刻意**不关任何本地标签**：账户没了不等于本地未保存的编辑要丢。
-     * 用户可能正想把自己写的卡另存出来 —— 这条边界与登出完全一致。
-     */
-    this.accountDeleteDialog = new AccountDeleteDialog({
-      getUsername: () => session.user?.username ?? '',
-      getStats: async () => {
-        try {
-          return await session.accountSummary();
-        } catch {
-          return null;
-        }
-      },
-      onConfirm: (input) => session.deleteAccount(input.confirmUsername, input.password),
-      onDeleted: (receipt) => {
-        this.refreshAccountButton();
-        this.applyScopeGating();
-        // 账户已不存在 → 卡片列表/同步面板里的东西都过期了，重探一次
-        void this.autoProbe();
-        this.setStatus(
-          `账户「${receipt.username}」已注销：本地未保存的编辑不受影响，建议先另存需要保留的内容`,
-          'warn',
-        );
-        // 「我的卡片」如果开着，里面的列表已经全部失效（账户没了）
-        this.cardsDialog?.close();
-        this.syncDialog?.close();
-        this.repoDialog?.close();
-      },
-      notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
-    });
-
-    /*
-     * 仓库与令牌面板（T10.8）。
-     *
-     * 与登录框同一条规则：**只存在于账户身份**。仓库管理不接受 legacy 令牌
-     * （没有账户可挂）、也不接受仓库令牌（能自签 = 一次泄露可无限续期）。
-     * 所以 `getConfig` 在这里返回 null 而不是"退化成 legacy"。
-     */
-    this.repoDialog = new RepoDialog({
-      getConfig: () => this.repoClientConfig(),
-      notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
-      onUnauthorized: () => this.handleUnauthorized(),
-    });
-
-    // 启动时读回令牌并**静默**续期。
-    // 不 await：续期要发网络请求，不能挡住首屏渲染；也不在失败时弹窗
-    // （启动瞬间弹登录框，用户第一反应是"是不是被盗号了"）。
-    void session.bootstrap().then((ok) => {
-      this.refreshAccountButton();
-      if (ok) void this.autoProbe();
-    });
-  }
 
   /** 浏览器直开（无壳）时的服务端地址兜底，与 `?settings=1&serverUrl=…` 调试参数同源 */
   private applyDebugServerUrl(): void {
@@ -1438,31 +1237,7 @@ class EditorApp {
    *     这里直接返回 null，避免让用户看到一个注定失败的按钮）。
    * 未登录时返回 null → 面板显示"需要先登录账户"。
    */
-  private repoClientConfig(): { serverUrl: string; accessToken: string } | null {
-    const connection = this.connection;
-    const session = this.authSession;
 
-    /*
-     * 仓库令牌模式下**一律返回 null**（v0.1.4 / G1）。
-     *
-     * `AuthSession.accessToken` 那个 getter 在令牌模式下返回令牌**原文** ——
-     * 那是让既有同步链路零改动的关键设计。但仓库管理（`/api/repos` 系列）
-     * 只认账户令牌，把它交给这里等于拿 `tcr_` 去调，服务端必回 403。
-     *
-     * 原来只在两处 `getRepos` 各自挡了一下，**仓库对话框本身没挡**：
-     * 于是令牌模式下打开「仓库与令牌」，看到的是"加载仓库列表失败：仓库令牌
-     * 不能管理仓库…"这种把用户引向错误方向的提示。
-     *
-     * 挡在这里是唯一能覆盖全部调用点的位置（本函数只有三个调用点，
-     * 都在"管理仓库"这条链上，上传走的是 server-sync 的另一套配置）。
-     */
-    if (session?.isRepoTokenMode === true) return null;
-
-    const token = session?.accessToken ?? '';
-    const serverUrl = connection?.url ?? this.authServerUrl;
-    if (token === '' || serverUrl === '' || serverUrl === undefined) return null;
-    return { serverUrl, accessToken: token };
-  }
 
   /**
    * 仓库令牌模式下要交给同步面板的上下文（v0.1.3 / F5 后半）。
@@ -1472,23 +1247,7 @@ class EditorApp {
    * scope→能力的映射只在 `auth/repo-token.ts` 里定义一份，服务端那边的
    * `requiredScope()` 是它的镜像（测试里交叉断言两者一致）。
    */
-  private repoTokenContext(): RepoTokenContext | null {
-    const session = this.authSession;
-    if (session?.isRepoTokenMode !== true) return null;
-    const caps = session.capabilities;
-    return {
-      repoId: session.repoTokenRepoId,
-      repoName: session.repoTokenRepoName,
-      label: repoTokenModeLabel(session.repoTokenRepoName),
-      caps,
-      reason: {
-        upload: disabledReason('upload', caps),
-        rollback: disabledReason('rollback', caps),
-        delete: disabledReason('delete', caps),
-        move: disabledReason('move', caps),
-      },
-    };
-  }
+
 
   /**
    * 三个同步按钮的可用性（v0.1.3 / F5 后半）。
@@ -1500,94 +1259,30 @@ class EditorApp {
    * 必须点名"缺哪一档"写在 title 里：这把令牌通常是别人签的，
    * 用户需要知道去要哪一档，而不是自己去猜为什么按钮是灰的。
    */
-  private applyScopeGating(): void {
-    const session = this.authSession;
-    const isRepoToken = session?.isRepoTokenMode === true;
-    const caps = session?.capabilities ?? null;
 
-    const set = (id: string, enabled: boolean, reason: string): void => {
-      const button = byId<HTMLButtonElement>(id);
-      button.disabled = !enabled;
-      if (enabled) {
-        button.removeAttribute('title');
-      } else {
-        button.title = reason;
-      }
-    };
-
-    if (!isRepoToken || caps === null) {
-      // 账户 / legacy：恢复"全部可用"，并把上一次令牌模式留下的 title 清掉
-      set('btn-upload', true, '');
-      set('btn-history', true, '');
-      set('btn-rollback', true, '');
-      document.body.dataset['credentialMode'] = this.authSession?.mode ?? 'none';
-      delete document.body.dataset['repoTokenScopes'];
-      return;
-    }
-
-    set('btn-upload', caps.canUpload, disabledReason('upload', caps));
-    // 历史只需要读：有 read 就能看
-    set('btn-history', caps.canRead, caps.canRead ? '' : '此令牌没有「读」权限');
-    set('btn-rollback', caps.canRollback, disabledReason('rollback', caps));
-
-    // 端到端断言用：不靠读文案判断模式与权限
-    document.body.dataset['credentialMode'] = 'repo-token';
-    document.body.dataset['repoTokenScopes'] = [...(this.authSession?.repoTokenScopes ?? [])].join(',');
-  }
 
   /** 账户按钮的文案与状态（唯一一处改它的地方） */
-  private refreshAccountButton(): void {
-    const button = byId<HTMLButtonElement>('btn-account');
-    const session = this.authSession;
 
-    /*
-     * 仓库令牌模式（v0.1.3 / F5 后半）单独一条分支。
-     *
-     * 不能复用 phaseLabel：那个模式里 `user` 恒为 null（令牌代表的是**签发人**的账户，
-     * 用令牌的人未必是同一个），走原来的路径会显示「登录…」——
-     * 明明已经连上了却说没登录。文案必须写"仓库令牌 · <仓库名>"。
-     */
-    if (session?.isRepoTokenMode === true) {
-      const repoName = session.repoTokenRepoName;
-      button.textContent = repoTokenLabel(repoName);
-      button.title = repoTokenTitle(repoName, describeCapabilities(session.capabilities));
-      button.dataset['phase'] = 'repo-token';
-      button.dataset['repoName'] = repoName;
-      this.settings?.refreshIdentity();
-      return;
-    }
-    delete button.dataset['repoName'];
-
-    const phase = session?.currentPhase ?? 'anonymous';
-    const user = session?.user ?? null;
-    button.textContent = phaseLabel(phase, user);
-    button.title = phaseTitle(phase, user);
-    button.dataset['phase'] = phase;
-    // 设置面板里的「已登录：alice（账户令牌）」/「未登录」跟着变：
-    // 登录态可能在任何地方变化（登录、登出、静默过期、401 恢复），
-    // 只在一处改文案，避免两个面板各说一套。
-    this.settings?.refreshIdentity();
-  }
 
   /**
-   * 点账户按钮：已登录 → 卡片列表；否则 → 登录框。
+   * 点账户按钮：已登录进账户面板，否则进登录框。
    *
-   * v0.1.2 追加任务：**不再以"已连上/令牌有效"为前提**。唯一的前置条件是
-   * 服务端地址 —— 没有它，登录框连 `/api/auth/config` 都问不到。
-   * 那种情况直接把用户送到设置页并说明原因，而不是打开一个注定失败的登录框。
+   * 「我的卡片」也在账户面板里（v0.2.3 拆分）。右上角按钮回答「我是谁」，
+   * 第 4 个工具栏按钮回答「我的仓库与令牌」，两个入口不再互相串。
+   *
+   * v0.1.2 起不再要求「已连上 / 令牌有效」，只要求服务端地址。没有地址时
+   * 登录框连 `/api/auth/config` 都问不到，所以直接把用户送到设置页说明原因，
+   * 别开一个注定失败的框。
    */
   private async openAccountEntry(): Promise<void> {
     const session = this.authSession;
     if (!session) return;
 
     /*
-     * 仓库令牌模式（v0.1.3 / F5 后半）：点账户按钮 → 卡片列表，与账户模式一致。
-     * 「退出」在列表面板里（文案改成「退出令牌模式」），不在这里直接登出 ——
-     * 顶栏按钮一下就把连接断掉太容易误触，而列表面板里那个按钮
-     * 明确写着"退出令牌模式"，语义清楚。
+     * 仓库令牌模式（v0.1.3 / F5 后半）：点账户按钮仍进卡片列表，和账户模式一致。
+     * 「退出令牌模式」放在列表面板里；顶栏按钮一下把连接断掉太容易误触。
      *
-     * 前提仍是**有服务端地址**：令牌模式下地址是进来时用过的，
-     * 理论上不会丢，但用户可能刚在设置里清过。
+     * 地址是进来时用过的，理论上不会丢。但用户可能刚在设置里清过，仍要检查。
      */
     if (session.isRepoTokenMode) {
       if (!hasServerUrl(this.connection?.url ?? this.authServerUrl)) {
@@ -1605,7 +1300,7 @@ class EditorApp {
       return;
     }
     if (session.currentPhase === 'authenticated' && session.accessToken !== '') {
-      await this.cardsDialog?.open();
+      await this.accountDialog?.open();
       return;
     }
     await this.loginDialog?.open();
@@ -1622,12 +1317,12 @@ class EditorApp {
 
     const recovered = await session.recoverAfterUnauthorized();
     if (recovered) {
-      this.refreshAccountButton();
-      void this.autoProbe();
+      refreshAccountButton(this.refreshHost());
+      void autoProbe(this.connHost());
       return true;
     }
 
-    this.refreshAccountButton();
+    refreshAccountButton(this.refreshHost());
     // 「回登录界面」= 只打开对话框。刻意不关闭标签、不清除未保存内容：
     // 用户可能正在写一半的角色卡，重新登录这一下不该让他丢工作。
     void this.loginDialog?.open('登录已过期或令牌无效，请重新登录。本地未保存的编辑不会丢失。');
@@ -1654,68 +1349,14 @@ class EditorApp {
   }
 
   /** 世界书板块内的两个按钮（导入 / 导出），由 createBlock 挂在 worldbook 块里 */
-  private buildWorldbookActions(): HTMLElement {
-    const row = el('div', 'worldbook-actions');
-    const importButton = el('button', 'btn small', '导入世界书…') as HTMLButtonElement;
-    importButton.type = 'button';
-    importButton.dataset['role'] = 'worldbook-import';
-    importButton.title = '支持世界书文件与纯文本，会自动识别格式';
-    importButton.addEventListener('click', () => void this.pickAndImportWorldbook());
 
-    const exportJson = el('button', 'btn small ghost', '导出文件…') as HTMLButtonElement;
-    exportJson.type = 'button';
-    exportJson.dataset['role'] = 'worldbook-export-json';
-    exportJson.addEventListener('click', () => void this.exportWorldbookFile('json'));
-
-    const exportTxt = el('button', 'btn small ghost', '导出 TXT…') as HTMLButtonElement;
-    exportTxt.type = 'button';
-    exportTxt.dataset['role'] = 'worldbook-export-txt';
-    exportTxt.addEventListener('click', () => void this.exportWorldbookFile('txt'));
-
-    row.append(importButton, exportJson, exportTxt);
-    return row;
-  }
 
   /** 选一个世界书文件并导入（扩展名决定预期格式，但真正的识别在 shared 里做） */
-  private async pickAndImportWorldbook(): Promise<void> {
-    try {
-      const path = await pickCardFile(undefined, { allowText: true });
-      if (!path) return;
-      const file = await readTextExact(path);
-      await this.importWorldbookFile(file.pathDisplay ?? path, file.text);
-    } catch (error) {
-      this.setStatus(`读取世界书文件失败：${describe(error)}`, 'bad');
-    }
-  }
+
 
   /**
    * 当前同步配置：连接通过时才返回（未就绪不构造请求参数） */
-  private currentSyncConfig(): SyncConfig | null {
-    // v0.1.2 追加任务：**不再要求探测通过**。
-    //
-    // 上一版这里写着 `if (!isSyncReady(connection)) return null`，而 isSyncReady
-    // 要求 tokenValid === true —— 于是"没登录"被表达成"同步配置为空"，
-    // 卡片列表与同步面板于是说"未连接"。凭证只决定**能做什么**，
-    // 不能决定"能不能开始"：这里只要有地址 + 有凭证就交出配置，
-    // 请求失败由各面板自己报（那时才有真实错误可看）。
-    const accountToken = this.authSession?.accessToken ?? '';
-    const legacyToken = this.settingsToken ?? '';
-    const token = accountToken !== '' ? accountToken : legacyToken;
-    const serverUrl = this.connection?.url ?? this.authServerUrl;
-    if (!hasServerUrl(serverUrl) || token === '') return null;
-    /*
-     * 用户已确认过这个 origin 的证书风险吗（2026-11-17）。
-     *
-     * 只有桌面端用得上（webview 的 fetch 无法配置证书校验）。
-     * 注意这里是**每次现算**而不是缓存一个布尔：用户在设置里确认完
-     * 立刻就要生效，缓存会让"确认了还是传不上去"。
-     */
-    return {
-      serverUrl,
-      token,
-      ...(isOriginCertAcked(this.certAckedOrigins, serverUrl) ? { allowInvalidCert: true } : {}),
-    };
-  }
+
 
   /** 当前是否持有可用凭证（账户令牌或 legacy 全局令牌） */
   private hasCredentials(): boolean {
@@ -1766,112 +1407,9 @@ class EditorApp {
    * （用户看得见、也能改），清空的代价是他得重新找一次图（而且不会被告知为什么没了）。
    * 导出的兜底链本来就能处理"卡面缺失"，所以保留在功能上也安全。
    */
-  private async pullFaceFromServer(cardId: string): Promise<void> {
-    if (cardId === '') return;
-    const config = this.currentSyncConfig();
-    if (config === null) return;
-    try {
-      const face = await fetchFace(config, cardId);
-      if (face === null) return;
-      if (!this.hasSession) return;
-      /*
-       * keyword 固定给 'chara'：这里拿到的是**纯图**（服务端不收卡数据块），
-       * 它本身没有 keyword 概念；真正写进 PNG 时由导出链路按目标 spec 决定，
-       * 这个字段只在"保持原 spec"那条路上被读。
-       */
-      /*
-       * **必须先转成 PNG 容器**（v0.1.7 增补二之后）。
-       *
-       * 仓库卡面资产是 WebP（250KB 红线逼出来的），而 `pngSource` 的下游
-       * —— `buildPngCard` / 导出 / 推 ST —— 全都要求 PNG。
-       * 直接塞 WebP 的后果实测过：点推送抛
-       * `PngCardError: 不是 PNG 文件（文件签名不匹配）`，且那条链路没人 catch，
-       * 用户看到的是"点推送没反应"。
-       *
-       * 判据用**字节签名**而不是 MIME：MIME 来自 HTTP 头，可能是错的；
-       * 签名是内容本身。非 PNG 才转码，PNG 走原路（零重编码，决策 D1）。
-       */
-      let faceBytes = face.bytes;
-      if (!isPngBytes(faceBytes)) {
-        const converted = await convertToPng(faceBytes, 'face.webp');
-        faceBytes = converted.bytes;
-      }
-      this.session.setPngSource(toPngSource(faceBytes, null, 'chara'));
-      this.session.noteFaceUploaded(face.sha256 === '' ? null : face.sha256);
-    } catch {
-      // 拉卡面失败静默：内容已经载入，图只是可选资产
-    }
-  }
 
-  private applyRemoteText(
-    text: string,
-    displaySeq: number,
-    remoteSeq: number = displaySeq,
-    context?: { cardId: string; mode: 'restore' | 'rollback' },
-  ): void {
-    try {
-      const parsed = parseStCard(JSON.parse(text) as unknown, {
-        greetingFormat: this.greetingFormat().format,
-        /* 对话示例的说话人写法也按当前预设渲染（2026-11-11） */
-        chatExamplesFormat: this.chatExamplesFormat(),
-        /*
-         * 世界书必须按**当前激活预设**渲染（v0.1.6 缺陷一）。
-         * 不传的话这里会用内置默认格式渲染文本，而审计用当前预设解析 ——
-         * 两套格式分叉就是现场那条 `worldbook-no-entry-marker` 的来源。
-         */
-        worldbookFormat: this.worldbookPreset.format,
-      });
 
-      /*
-       * 零标签（v0.1.3 追加项三）：不再报"请先打开卡片"，而是**自动建一张卡**。
-       *
-       * 决策全部在 `planRemoteApply` 里（纯函数、有单测），这里只负责落地：
-       *   · `create` → 走 `createSessionWithCard`（与「打开…」同一条建卡路径），
-       *     cardId 用服务端那个，于是下一次上传是追加版本而不是新建卡；
-       *   · `replace` → 既有行为，一字未改。
-       *
-       * 没有 context 时（旧调用方/截图入口）按"有标签替换"处理 —— 那种情况下
-       * 本来就一定有会话，否则旧代码会抛错。
-       */
-      const plan = planRemoteApply({
-        hasSession: this.hasSession,
-        mode: context?.mode ?? 'restore',
-        serverCardId: context?.cardId ?? (this.hasSession ? this.session.cardId : ''),
-        targetSeq: displaySeq,
-        remoteSeq,
-        cardName: parsed.card.meta.name,
-        existingNames: this.sessions.map((item) => item.card.meta.name),
-      });
 
-      if (plan.action === 'create') {
-        if (plan.newSessionName !== null) {
-          // 名字已在 plan 里去重；卡片本身的 meta.name 也要跟着改，
-          // 否则标签栏显示"卡片 (2)"、导出文件里还是原名。
-          const renamed = { ...parsed.card, meta: { ...parsed.card.meta, name: plan.newSessionName } };
-          this.createSessionWithCard(renamed, plan.cardId);
-        }
-        this.session.noteRemoteVersion(plan.cardId, plan.baseSeq);
-      } else {
-        this.replaceCard(parsed.card);
-        this.session.noteRemoteVersion(this.session.cardId, plan.baseSeq);
-      }
-
-      this.setStatus(plan.status, plan.action === 'create' ? 'ok' : 'warn');
-
-      /*
-       * 卡面（v0.1.7 修订二）：取回/回滚时把服务端那份封面也收下来。
-       *
-       * fire-and-forget：内容已经载入成功了，卡面失败不该把这次操作判失败
-       * （而且用户看到的画面已经是对的 —— 编辑不需要图，图只在推 ST/导出时用）。
-       */
-      void this.pullFaceFromServer(plan.cardId);
-    } catch (error) {
-      this.setStatus(
-        `载入服务端版本失败：${error instanceof Error ? error.message : String(error)}`,
-        'bad',
-      );
-    }
-  }
 
   private dialogState(): DialogState {
     const rules = this.rules;
@@ -1916,78 +1454,10 @@ class EditorApp {
   }
 
   /** 切换平台规则：立即按新规则重检并提醒 */
-  private switchPlatform(id: string): void {
-    if (!this.rules) return;
-    let resolved;
-    try {
-      resolved = resolvePlatformRule(id, this.rules.platformFiles);
-    } catch (error) {
-      this.setStatus(
-        `平台规则「${id}」无法解析：${error instanceof Error ? error.message : String(error)}`,
-        'bad',
-      );
-      return;
-    }
 
-    this.rules = { ...this.rules, platform: resolved, platformId: id };
-    // 切换即重检：不等防抖，立刻跑，让用户马上看到结论变化
-    this.validate();
-    const { error, warning, info } = this.lastSummary;
-    this.setStatus(
-      `已切换到「${resolved.name}」：错误 ${error} · 警告 ${warning} · 提示 ${info}`,
-      error > 0 ? 'bad' : warning > 0 ? 'warn' : 'ok',
-    );
-    this.refreshRulesLabel();
-    // 记下选择（v0.1.5 / G5）
-    this.persistSelection({ platformRuleId: id });
-  }
 
   /** 切换高亮方案：重新编译 + 重新着色 */
-  private switchHighlight(id: string): void {
-    if (!this.rules) return;
-    const file = this.rules.highlightFiles.find((item) => item.id === id);
-    if (!file) {
-      this.setStatus(`高亮方案「${id}」不存在`, 'bad');
-      return;
-    }
 
-    let compiled;
-    try {
-      compiled = compileHighlightRule(resolveHighlightRule(id, this.rules.highlightFiles));
-    } catch (error) {
-      this.setStatus(
-        `高亮方案「${id}」编译失败：${error instanceof Error ? error.message : String(error)}`,
-        'bad',
-      );
-      return;
-    }
-
-    this.rules = { ...this.rules, highlight: compiled, highlightFile: file, highlightId: id };
-    // 配色来自方案本体 → 重新生成 CSS
-    applySchemeStyles(file);
-
-    // 已挂载的编辑器需要重建才能用新方案（装饰在 ViewPlugin 构造时绑定）
-    for (const runtime of this.blocks) {
-      if (!runtime.expanded) continue;
-      const text = runtime.editor?.getText() ?? runtime.snapshot.text;
-      runtime.editor?.destroy();
-      runtime.editor = null;
-      runtime.host.replaceChildren();
-      runtime.editor = new BlockEditor({
-        parent: runtime.host,
-        blockId: runtime.snapshot.id,
-        text,
-        compiled,
-        onChange: (next) => this.onBlockChange(runtime, next),
-      });
-      runtime.editor.setIssues(this.issuesFor(runtime.snapshot.id));
-    }
-
-    this.setStatus(`已切换高亮方案：${file.name}（${id}）`, 'ok');
-    this.refreshRulesLabel();
-    // 记下选择（v0.1.5 / G5）
-    this.persistSelection({ highlightSchemeId: id });
-  }
 
   /**
    * 加载用户预设库，并恢复上次选中的预设（v0.1.5 / G5）。
@@ -2003,38 +1473,7 @@ class EditorApp {
    *   · **提示合并成一条**：启动时把 8 条警告逐条 setStatus，用户只会看到最后一条，
    *     等于没提示。
    */
-  private async loadPresetLibrary(): Promise<void> {
-    /*
-     * 浏览器直开（无壳）没有配置文件也没有预设库 —— 不是错误。
-     * 不加这一层，每次刷新页面都会在状态栏留一条"预设库读取失败"，
-     * 而那是故意不支持的场景（截图/验收才用浏览器）。
-     */
-    if (!isShellAvailable()) {
-      this.presetStoreReady = true;
-      return;
-    }
 
-    const loaded = await this.presetStore.load();
-    this.presetStoreReady = true;
-
-    const problems: string[] = [...loaded.warnings];
-    for (const item of loaded.items) {
-      const problem = this.applyLibraryItem(item);
-      if (problem !== null) {
-        const label = item.name !== '' ? item.name : (item.id ?? '(未命名)');
-        problems.push(`预设库里的 ${item.kind}「${label}」未能加载：${problem}`);
-      }
-    }
-
-    const selectionProblems = await this.restorePresetSelection();
-    problems.push(...selectionProblems);
-
-    if (problems.length > 0) {
-      this.setStatus(problems.join('；'), 'warn');
-      // 同时进控制台：状态栏只显示一行，长内容会被截断
-      console.warn('[presets] 预设库加载问题：', problems);
-    }
-  }
 
   /**
    * 把库里的一条并进内存列表。**不切换、不提示**（那由调用方决定）。
@@ -2045,57 +1484,7 @@ class EditorApp {
    * （`importHighlightText` 会 `switchHighlight`），启动时切换就会覆盖
    * config 里记着的选择 —— 那正是这一版要修的问题。
    */
-  private applyLibraryItem(item: PresetLibraryItem): string | null {
-    if (!this.rules) return '规则尚未加载';
-    switch (item.kind) {
-      case 'platform': {
-        const outcome = importPlatformRule(this.rules.platformFiles, item.text);
-        if (!outcome.ok) return firstIssue(outcome.issues);
-        const platformSourceText = { ...this.rules.platformSourceText };
-        if (outcome.id) platformSourceText[outcome.id] = item.text;
-        this.rules = { ...this.rules, platformFiles: outcome.value, platformSourceText };
-        return null;
-      }
-      case 'highlight': {
-        const outcome = importHighlightScheme(
-          this.rules.highlightFile,
-          this.rules.highlightFiles,
-          item.text,
-        );
-        if (!outcome.ok || !outcome.value || outcome.id === null) return firstIssue(outcome.issues);
-        this.rules = {
-          ...this.rules,
-          highlightFiles: [
-            ...this.rules.highlightFiles.filter((file) => file.id !== outcome.id),
-            outcome.value,
-          ],
-          highlightSourceText: { ...this.rules.highlightSourceText, [outcome.id]: item.text },
-        };
-        return null;
-      }
-      case 'txt': {
-        const outcome = importTxtPreset(this.rules.presets, item.text);
-        if (!outcome.ok) return firstIssue(outcome.issues);
-        this.rules = { ...this.rules, presets: outcome.value };
-        return null;
-      }
-      case 'worldbook': {
-        const outcome = importWorldbookPreset(this.worldbookPresets, item.text);
-        if (!outcome.ok) return firstIssue(outcome.issues);
-        this.worldbookPresets = outcome.value;
-        return null;
-      }
-      case 'greeting':
-      case 'chat-examples': {
-        const block: FieldPresetBlock = item.kind === 'greeting' ? 'initial-scene' : 'chat-examples';
-        const outcome = importFieldPreset(this.fieldPresetsOf(block), item.text, block);
-        if (!outcome.ok) return firstIssue(outcome.issues);
-        if (block === 'initial-scene') this.greetingPresets = outcome.value;
-        else this.chatExamplePresets = outcome.value;
-        return null;
-      }
-    }
-  }
+
 
   /**
    * 按 config 里记的 id 恢复六类选择。
@@ -2104,89 +1493,7 @@ class EditorApp {
    * 不能因为一个 id 失效就停在半初始化状态 —— 那样用户连"为什么我的规则不对"
    * 都无从查起。
    */
-  private async restorePresetSelection(): Promise<string[]> {
-    if (!this.rules) return [];
-    let config;
-    try {
-      config = await configGet();
-    } catch {
-      // 浏览器直开：没有配置可读，不算问题
-      return [];
-    }
 
-    const problems: string[] = [];
-
-    // ── 平台规则 ──
-    if (config.platformRuleId !== null && config.platformRuleId !== this.rules.platformId) {
-      try {
-        const resolved = resolvePlatformRule(config.platformRuleId, this.rules.platformFiles);
-        this.rules = { ...this.rules, platform: resolved, platformId: config.platformRuleId };
-      } catch {
-        problems.push(`上次使用的平台规则「${config.platformRuleId}」已不存在，已回到「${this.rules.platformId}」`);
-      }
-    }
-
-    // ── 高亮方案 ──
-    if (config.highlightSchemeId !== null && config.highlightSchemeId !== this.rules.highlightId) {
-      const file = this.rules.highlightFiles.find((item) => item.id === config.highlightSchemeId);
-      if (file === undefined) {
-        problems.push(`上次使用的高亮方案「${config.highlightSchemeId}」已不存在，已回到「${this.rules.highlightId}」`);
-      } else {
-        try {
-          const compiled = compileHighlightRule(resolveHighlightRule(file.id, this.rules.highlightFiles));
-          this.rules = { ...this.rules, highlight: compiled, highlightFile: file, highlightId: file.id };
-          applySchemeStyles(file);
-        } catch (error) {
-          problems.push(`高亮方案「${file.id}」编译失败已回退：${describe(error)}`);
-        }
-      }
-    }
-
-    // ── TXT 预设 ──
-    if (config.presetId !== null) {
-      const preset = this.rules.presets.find((item) => item.id === config.presetId);
-      if (preset === undefined) {
-        problems.push(`上次使用的 TXT 预设「${config.presetId}」已不存在，继续用当前的`);
-      } else {
-        this.rules = { ...this.rules, preset };
-      }
-    }
-
-    // ── 世界书格式预设 ──
-    if (config.worldbookPresetId !== null) {
-      const preset = this.worldbookPresets.find((item) => item.id === config.worldbookPresetId);
-      if (preset === undefined) {
-        problems.push(`上次使用的世界书格式「${config.worldbookPresetId}」已不存在，继续用内置格式`);
-      } else {
-        this.worldbookPreset = preset;
-      }
-    }
-
-    // ── 初始场景 / 对话示例格式预设 ──
-    if (config.greetingPresetId !== null) {
-      const preset = this.greetingPresets.find((item) => item.id === config.greetingPresetId);
-      if (preset === undefined) {
-        problems.push(`上次使用的初始场景格式「${config.greetingPresetId}」已不存在，继续用内置格式`);
-      } else {
-        this.greetingPreset = preset;
-      }
-    }
-    if (config.chatExamplePresetId !== null) {
-      const preset = this.chatExamplePresets.find((item) => item.id === config.chatExamplePresetId);
-      if (preset === undefined) {
-        problems.push(`上次使用的对话示例格式「${config.chatExamplePresetId}」已不存在，继续用内置格式`);
-      } else {
-        this.chatExamplePreset = preset;
-      }
-    }
-
-    // 会话里存着格式（编辑世界书时用它），恢复完要同步到已打开的会话
-    if (this.worldbookPreset !== DEFAULT_WORLDBOOK_PRESET) {
-      for (const session of this.sessions) session.setWorldbookFormat(this.worldbookPreset.format);
-    }
-
-    return problems;
-  }
 
   /**
    * 记下刚导入成功的预设（v0.1.5 / G5）。
@@ -2197,70 +1504,22 @@ class EditorApp {
    *   · 库还没加载完时不写（`presetStoreReady`）：那会把磁盘上已有的预设
    *     连同这次导入一起覆盖成"只有这一条"。
    */
-  private async rememberPreset(
-    kind: PresetKind,
-    name: string,
-    text: string,
-    id: string | null,
-  ): Promise<void> {
-    // 取证/截图演示期间不落盘：那是用户真实内容，不该被写进本机预设库
-    if (this.demoQuiet) return;
-    if (!this.presetStoreReady) {
-      this.setStatus(
-        `已导入「${id ?? name}」（本次生效）—— 预设库尚未加载完成，这次没有保存，重启会丢失`,
-        'warn',
-      );
-      return;
-    }
-    const result = await this.presetStore.remember(kind, name, text, id);
-    if (!result.saved) {
-      this.setStatus(
-        `已导入「${id ?? name}」（本次生效），但**没能保存到预设库**：${result.error ?? '未知原因'}。重启后需要重新导入。`,
-        'warn',
-      );
-    }
-  }
+
 
   /** 记录当前选择（切换时调；失败只警告，不影响编辑） */
   private persistSelection(patch: Partial<ClientConfig>): void {
     // 浏览器直开无配置可写 —— 那是预期内的，不该每切一次弹一条警告
     if (!isShellAvailable()) return;
     void configPatch(patch).catch((error: unknown) => {
-      this.setStatus(`设置未能保存（下次启动会回到默认）：${describe(error)}`, 'warn');
+      this.setStatus(`设置未能保存（下次启动会回到默认）：${describeError(error)}`, 'warn');
     });
   }
 
   /** 导入 TXT 预设（T10.30）：原子回退 + 同 id 覆盖 + 不自动切换 */
-  private importTxtPresetText(text: string): PresetImportOutcome<TxtPreset[]> {
-    if (!this.rules) {
-      return { ok: false, value: [], issues: [], warnings: [], id: null, name: null, replaced: false, renameHint: '' };
-    }
-    const outcome = importTxtPreset(this.rules.presets, text);
-    if (!outcome.ok) return outcome;
 
-    this.rules = { ...this.rules, presets: outcome.value };
-    // 导入后**不切换**当前预设：导入是"加入候选"，切换是"改变导出格式"，
-    // 两件事合在一起时，用户正在看的内容会突然按另一种格式重排，很难归因。
-    this.refreshRulesLabel();
-    /*
-     * 落盘（v0.1.5 / G5）。**不 await**：导入已经在内存生效，写盘是副作用，
-     * 让它卡住"导入"这个动作的响应没有好处。失败时 `rememberPreset`
-     * 自己会提示，且不回滚。
-     */
-    void this.rememberPreset('txt', outcome.name ?? 'TXT 预设', text, outcome.id);
-    return outcome;
-  }
 
   /** 导入世界书预设（T10.31） */
-  private importWorldbookPresetText(text: string): PresetImportOutcome<WorldbookPreset[]> {
-    const outcome = importWorldbookPreset(this.worldbookPresets, text);
-    if (!outcome.ok) return outcome;
-    this.worldbookPresets = outcome.value;
-    // 落盘（v0.1.5 / G5）：世界书格式是"分节编号 + 隐式闭合"这类外部格式的唯一载体，
-    // 丢了它下次打开软件就会按默认格式解析用户的世界书 → 又变成"解析不出条目"
-    void this.rememberPreset('worldbook', outcome.name ?? '世界书预设', text, outcome.id);
-    return outcome;
-  }
+
 
   private selectWorldbookPreset(id: string): void {
     const preset = this.worldbookPresets.find((item) => item.id === id);
@@ -2279,7 +1538,7 @@ class EditorApp {
     }
     // 世界书预设参与解析与格式检查，切换后必须重检 —— 否则面板停在旧口径上
     this.validate();
-    this.refreshRulesLabel();
+    refreshRulesLabel(this.refreshHost());
     // 记下选择（v0.1.5 / G5）：否则下次启动又回到默认格式，
     // 而用户的文本是按这套格式写的 —— 表现为"世界书又解析不出来了"
     this.persistSelection({ worldbookPresetId: preset.id });
@@ -2355,9 +1614,7 @@ class EditorApp {
     return turns === null ? '' : ` · 当前文本 ${String(turns)} 轮`;
   }
 
-  private fieldPresetsOf(block: FieldPresetBlock): readonly FieldPreset[] {
-    return block === 'initial-scene' ? this.greetingPresets : this.chatExamplePresets;
-  }
+
 
   private fieldPresetOf(block: FieldPresetBlock): FieldPreset {
     return block === 'initial-scene' ? this.greetingPreset : this.chatExamplePreset;
@@ -2389,30 +1646,7 @@ class EditorApp {
    * 而那种情况下下拉里还留着、切回成本很低。反过来，"导入成功却不生效"
    * 会让用户去怀疑代码坏了 —— 这次的排查就这么发生了一次。
    */
-  private importFieldPresetText(block: FieldPresetBlock, text: string): PresetImportOutcome<FieldPreset[]> {
-    const outcome = importFieldPreset(this.fieldPresetsOf(block), text, block);
-    if (!outcome.ok) return outcome;
-    if (block === 'initial-scene') this.greetingPresets = outcome.value;
-    else this.chatExamplePresets = outcome.value;
-    /*
-     * 落盘（v0.1.5 / G5）。两个板块在库里用不同 kind 分开存 ——
-     * 混成一个的话，把「对话示例预设」导进「初始场景」那一栏这种错位
-     * 在加载时就再也检不出来了（`importFieldPreset` 的 block 校验会白做）。
-     */
-    if (block === 'initial-scene') {
-      void this.rememberPreset('greeting', outcome.name ?? '初始场景预设', text, outcome.id);
-    } else {
-      void this.rememberPreset('chat-examples', outcome.name ?? '对话示例预设', text, outcome.id);
-    }
-    /*
-     * 导入即启用。`selectFieldPreset` 已经包含全部后续动作：
-     * 重指对象 → 按新格式重算未编辑板块的视图 → 重检 → 记下选择 → 状态栏说明。
-     * 自己再写一遍必然漏一项（这正是 2026-11-17 之前的状况：只更新了数组，
-     * 没重指对象，也没重算视图）。
-     */
-    if (outcome.id !== null) this.selectFieldPreset(block, outcome.id);
-    return outcome;
-  }
+
 
   /**
    * 切换字段板块预设。
@@ -2422,7 +1656,7 @@ class EditorApp {
    *   2. 重检 —— 分隔行二义、旧格式提示这些都会随格式变化。
    */
   private selectFieldPreset(block: FieldPresetBlock, id: string): void {
-    const preset = this.fieldPresetsOf(block).find((item) => item.id === id);
+    const preset = fieldPresetsOf(this.importHost(), block).find((item) => item.id === id);
     if (!preset) return;
     if (block === 'initial-scene') this.greetingPreset = preset;
     else this.chatExamplePreset = preset;
@@ -2447,7 +1681,7 @@ class EditorApp {
     }
 
     this.validate();
-    this.refreshRulesLabel();
+    refreshRulesLabel(this.refreshHost());
     this.rulesDialog?.refresh();
     this.setStatus(
       block === 'initial-scene'
@@ -2465,7 +1699,7 @@ class EditorApp {
   }
 
   private exportFieldPresetById(block: FieldPresetBlock, id: string): string | null {
-    const preset = this.fieldPresetsOf(block).find((item) => item.id === id);
+    const preset = fieldPresetsOf(this.importHost(), block).find((item) => item.id === id);
     return preset ? serializePreset(preset) : null;
   }
 
@@ -2489,75 +1723,44 @@ class EditorApp {
     this.persistSelection({ presetId: preset.id });
   }
 
-  /** 导入平台规则：校验 + 原子回退都在 rule-library 里 */
-  private importPlatformText(text: string) {
-    if (!this.rules) {
-      return { ok: false, value: null, issues: [], warnings: [], id: null, name: null };
+  /**
+   * 真正落地「应用预设」：**同时**把该预设设为当前预设，再按 plan 重排。
+   *
+   * 为什么必须一起做：重排是按这个预设的标题/分隔符写的，
+   * 若 `rules.preset` 还停在旧预设，导出会按旧格式拼装，
+   * 于是"刚重排成 divider，导出的却是 default"——两者不一致。
+   */
+  private commitPresetApply(preset: TxtPreset, plan: PresetApplyPlan): void {
+    if (this.rules) {
+      this.rules = { ...this.rules, preset };
     }
-    const outcome = importPlatformRule(this.rules.platformFiles, text);
-
-    if (outcome.ok) {
-      // 只有成功才落到 this.rules —— 这就是原子性的落点
-      const platformSourceText = { ...this.rules.platformSourceText };
-      if (outcome.id) platformSourceText[outcome.id] = text;
-      this.rules = {
-        ...this.rules,
-        platformFiles: outcome.value,
-        platformSourceText,
-      };
-      // 若当前平台被同名覆盖，重新解析一次，避免用着旧对象
-      if (outcome.id === this.rules.platformId) {
-        this.rules = {
-          ...this.rules,
-          platform: resolvePlatformRule(outcome.id, outcome.value),
-        };
-        this.validate();
-      }
-      // 落盘（v0.1.5 / G5）
-      void this.rememberPreset('platform', outcome.name ?? '平台规则', text, outcome.id);
-    }
-    return outcome;
+    // 换预设要置脏：预设决定导出时的标题与顺序，属于产出的一部分（见 CardSession 注释）
+    this.session.replaceCard(applyPresetPlan(this.card, plan));
+    this.session.markDirty();
+    this.reloadBlocksFromCard();
+    this.rulesDialog?.refresh();
+    // 重排后按新预设口径立即重检（分隔符/顺序类问题应当消失）
+    this.validate();
+    refreshRulesLabel(this.refreshHost());
+    refreshStats(this.refreshHost());
+    this.setStatus(
+      `已应用预设「${preset.name}」：${plan.changes.join('；') || '标题样式已重排'} · 已按新格式重检`,
+      'ok',
+    );
   }
+
+  /** 导入平台规则：校验 + 原子回退都在 rule-library 里 */
+
 
   /** 导入高亮方案：同样原子回退，且必须能编译 */
-  private importHighlightText(text: string) {
-    if (!this.rules) {
-      return { ok: false, value: null, issues: [], warnings: [], id: null, name: null };
-    }
-    const outcome = importHighlightScheme(
-      this.rules.highlightFile,
-      this.rules.highlightFiles,
-      text,
-    );
 
-    if (outcome.ok && outcome.value && outcome.compiled && outcome.id) {
-      const highlightSourceText = { ...this.rules.highlightSourceText };
-      highlightSourceText[outcome.id] = text;
-      this.rules = {
-        ...this.rules,
-        highlightFiles: [...this.rules.highlightFiles.filter((f) => f.id !== outcome.id), outcome.value],
-        highlightSourceText,
-      };
-      // 导入即应用：切到新方案，用户能立刻看到效果
-      this.switchHighlight(outcome.id);
-      this.rulesDialog?.refresh();
-      // 落盘（v0.1.5 / G5）
-      void this.rememberPreset('highlight', outcome.name ?? '高亮方案', text, outcome.id);
-    }
-    return outcome;
-  }
 
-  private refreshRulesLabel(): void {
-    const label = byId('rules-label');
-    const rules = this.rules;
-    if (!rules) return;
-    label.textContent = `平台 ${rules.platformId} · 高亮 ${rules.highlightId} · 预设 ${rules.preset?.id ?? '—'}`;
-  }
+
 
   /** 卡片被整体替换（应用预设 / 打开文件）后重建板块视图 */
   private reloadBlocksFromCard(): void {
     for (const runtime of this.blocks) {
-      this.collapse(runtime);
+      collapse(this.blockHost(), runtime);
       runtime.section.remove();
     }
     // 清掉空工作台留下的占位块。
@@ -2565,7 +1768,7 @@ class EditorApp {
     // this.blocks 里，于是"从零标签新建一张卡"之后它会残留在编辑区中间
     // （2026-10-22 截图里同时出现空占位与八个板块，就是这个原因）。
     this.blockList.replaceChildren();
-    this.blocks = collectBlocks(this.card).map((snapshot) => this.createBlock(snapshot));
+    this.blocks = collectBlocks(this.card).map((snapshot) => createBlock(this.blockHost(), snapshot));
     /*
      * 「角色提示词」板块（2026-11-17，用户要求"桌面端开一个板块专门编辑角色提示词"）。
      *
@@ -2600,9 +1803,9 @@ class EditorApp {
     for (const runtime of this.blocks) {
       const shouldExpand =
         expandAll || explicitExpand.has(runtime.snapshot.id) || (explicitExpand.size === 0 && defaultExpanded.has(runtime.snapshot.id));
-      if (shouldExpand) this.expand(runtime, true);
+      if (shouldExpand) expand(this.blockHost(), runtime, true);
     }
-    this.refreshStats();
+    refreshStats(this.refreshHost());
     this.renderCardName();
   }
 
@@ -2629,7 +1832,7 @@ class EditorApp {
           const accepted = this.session.updateCharacterPrompts(next);
           if (accepted) {
             this.setStatus('已更新角色提示词（记得保存或导出）', 'ok');
-            this.refreshStats();
+            refreshStats(this.refreshHost());
             this.scheduleValidate(0);
           } else if (!this.session.hasCharacterPrompts() || !this.sessionPromptsWithinLimits()) {
             /*
@@ -2662,118 +1865,7 @@ class EditorApp {
   //
   // 关键原则：同步是"可选的增强"，网络问题不得影响本地编辑。
   // 因此这里做三件事：① 顶栏状态胶囊；② 同步条按钮启用/禁用；③ 最多一次自动探测。
-  private wireSettings(): void {
-    this.settings = new SettingsDialog({
-      /*
-       * 设置面板测出"证书不受信任"时，由**外壳**统一问（2026-11-17）。
-       *
-       * 面板自己不弹框：它的 `test()` 会被「连接本机服务端」与端到端脚本
-       * 反复调用，两处各弹一个就会叠在一起问同一件事。确认入口只能有一个。
-       */
-      onConnectionChange: (result) => {
-        this.applyConnection(result);
-        if (result?.certUntrusted === true) {
-          /*
-           * `result.url` 在失败时是**归一化后的那个**（见 `failure()` 里
-           * 传了 `url: base`），所以能直接用来取 origin。
-           * 理论上不会为空；真为空就退回当前配置的地址。
-           */
-          void this.offerCertTrust(result.url ?? this.authServerUrl);
-        }
-      },
-      // T10.26：诊断导出由 app 实现（它知道版本、连接状态、会话摘要与日志路径）
-      onExportDiagnostics: () => this.exportDiagnostics(),
-      onSaved: () => {
-        void this.refreshTokenAfterSave();
-        this.setStatus('设置已保存', 'ok');
-      },
-      // 身份行：登录态从 AuthSession 现读（闭包，构造时 session 可能还不存在）
-      getIdentity: () => ({
-        phase: this.authSession?.currentPhase ?? 'anonymous',
-        user: this.authSession?.user ?? null,
-      }),
-      // 令牌模式要单独告诉设置页：那个模式下没有账户身份（user 恒 null），
-      // 走 getIdentity 那条路会显示成「已登录」或「未登录」，两种都是错的
-      getRepoTokenMode: () =>
-        this.authSession?.isRepoTokenMode === true
-          ? { repoName: this.authSession.repoTokenRepoName }
-          : null,
-      onLogin: () => void this.openAccountEntry(),
-      onLogout: async () => {
-        await this.authSession?.logout();
-        this.refreshAccountButton();
-        void this.autoProbe();
-        this.setStatus('已登出；本地编辑不受影响', 'info');
-      },
-      // 注销账户（v0.1.3 / F3）：只负责把二次确认弹窗打开
-      onDeleteAccount: () => void this.accountDeleteDialog?.open(),
-    });
 
-    byId<HTMLButtonElement>('btn-settings').addEventListener('click', () => {
-      void this.settings?.open();
-    });
-
-    // 调试/截图入口：?settings=1 自动打开；配合 &serverUrl=…&token=… 会执行一次真实探测。
-    // 只影响"打开面板"这一步，探测逻辑与手动点击完全一致（不伪造状态）。
-    //
-    // `&localConnect=1` 再往前走一步：点一次「连接本机服务端」按钮。
-    // 这是 F6 的端到端断言入口 —— 必须真的点按钮，而不是直接调编排函数，
-    // 否则测不到按钮绑定、busy 状态、分步说明渲染这些 UI 环节。
-    const params = new URLSearchParams(location.search);
-    if (params.get('settings') === '1') {
-      const serverUrl = params.get('serverUrl') ?? undefined;
-      const token = params.get('token') ?? undefined;
-      const wantLocalConnect = params.get('localConnect') === '1';
-      void (async () => {
-        await this.settings?.open({ serverUrl, token });
-        if (wantLocalConnect) {
-          await this.settings?.clickConnectLocal();
-          return;
-        }
-        if (params.get('probe') === '1') {
-          await this.settings?.runProbe();
-        }
-      })();
-    }
-
-    /*
-     * ST 地址四种显示状态的取证入口（v0.1.6 / T14.0）：`?settings=1&stAddrDemo=ok|refused|timeout|other|format|skip`
-     *
-     * 注入的是**传输结果**，不是"检测通过"这个结论 —— 每一句话仍由
-     * `describeTcpFailure` / `parseStAddress` 生成。三态判定与真实 TCP 的对应
-     * 由 `.verify/t140-three-states.mjs` 跑真 socket 证明，不靠截图。
-     *
-     * 位置仍在 `start()` 尾部（第六次踩这个坑的同一个判据）：依赖 `settings` 已构造，
-     * 写早了 `?.` 会静默跳过，截出来是普通编辑器页面。
-     */
-    const stAddrDemo = params.get('stAddrDemo');
-    if (
-      stAddrDemo === 'ok' ||
-      stAddrDemo === 'refused' ||
-      stAddrDemo === 'timeout' ||
-      stAddrDemo === 'other' ||
-      stAddrDemo === 'format' ||
-      stAddrDemo === 'skip'
-    ) {
-      void (async () => {
-        await this.settings?.open();
-        this.settings?.previewStAddressState(stAddrDemo);
-      })();
-    }
-
-    // T6.7：三个同步入口都打开同一个面板（面板内按职责分区：上传 / 历史 / 回滚）
-    for (const id of ['btn-upload', 'btn-history', 'btn-rollback']) {
-      byId<HTMLButtonElement>(id).addEventListener('click', () => {
-        // 入口永远可点（v0.1.2 追加任务）。面板按 地址 / 凭证 三态说明现状：
-        // 「还没配置地址」或「登录后可同步」都比门口一句"同步未就绪"有用 ——
-        // 后者既说不出缺什么，也让"还没登录"看起来像功能坏了。
-        this.syncDialog?.open();
-      });
-    }
-
-    this.applyConnection(null);
-    void this.autoProbe();
-  }
 
   /**
    * 预览场景驱动（仅测试/截图用，正常启动不触发）。
@@ -2782,185 +1874,10 @@ class EditorApp {
    * 抓不到这类问题 —— 必须真的在浏览器里点一次、并确认点击能返回。
    * 这里只做「点按钮 + 读 DOM」，不伪造任何业务状态。
    */
-  private async runPreviewScenario(mode: string): Promise<void> {
-    const button = byId<HTMLButtonElement>('btn-preview');
-    const visibleCount = (): number =>
-      [...document.querySelectorAll<HTMLElement>('.preview')].filter((node) => !node.hidden).length;
-    const nodeCount = (): number =>
-      [...document.querySelectorAll<HTMLElement>('.preview')].reduce((sum, node) => sum + node.childNodes.length, 0);
-    const mark = (key: string, value: string): void => {
-      document.body.dataset[key] = value;
-    };
 
-    // 默认启动会展开前两个板块，预览只对已展开的块生效
-    const expanded = this.blocks.filter((runtime) => runtime.expanded).length;
-    mark('previewExpanded', String(expanded));
-
-    if (mode === 'open') {
-      const started = performance.now();
-      button.click();
-      mark('previewMs', (performance.now() - started).toFixed(1));
-      mark('previewVisible', String(visibleCount()));
-      mark('previewNodes', String(nodeCount()));
-      return;
-    }
-
-    if (mode === 'cycle10') {
-      // 需求 F8.2：重复打开关闭 10 次，不泄漏、不累积遮罩
-      let worstVisibleAfterClose = 0;
-      let worstNodesAfterClose = 0;
-      for (let round = 0; round < 10; round += 1) {
-        button.click();
-        button.click();
-        worstVisibleAfterClose = Math.max(worstVisibleAfterClose, visibleCount());
-        worstNodesAfterClose = Math.max(worstNodesAfterClose, nodeCount());
-      }
-      mark('previewCycles', '10');
-      mark('previewVisibleAfterClose', String(worstVisibleAfterClose));
-      mark('previewNodesAfterClose', String(worstNodesAfterClose));
-      // 只统计**可见**的遮罩层。页面里本来就有设置/规则对话框的 .modal-overlay，
-      // 它们带 hidden 属性常驻 DOM；把它们算进来会得到一个永远非零的假告警。
-      const visibleOverlays = [...document.querySelectorAll<HTMLElement>(
-        '[class*=overlay],[class*=mask],[class*=backdrop]',
-      )].filter((node) => !node.hidden && node.getClientRects().length > 0).length;
-      mark('previewOverlays', String(visibleOverlays));
-      return;
-    }
-
-    if (mode === 'typing') {
-      // 需求 F8.2：预览打开期间编辑器仍可输入（预览不应独占）
-      button.click();
-      mark('previewVisible', String(visibleCount()));
-      const content = document.querySelector<HTMLElement>('.cm-content');
-      if (!content) {
-        mark('typingResult', 'no-editor');
-        return;
-      }
-      const before = content.textContent ?? '';
-      content.focus();
-      // execCommand 会产生真实的 beforeinput/input 事件，CM6 按正常路径接收
-      document.execCommand('insertText', false, '预览期间输入');
-      const after = content.textContent ?? '';
-      mark('typingResult', after !== before ? 'changed' : 'unchanged');
-      mark('typingContentEditable', content.getAttribute('contenteditable') ?? 'null');
-      // 中心点最上层元素必须仍在编辑器内，说明没有被全屏遮罩挡住
-      const rect = content.getBoundingClientRect();
-      const top = document.elementFromPoint(
-        Math.round(rect.left + rect.width / 2),
-        Math.round(rect.top + Math.min(rect.height / 2, 20)),
-      );
-      mark('typingTopmost', top && content.contains(top) ? 'editor' : (top?.className || top?.tagName || 'null'));
-      return;
-    }
-
-    if (mode === 'sweep') {
-      // T9.18：顶栏其余按钮逐个点一遍，确认没有「点了不返回」的同类状态机问题。
-      // 判据是 click 的同步耗时 —— F8 那种故障会让 click 永不返回，
-      // 这里因此拿不到 dump（进程被杀），本身就是失败信号。
-      const ids = [
-        'btn-open',
-        'btn-save',
-        'btn-preview',
-        'btn-export',
-        'btn-rules',
-        'btn-settings',
-        'btn-upload',
-        'btn-history',
-        'btn-rollback',
-      ];
-      const parts: string[] = [];
-      for (const id of ids) {
-        const node = document.getElementById(id) as HTMLButtonElement | null;
-        if (!node) {
-          parts.push(`${id}:missing`);
-          continue;
-        }
-        if (node.disabled) {
-          // 「打开/另存为」在浏览器模式下不可用（依赖 Tauri 契约），保持跳过；
-          // 同步三键在未配置服务端时是 disabled，但它们内部只是「置一条提示后返回」，
-          // 强制启用一次才能真正覆盖到处理函数，否则这一格等于没测。
-          if (id.startsWith('btn-') && !['btn-open', 'btn-save'].includes(id)) {
-            node.disabled = false;
-            const startedForce = performance.now();
-            let forcedState = 'ok';
-            try {
-              node.click();
-            } catch (error) {
-              forcedState = `threw(${(error as Error).message.slice(0, 30)})`;
-            }
-            parts.push(`${id}:${(performance.now() - startedForce).toFixed(1)}ms:${forcedState}(forced)`);
-            node.disabled = true;
-          } else {
-            parts.push(`${id}:disabled`);
-          }
-          continue;
-        }
-        const started = performance.now();
-        let state = 'ok';
-        try {
-          node.click();
-        } catch (error) {
-          state = `threw(${(error as Error).message.slice(0, 30)})`;
-        }
-        const elapsed = performance.now() - started;
-        parts.push(`${id}:${elapsed.toFixed(1)}ms:${state}`);
-        // 关掉可能弹出的对话框，否则会挡住后续点击
-        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-        for (const close of document.querySelectorAll<HTMLElement>('.modal-close,[data-close]')) {
-          if (close.getClientRects().length > 0) close.click();
-        }
-        // 预览是开关，点成打开后要再点回来，避免状态污染后续按钮
-        if (id === 'btn-preview' && visibleCount() > 0) node.click();
-      }
-      // 全部点完再看一次：可见遮罩应为 0，页面仍可响应
-      const leftover = [...document.querySelectorAll<HTMLElement>(
-        '[class*=overlay],[class*=mask],[class*=backdrop]',
-      )].filter((node) => !node.hidden && node.getClientRects().length > 0).length;
-      mark('sweepResults', parts.join(' | '));
-      mark('sweepVisibleOverlays', String(leftover));
-      mark('sweepVisiblePreview', String(visibleCount()));
-      return;
-    }
-  }
 
   /** 启动时探测一次已保存的配置；失败静默（不打扰编辑） */
-  private async autoProbe(): Promise<void> {
-    let serverUrl = this.authServerUrl;
-    let legacyToken = this.settingsToken;
-    try {
-      const config = await configGet();
-      this.settingsToken = config.token;
-      // 上次导出用的卡面（v0.1.4 / T12.5）：一次性读进来，导出面板换格式时不再打 IPC
-      this.lastFaceChoice = config.lastFaceChoice ?? null;
-      // 认证请求用的地址与探测用的地址同源：都没配置时一并留空，
-      // 这样"点登录"会明确提示去设置里填地址，而不是打向一个默认端口
-      this.authServerUrl = config.serverUrl;
-      serverUrl = config.serverUrl;
-      legacyToken = config.token;
-      /* 用户以前确认过的证书风险（2026-11-17）；旧配置没有这个键 → 空表 */
-      this.certAckedOrigins = Array.isArray(config.certAckedOrigins) ? config.certAckedOrigins : [];
-    } catch {
-      // 浏览器模式（无 C5 能力）读不到配置：回落到 ?serverUrl= 调试参数。
-      // 这不是给正式用户用的入口 —— 壳里永远能读到配置，走不到这里。
-    }
 
-    if (!serverUrl.trim()) return;
-    // 账户令牌优先：登录后顶栏的"已连接"依据的是**账户**身份，
-    // 不能还拿 v0.1.1 的全局令牌去探（那会掩盖"登录没成功"）
-    const accountToken = this.authSession?.accessToken ?? '';
-    try {
-      const result = await probeServer({
-        serverUrl,
-        token: accountToken !== '' ? accountToken : legacyToken,
-        ...(isOriginCertAcked(this.certAckedOrigins, serverUrl) ? { allowInvalidCert: true } : {}),
-      });
-      this.applyConnection(result);
-      /* 证书不受信任 → 问一次；确认后记住 origin 并重试（见方法注释） */
-      if (result.certUntrusted) void this.offerCertTrust(serverUrl);
-    } catch {
-      // 探测失败：保持"未连接"，不影响本地功能
-    }
-  }
 
   /**
    * 把连接结果映射到界面：胶囊 + 同步提示。
@@ -2986,7 +1903,7 @@ class EditorApp {
 
     // 按钮可用性不在这里定：账户/legacy 路径是"全部可用"，仓库令牌路径要按
     // scope 置灰。两个语义都在 applyScopeGating 里，只在一处写。
-    this.applyScopeGating();
+    applyScopeGating(this.blockHost());
 
     const gate = this.syncGate();
     const summary = syncHintText(gate, result?.cardCount ?? null);
@@ -2997,123 +1914,20 @@ class EditorApp {
   }
 
   // ── 构造 ────────────────────────────────────────────────
-  private createBlock(snapshot: EditorBlockSnapshot): BlockRuntime {
-    const section = el('section', 'block');
-    section.dataset['blockId'] = snapshot.id;
 
-    const header = el('button', 'block-head');
-    header.type = 'button';
-
-    const caret = el('span', 'caret', '▸');
-    const title = el('span', 'block-title', snapshot.label);
-    const meta = el('span', 'block-meta', `${snapshot.length} 字`);
-
-    // 缺失标记：CardBlock.missing 的语义是「导入源里根本没有这个板块」，
-    // shared 要求 UI 显式标出，不允许让它看起来像「用户清空了」。
-    // 因此这里在标题旁常驻一个小标签，与「空块」在视觉上区分开。
-    const missingTag = el('span', 'block-missing', '原文缺失');
-    missingTag.hidden = !snapshot.missing;
-    missingTag.title = '导入源中没有该板块，已按空处理；填写后会在导出时写入';
-
-    const badge = el('span', 'block-badge');
-    badge.hidden = true;
-
-    header.append(caret, title, missingTag, meta, badge);
-    if (snapshot.missing) section.dataset['missing'] = '1';
-
-    const body = el('div', 'block-body');
-    body.hidden = true;
-
-    const host = el('div', 'cm-host');
-    const preview = el('div', 'preview');
-    preview.hidden = true;
-    // 世界书块额外挂「导入 / 导出」——世界书是唯一能从外部独立导入导出的板块，
-    // 入口放在它自己的块里，用户不用去别处找（T10.9）。
-    if (snapshot.id === 'worldbook') body.append(this.buildWorldbookActions());
-    body.append(host, preview);
-
-    section.append(header, body);
-
-    const runtime: BlockRuntime = {
-      snapshot,
-      section,
-      body,
-      host,
-      preview,
-      badge,
-      editor: null,
-      expanded: false,
-      previewOn: false,
-    };
-
-    header.addEventListener('click', () => this.toggle(runtime));
-    this.blockList.append(section);
-    return runtime;
-  }
 
   // ── 展开 / 折叠（懒渲染核心）──────────────────────────────
   private toggle(runtime: BlockRuntime): void {
-    if (runtime.expanded) this.collapse(runtime);
-    else this.expand(runtime);
+    if (runtime.expanded) collapse(this.blockHost(), runtime);
+    else expand(this.blockHost(), runtime);
   }
 
-  private expand(runtime: BlockRuntime, silent = false): void {
-    if (runtime.expanded) return;
-    runtime.expanded = true;
-    runtime.body.hidden = false;
-    runtime.section.classList.add('expanded');
-    runtime.section.querySelector('.caret')!.textContent = '▾';
 
-    // 懒渲染：只有展开时才创建 CodeMirror 实例
-    if (!runtime.editor) {
-      runtime.editor = new BlockEditor({
-        parent: runtime.host,
-        blockId: runtime.snapshot.id,
-        text: runtime.snapshot.text,
-        compiled: this.rules?.highlight ?? null,
-        onChange: (text) => this.onBlockChange(runtime, text),
-      });
-      runtime.editor.setIssues(this.issuesFor(runtime.snapshot.id));
-    }
-    if (!silent) runtime.editor.view.focus();
-  }
 
-  private collapse(runtime: BlockRuntime): void {
-    if (!runtime.expanded) return;
-    runtime.expanded = false;
-    runtime.body.hidden = true;
-    runtime.section.classList.remove('expanded');
-    runtime.section.querySelector('.caret')!.textContent = '▸';
 
-    // 折叠即销毁：保证隐藏板块不进 DOM（含 CodeMirror 的 contenteditable 结构）
-    runtime.editor?.destroy();
-    runtime.editor = null;
-    runtime.host.replaceChildren();
-  }
 
   // ── 编辑 → 校验 ──────────────────────────────────────────
-  private onBlockChange(runtime: BlockRuntime, text: string): void {
-    // 走 session：它内部会置脏并让审计缓存失效。
-    // 直接 `this.card = result.card` 会绕过这两件事 —— 那正是脏标记不可靠的老原因。
-    // 记下改之前是否已脏：脏标记只在「首次变脏」时才会改变标签文字，
-    // 每敲一个字都重绘整个标签栏是白费（TabBar.render 会重建 DOM）。
-    const wasDirty = this.session.dirty;
-    const result = this.session.setBlockText(runtime.snapshot.id, text);
-    if (!result.changed) return;
 
-    runtime.snapshot = {
-      ...runtime.snapshot,
-      text,
-      length: [...text].length,
-      empty: text.trim() === '',
-    };
-    // 标签上的 ● 必须跟着第一次改动立刻出现。
-    // 之前这里只刷了统计与校验，于是「改完内容后标签看不出有未保存修改」，
-    // 要等切标签/新建才补上（2026-10-22 T9.14 端到端抓到的缺陷）。
-    if (!wasDirty && this.session.dirty) this.refreshTabs();
-    this.refreshStats();
-    this.scheduleValidate(260);
-  }
 
   /**
    * 验收入口（v0.1.5 / G3-2）：把一段世界书文本**真实地**喂进编辑器。
@@ -3126,42 +1940,7 @@ class EditorApp {
    *
    * @param kind `foreign` = 用户报障那种 `【条目N：…】` 格式；`good` = 标准 @@ENTRY
    */
-  applyDemoWorldbook(kind: 'foreign' | 'good'): void {
-    const foreign = [
-      '持续世界书',
-      '【条目1：西奥核心关系逻辑】',
-      '顺序：275',
-      '触发概率：100',
-      '内容：{{char}}与{{user}}的关系发展缓慢，从保持距离逐渐转为依赖。',
-      '【条目2：西奥成人规则】',
-      '顺序：300',
-      '触发概率：100',
-      '内容：{{char}}是纯0／固定被动方，不会转为1。',
-    ].join('\n');
 
-    const good = [
-      '@@ENTRY 0',
-      'name: 西奥核心关系逻辑',
-      'insertion_order: 275',
-      '@@CONTENT',
-      '{{char}}与{{user}}的关系发展缓慢，从保持距离逐渐转为依赖。',
-      '@@END 0',
-      '',
-      '@@ENTRY 1',
-      'name: 西奥成人规则',
-      'insertion_order: 300',
-      '@@CONTENT',
-      '{{char}}是纯0／固定被动方，不会转为1。',
-      '@@END 1',
-    ].join('\n');
-
-    const runtime = this.blocks.find((item) => item.snapshot.id === 'worldbook');
-    if (runtime === undefined) return;
-    if (!runtime.expanded) this.expand(runtime, true);
-    const text = kind === 'foreign' ? foreign : good;
-    this.onBlockChange(runtime, text);
-    this.validate();
-  }
 
   /**
    * 世界书"常驻"误报取证（v0.1.5 / G7）。
@@ -3194,113 +1973,9 @@ class EditorApp {
    *
    * 卡本身取自 `examples/`（标准 ST 卡，仓库里的公开样本），不涉及用户内容。
    */
-  private async runArrivalDemo(kind: 'before' | 'after'): Promise<void> {
-    try {
-      const response = await fetch('arrival/standard-card.json', { cache: 'no-store' });
-      if (!response.ok) throw new Error(`取不到内置卡片（服务返回 ${String(response.status)}）`);
-      const raw = await response.json();
 
-      // 1. 导入一份"自定义写法"的世界书预设并切到它 —— 现场的前提条件
-      this.demoQuiet = true;
-      const outcome = this.importWorldbookPresetText(JSON.stringify(ARRIVAL_DEMO_PRESET));
-      if (!outcome.ok) throw new Error(`世界书预设导入失败：${outcome.issues[0]?.message ?? ''}`);
-      if (outcome.id) this.selectWorldbookPreset(outcome.id);
-      this.demoQuiet = false;
 
-      // 2. 解析这张卡：before 不给格式（旧行为），after 给当前预设（现行）
-      const parsed =
-        kind === 'before'
-          ? /* no-worldbook */ parseStCard(raw as unknown, {
-              greetingFormat: this.greetingFormat().format,
-              chatExamplesFormat: this.chatExamplesFormat(),
-            })
-          : parseStCard(raw as unknown, {
-              greetingFormat: this.greetingFormat().format,
-              chatExamplesFormat: this.chatExamplesFormat(),
-              worldbookFormat: this.worldbookPreset.format,
-            });
 
-      // 3. 落地：before 直接进会话（跳过去达规范化），after 走真实入口
-      if (kind === 'before') {
-        this.session.replaceCard(parsed.card);
-        this.session.markSaved(this.session.filePath);
-        this.reloadBlocksFromCard();
-      } else {
-        this.replaceCard(parsed.card);
-      }
-      this.validate();
-
-      const runtime = this.blocks.find((item) => item.snapshot.id === 'worldbook');
-      if (runtime !== undefined) this.expand(runtime, true);
-
-      const report = this.report;
-      const worldbookIssues =
-        report?.issues.filter((issue) => issue.location.blockId === 'worldbook') ?? [];
-      const errors = worldbookIssues.filter((issue) => issue.severity === 'error').length;
-      this.setStatus(
-        `对比（${kind === 'before' ? '修复前' : '修复后'}）` +
-          ` · 世界书错误 ${String(errors)} 条 · 条目 ${String(this.session.card.worldbook.entries.length)} 条` +
-          ` · 文本 ${String(this.session.card.worldbook.text.length)} 字` +
-          ` · 当前预设「${this.worldbookPreset.name}」`,
-        errors > 0 ? 'bad' : 'ok',
-      );
-    } catch (error) {
-      this.demoQuiet = false;
-      this.setStatus(`对比检查失败：${describe(error)}`, 'bad');
-    }
-  }
-
-  private async runAuditDemo(kind: 'before' | 'after'): Promise<void> {
-    try {
-      const response = await fetch(`g7/${kind}.json`, { cache: 'no-store' });
-      if (!response.ok) throw new Error(`取不到夹具（HTTP ${String(response.status)}）`);
-      const demo = (await response.json()) as {
-        label: string;
-        worldbookText: string;
-        worldbookPreset: { id: string; name: string };
-        platformRule: { id: string; name: string };
-      };
-
-      this.demoQuiet = true;
-      const wbOutcome = this.importWorldbookPresetText(JSON.stringify(demo.worldbookPreset));
-      if (!wbOutcome.ok) throw new Error(`世界书预设导入失败：${wbOutcome.issues[0]?.message ?? ''}`);
-      if (wbOutcome.id) this.selectWorldbookPreset(wbOutcome.id);
-
-      const ruleOutcome = this.importPlatformText(JSON.stringify(demo.platformRule));
-      if (!ruleOutcome.ok) throw new Error(`平台规则导入失败：${ruleOutcome.issues[0]?.message ?? ''}`);
-      if (ruleOutcome.id) this.switchPlatform(ruleOutcome.id);
-      this.demoQuiet = false;
-
-      const runtime = this.blocks.find((item) => item.snapshot.id === 'worldbook');
-      if (runtime === undefined) throw new Error('世界书面板还没建起来');
-      this.onBlockChange(runtime, demo.worldbookText);
-      /*
-       * 必须重建一次板块视图再展开。
-       *
-       * `onBlockChange` 只更新 `runtime.snapshot` 与会话，**不会**把新文本推给
-       * 已经存在的编辑器实例（BlockEditor 没有 setText）。所以先 expand 再改文本时，
-       * 面板上仍是旧内容 —— 而审计用的是会话里的新内容，于是截图会出现
-       * "面板显示 A、数字算的是 B"这种最误导人的组合。
-       */
-      this.reloadBlocksFromCard();
-      const rebuilt = this.blocks.find((item) => item.snapshot.id === 'worldbook');
-      if (rebuilt !== undefined) this.expand(rebuilt, true);
-      this.validate();
-
-      const report = this.report;
-      const wb = this.session.card.worldbook;
-      this.setStatus(
-        `检查结果（${demo.label}）：错误 ${String(report?.summary.error ?? 0)} · ` +
-          `警告 ${String(report?.summary.warning ?? 0)} · 提示 ${String(report?.summary.info ?? 0)}` +
-          ` · 世界书域 ${String(report?.issues.filter((i) => i.location.blockId === 'worldbook').length ?? 0)} 条` +
-          ` · 世界书文本 ${String(wb.text.length)} 字 / 条目 ${String(wb.entries.length)} 条`,
-        'info',
-      );
-    } catch (error) {
-      this.demoQuiet = false;
-      this.setStatus(`检查失败：${describe(error)}`, 'bad');
-    }
-  }
 
   private scheduleValidate(delay: number): void {
     if (this.validateTimer !== null) window.clearTimeout(this.validateTimer);
@@ -3337,9 +2012,9 @@ class EditorApp {
         report.summary.error > 0 ? 'bad' : report.issues.length > 0 ? 'warn' : 'ok'
       }`;
     }
-    this.refreshBlockBadges(report.issues);
+    refreshBlockBadges(this.refreshHost(), report.issues);
     // 顶栏计数必须跟着报告走，否则会出现"顶栏 错误 0 / 面板 错误 1"
-    this.refreshStats();
+    refreshStats(this.refreshHost());
     // 已挂载的编辑器同步标记：修正后这里会收到空数组，高亮即时消失
     for (const runtime of this.blocks) {
       runtime.editor?.setIssues(this.issuesFor(runtime.snapshot.id));
@@ -3360,7 +2035,7 @@ class EditorApp {
     if (!runtime) return;
 
     this.activeIssueId = issue.id;
-    this.expand(runtime, true);
+    expand(this.blockHost(), runtime, true);
     runtime.editor?.focusRange(start, end);
     this.auditPanel?.setActiveIssue(issue.id);
   }
@@ -3378,54 +2053,9 @@ class EditorApp {
   }
 
   // ── 渲染：统计 / 徽标 / 问题列表 ──────────────────────────
-  private refreshStats(): void {
-    const total = totalLength(this.blocks.map((block) => block.snapshot));
-    const totalCp = [...[...this.blocks.map((b) => b.snapshot.text)].join('')].length;
-    // 等级计数一律取 lastSummary：它是「最近一次审计报告」的唯一投影。
-    // 若在这里数 this.issues，会和 report.summary 形成两个数据源
-    // （曾导致顶栏显示"错误 0"而审计面板显示"错误 1"）。
-    const { error: errors, warning: warnings } = this.lastSummary;
 
-    this.toolbarStats.replaceChildren(
-      el('span', 'stat', `八板块 ${totalCp} 字`),
-      el('span', 'stat', `块内合计 ${total} 字`),
-      el('span', `stat ${errors > 0 ? 'bad' : 'ok'}`, `错误 ${errors}`),
-      el('span', `stat ${warnings > 0 ? 'warn' : 'ok'}`, `警告 ${warnings}`),
-    );
-  }
 
-  private refreshBlockBadges(all: readonly AuditIssue[]): void {
-    for (const runtime of this.blocks) {
-      const mine = all.filter((issue) => issue.location.blockId === runtime.snapshot.id);
-      const errors = mine.filter((i) => i.severity === 'error').length;
-      const warnings = mine.filter((i) => i.severity === 'warning').length;
-      const total = mine.length;
 
-      runtime.section.dataset['errors'] = String(errors);
-      runtime.section.dataset['warnings'] = String(warnings);
-
-      const meta = runtime.section.querySelector('.block-meta');
-      if (meta) meta.textContent = `${runtime.snapshot.length} 字`;
-
-      if (total === 0) {
-        runtime.badge.hidden = true;
-        runtime.badge.textContent = '';
-        continue;
-      }
-      runtime.badge.hidden = false;
-      // 只有提示级问题时不能显示「0 警告」——按最严重的一级决定文案
-      if (errors > 0) {
-        runtime.badge.textContent = `${errors} 错误`;
-        runtime.badge.className = 'block-badge bad';
-      } else if (warnings > 0) {
-        runtime.badge.textContent = `${warnings} 警告`;
-        runtime.badge.className = 'block-badge warn';
-      } else {
-        runtime.badge.textContent = `${total} 提示`;
-        runtime.badge.className = 'block-badge info';
-      }
-    }
-  }
 
 
   // ── 角色名就地编辑（F10）──────────────────────────────────
@@ -3436,66 +2066,7 @@ class EditorApp {
   //
   // 与【基本信息】板块里的「姓名」行不双写：meta.name 是唯一数据源，
   // 正文里的姓名由用户自己维护（面板会给 info 级提示，但不强制同步，也不回写）。
-  private wireNameEditor(): void {
-    const display = byId<HTMLButtonElement>('card-name');
-    const input = byId<HTMLInputElement>('card-name-input');
-    /** 进入编辑时记住原值，Esc 要能退回去 */
-    let original = '';
 
-    const begin = (): void => {
-      // 进编辑就算"用户已经知道这里能改"——不必等他真的改成功
-      this.hideNameHint();
-      original = this.card.meta.name;
-      input.value = original;
-      display.hidden = true;
-      input.hidden = false;
-      input.focus();
-      // 全选：改名通常是想整个换掉，而不是在中间插字
-      input.select();
-    };
-
-    const commit = (): void => {
-      if (input.hidden) return;
-      input.hidden = true;
-      display.hidden = false;
-      const next = input.value.trim();
-      if (next === original) {
-        // 没改就什么都不做 —— 免得把「点了一下又点走」记成一次内容变更
-        this.renderCardName();
-        return;
-      }
-      this.applyCardName(next);
-    };
-
-    const cancel = (): void => {
-      if (input.hidden) return;
-      input.hidden = true;
-      display.hidden = false;
-      this.renderCardName();
-    };
-
-    display.addEventListener('click', begin);
-
-    // T10.29：点提示文字等同于点角色名 —— 提示是"可点的路标"，点它没反应比没有提示更差。
-    // 两条路径都要把"用户已经知道这里能改"记下来（进入编辑就算知道了，不必等改成功）。
-    const hint = byId<HTMLElement>('card-name-hint');
-    hint.addEventListener('click', () => {
-      this.hideNameHint();
-      begin();
-    });
-
-    // 失焦即确认：这是这类就地编辑的通行行为，用户点别处就是不打算改了
-    input.addEventListener('blur', commit);
-    input.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        commit();
-      } else if (event.key === 'Escape') {
-        event.preventDefault();
-        cancel();
-      }
-    });
-  }
 
   /**
    * 刷新「← 点这里改角色名」提示（v0.1.2 反馈项四 / T10.29）。
@@ -3505,12 +2076,7 @@ class EditorApp {
    * 第一次判定在启动时做，切换会话/新建打开后也调一次 —— 否则从零标签进入一张卡
    * 之后提示永远不出现（零标签那次被第一条挡住了）。
    */
-  private refreshNameHint(): void {
-    const hint = byId<HTMLElement>('card-name-hint');
-    const inputVisible = !byId<HTMLInputElement>('card-name-input').hidden;
-    const show = this.hasSession && !inputVisible && shouldShowNameHint(browserHintStore());
-    hint.hidden = !show;
-  }
+
 
   /** 用户点了角色名（或提示本身）→ 永久隐藏。写失败也先隐藏本次会话。 */
   private hideNameHint(): void {
@@ -3522,12 +2088,6 @@ class EditorApp {
     }
     hint.hidden = true;
     dismissNameHint(browserHintStore());
-  }
-
-  /** 设置里「重置」之后让提示重新出现（不然这个功能只对新用户有效） */
-  resetNameHintForDemo(): void {
-    resetNameHint(browserHintStore());
-    this.refreshNameHint();
   }
 
   // ── 异常日志（T10.26）──────────────────────────────────────
@@ -3585,7 +2145,7 @@ class EditorApp {
         // 用户可能在两次运行之间删过日志文件 —— 读不到不算失败，导出文件里写明
         logText = (await readTextExact(logPath)).text;
       } catch (error) {
-        logError = describe(error);
+        logError = describeError(error);
       }
     } else {
       logError = '本次使用期间还没有记录到错误（没有出现异常，或日志文件写入失败）';
@@ -3611,7 +2171,7 @@ class EditorApp {
     try {
       await writeFileAtomic(target, text);
     } catch (error) {
-      return `导出失败：写入被拒绝（${describe(error)}）`;
+      return `导出失败：写入被拒绝（${describeError(error)}）`;
     }
     return `诊断日志已导出：${target}（${String(text.length)} 字符）`;
   }
@@ -3721,7 +2281,7 @@ class EditorApp {
     byId('card-name').textContent = this.card.meta.name || '(未命名)';
     // 提示跟着"当前有没有卡"走：零标签时角色名显示"未打开角色卡"，
     // 那时提示"点这里改角色名"是假的（点了也没有可改的名字）。
-    this.refreshNameHint();
+    refreshNameHint(this.refreshHost());
   }
 
   /**
@@ -3763,8 +2323,8 @@ class EditorApp {
 
     const newButton = byId<HTMLButtonElement>('btn-new');
     newButton.addEventListener('click', () => void this.newCard());
-    openButton.addEventListener('click', () => void this.openCard());
-    saveButton.addEventListener('click', () => void this.saveCard());
+    openButton.addEventListener('click', () => void openCard(this.openHost()));
+    saveButton.addEventListener('click', () => void saveCard(this.saveHost()));
     previewButton.addEventListener('click', () => this.togglePreview());
 
     /*
@@ -3796,83 +2356,7 @@ class EditorApp {
    * 回调都很薄：地址只从壳拿、推送走 `st-push.ts` 那唯一一条链路、
    * 宽度记忆进配置（C5）。这里不放 ST 相关判断 —— 那些在可单测的纯逻辑里。
    */
-  private ensureStPane(): StPane {
-    if (this.stPane !== null) return this.stPane;
 
-    const pane = new StPane({
-      /*
-       * 地址只来自壳。**不**在这里拼 `http://127.0.0.1:…`：
-       * 拼错的后果不是"打不开"，而是"这扇窗指向了别处"。
-       */
-      startProxy: async () => {
-        const info = await stProxyStart();
-        return { baseUrl: info.baseUrl, target: info.target, port: info.port };
-      },
-      // 端口要传下去：迟到的停止请求不该杀掉后来新起的代理（缺陷二）
-      stopProxy: (port) => stProxyStop(port),
-      /*
-       * 代理存活判据走壳侧 TCP 探测（`probe_tcp`），**不用 iframe 的 onerror**：
-       * 跨源 iframe 在连不上时不保证触发 error 事件，也拿不到原因；
-       * 而同进程探测回环端口不受系统代理干扰（F15 的结论）。
-       */
-      probePort: async (port) => {
-        const probe = await probeTcp('127.0.0.1', port);
-        return probe.alive;
-      },
-      /*
-       * 决定性诊断（v0.1.6 真机缺陷二）：问壳"代理端口进来过几条连接"。
-       * 0 条 ⇒ 请求从未离开浏览器网络层（环境拦了回环），壳内修不了。
-       */
-      queryProxyStats: async () => {
-        const status = await stProxyStatus();
-        return {
-          alive: status.running && status.alive,
-          accepted: status.stats.accepted,
-          probeHits: status.stats.probeHits,
-        };
-      },
-      logError: (line) => this.crashLogger?.record('error', new Error(line), this.sessionSummary()),
-      loadWidth: async () => {
-        const config = await configGet();
-        const width = config.stPaneWidth;
-        return isPaneWidthUsable(width) ? width : null;
-      },
-      saveWidth: async (width) => {
-        await configPatch({ stPaneWidth: width });
-      },
-      push: async () => {
-        const located = await this.locateStCharactersDir();
-        if ('error' in located) return { error: located.error };
-        const outcome = await pushCardToSt({
-          charactersDir: located.dir,
-          cardName: this.session.card.meta.name,
-          cardId: this.session.cardId,
-          build: () => this.buildStPushArtifact(),
-          deps: {
-            probeDir: (dir, options) => probeCardsDir(dir, options),
-            scanDir: (dir, limit, extensions) => scanCardsDir(dir, limit, extensions),
-            writeBinary: (path, base64, sha256) => writeBinaryFileAtomic(path, base64, sha256),
-            ...configNameDeps,
-          },
-        });
-        if (!outcome.ok) return { error: outcome.reason };
-        if (outcome.nameNote !== '') this.setStatus(outcome.nameNote, 'warn');
-        if (outcome.staleNote !== '') this.setStatus(outcome.staleNote, 'info');
-        // 带上 isUpdate：面板据此说「已更新」还是「已推送」（v0.1.7 修订一）
-        return { fileName: outcome.fileName, isUpdate: outcome.isUpdate };
-      },
-      notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
-      hasCard: () => this.hasSession,
-      openWizard: () => void this.openStDialog(),
-      hasShell: () => isShellAvailable(),
-    });
-
-    const layout = document.querySelector('.layout');
-    if (layout instanceof HTMLElement) pane.mount(layout);
-    void pane.restoreWidth();
-    this.stPane = pane;
-    return pane;
-  }
 
   /** 顶栏按钮：开着就收起，收起/关着就打开 */
   private async toggleStPane(): Promise<void> {
@@ -3880,7 +2364,7 @@ class EditorApp {
       this.setStatus('先打开一张角色卡，再在 SillyTavern 里看效果', 'warn');
       return;
     }
-    const pane = this.ensureStPane();
+    const pane = ensureStPane(this.stPushHost());
     await pane.toggle();
     // 代理状态在壳里是单例，这里同步一次是为了"面板被外部关掉后按钮仍准确"
     if (!pane.isOpen) return;
@@ -3901,39 +2385,7 @@ class EditorApp {
    *
    * 断言三件事：折叠后是条宽、点一下能展开、展开宽度回到记忆值。
    */
-  private async runCollapseRoundTrip(): Promise<void> {
-    const pane = this.stPane;
-    if (pane === null) return;
-    const button = document.querySelector<HTMLButtonElement>('[data-role="st-pane-toggle"]');
-    if (button === null) {
-      this.setStatus('检查折叠按钮失败：没有找到按钮', 'bad');
-      return;
-    }
 
-    const nextFrame = (): Promise<void> =>
-      new Promise<void>((resolve) => {
-        requestAnimationFrame(() => resolve());
-      });
-
-    const beforeWidth = pane.currentWidth;
-    pane.collapse();
-    await nextFrame();
-    const collapsedWidth = pane.currentWidth;
-    const collapsedGlyph = button.textContent ?? '';
-
-    button.click(); // ← 就是这一步在真机里没反应
-    await nextFrame();
-    const expanded = !pane.isCollapsed;
-    const expandedWidth = pane.currentWidth;
-
-    const ok = collapsedWidth !== beforeWidth && expanded && expandedWidth === beforeWidth;
-    this.setStatus(
-      `折叠宽度 ${String(collapsedWidth)}（图标「${collapsedGlyph}」）` +
-        ` → 点击后 ${expanded ? '已展开' : '仍是折叠'}，宽 ${String(expandedWidth)}` +
-        `（记忆值 ${String(beforeWidth)}）`,
-      ok ? 'ok' : 'bad',
-    );
-  }
 
   /**
    * ST 的 characters 目录（推送落点）。
@@ -3941,26 +2393,7 @@ class EditorApp {
    * 与四状态对话框共用 `locateSt`：检测规则写两份的下场是"对话框说装了、
    * 面板说没装"，而两边各自的单测都绿（F15 期间踩过同类）。
    */
-  private async locateStCharactersDir(): Promise<{ dir: string } | { error: string }> {
-    if (!isShellAvailable()) {
-      return { error: '推送需要桌面客户端（浏览器模式没有写本机目录的能力）' };
-    }
-    const located = await locateSt({
-      findCandidates: () => findStCandidates(),
-      readConfig: async () => {
-        const config = await configGet();
-        return { stPath: config.stPath, stAddress: config.stAddress };
-      },
-      probePaths: (paths) => probePaths(paths),
-      readText: (path, maxBytes) => readTextExact(path, maxBytes),
-    });
-    if (located.chosen === null) {
-      return {
-        error: '没找到本地 SillyTavern：先点面板底部的「安装 / 启动向导」指定它的位置',
-      };
-    }
-    return { dir: located.chosen.charactersDir };
-  }
+
 
   /**
    * 打开 ST 面板（延迟构造）。
@@ -3975,7 +2408,7 @@ class EditorApp {
       notify: (message, kind) => this.setStatus(message, kind ?? 'info'),
       getCardName: () => this.session.card.meta.name,
       getCardId: () => this.session.cardId,
-      buildStPush: () => this.buildStPushArtifact(),
+      buildStPush: () => buildStPushArtifact(this.stPushHost()),
       rememberPath: (path) => this.rememberStPath(path),
     });
     await this.stDialog.open();
@@ -4003,57 +2436,7 @@ class EditorApp {
    * 审计 error 不拦：这是"拿去 ST 里看看效果"的入口，草稿阶段本来就有问题 ——
    * 拦下来等于把 ST 变成又一个导出闸门。
    */
-  private async buildStPushArtifact(): Promise<{
-    bytes: Uint8Array;
-    sha256: string;
-    fileName: string;
-    face: { from: 'source' | 'library' | 'default'; fileName: string | null; note: string };
-  } | null> {
-    const reasons = checkWorldbookExportSafety(this.card, this.worldbookPreset.format);
-    if (reasons.length > 0) {
-      this.setStatus(`推送已阻止：${reasons[0] ?? ''}`, 'bad');
-      return null;
-    }
 
-    const face = await this.resolveSaveFace();
-    if (face === null) {
-      // 浏览器里读不到任何卡面（readDefaultFace 走 IPC）—— PNG 卡必须有图
-      this.setStatus('推送需要一个卡面，但当前环境读不到（浏览器模式请用桌面客户端）', 'bad');
-      return null;
-    }
-
-    const preset = this.rules?.preset ?? null;
-    /*
-     * 最后一公里防线：`buildPngCard` 只接受 PNG 容器。
-     *
-     * `resolveSaveFace()` 正常路径已经保证是 PNG（非 PNG 会走 `convertToPng`），
-     * 但 2026-10-29 的现场是：取回一侧把仓库的 WebP 直接塞进了 `pngSource`，
-     * 于是异常从这条链路最深处抛出来，而那里没人 catch ——
-     * 用户看到的是"点推送没反应"。
-     *
-     * 所以这里再挡一次。它不是重复校验，是**把失败变成一个可读的提示**：
-     * 宁可多转一次码，也不要让用户对着一个毫无反应的按钮猜。
-     */
-    let faceBytes = face.bytes;
-    if (!isPngBytes(faceBytes)) {
-      faceBytes = (await convertToPng(faceBytes, 'face.webp')).bytes;
-    }
-
-    const artifact = await buildExportAsync(
-      this.card,
-      preset,
-      'png',
-      this.greetingFormat().format,
-      faceBytes,
-    );
-    if (artifact.format !== 'png') throw new Error('内部错误：PNG 推送拿到了文本产物');
-    return {
-      bytes: artifact.png,
-      sha256: artifact.sha256,
-      fileName: artifact.fileName,
-      face: { from: face.from, fileName: face.fileName, note: face.note },
-    };
-  }
 
   /** 记住用户选过的 ST 目录（C5） */
   private async rememberStPath(path: string): Promise<void> {
@@ -4061,7 +2444,7 @@ class EditorApp {
       await configPatch({ stPath: path });
     } catch (error) {
       // 记不住不拦住推送：路径只是"下次不用再选"，不是功能前提
-      this.setStatus(`ST 目录未能记住（下次仍可重新选）：${describe(error)}`, 'warn');
+      this.setStatus(`ST 目录未能记住（下次仍可重新选）：${describeError(error)}`, 'warn');
     }
   }
 
@@ -4113,7 +2496,7 @@ class EditorApp {
 
     // 先把当前 UI 的编辑器全部销毁（折叠即销毁），再换会话重建
     for (const runtime of this.blocks) {
-      this.collapse(runtime);
+      collapse(this.blockHost(), runtime);
       runtime.section.remove();
     }
     this.blocks = [];
@@ -4193,7 +2576,7 @@ class EditorApp {
     newBtn.addEventListener('click', () => void this.newCard());
     const openBtn = el('button', 'btn', '打开角色卡…');
     openBtn.type = 'button';
-    openBtn.addEventListener('click', () => void this.openCard());
+    openBtn.addEventListener('click', () => void openCard(this.openHost()));
     actions.append(newBtn, openBtn);
 
     empty.append(title, hint, actions);
@@ -4203,7 +2586,7 @@ class EditorApp {
     byId('card-name').textContent = '未打开角色卡';
     byId('stats').textContent = '';
     // 零标签没有可改的名字，"点这里改角色名"必须收起来（T10.29）
-    this.refreshNameHint();
+    refreshNameHint(this.refreshHost());
     this.issueSummary.replaceChildren();
     this.auditPanel?.clear();
     this.setStatus('空白工作台：新建或打开一张角色卡开始', 'info');
@@ -4222,10 +2605,10 @@ class EditorApp {
 
     // 有未落盘修改时先问用户（三选：保存并关闭 / 不保存关闭 / 取消）
     if (session.dirty) {
-      const decision = await this.confirmClose(session);
+      const decision = await confirmClose(session);
       if (decision === 'cancel') return;
       if (decision === 'save') {
-        const saved = await this.saveSessionToDisk(session);
+        const saved = await saveSessionToDisk(this.saveHost(), session);
         if (!saved) return; // 保存失败或用户取消保存对话框 → 中止关闭
       }
     }
@@ -4237,7 +2620,7 @@ class EditorApp {
       this.activeId = next?.id ?? null;
       // 先清掉旧 UI，再按新会话（或空工作台）重建
       for (const runtime of this.blocks) {
-        this.collapse(runtime);
+        collapse(this.blockHost(), runtime);
         runtime.section.remove();
       }
       this.blocks = [];
@@ -4248,54 +2631,7 @@ class EditorApp {
   }
 
   /** 三选确认：保存并关闭 / 不保存关闭 / 取消 */
-  private confirmClose(session: CardSession): Promise<'save' | 'discard' | 'cancel'> {
-    return new Promise((resolve) => {
-      const overlay = el('div', 'modal-overlay');
-      const panel = el('div', 'modal confirm-close-modal');
-      const head = el('div', 'modal-head');
-      head.append(el('h2', 'modal-title', '有未保存的修改'));
-      const body = el('div', 'modal-body');
-      body.append(
-        el(
-          'p',
-          'confirm-text',
-          `「${session.displayName}」有尚未保存到磁盘的修改。关闭前要保存吗？`,
-        ),
-      );
-      const foot = el('div', 'modal-foot');
-      const cancel = el('button', 'btn', '取消');
-      cancel.type = 'button';
-      const discard = el('button', 'btn', '不保存关闭');
-      discard.type = 'button';
-      const save = el('button', 'btn primary', '保存并关闭');
-      save.type = 'button';
-      foot.append(cancel, discard, save);
-      panel.append(head, body, foot);
-      overlay.append(panel);
-      document.body.append(overlay);
 
-      const finish = (value: 'save' | 'discard' | 'cancel'): void => {
-        overlay.remove();
-        resolve(value);
-      };
-      cancel.addEventListener('click', () => finish('cancel'));
-      discard.addEventListener('click', () => finish('discard'));
-      save.addEventListener('click', () => finish('save'));
-    // 点遮罩**不关闭**（2026-10-29 用户要求）：子窗口只能由它自己的按钮或 × 关闭。
-    // 去掉这条监听是有意的，不是漏了 —— 误触空白处关掉正在填的表单比多点一次 × 更烦。
-      document.addEventListener(
-        'keydown',
-        (event) => {
-          if (event.key === 'Escape' && overlay.isConnected) {
-            event.preventDefault();
-            finish('cancel');
-          }
-        },
-        { once: true },
-      );
-      save.focus();
-    });
-  }
 
   /**
    * 只打开格式选择框（截图/验收用，不写盘）。
@@ -4303,22 +2639,7 @@ class EditorApp {
    * `forcePngDisabled` 用来演示"浏览器里 PNG 不可用"那种态 —— 真实环境下
    * 它由 `askSaveFormat` 探测卡面能否取得来判定。
    */
-  async previewSaveFormatDialog(forcePngDisabled = false): Promise<void> {
-    if (!this.saveFormatDialog) this.saveFormatDialog = new SaveFormatDialog();
-    const result = await this.saveFormatDialog.open({
-      defaultFormat: this.hasSession ? this.session.saveFormat : 'json',
-      pngAvailable: !forcePngDisabled,
-      ...(forcePngDisabled
-        ? { pngUnavailableReason: '浏览器模式读不到卡面 —— 请在桌面客户端里另存为 PNG' }
-        : {}),
-    });
-    if (result !== null) {
-      this.setStatus(
-        `已选择 ${saveFormatOption(result.format).label}${result.remember ? '（并记住此格式）' : ''}`,
-        'ok',
-      );
-    }
-  }
+
 
   /**
    * 保存指定会话到磁盘（另存为语义）。
@@ -4330,101 +2651,7 @@ class EditorApp {
    * —— 两条链路共用 `buildExportAsync`，不各拼一份。格式记到会话上，此后 Ctrl+S
    * 沿用它（否则另存为 PNG 之后保存会往 `.png` 写 JSON）。
    */
-  private async saveSessionToDisk(session: CardSession): Promise<boolean> {
-    try {
-      const choice = await this.askSaveFormat(session);
-      if (choice === null) return false;
-      if (choice.remember) session.setSaveFormat(choice.format);
 
-      // PNG 需要卡面：先解析（失败要在弹保存对话框**之前**说，否则用户填完路径才失败）
-      const face = choice.format === 'png' ? await this.resolveSaveFace() : null;
-
-      // 默认落点 = cardsDir（F4）；文件名取角色名并按格式换扩展名，重名自动追加序号
-      const dir = await effectiveCardsDir();
-      const suggestedBase = await suggestCardFileName(session.card.meta.name, dir);
-      /*
-       * `let` 而不是 `const`：撞名守卫可能把落点改到「另存」的编号副本上
-       * （异卡撞名 / 用户在脏三选里选另存），后续 markSaved 必须记实际路径。
-       */
-      let target = await pickSavePath(
-        withSaveExtension(suggestedBase, choice.format),
-        choice.format,
-        dir === '' ? undefined : dir,
-      );
-      if (!target) return false;
-
-      const artifact = await buildExportAsync(
-        session.card,
-        this.rules?.preset ?? null,
-        choice.format,
-        this.greetingFormat().format,
-        face?.bytes,
-      );
-
-      // PNG 是二进制：走二进制写；文本两种格式走文本写。
-      // 两条都带 sha256 断言（壳写后回读重算，不一致就报错）。
-      let receipt;
-      if (artifact.format === 'png') {
-        /*
-         * 写盘前过一道"同名撞名"守卫（v0.1.7 增补三）。
-         *
-         * 系统保存对话框已经问过一次"要覆盖吗"，但它**只知道重名、
-         * 不知道身份**：用户手选了一个已有的 `西奥.png`，而那可能是另一张卡 ——
-         * 覆盖掉就等于毁了别人的文件，且没有任何提示。
-         * 这里按 PNG 里嵌的 `extensions.tcs.cardId` 判身份，五种情况分别处理。
-         */
-        const guarded = await this.savePngWithGuard(target, artifact.png, session);
-        if (guarded === null) return false; // 用户在三选里取消了
-        if (guarded.receipt === null) {
-          // 没落盘（查看差异 / 标签占用）：已经给过提示，不要伪装成保存成功
-          this.setStatus(
-            guarded.note === '' ? '这次没有写入文件' : guarded.note,
-            'warn',
-          );
-          return false;
-        }
-        receipt = guarded.receipt;
-        if (guarded.path !== target) {
-          // 另存了：后续 markSaved 必须记实际路径，否则下次保存还往旧路径写
-          target = guarded.path;
-        }
-        if (guarded.note !== '') this.setStatus(guarded.note, 'info');
-      } else {
-        receipt = await writeFileAtomic(target, artifact.text, artifact.sha256);
-      }
-
-      session.markSaved(target);
-      session.setSaveFormat(choice.format);
-      this.refreshTabs();
-      this.renderCardName();
-
-      const notes: string[] = [];
-      if (face !== null && face.note !== '') notes.push(face.note);
-      if (face !== null) {
-        notes.push(
-          face.from === 'source'
-            ? '卡面用本卡原图（像素未重编码）'
-            : face.from === 'library'
-              ? `卡面用图库：${face.fileName ?? '(未知)'}`
-              : '卡面用内置默认图',
-        );
-      }
-      const followUp = saveFormatNote(choice.format);
-      if (followUp !== '') notes.push(followUp);
-
-      this.setStatus(
-        `已保存（${saveFormatOption(choice.format).label}）：${receipt.pathDisplay ?? '(非 UTF-8 路径)'} · ` +
-          `${String(receipt.bytesWritten)} 字节 · ` +
-          `文件${receipt.verified ? '校验通过' : '校验未通过！'}` +
-          (notes.length === 0 ? '' : ` —— ${notes.join('；')}`),
-        receipt.verified ? 'ok' : 'bad',
-      );
-      return true;
-    } catch (error) {
-      this.setStatus(`保存失败：${describe(error)}`, 'bad');
-      return false;
-    }
-  }
 
   /**
    * 问格式（v0.1.5 / G6）。
@@ -4432,29 +2659,7 @@ class EditorApp {
    * 为什么每次都问（而不是"直接按会话格式存"）：另存为本身就是"我要存成另一种"
    * 的动作。想跳过就勾「以后都用这个格式」，那时不再问。
    */
-  private async askSaveFormat(session: CardSession): Promise<SaveFormatDialogResult | null> {
-    if (!this.saveFormatDialog) this.saveFormatDialog = new SaveFormatDialog();
 
-    // 能不能出 PNG 取决于能否拿到卡面（浏览器无壳读不到内置默认图）
-    let pngAvailable = true;
-    let pngUnavailableReason = '';
-    try {
-      const probe = await this.resolveSaveFace();
-      if (probe === null) {
-        pngAvailable = false;
-        pngUnavailableReason = '浏览器模式读不到卡面 —— 请在桌面客户端里另存为 PNG';
-      }
-    } catch (error) {
-      pngAvailable = false;
-      pngUnavailableReason = `卡面不可用：${describe(error)}`;
-    }
-
-    return this.saveFormatDialog.open({
-      defaultFormat: session.saveFormat,
-      pngAvailable,
-      pngUnavailableReason,
-    });
-  }
 
   /** 解析"这张卡自己的封面"（原图 > 图库记住的那张 > 内置默认） */
   /**
@@ -4476,113 +2681,9 @@ class EditorApp {
    * 失败一律当"不脏"：这条判据的作用是**多问一句**，不是拦路。
    * 它自己出错时让人正常导出，比让人导不出去好。
    */
-  private async savePngWithGuard(
-    target: string,
-    png: Uint8Array,
-    session: CardSession,
-  ): Promise<{ path: string; receipt: WriteReceipt | null; note: string } | null> {
-    const incomingCardId = readCardIdFromCardJson(session.card);
-    const config = await configGet().catch(() => null);
-    const baselines = config?.fileBaselines ?? {};
 
-    const result = await saveTargetWithGuard(target, png, incomingCardId, {
-      readFile: async (path) => {
-        try {
-          const file = await readBinaryFile(path);
-          const decoded = await decodeBinaryFile(file);
-          return decoded.bytes;
-        } catch {
-          // 不存在是正常路径；读失败也当"没有"，让守卫走"直接写"
-          return null;
-        }
-      },
-      readCardId: (bytes) => {
-        const parsed = parsePngCard(bytes);
-        if (parsed.kind !== 'card') return null;
-        return readCardIdFromCardJson(parsed.json);
-      },
-      isOpenInTab: (path) =>
-        this.sessions.some((item) => item.filePath === path),
-      isDirty: (path) =>
-        this.sessions.some((item) => item.filePath === path && item.dirty),
-      isNewer: async (path) => {
-        try {
-          const stat = await statFile(path);
-          if (stat === null) return false;
-          return isNewerThanBaseline(stat.mtimeMs, getBaseline(baselines, path));
-        } catch {
-          // 见方法注释：判据出错时放行，不拦用户导出
-          return false;
-        }
-      },
-      writeAtomic: async (path, bytes) => {
-        const written = await writeBinaryFileAtomic(path, bytesToBase64(bytes));
-        return { sha256: written.sha256 };
-      },
-      listDir: async (dir) => {
-        const scan = await scanCardsDir(dir, undefined, ['png']);
-        return scan.names;
-      },
-      joinPath: (dir, name) => joinPath(dir, name),
-      askDirty: (options) => askDirtyChoice(options),
-      askUnknown: (options) => askUnknownChoice(options),
-      note: (message) => { this.setStatus(message, 'info'); },
-    });
 
-    if (result === null) return null;
 
-    /*
-     * 没落盘时 `sha256` 是空串（查看差异 / 标签占用这两支）。
-     * 用它当判据而不是另外加一个布尔：空摘要本身就不可能是一次成功写入的产物，
-     * 两个字段表达同一件事会分叉。
-     */
-    if (result.sha256 === '') {
-      return { path: result.path, receipt: null, note: result.note };
-    }
-
-    /*
-     * 写完立刻把**这份文件的新 mtime** 记成基线。
-     *
-     * 必须真去 stat 一次，不能拿"当前时间"顶替：文件的 mtime 由文件系统写、
-     * 与我们这边的时间可能有几百毫秒差（尤其在同步盘上）。拿当前时间记基线，
-     * 下次判定会得到 `fileMtime < baseline` ⇒ 永远判不脏 ⇒ 这条判据失效。
-     */
-    try {
-      const after = await statFile(result.path);
-      if (after !== null) {
-        await configPatch({ fileBaselines: recordBaseline(baselines, result.path, after.mtimeMs) });
-      }
-    } catch {
-      // 记基线失败不影响这次导出的结果：只是下次会少一层保护
-    }
-
-    return {
-      path: result.path,
-      receipt: {
-        pathDisplay: result.path,
-        bytesWritten: png.byteLength,
-        sha256: result.sha256,
-        verified: true,
-      },
-      note: result.note,
-    };
-  }
-
-  private async resolveSaveFace(): Promise<ResolvedSaveFace | null> {
-    return resolveSaveFace(
-      defaultSaveFaceDeps({
-        sourceBytes: () => this.session?.pngSource?.bytes ?? null,
-        cardsDir: () => effectiveCardsDir(),
-        remembered: () => this.lastFaceChoice,
-        readLibraryFile: async (path) => {
-          const fileName = path.slice(path.lastIndexOf('/') + 1);
-          const binary = await readBinaryFile(path);
-          // 复用 png-source 的版本：它顺带核对摘要（字节数与 sha256 自证）
-          return { bytes: (await decodeBinaryFile(binary)).bytes, fileName };
-        },
-      }),
-    );
-  }
 
   /** 把会话的规则选择同步到界面（切换标签后调用） */
   private syncRulesUiToSession(): void {
@@ -4629,7 +2730,7 @@ class EditorApp {
 
     // 切换过去：把旧 UI 拆掉、按新会话重建
     for (const runtime of this.blocks) {
-      this.collapse(runtime);
+      collapse(this.blockHost(), runtime);
       runtime.section.remove();
     }
     this.blocks = [];
@@ -4662,69 +2763,7 @@ class EditorApp {
     }
   }
 
-  private async openCard(): Promise<void> {
-    try {
-      const dir = await effectiveCardsDir();
-      // T10.9：过滤器放开 .txt —— TXT 角色卡**没有 JSON 信封**，整篇按当前预设切板块
-      // v0.1.4 / T12.4：再放开 .png —— SillyTavern 的 PNG 卡
-      const path = await pickCardFile(dir === '' ? undefined : dir, { allowText: true });
-      if (!path) return;
 
-      /*
-       * PNG 必须在**读文本之前**分流。
-       *
-       * `readTextExact` 对 PNG 会报 `NOT_UTF8`（那是它的正确行为）——
-       * 若把它当"打开失败"报给用户，一张正常的 PNG 卡就变成了"文件有问题"。
-       */
-      if (/\.png$/i.test(path)) {
-        await this.openPngCard(path, dir);
-        return;
-      }
-
-      const file = await readTextExact(path);
-
-      // 按扩展名分流，而不是「先试 JSON、失败再退回 TXT」：后者会把一个语法错误的
-      // JSON 悄悄当成纯文本再解析一次，用户看到的是一份莫名其妙的板块缺失列表，
-      // 而真正的原因（JSON 少了个逗号）被完全掩盖。
-      //
-      // ★ TXT 走 `openTextCard`（2026-11-17）：它自己判"同名覆盖 / 异名新建"，
-      //   因为 TXT 的卡名只能从文件名推，判定必须在读文本之后、建会话之前做。
-      if (/\.txt$/i.test(path)) {
-        await this.openTextCard(file.pathDisplay ?? path, file.text, dir);
-        return;
-      }
-
-      const parsed = parseStCard(file.text, {
-        greetingFormat: this.greetingFormat().format,
-        chatExamplesFormat: this.chatExamplesFormat(),
-        worldbookFormat: this.worldbookPreset.format,
-      });
-      /*
-       * ★ 同名覆盖 / 异名新建（2026-11-17）。以前这里无条件 `replaceCard`，
-       *   于是"打开一张新卡"＝悄悄丢弃当前卡的内容。
-       */
-      const placed = await this.openArrivedCard(parsed.card, path);
-      // 用户在覆盖确认里选了取消：什么都不做（连 PNG 来源都不动）
-      if (placed.mode === 'cancelled') return;
-      /*
-       * 打开了 JSON 卡 ⇒ 这张卡的原图来源失效。
-       *
-       * 不清的话，用户在 A 卡（PNG 导入）的会话里又打开了一个 JSON 卡，
-       * 导出 PNG 时"原图"候选还是 A 那张 —— 等于把别人的封面安到这张卡上。
-       */
-      this.session.setPngSource(null);
-      // 打开的文件不在 cardsDir 里时说一句：用户会以为"打开过的卡都在那个目录"
-      const outside = dir !== '' && !path.toLowerCase().startsWith(dir.toLowerCase());
-      this.setStatus(
-        `${placed.mode === 'created' ? `已新建「${placed.name}」并打开` : `已覆盖同名卡「${placed.name}」`}：` +
-          `${file.pathDisplay ?? '(非 UTF-8 路径)'}（${file.bytesLen} 字节）` +
-          (outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${dir}` : ''),
-        outside ? 'warn' : placed.mode === 'created' ? 'ok' : 'info',
-      );
-    } catch (error) {
-      this.setStatus(`打开失败：${describe(error)}`, 'bad');
-    }
-  }
 
   /**
    * 打开 PNG 卡（v0.1.4 / T12.4，决策 #165）。
@@ -4739,63 +2778,7 @@ class EditorApp {
    * 第 3 条很关键：ST 生态里"拿一张立绘当头像"是常见动作，
    * 如果它被当成"导入失败"，用户会以为自己选错了文件。
    */
-  private async openPngCard(path: string, cardsDir: string): Promise<void> {
-    const binary = await readBinaryFile(path);
-    const { bytes, digestVerified } = await decodeBinaryFile(binary);
-    const display = binary.pathDisplay ?? '(非 UTF-8 路径)';
 
-    if (!digestVerified) {
-      // 不阻断：可能是环境没有 subtle，也可能真的坏了。后面 CRC 会再判一次。
-      this.setStatus(`警告：${display} 的字节摘要与读取结果不一致，可能已损坏`, 'warn');
-    }
-
-    const inspected = inspectPng(bytes);
-
-    if (inspected.kind === 'bare') {
-      // 没有卡数据：当作封面图，不当作失败的导入
-      const created = this.hasSession
-        ? null
-        : this.createSessionFromFile(path.replace(/\.png$/i, '.json'));
-      this.session.setPngSource(toPngSource(bytes, binary.pathDisplay, 'chara'));
-      const size = `${String(inspected.note)}`;
-      this.setStatus(
-        created === null
-          ? `已把 ${display} 设为当前卡的封面（${size}）`
-          : `已新建「${created}」并把 ${display} 设为封面（${size}）`,
-        'info',
-      );
-      // 封面只能在导出时体现，界面需要重画一次候选列表
-      this.exportDialog?.refreshFaceChoices();
-      return;
-    }
-
-    const parsed = parseStCard(inspected.jsonText, {
-      greetingFormat: this.greetingFormat().format,
-      chatExamplesFormat: this.chatExamplesFormat(),
-      worldbookFormat: this.worldbookPreset.format,
-    });
-    /* 同名覆盖 / 异名新建（2026-11-17）—— 与 JSON、TXT 同一条规则 */
-    const placed = await this.openArrivedCard(parsed.card, path);
-    if (placed.mode === 'cancelled') return;
-    /*
-     * 记住原图（D4）。注意存的是**完整字节**（含数据块）：导出时
-     * `buildPngCard` 会剥掉旧块再写新卡，所以"复用原图"不会把旧内容留在图里。
-     *
-     * `openArrivedCard` 可能已经切到另一个标签，所以这里读的 `this.session`
-     * 是切过之后的那一个 —— 正是刚写入这张卡的那个，符合预期。
-     */
-    this.session.setPngSource(toPngSource(bytes, binary.pathDisplay, inspected.keyword));
-    this.exportDialog?.refreshFaceChoices();
-
-    const spec = inspected.keyword === 'ccv3' ? 'V3' : 'V2';
-    const outside = cardsDir !== '' && !path.toLowerCase().startsWith(cardsDir.toLowerCase());
-    const tail = outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${cardsDir}` : '';
-    this.setStatus(
-      `${placed.mode === 'created' ? `已新建「${placed.name}」并打开` : `已覆盖同名卡「${placed.name}」`} PNG 卡：` +
-        `${display}（${spec} 数据块 · ${String(binary.bytesLen)} 字节）${tail}`,
-      outside ? 'warn' : placed.mode === 'created' ? 'ok' : 'info',
-    );
-  }
 
   /**
    * 零标签时按文件名建一个空会话（v0.1.2 反馈项三）。
@@ -4831,51 +2814,7 @@ class EditorApp {
    * 那不是用户此刻的意图（他想打开这个文件）。给两选：覆盖 / 取消。
    * 想保留旧内容就取消、先另存，再打开。
    */
-  private confirmOverwrite(targetName: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      const overlay = el('div', 'modal-overlay');
-      const panel = el('div', 'modal confirm-close-modal');
-      const head = el('div', 'modal-head');
-      head.append(el('h2', 'modal-title', '要覆盖同名卡吗'));
-      const body = el('div', 'modal-body');
-      body.append(
-        el(
-          'p',
-          'confirm-text',
-          `已打开「${targetName}」这张卡，而它还有未保存到磁盘的修改。` +
-            '继续打开会用文件里的内容整张替换它，那些修改会丢失。',
-        ),
-      );
-      const foot = el('div', 'modal-foot');
-      const cancel = el('button', 'btn', '取消');
-      cancel.type = 'button';
-      const overwrite = el('button', 'btn primary', '覆盖');
-      overwrite.type = 'button';
-      foot.append(cancel, overwrite);
-      panel.append(head, body, foot);
-      overlay.append(panel);
-      document.body.append(overlay);
 
-      const finish = (value: boolean): void => {
-        overlay.remove();
-        resolve(value);
-      };
-      cancel.addEventListener('click', () => finish(false));
-      overwrite.addEventListener('click', () => finish(true));
-      // 与 confirmClose 同一条规矩：点遮罩不关闭，只有按钮或 Esc
-      document.addEventListener(
-        'keydown',
-        (event) => {
-          if (event.key === 'Escape' && overlay.isConnected) {
-            event.preventDefault();
-            finish(false);
-          }
-        },
-        { once: true },
-      );
-      cancel.focus();
-    });
-  }
 
   /**
    * 「打开」路径的**唯一落点**：同名覆盖，异名新建（2026-11-17）。
@@ -4905,46 +2844,7 @@ class EditorApp {
    *
    * @param fallbackName 卡里没有名字时用它兜底（通常是文件路径）
    */
-  private async openArrivedCard(
-    card: UnifiedCard,
-    fallbackName: string,
-  ): Promise<{ mode: 'replaced' | 'created' | 'cancelled'; name: string }> {
-    const incomingName = (card.meta.name ?? '').trim();
-    const target = decideOpenTarget({
-      incomingName,
-      openSessions: this.sessions.map((item) => ({ id: item.id, name: item.card.meta.name })),
-      activeId: this.hasSession ? this.activeId : null,
-    });
 
-    if (target.kind === 'replace') {
-      /*
-       * 目标标签有未保存修改 → 先问（只有这条路径会静默丢内容，
-       * TXT 那条有导入对话框兜底，不必二次确认）。
-       */
-      const victim = this.sessions.find((item) => item.id === target.sessionId);
-      if (victim !== undefined && victim.dirty && !(await this.confirmOverwrite(target.name))) {
-        return { mode: 'cancelled', name: target.name };
-      }
-      if (target.sessionId !== this.activeId) this.activateSession(target.sessionId);
-      this.replaceCard(card);
-      return { mode: 'replaced', name: target.name };
-    }
-
-    /*
-     * 新建。名字优先用卡里的；没有就从文件名推，并**去重**——
-     * 两个同名标签会让"覆盖哪一个"变得无法预期。
-     */
-    const name =
-      incomingName !== ''
-        ? incomingName
-        : deriveCardNameFromFile(fallbackName, this.sessions.map((item) => item.card.meta.name));
-    const named = incomingName !== '' ? card : { ...card, meta: { ...card.meta, name } };
-    const created = this.createSessionWithCard(
-      named,
-      readCardIdFromCard(named) ?? generateCardId(name),
-    );
-    return { mode: 'created', name: created };
-  }
 
   /**
    * 打开 TXT 角色卡（2026-11-17）：**先判同名，再决定导入到哪张卡**。
@@ -4990,7 +2890,7 @@ class EditorApp {
     const note =
       (target.kind === 'replace' ? `（已覆盖同名卡「${target.name}」）` : '') +
       (outside ? ` —— 该文件不在卡片目录内，另存时会回到 ${dir}` : '');
-    await this.importCardTextFile(fileName, text, createdSession, false, note);
+    await importCardTextFile(this.openHost(), fileName, text, createdSession, false, note);
   }
 
   /**
@@ -5012,7 +2912,7 @@ class EditorApp {
   private createSessionWithCard(card: UnifiedCard, cardId: string): string {
     const preset = this.rules?.preset ?? null;
     // 零标签取回/打开也走同一条到达规范化（缺陷一）
-    const stamped = withCardId(this.arriveCard(card), cardId);
+    const stamped = withCardId(arriveCard(this.landingHost(), card), cardId);
 
     const session = new CardSession({
       card: stamped,
@@ -5027,7 +2927,7 @@ class EditorApp {
 
     // 与 newCard() 一样：旧 UI 拆掉，按新会话重建
     for (const runtime of this.blocks) {
-      this.collapse(runtime);
+      collapse(this.blockHost(), runtime);
       runtime.section.remove();
     }
     this.blocks = [];
@@ -5044,10 +2944,7 @@ class EditorApp {
    * 注意它改的只是**会话状态**（session.filePath / dirty），
    * app.ts 里没有任何文件路径字段。
    */
-  private async saveCard(): Promise<void> {
-    if (!this.hasSession) return;
-    await this.saveSessionToDisk(this.session);
-  }
+
 
   private togglePreview(): void {
     for (const runtime of this.blocks) {
@@ -5082,63 +2979,7 @@ class EditorApp {
    * 传进来是为了在状态栏那句里带上"新建了哪张卡"——否则用户只看到"已导入"，
    * 不知道标签栏那个新标签是哪来的。
    */
-  private async importCardTextFile(
-    fileName: string,
-    text: string,
-    createdSession: string | null = null,
-    autoConfirm = false,
-    /** 追加在最终结论后面的说明（打开路径用它说清"覆盖了哪张卡 / 目录外"） */
-    note = '',
-  ): Promise<void> {
-    if (!this.hasSession) {
-      this.setStatus('先打开或新建一张卡，再导入 TXT（导入会替换当前卡的板块内容）', 'warn');
-      return;
-    }
-    // 不 await：对话框要等用户点确认/取消。自动确认（截图与端到端用）时
-    // 先让渲染跑一帧再点按钮 —— 否则 querySelector 拿到的还是上一轮隐藏的节点。
-    const pending = this.importDialog?.openCardText(fileName, text);
-    if (autoConfirm) {
-      await new Promise<void>((resolve) => {
-        requestAnimationFrame(() => resolve());
-      });
-      document.querySelector<HTMLButtonElement>('[data-role="import-confirm"]')?.click();
-    }
-    const decision = await pending;
-    if (!decision || !('card' in decision)) {
-      // 用户取消：刚建的那张卡**留着**（它是用户点「打开…」的直接结果，
-      // 而且里面还是空卡，没有需要回滚的内容）。状态栏说明这一点，避免"我点了取消
-      // 怎么多了一张卡"的困惑。
-      if (createdSession !== null) {
-        this.setStatus(
-          `已新建「${createdSession}」（空卡）；TXT 导入已取消，未写入任何内容${note}`,
-          'info',
-        );
-      }
-      return;
-    }
 
-    /*
-     * TXT 导入是**第三条到达路径**：`import-flow` 交回来的已经是卡对象，
-     * 不经过 `replaceCard`（那条路会 markSaved，而导入是"改当前卡"）。
-     * 所以这里必须显式过一遍到达规范化 —— 否则"用自定义世界书预设导入
-     * 一份标准写法的 TXT"仍然会报 no-entry-marker，正是缺陷一本身。
-     */
-    this.session.replaceCard(this.arriveCard(decision.card));
-    this.reloadBlocksFromCard();
-    this.scheduleValidate(0);
-
-    const prefix = createdSession === null ? `已导入 TXT：${fileName}` : `已新建「${createdSession}」并导入：${fileName}`;
-
-    // 保全机制（v0.1.2 反馈项二）之后，导入结果的说明重心从"缺了几个板块"
-    // 变成"多少原文被放到了哪里" —— 后者才是用户需要知道的事。
-    // 措辞由 import-flow.preservedNoteOf 统一给出，对话框里显示的是同一句。
-    if (decision.preservedNote !== '') {
-      const tone = decision.preserved?.wholeText === true ? 'warn' : 'info';
-      this.setStatus(`${prefix} —— ${decision.preservedNote}${note}`, tone);
-      return;
-    }
-    this.setStatus(`${prefix}（原文全部识别，无未识别内容）${note}`, 'ok');
-  }
 
   /**
    * 世界书导入（T10.9）。
@@ -5148,32 +2989,7 @@ class EditorApp {
    *   · `preview.canImport === false` 时一律不写回 —— 残缺结果会把
    *     "没解析出来的条目"当成"用户删除"，一次导入能清空整个世界书。
    */
-  private async importWorldbookFile(fileName: string, text: string): Promise<void> {
-    if (!this.hasSession) {
-      this.setStatus('先打开或新建一张卡，再导入世界书', 'warn');
-      return;
-    }
-    const decision = await this.importDialog?.openWorldbook(fileName, text, this.worldbookPreset.format);
-    if (!decision || !('preview' in decision)) return;
 
-    const next = applyWorldbookImport(this.card, decision.preview);
-    if (next === null) {
-      this.setStatus('世界书导入被拒绝：解析结果不完整，未修改当前卡片', 'bad');
-      return;
-    }
-
-    // 记下原文：未改动时导出走逐字节写回（JSON 往返无损的唯一可靠实现）
-    this.session.setWorldbookSource(decision.result);
-    this.session.replaceCard(next);
-    this.reloadBlocksFromCard();
-    this.scheduleValidate(0);
-    this.setStatus(
-      `已导入世界书：${String(decision.result.entries.length)} 个条目（格式 ${
-        decision.result.format === 'json' ? 'JSON' : 'TXT'
-      }），未改动时导出将逐字节还原原文`,
-      'ok',
-    );
-  }
 
   /** 导出世界书（双向的另一半）。`format` 由用户选，走同一个保存对话框 */
   private async exportWorldbookFile(format: 'json' | 'txt'): Promise<void> {
@@ -5193,8 +3009,452 @@ class EditorApp {
         result.verbatim ? 'ok' : 'warn',
       );
     } catch (error) {
-      this.setStatus(`导出世界书失败：${describe(error)}`, 'bad');
+      this.setStatus(`导出世界书失败：${describeError(error)}`, 'bad');
     }
+  }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  /**
+   * 功能
+   * 预设导入的接入点。实现在 `import-actions.ts`。
+   *
+   * 注意事项
+   * 四个预设集合都可写（导入就是往里塞）。`demoQuiet` 只读 ——
+   * 它控制"取证期间不落盘"，那个开关属于启动参数，不属于导入。
+   *
+   * 踩过的坑
+   * `worldbookPresets`（全部）与 `worldbookPreset`（当前选中）是两个字段，
+   * 名字差一个 s。只声明一个编译能过，但语义是错的。
+   */
+  private importHost(): ImportHost {
+    const self = this;
+    return {
+      get greetingPresets() { return self.greetingPresets; },
+      set greetingPresets(next) { self.greetingPresets = next; },
+      get chatExamplePresets() { return self.chatExamplePresets; },
+      set chatExamplePresets(next) { self.chatExamplePresets = next; },
+      get worldbookPresets() { return self.worldbookPresets; },
+      set worldbookPresets(next) { self.worldbookPresets = next; },
+      get worldbookPreset() { return self.worldbookPreset; },
+      set worldbookPreset(next) { self.worldbookPreset = next; },
+      get rules() { return self.rules; },
+      set rules(next) { self.rules = next; },
+      get rulesDialog() { return self.rulesDialog; },
+      get importDialog() { return self.importDialog; },
+      get presetStore() { return self.presetStore; },
+      get presetStoreReady() { return self.presetStoreReady; },
+      get demoQuiet() { return self.demoQuiet; },
+      get card() { return self.card; },
+      get session() { return self.session; },
+      get hasSession() { return self.hasSession; },
+      setStatus: (message, kind) => self.setStatus(message, kind),
+      refreshRulesLabel: () => refreshRulesLabel(self.refreshHost()),
+      reloadBlocksFromCard: () => self.reloadBlocksFromCard(),
+      scheduleValidate: (delay) => self.scheduleValidate(delay ?? 0),
+      selectFieldPreset: (block, id) => self.selectFieldPreset(block, id),
+      switchHighlight: (id) => switchHighlight(self.refreshHost(), id),
+      validate: () => self.validate(),
+    };
+  }
+
+  /**
+   * 功能
+   * 板块操作的接入点。实现在 `block-actions.ts`。
+   *
+   * 注意事项
+   * `blocks` 与 `blockList` 是两个东西：前者是运行时数组（遍历用），
+   * 后者是容器节点（挂载用）。别只给一个。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  private blockHost(): BlockHost {
+    const self = this;
+    return {
+      get blocks() { return self.blocks; },
+      get blockList() { return self.blockList; },
+      get card() { return self.card; },
+      get rules() { return self.rules; },
+      get session() { return self.session; },
+      get authSession() { return self.authSession; },
+      refreshStats: () => refreshStats(self.refreshHost()),
+      refreshTabs: () => self.refreshTabs(),
+      scheduleValidate: (delay) => self.scheduleValidate(delay ?? 0),
+      issuesFor: (blockId) => self.issuesFor(blockId),
+      exportWorldbookFile: (format) => self.exportWorldbookFile(format),
+      toggle: (runtime) => self.toggle(runtime),
+      importHost: () => self.importHost(),
+    };
+  }
+
+  /**
+   * 功能
+   * 界面刷新的接入点。实现在 `ui-refresh.ts`。
+   *
+   * 注意事项
+   * `rules` 与 `settingsToken` 可写（两个 switch* 会改）；其余只读。
+   * `toolbarStats` 声明成非空 —— 它是索引页的常驻节点。
+   *
+   * 踩过的坑
+   * 第一版把 `blocks` 写成 `unknown[]`、`toolbarStats` 写成 `unknown`，
+   * `refreshBlockBadges` 里遍历时连锁报 30 多个错。**类型要去抄字段声明。**
+   */
+  private refreshHost(): RefreshHost {
+    const self = this;
+    return {
+      get blocks() { return self.blocks; },
+      get issues() { return self.issues; },
+      get lastSummary() { return self.lastSummary; },
+      get rules() { return self.rules; },
+      set rules(next) { self.rules = next; },
+      get settings() { return self.settings; },
+      get settingsToken() { return self.settingsToken; },
+      set settingsToken(next) { self.settingsToken = next; },
+      get authServerUrl() { return self.authServerUrl; },
+      set authServerUrl(next) { self.authServerUrl = next; },
+      get authSession() { return self.authSession; },
+      get hasSession() { return self.hasSession; },
+      get toolbarStats() { return self.toolbarStats!; },
+      setStatus: (message, kind) => self.setStatus(message, kind),
+      validate: () => self.validate(),
+      issuesFor: (blockId) => self.issuesFor(blockId),
+      persistSelection: (patch) => self.persistSelection(patch),
+      applyConnection: (result) => self.applyConnection(result as never),
+      blockHost: () => self.blockHost(),
+    };
+  }
+
+  /**
+   * 功能
+   * 取证/预览场景的接入点。实现在 `preview-scenarios.ts`。
+   *
+   * 注意事项
+   * 只有两个字段：`blocks`（判展开数）与 `stPane`（世界书演示）。
+   * 这个 host 越窄越好 —— 它服务的代码只在带 URL 参数启动时跑。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  private previewHost(): PreviewHost {
+    const self = this;
+    return {
+      get blocks() { return self.blocks; },
+      get stPane() { return self.stPane; },
+      setStatus: (message, kind) => self.setStatus(message, kind),
+      validate: () => self.validate(),
+      blockHost: () => self.blockHost(),
+    };
+  }
+
+  /**
+   * 功能
+   * 预设恢复的接入点。实现在 `preset-restore.ts`。
+   *
+   * 注意事项
+   * 八个字段**全部可写** —— 恢复就是往它们上面赋值。名字只差一个 s 的两对
+   * （greetingPreset/greetingPresets、worldbookPreset/worldbookPresets）都要，
+   * 少一个不会报错，但恢复会失效。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  private presetRestoreHost(): PresetRestoreHost {
+    const self = this;
+    return {
+      get rules() { return self.rules; },
+      set rules(next) { self.rules = next; },
+      get greetingPreset() { return self.greetingPreset; },
+      set greetingPreset(next) { self.greetingPreset = next; },
+      get greetingPresets() { return self.greetingPresets; },
+      set greetingPresets(next) { self.greetingPresets = next; },
+      get chatExamplePreset() { return self.chatExamplePreset; },
+      set chatExamplePreset(next) { self.chatExamplePreset = next; },
+      get chatExamplePresets() { return self.chatExamplePresets; },
+      set chatExamplePresets(next) { self.chatExamplePresets = next; },
+      get worldbookPreset() { return self.worldbookPreset; },
+      set worldbookPreset(next) { self.worldbookPreset = next; },
+      get worldbookPresets() { return self.worldbookPresets; },
+      set worldbookPresets(next) { self.worldbookPresets = next; },
+      get sessions() { return self.sessions; },
+    };
+  }
+
+  /**
+   * 功能
+   * 三块面板接线的接入点。实现在 `wiring.ts`。
+   *
+   * 注意事项
+   * 25 个成员：7 个对话框实例（懒建后复用，所以要可写）、4 个账号状态、
+   * 14 个转发动作。`blockHost` / `refreshHost` 是转手 ——
+   * 那两个模块各自已有 host，这里只透传入口。
+   *
+   * 踩过的坑
+   * 三个动作的真实形状与我第一版猜的不同：
+   * `handleUnauthorized` 返回 `Promise<boolean>`（true = 已恢复可重试）、
+   * `exportDiagnostics` 返回 `Promise<string>`（导出的文本）、
+   * `offerCertTrust` 收一个 `serverUrl` 参数。
+   * **写 host 接口前必须 grep 方法签名。**
+   */
+  private wireHost(): WireHost {
+    const self = this;
+    return {
+      get authSession() { return self.authSession; },
+      set authSession(next) { self.authSession = next; },
+      get authServerUrl() { return self.authServerUrl; },
+      set authServerUrl(next) { self.authServerUrl = next; },
+      get card() { return self.card; },
+      get connection() { return self.connection; },
+      get accountDeleteDialog() { return self.accountDeleteDialog; },
+      set accountDeleteDialog(next) { self.accountDeleteDialog = next; },
+      get loginDialog() { return self.loginDialog; },
+      set loginDialog(next) { self.loginDialog = next; },
+      get repoDialog() { return self.repoDialog; },
+      set repoDialog(next) { self.repoDialog = next; },
+      get accountDialog() { return self.accountDialog; },
+      set accountDialog(next) { self.accountDialog = next; },
+      get cardsDialog() { return self.cardsDialog; },
+      set cardsDialog(next) { self.cardsDialog = next; },
+      get settings() { return self.settings; },
+      set settings(next) { self.settings = next; },
+      get syncDialog() { return self.syncDialog; },
+      set syncDialog(next) { self.syncDialog = next; },
+      setStatus: (message, kind) => self.setStatus(message, kind),
+      applyCardName: (name) => self.applyCardName(name),
+      renderCardName: () => self.renderCardName(),
+      hideNameHint: () => self.hideNameHint(),
+      applyConnection: (result) => self.applyConnection(result as never),
+      autoProbe: () => autoProbe(self.connHost()),
+      currentSyncConfig: () => currentSyncConfig(self.connHost()),
+      exportDiagnostics: () => self.exportDiagnostics(),
+      handleUnauthorized: () => self.handleUnauthorized(),
+      offerCertTrust: (serverUrl) => offerCertTrust(self.connHost(), serverUrl),
+      openAccountEntry: () => self.openAccountEntry(),
+      repoClientConfig: () => repoClientConfig(self.connHost()),
+      repoTokenContext: () => repoTokenContext(self.connHost()),
+      blockHost: () => self.blockHost(),
+      refreshHost: () => self.refreshHost(),
+    };
+  }
+
+  /**
+   * 功能
+   * 打开卡片的接入点。实现在 `open-actions.ts`。
+   *
+   * 注意事项
+   * 3 个对话框实例可写（懒建后复用），其余只读。
+   * `worldbookPreset.format` 的**真实类型是结构化的 `WorldbookFormatParams`**，
+   * 不是字符串 —— 写成 string 会让 parseStCard 的入参报错。
+   *
+   * 踩过的坑
+   * `createSessionWithCard` 返回的是新会话的 id（string），我第一版写成 void，
+   * 于是 `readCardIdFromCard(...) ?? generateCardId(name)` 的结果没法传下去。
+   */
+  private openHost(): OpenHost {
+    const self = this;
+    return {
+      get card() { return self.card; },
+      get session() { return self.session; },
+      get hasSession() { return self.hasSession; },
+      get sessions() { return self.sessions; },
+      get activeId() { return self.activeId; },
+      get worldbookPreset() { return self.worldbookPreset; },
+      get cardInfoDialog() { return self.cardInfoDialog; },
+      set cardInfoDialog(next) { self.cardInfoDialog = next; },
+      get exportDialog() { return self.exportDialog; },
+      set exportDialog(next) { self.exportDialog = next; },
+      get importDialog() { return self.importDialog; },
+      set importDialog(next) { self.importDialog = next; },
+      setStatus: (message, kind) => self.setStatus(message, kind),
+      openTextCard: (fileName, text, dir) => self.openTextCard(fileName, text, dir),
+      arriveCard: (card) => arriveCard(self.landingHost(), card),
+      activateSession: (id) => self.activateSession(id),
+      replaceCard: (card) => self.replaceCard(card),
+      reloadBlocksFromCard: () => self.reloadBlocksFromCard(),
+      scheduleValidate: (delay) => self.scheduleValidate(delay ?? 0),
+      createSessionFromFile: (path) => self.createSessionFromFile(path),
+      createSessionWithCard: (card, cardId) => self.createSessionWithCard(card as never, cardId),
+      greetingFormat: () => self.greetingFormat(),
+      chatExamplesFormat: () => self.chatExamplesFormat(),
+    };
+  }
+
+  /**
+   * 功能
+   * ST 推送与演示场景的接入点。实现在 `st-push.ts`。
+   *
+   * 注意事项
+   * `stPane` 与 `demoQuiet` 可写：前者懒建，后者是演示期间临时置位的开关。
+   * 其余只读。
+   *
+   * 踩过的坑
+   * `worldbookPreset` 要声明成真的 `WorldbookPreset`，不能用 unknown ——
+   * 演示里要读 `.format`。
+   */
+  private stPushHost(): StPushHost {
+    const self = this;
+    return {
+      get card() { return self.card; },
+      get blocks() { return self.blocks; },
+      get session() { return self.session; },
+      get hasSession() { return self.hasSession; },
+      get rules() { return self.rules; },
+      get worldbookPreset() { return self.worldbookPreset; },
+      get crashLogger() { return self.crashLogger; },
+      get report() { return self.report; },
+      get demoQuiet() { return self.demoQuiet; },
+      set demoQuiet(next) { self.demoQuiet = next; },
+      get stPane() { return self.stPane; },
+      set stPane(next) { self.stPane = next; },
+      setStatus: (message, kind) => self.setStatus(message, kind),
+      openStDialog: () => self.openStDialog(),
+      sessionSummary: () => self.sessionSummary(),
+      greetingFormat: () => self.greetingFormat(),
+      chatExamplesFormat: () => self.chatExamplesFormat(),
+      selectWorldbookPreset: (id) => self.selectWorldbookPreset(id),
+      saveHost: () => self.saveHost(),
+      blockHost: () => self.blockHost(),
+      importHost: () => self.importHost(),
+      refreshHost: () => self.refreshHost(),
+      reloadBlocksFromCard: () => self.reloadBlocksFromCard(),
+      replaceCard: (card) => self.replaceCard(card),
+      validate: () => self.validate(),
+    };
+  }
+
+  /**
+   * 功能
+   * 落地路径的接入点。实现在 `landing.ts`。
+   *
+   * 注意事项
+   * `arriveCard` 是到达规范化的唯一入口：打开卡、导入 TXT、取回服务端版本、
+   * 回滚四条路都过它。`landingHost` 里 `sessions` 必须给全 ——
+   * `applyRemoteText` 要靠它找"这张卡在哪个标签"。
+   *
+   * 踩过的坑
+   * `worldbookPreset.format` 是结构化的 `WorldbookFormatParams`，不是字符串。
+   */
+  private landingHost(): LandingHost {
+    const self = this;
+    return {
+      get session() { return self.session; },
+      get hasSession() { return self.hasSession; },
+      get sessions() { return self.sessions; },
+      get worldbookPreset() { return self.worldbookPreset; },
+      setStatus: (message, kind) => self.setStatus(message, kind),
+      replaceCard: (card) => self.replaceCard(card),
+      createSessionWithCard: (card, cardId) => self.createSessionWithCard(card, cardId),
+      currentSyncConfig: () => currentSyncConfig(self.connHost()),
+      greetingFormat: () => self.greetingFormat(),
+      chatExamplesFormat: () => self.chatExamplesFormat(),
+    };
+  }
+
+  /**
+   * 功能
+   * 连接配置的接入点。实现在 `connection.ts`。
+   *
+   * 注意事项
+   * `connection` / `certAckedOrigins` / `certAsking` / `authServerUrl` /
+   * `lastFaceChoice` / `settingsToken` 都可写 —— 探测与证书询问会改它们。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  private connHost(): ConnHost {
+    const self = this;
+    return {
+      get authSession() { return self.authSession; },
+      get authServerUrl() { return self.authServerUrl; },
+      set authServerUrl(next) { self.authServerUrl = next; },
+      get connection() { return self.connection; },
+      set connection(next) { self.connection = next; },
+      get certAckedOrigins() { return self.certAckedOrigins; },
+      set certAckedOrigins(next) { self.certAckedOrigins = next; },
+      get certAsking() { return self.certAsking; },
+      set certAsking(next) { self.certAsking = next; },
+      get lastFaceChoice() { return self.lastFaceChoice; },
+      set lastFaceChoice(next) { self.lastFaceChoice = next; },
+      get settingsToken() { return self.settingsToken; },
+      set settingsToken(next) { self.settingsToken = next; },
+      setStatus: (message, kind) => self.setStatus(message, kind),
+      applyConnection: (result) => self.applyConnection(result as never),
+    };
+  }
+
+  /**
+   * 功能
+   * 预设库的接入点。实现在 `library-actions.ts`。
+   *
+   * 注意事项
+   * `presetStoreReady` 可写 —— `loadPresetLibrary` 读完库要把它置真，
+   * 那是"允许写盘"的闸门。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  private libraryHost(): LibraryHost {
+    const self = this;
+    return {
+      get greetingPresets() { return self.greetingPresets; },
+      set greetingPresets(next) { self.greetingPresets = next; },
+      get chatExamplePresets() { return self.chatExamplePresets; },
+      set chatExamplePresets(next) { self.chatExamplePresets = next; },
+      get worldbookPresets() { return self.worldbookPresets; },
+      set worldbookPresets(next) { self.worldbookPresets = next; },
+      get rules() { return self.rules; },
+      set rules(next) { self.rules = next; },
+      get presetStore() { return self.presetStore; },
+      get presetStoreReady() { return self.presetStoreReady; },
+      set presetStoreReady(next) { self.presetStoreReady = next; },
+      setStatus: (message, kind) => self.setStatus(message, kind),
+      importHost: () => self.importHost(),
+      presetRestoreHost: () => self.presetRestoreHost(),
+    };
+  }
+
+  /**
+   * 功能
+   * 保存管线的接入点。实现在 `save-actions.ts`。
+   *
+   * 注意事项
+   * `session` / `sessions` / `rules` / `lastFaceChoice` / `saveFormatDialog`
+   * 都是编辑器持有的核心状态，模块只读；`saveFormatDialog` 可写 ——
+   * 懒建一次后复用，不要每次都 new。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  private saveHost(): SaveHost {
+    const self = this;
+    return {
+      get session() { return self.session; },
+      get sessions() { return self.sessions; },
+      get hasSession() { return self.hasSession; },
+      get rules() { return self.rules; },
+      get lastFaceChoice() { return self.lastFaceChoice; },
+      get saveFormatDialog() { return self.saveFormatDialog; },
+      set saveFormatDialog(next) { self.saveFormatDialog = next; },
+      setStatus: (message, kind) => self.setStatus(message, kind),
+      refreshTabs: () => self.refreshTabs(),
+      renderCardName: () => self.renderCardName(),
+      greetingFormat: () => self.greetingFormat(),
+      chatExamplesFormat: () => self.chatExamplesFormat(),
+    };
   }
 
   /**
@@ -5221,40 +3481,12 @@ class EditorApp {
    * `replaceCard` / `createSessionWithCard`。放在这两个入口上，就不存在
    * "某条路忘了调"（用户明确要求不接受只修一个入口）。
    */
-  private arriveCard(card: UnifiedCard): UnifiedCard {
-    const result = normalizeOnArrival(card, {
-      worldbook: this.worldbookPreset.format,
-      greeting: this.greetingFormat().format,
-      /*
-       * ★ 对话示例的说话人写法必须一起给（2026-11-17）。
-       *
-       * 少了这一项，`refreshFieldBlockViews` 会拿初始场景的格式去重算
-       * 「对话示例」板块 —— 那套格式没有 `user`/`char` 映射，于是
-       * `renderChatExamples` 原样返回，**把导入时刚渲染好的 `用户：`
-       * 刷回 `{{user}}:`**。导入那一步永远看起来是对的，所以极难归因。
-       */
-      chatExamples: this.chatExamplesFormat(),
-    });
 
-    /*
-     * "格式不匹配"与"解析不出"是两种状态，措辞必须分开：
-     *   · 前者是 info —— 用户没做错任何事，卡是好的，只是写法不同；
-     *   · 后者是 bad —— 真的解析不出，导出会被硬闸门挡住。
-     * 把前者报成错误，就是现场这次"一张正常卡看起来坏了"。
-     */
-    const firstFailure = result.failures[0];
-    if (firstFailure !== undefined) {
-      this.setStatus(firstFailure.message, 'bad');
-    } else if (result.notes.length > 0) {
-      this.setStatus(result.notes.join('；'), 'info');
-    }
-    return result.card;
-  }
 
   private replaceCard(card: UnifiedCard): void {
     // 到达规范化（v0.1.6 缺陷一）：所有"整张卡进来"的路都经过这里，
     // 所以放在这里而不是在每个调用点各写一次 —— 少写一处就是少一个洞口。
-    const arrived = this.arriveCard(card);
+    const arrived = arriveCard(this.landingHost(), card);
     // 走 session：它会深拷贝，避免调用方后续改动这份卡数据时渗透进会话。
     // 但"打开文件/导入"应当重置脏标记 —— 刚载入的内容相对磁盘是干净的。
     this.session.replaceCard(arrived);
@@ -5268,568 +3500,177 @@ class EditorApp {
     this.statusBar.className = `status ${kind}`;
   }
 
-  // ── 调试/截图入口（走真实逻辑，不伪造状态）──────────────────
-  selectPresetForDemo(id: string): void {
-    this.selectPresetById(id);
-    this.refreshRulesLabel();
-  }
-
-  applyPresetForDemo(id: string): void {
-    const preset = this.rules?.presets.find((item) => item.id === id);
-    if (!preset) return;
-    const decision = decideApplyPreset(this.card, preset);
-    if (decision.kind !== 'confirm') {
-      this.setStatus(decision.kind === 'noop' ? decision.message : '没有可应用的变化', 'warn');
-      return;
-    }
-    // 与 UI 里的「应用预设」走同一条路径，只是跳过 window.confirm（自动化无法应答）
-    this.commitPresetApply(preset, decision.plan);
-  }
-
-  /**
-   * 真正落地「应用预设」：**同时**把该预设设为当前预设，再按 plan 重排。
+  /*
+   * 这个区块的边界就是判据（见下方那行 `──` 注释）。
    *
-   * 为什么必须一起做：重排是按这个预设的标题/分隔符写的，
-   * 若 `rules.preset` 还停在旧预设，导出会按旧格式拼装，
-   * 于是"刚重排成 divider，导出的却是 default"——两者不一致。
-   */
-  private commitPresetApply(preset: TxtPreset, plan: PresetApplyPlan): void {
-    if (this.rules) {
-      this.rules = { ...this.rules, preset };
-    }
-    // 换预设要置脏：预设决定导出时的标题与顺序，属于产出的一部分（见 CardSession 注释）
-    this.session.replaceCard(applyPresetPlan(this.card, plan));
-    this.session.markDirty();
-    this.reloadBlocksFromCard();
-    this.rulesDialog?.refresh();
-    // 重排后按新预设口径立即重检（分隔符/顺序类问题应当消失）
-    this.validate();
-    this.refreshRulesLabel();
-    this.refreshStats();
-    this.setStatus(
-      `已应用预设「${preset.name}」：${plan.changes.join('；') || '标题样式已重排'} · 已按新格式重检`,
-      'ok',
-    );
-  }
-
-  switchPlatformForDemo(id: string): void {
-    this.switchPlatform(id);
-    this.refreshRulesLabel();
-  }
-
-  switchHighlightForDemo(id: string): void {
-    this.switchHighlight(id);
-    this.refreshRulesLabel();
-  }
-
-  openRulesDialogForDemo(): void {
-    this.rulesDialog?.open();
-  }
-
-  /**
-   * T10.34 验收演示：一份「条目4：爱好」数据走**自定义路径**（截图用）。
+   * ## 里面只能有 demo 方法
    *
-   * 走的是真实链路，没有伪造状态：
-   *   · 自定义 TXT 预设 → 经 importTxtPresetText（同一套原子回退/同 id 覆盖）；
-   *   · 中文世界书预设 → preset-library；
-   *   · 自定义平台规则 → 经 importPlatformText（schema 校验 + 继承解析）；
-   *   · 世界书条目 → importWorldbook 按自定义格式解析出来，再回写成 TXT。
+   * `test/godclass-split-guard.test.mjs` 盯着：区块内的每个方法名必须是
+   * `*ForDemo` 后缀或 `demo*` 前缀，例外清单为空。
+   *
+   * 为什么较真：这些方法依赖 26 个 private 成员（`this.rules` / `this.card` /
+   * `this.rulesDialog` / `this.setStatus` …），所以**整体外移的代价远大于收益**
+   * （报告 P2-2 建议的"移到单独文件"做不到）。但区块边界将来会被用到 ——
+   * 构建期隔离、或者真去重构时，都是按这个边界切。
+   *
+   * ★ 2026-11-24 现场发现的一个真坑：`commitPresetApply`（"应用预设"的真实
+   *   落地逻辑，被 `onPresetApply` 生产路径调用）原本夹在两个 demo 方法之间。
+   *   照着区块边界做整体处理会**把产品功能一起带走**。已挪回生产区。
+   *
+   * ## 纪律：走真实逻辑，不伪造状态
+   *
+   * `?rules=1&applyPreset=divider` 真的执行「应用预设」（会重排），
+   * 而不是把界面摆成"应用过了"的样子。`?crashInject=1` 走真实的全局
+   * error 钩子 —— 这样截图与端到端才有验证价值。
    */
-  applyCustomTrackDemo(mode: 'rules' | 'audit' | 'warn'): void {
-    // 零标签时先建一张卡：this.card 只在有活动会话时可用，
-    // 直接写卡片状态会抛「当前没有活动会话」而整段演示静默中断。
-    if (!this.hasSession) this.createSessionFromFile('未命名角色卡.txt');
-    // warn 模式：删掉「关键词」行 + 触发深度写 88（越界），用来展示自定义规则的
-    // 与内置默认规则集各自报什么（验收第 ③④ 条）。
-    const sample =
-      mode === 'warn'
-        ? ['条目4：', '名称：爱好', '触发深度：88', '内容：', '主角喜欢读书和看电影。', '条目4结束', ''].join('\n')
-        : [
-            '条目4：',
-            '名称：爱好',
-            '关键词：读书、电影',
-            '触发深度：5',
-            '内容：',
-            '主角喜欢读书和看电影。',
-            '条目4结束',
-            '',
-          ].join('\n');
-
-    const customWb = {
-      schemaVersion: 1 as const,
-      id: 'cn-kv',
-      name: '中文键值世界书',
-      version: '1.0.0',
-      description: '条目{id}：/ 名称：/ 关键词：/ 触发深度：/ 内容：',
-      format: {
-        entryOpen: '条目{id}：',
-        contentMark: '内容：',
-        entryClose: '条目{id}结束',
-        fieldOrder: ['name', 'keys', 'insertion_order'],
-        labelMap: { name: '名称', keys: '关键词', insertion_order: '触发深度' },
-        fieldSeparator: '：',
-        listSeparator: '、',
-        entrySeparator: '\n',
+    // ── 调试/截图入口的接入点（实现在 demo-actions.ts）────────────
+  /*
+   * ## 这里为什么只剩一个方法
+   *
+   * 20 个 `*ForDemo` 方法共约 500 行，2026-11-24 搬到了 `demo-actions.ts`。
+   * 它们此前卡在类里动不了，因为依赖 26 个 `private` 成员。
+   *
+   * 现在只剩这一处接口：`demoHost()` 把 demo 代码需要的 31 个能力包成一个
+   * 窄接口对象。**这是全部耦合面** —— 读 `DemoHost` 就够，不必翻 500 行。
+   *
+   * ## 为什么不把 26 个成员改成 public
+   *
+   * 那会让封装永久变松：以后任何人从任何地方都能 `app.setStatus(...)`／
+   * 直接改 `app.rules`。用一个显式接口限定"demo 能碰什么"，边界看得见。
+   *
+   * ## 为什么不在这里放薄包装方法
+   *
+   * 试过：包装方法要同步调到 demo 函数 ⇒ 必须静态 `import demo-actions`
+   * ⇒ 那 500 行又回到主 chunk，白拆。所以调用方改为直接持有 host：
+   *
+   * ```text
+   *   debug-params.ts   const demo = await import('./demo-actions')
+   *                     demo.importSampleForDemo(app.demoHost(), sample)
+   * ```
+   *
+   * `import type { DemoHost }` 是**纯类型**，编译后擦除，不产生运行时依赖 ——
+   * 所以主 chunk 里只有下面这 30 行转发。
+   */
+  demoHost(): DemoHost {
+    const self = this;
+    return {
+      get card() {
+        return self.card;
       },
+      get hasSession() {
+        return self.hasSession;
+      },
+      get rules() {
+        return self.rules;
+      },
+      get blocks() {
+        return self.blocks;
+      },
+      get issues() {
+        return self.issues;
+      },
+      get lastSummary() {
+        return self.lastSummary;
+      },
+      get worldbookPreset() {
+        return self.worldbookPreset;
+      },
+      get exportDialog() {
+        return self.exportDialog;
+      },
+      get importDialog() {
+        return self.importDialog;
+      },
+      get rulesDialog() {
+        return self.rulesDialog;
+      },
+      get syncDialog() {
+        return self.syncDialog;
+      },
+      // 唯一可写字段：`?settings=1&token=` 会把它写进来
+      get settingsToken() {
+        return self.settingsToken;
+      },
+      set settingsToken(next: string) {
+        self.settingsToken = next;
+      },
+      setStatus: (text, kind) => self.setStatus(text, kind),
+      validate: () => self.validate(),
+      refreshRulesLabel: () => refreshRulesLabel(self.refreshHost()),
+      refreshStats: () => refreshStats(self.refreshHost()),
+      refreshNameHint: () => refreshNameHint(self.refreshHost()),
+      reloadBlocksFromCard: () => self.reloadBlocksFromCard(),
+      replaceCard: (card) => self.replaceCard(card),
+      selectPresetById: (id) => self.selectPresetById(id),
+      selectWorldbookPreset: (id) => self.selectWorldbookPreset(id),
+      switchPlatform: (id) => switchPlatform(self.refreshHost(), id),
+      switchHighlight: (id) => switchHighlight(self.refreshHost(), id),
+      commitPresetApply: (preset, plan) => self.commitPresetApply(preset, plan),
+      createSessionFromFile: (path) => self.createSessionFromFile(path),
+      applyConnection: (result) => self.applyConnection(result),
+      expand: (runtime, silent) => expand(self.blockHost(), runtime, silent),
+      collapse: (runtime) => collapse(self.blockHost(), runtime),
+      importPlatformText: (text) => importPlatformText(self.importHost(), text),
+      importTxtPresetText: (text) => importTxtPresetText(self.importHost(), text),
+      importWorldbookPresetText: (text) => importWorldbookPresetText(self.importHost(), text),
+      importCardTextFile: (fileName, text, createdSession, autoConfirm, note) =>
+        importCardTextFile(self.openHost(), fileName, text, createdSession, autoConfirm, note),
     };
-
-    // 1) 自定义 TXT 预设（复制内置那份并改 id，模拟"导入用户自己的格式"）
-    const basePreset = this.rules?.presets.find((item) => item.id === 'default');
-    if (basePreset) {
-      this.importTxtPresetText(
-        JSON.stringify({ ...basePreset, id: 'my-format', name: '我的格式', builtin: false }),
-      );
-    }
-
-    // 2) 自定义世界书预设并选中
-    const wbOutcome = this.importWorldbookPresetText(JSON.stringify(customWb));
-    if (wbOutcome.ok && wbOutcome.id !== null) this.selectWorldbookPreset(wbOutcome.id);
-
-    // 3) 解析样本 → 写入卡片的世界书（按自定义格式回写 TXT，结构检查才不会误报）
-    const format = this.worldbookPreset.format;
-    const parsed = importWorldbook(sample, format);
-    if (parsed.entries.length > 0) {
-      this.card.worldbook = {
-        entries: parsed.entries,
-        text: renderWorldbookTextWith(parsed.entries, format),
-        dirty: false,
-        raw: null,
-      };
-      this.reloadBlocksFromCard();
-    }
-
-    // 4) 自定义平台规则（经真实导入路径）
-    this.importPlatformText(
-      JSON.stringify({
-        schemaVersion: 1,
-        id: 'my-worldbook-policy',
-        name: '我的世界书规范',
-        version: '1.0.0',
-        target: { spec: 'any' },
-        placeholders: { char: ['{{char}}'], user: ['{{user}}'] },
-        fields: [],
-        rules: [
-          {
-            id: 'mine:entry-name-required',
-            type: 'non-empty',
-            message: '条目名不能为空（{entry}）',
-            scope: 'worldbook:entries[].name',
-            severity: 'error',
-            category: 'worldbook',
-          },
-          {
-            id: 'mine:keys-not-empty',
-            type: 'list-count',
-            min: 1,
-            message: '{entry}没有关键词，永远不会被触发',
-            scope: 'worldbook:entries[].keys',
-            severity: 'warning',
-            category: 'worldbook',
-          },
-          {
-            id: 'mine:depth-range',
-            type: 'number-range',
-            min: 0,
-            max: 10,
-            message: '触发深度必须在 0..10',
-            scope: 'worldbook:entries[].insertion_order',
-            severity: 'warning',
-            category: 'worldbook',
-          },
-        ],
-      }),
-    );
-    this.switchPlatform('my-worldbook-policy');
-    this.validate();
-
-    if (mode === 'rules') this.rulesDialog?.open();
-    this.setStatus('已导入自定义预设与平台规则', 'ok');
-  }
-
-  /**
-   * 演示/验证用：让**两个新板块**各产生一条真实的审计问题。
-   *
-   * 为什么需要它：`?forceError=1` 的问题都落在「基本信息」，看不出新板块
-   * 是否真的接进了审计链路（一个板块"显示出来"和"它的文本真的进入规则求值"
-   * 是两件事）。这里同样不伪造报告 —— 把新板块改成真正会触发内置检查的状态：
-   *   · 对话示例：标成"导入源里没有这个标题"（`missing`），触发 `builtin:block-missing`；
-   *   · 初始场景：写一段**分隔行条数多于备用开场白**的文本，触发
-   *     `builtin:greeting-divider-ambiguous`（这是 v0.1.3 新增的那条 info）。
-   * 两条问题的 `location.blockId` 分别是两个新板块，面板上可直接点着定位。
-   */
-  injectNewBlockIssuesForDemo(): void {
-    const broken = structuredClone(this.card);
-    const examples = broken.blocks.find((block) => block.id === 'chat-examples');
-    if (examples) {
-      examples.text = '';
-      examples.raw = '';
-      examples.dirty = false;
-      examples.missing = true;
-    }
-    const scene = broken.blocks.find((block) => block.id === 'initial-scene');
-    if (scene) {
-      // 分隔行 2 处、备用开场白 0 条 ⇒ 多出来的来自 first_mes 正文本身
-      scene.text = '第一幕\n\n---\n\n第二幕\n\n---\n\n第三幕';
-      scene.dirty = false;
-    }
-    this.replaceCard(broken);
-    this.validate();
-    const newBlockIssues = this.issues.filter(
-      (issue) => issue.location.blockId === 'chat-examples' || issue.location.blockId === 'initial-scene',
-    );
-    this.setStatus(
-      `新板块产生 ${String(newBlockIssues.length)} 条提示（对话示例·原文缺失 / 初始场景·分隔行二义）`,
-      'warn',
-    );
-  }
-
-
-  /**
-   * 演示/验证用：注入一个**真实会被规则引擎判为 error** 的问题。
-   *
-   * 做法不是伪造报告——而是把卡片改成真正违规（清空 name、并把某必填字段写空），
-   * 再走正常审计链路。这样弹出的拦截框与真实使用完全一致。
-   */
-  injectErrorForDemo(): void {
-    const broken = structuredClone(this.card);
-    // name 为空：多数平台规则将其判为 error（必填）
-    broken.meta.name = '';
-    // 再把基本信息正文清空，触发"必填板块为空"这类 error
-    const basic = broken.blocks.find((block) => block.id === 'basic');
-    if (basic) {
-      basic.text = '';
-      basic.dirty = true;
-    }
-    this.replaceCard(broken);
-    this.validate();
-    const { error } = this.lastSummary;
-    this.setStatus(`已生成 ${String(error)} 个错误级问题（角色名称为空 + 基本信息为空）`, 'warn');
-  }
-
-  openExportForDemo(): void {
-    this.exportDialog?.open('json');
-  }
-
-  /** 调试/截图：直接打开同步面板（需连接就绪） */
-  openSyncForDemo(): void {
-    this.syncDialog?.open();
-  }
-
-  /** 调试/截图：预选服务端卡片并加载其版本历史 */
-  preselectSyncCardForDemo(cardId: string): void {
-    // 只改"看哪张卡的历史"，不改上传目标 —— 上传目标恒为活动会话
-    this.syncDialog?.selectCard(cardId);
-  }
-
-  /** 调试/截图：以给定地址+令牌连接一次（走真实 probeServer） */
-  async connectForDemo(serverUrl: string, token: string): Promise<void> {
-    this.settingsToken = token;
-    const result = await probeServer({ serverUrl, token });
-    this.applyConnection(result);
-  }
-
-  /**
-   * 演示/验证用：喂一段**真实存在缺陷**的规则文本走完整导入链路，
-   * 让「导入失败 + 原子回退 + 字段级错误」在界面上可见。
-   * 文本取自真实规则文件并定向破坏（不是手搓的假结构）。
-   */
-  importBadRuleForDemo(): void {
-    if (!this.rules) return;
-    const sample = this.rules.platformSourceText[this.rules.platformId];
-    let broken: string;
-    if (sample) {
-      const parsed = JSON.parse(sample) as Record<string, unknown>;
-      const fields = Array.isArray(parsed['fields']) ? (parsed['fields'] as unknown[]) : [];
-      // 定向破坏两处：清空 label、把 required 改成字符串
-      if (fields.length > 0 && typeof fields[0] === 'object' && fields[0] !== null) {
-        (fields[0] as Record<string, unknown>)['label'] = '';
-      }
-      if (fields.length > 1 && typeof fields[1] === 'object' && fields[1] !== null) {
-        (fields[1] as Record<string, unknown>)['required'] = 'yes';
-      }
-      parsed['id'] = 'broken-demo';
-      broken = JSON.stringify(parsed, null, 2);
-    } else {
-      broken = '{ "id": "broken-demo", "name": '; // 截断 JSON
-    }
-
-    const outcome = this.importPlatformText(broken);
-    this.rulesDialog?.open();
-    this.rulesDialog?.showImportFailure(outcome);
-  }
-
-  /** 演示/验证用：走真实的宽松 TXT 导入，让「原文缺失」标记可见 */
-  applyDemoLenientText(): void {
-    if (!this.rules?.preset) return;
-    const text = '【基本信息】\n姓名：{{char}}\n年龄：24';
-    const result = importCardText(this.card, text, this.rules.preset, 'lenient');
-    if (!result.card) {
-      this.setStatus(`导入被拒绝：${result.issues.map((i) => i.message).join('；')}`, 'bad');
-      return;
-    }
-    this.replaceCard(result.card);
-    this.setStatus(
-      `宽松导入仅含「基本信息」的 TXT，其余板块按「原文缺失」标记（${String(result.issues.length)} 条提示）`,
-      'warn',
-    );
-  }
-
-  /**
-   * 演示/截图/端到端入口：用内置样本文本走**真实的导入对话框**（T10.27）。
-   *
-   * 为什么要这类入口：浏览器直开（截图与 headless 验证就是这么跑的）没有壳能力，
-   * 点「打开…」弹不出文件选择器。这里注入的只是**输入文本**，之后的分流、预览、
-   * 保全装配、状态栏文案全是生产代码 —— 与 `?demo=lenient` 同一个套路。
-   *
-   * @param sample 'zero'（0 命中）/ 'mixed'（混合）/ 'clean'（全部标准板块）
-   */
-  async importSampleForDemo(sample: string): Promise<void> {
-    const texts: Record<string, string> = {
-      zero: [
-        '条目1：这是一段完全自由的设定文本',
-        '它没有使用任何【】或 ## 标题，所以整篇都不会被切分。',
-        '',
-        '条目2：第二段',
-        '  缩进与空行都是原文的一部分',
-        '',
-        '条目3：结尾',
-      ].join('\n'),
-      mixed: [
-        '【基本信息】',
-        '姓名：林晚照',
-        '年龄：27',
-        '',
-        '【性格】',
-        '冷静，话少。',
-        '',
-        '## 战斗系统',
-        '条目1：先攻按敏捷排序',
-        '条目2：暴击倍率 1.5',
-        '',
-        '【其他设定】',
-        '这是已识别到的其他设定内容。',
-        '',
-        '## 招式表',
-        '条目甲：斩击',
-        '条目乙：突刺',
-      ].join('\n'),
-      clean: [
-        '【基本信息】',
-        '姓名：林晚照',
-        '年龄：27',
-        '',
-        '【性格】',
-        '冷静，话少。',
-        '',
-        '【其他设定】',
-        '普通设定。',
-        '',
-        '【特殊设定】',
-        '无。',
-        '',
-        '【用户相关设定】',
-        '{{user}} 是常客。',
-      ].join('\n'),
-    };
-    const text = texts[sample];
-    if (text === undefined) return;
-    // 零标签时先按文件名建会话 —— 与「打开…」走同一条路径（T10.28）
-    if (!this.hasSession) this.createSessionFromFile(`${sample}.txt`);
-    await this.importCardTextFile(`${sample}.txt`, text, null, true);
-  }
-
-  /** 演示/截图入口：只打开导入对话框（不确认），用于截"导入前"那两张图 */
-  async previewSampleForDemo(sample: string): Promise<void> {
-    if (!this.hasSession) this.createSessionFromFile(`${sample}.txt`);
-    const texts: Record<string, string> = {
-      zero: '条目1：这是一段完全自由的设定文本\n它没有使用任何【】或 ## 标题，所以整篇都不会被切分。\n\n条目2：第二段\n  缩进与空行都是原文的一部分\n\n条目3：结尾',
-      mixed: '【基本信息】\n姓名：林晚照\n年龄：27\n\n【性格】\n冷静，话少。\n\n## 战斗系统\n条目1：先攻按敏捷排序\n条目2：暴击倍率 1.5\n\n【其他设定】\n这是已识别到的其他设定内容。\n\n## 招式表\n条目甲：斩击\n条目乙：突刺',
-    };
-    const text = texts[sample];
-    if (text === undefined) return;
-    await this.importDialog?.openCardText(`${sample}.txt`, text);
-  }
-
-  /**
-   * 演示/截图入口：注入一个真实的渲染层异常（T10.26）。
-   *
-   * 用 `window.dispatchEvent(new ErrorEvent(...))` 而不是 `setTimeout(() => { throw })`：
-   * 前者走的就是全局 `error` 钩子，且不会让 headless Chrome 因为未捕获异常
-   * 而提前退出（那样 `--dump-dom` 拿不到任何东西）。
-   * 落盘在浏览器模式下是 no-op（`isShellAvailable()` 为 false），
-   * 所以"日志文件里有记录"这条必须到壳里验 —— 见 scripts/verify-t1026-crash.mjs。
-   */
-  injectCrashForDemo(): void {
-    window.dispatchEvent(
-      new ErrorEvent('error', {
-        message: '模拟异常：Uncaught TypeError: demo is not a function',
-        error: new TypeError('demo is not a function'),
-      }),
-    );
-  }
-
-  /**
-   * 演示/截图入口：把某一个板块的高亮效果单独展示出来（v0.1.3 追加项二）。
-   *
-   * 为什么不是"打开样例卡再滚过去"：headless Chrome 里 `scrollIntoView` 会让
-   * 整块布局下移、上方留一片空白，截出来像布局坏了（v0.1.3 / F4 踩过两次）。
-   * 这里改成**只展开目标板块**（其余折叠 → 折叠即销毁编辑器），
-   * 页面本身就短，不需要滚动。
-   *
-   * 内容也是刻意构造的：`worldbook` 要出现 `@@ENTRY` / `keys:` / `@@CONTENT` /
-   * `@@END`（否则看不见新增的那 5 条规则），`chat-examples` 要出现 `<START>`，
-   * `initial-scene` 要出现多条开场白的分隔行。用样例卡会碰运气。
-   */
-  demoHighlightBlock(blockId: string): void {
-    if (!this.hasSession) this.createSessionFromFile('高亮示例.txt');
-
-    const demoWorldbookText = [
-      '@@ENTRY 0',
-      'name: 银座',
-      'keys: 东京, 银座, 酒吧',
-      'insertion_order: 10',
-      '@@CONTENT',
-      '{{char}} 在这里第一次遇见 {{user}}。',
-      '@@END 0',
-      '',
-      '@@ENTRY 1',
-      'name: 旧宅',
-      'keys: 旧宅, 老屋',
-      '@@CONTENT',
-      '木门后面是{{user}}小时候住过的院子。',
-      '@@END 1',
-    ].join('\n');
-
-    const demoExamples = [
-      '<START>',
-      '{{user}}: 「今天也不打算说话？」',
-      '{{char}}: 「……嗯。」她把手里的书翻过一页。',
-      '<START>',
-      '{{user}}: 「我带了咖啡。」',
-      '{{char}}: （抬头看了一眼）「放那儿吧。」',
-    ].join('\n');
-
-    /*
-     * 分隔行刻意**两种都放**：`---` 与 `~~~`。
-     *
-     *   · `---` 会同时命中全局 `hr-line`(priority 80) 与专用 `scene-divider`(78)，
-     *     高优先级赢 —— 视觉上仍是分隔线，证明两条规则不打架；
-     *   · `~~~` 只有 `scene-divider` 认（`hr-line` 的字符类是 `-=*`），
-     *     这是本板块专用规则存在的**唯一可见证据**。
-     *
-     * 只放 `---` 的话，`scene-divider` 被 `hr-line` 压着，
-     * 删掉它截图也一模一样 —— 那样的"验收"等于没验（第一版就是这样）。
-     *
-     * 切分仍按冻结分隔符 `\n\n---\n\n`：`~~~` 在第二段正文里，不参与切分。
-     */
-    const demoScene = [
-      '{{char}} 推开窗，风把纸页吹得哗啦响。',
-      '',
-      '---',
-      '',
-      '「你来得比约定的早。」{{char}} 说。',
-      '',
-      '~~~',
-      '',
-      '雨停之后，{{user}} 在门口等到了她。',
-    ].join('\n');
-
-    const base = structuredClone(this.card);
-    base.blocks = base.blocks.map((block) => {
-      if (block.id === 'chat-examples') return { ...block, text: demoExamples, dirty: false };
-      if (block.id === 'initial-scene') return { ...block, text: demoScene, dirty: false };
-      return block;
-    });
-    base.worldbook = { ...base.worldbook, text: demoWorldbookText };
-    // residual 也一起改：否则下一次校验会按 residual 把视图刷回去，
-    // 截图里看到的是"内容变空"而不是演示文本。
-    base.residual = {
-      ...base.residual,
-      mesExample: demoExamples,
-      firstMes: demoScene.split('\n\n---\n\n')[0]!,
-      alternateGreetings: demoScene.split('\n\n---\n\n').slice(1),
-    };
-    this.replaceCard(base);
-
-    // 只留目标板块展开：折叠会销毁编辑器，页面于是只剩一块内容
-    for (const runtime of this.blocks) {
-      if (runtime.snapshot.id === blockId) this.expand(runtime, true);
-      else if (runtime.expanded) this.collapse(runtime);
-    }
-    this.setStatus(`高亮检查：${blockId}（当前方案 ${this.rules?.highlightId ?? '—'}）`, 'info');
-  }
-
-  /**
-   * 演示/截图入口：把规则面板滚到两个新预设区块之一（v0.1.3 追加项一）。
-   *
-   * ## 为什么滚的是 `.modal` 而不是 window
-   *
-   * 面板本体是 `.modal`（`max-height: 90vh; overflow: auto`），滚动容器是
-   * **它自己**，页面本身不滚。用 `scrollIntoView` 会连带滚动所有可滚祖先
-   * （含 window），在 headless 里表现是整块布局下移、上方留一片空白 ——
-   * v0.1.3 的 F4 截图为此返工过两次。这里直接改容器的 `scrollTop`，指哪打哪。
-   */
-  demoRulesSection(section: 'greeting' | 'example'): void {
-    const role = section === 'greeting' ? 'greeting-preset-section' : 'chat-example-preset-section';
-    const target = document.querySelector<HTMLElement>(`[data-role="${role}"]`);
-    if (target === null) return;
-    const scroller = target.closest<HTMLElement>('.modal');
-    if (scroller === null) return;
-    // 目标区块相对滚动容器的偏移（加 scrollTop 是因为 rect 已是"滚动后"的位置）
-    const offset = target.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
-    // 留 8px 呼吸位，避免标题贴着容器顶边
-    scroller.scrollTop = Math.max(0, offset - 8);
-  }
-
-  /** 演示/截图入口：改名提示（T10.29）。`state` = 'show' 显示 / 'hide' 模拟已点过 */
-  setNameHintForDemo(state: 'show' | 'hide'): void {
-    if (state === 'hide') {
-      dismissNameHint(browserHintStore());
-      const hint = byId<HTMLElement>('card-name-hint');
-      hint.hidden = true;
-      return;
-    }
-    resetNameHint(browserHintStore());
-    this.refreshNameHint();
   }
 }
 
-function describe(error: unknown): string {
-  const shellError = error as Partial<ShellError>;
-  if (typeof shellError?.code === 'string') {
-    return `[${shellError.code}] ${shellError.message ?? ''}`;
-  }
-  return error instanceof Error ? error.message : String(error);
-}
 
-/**
- * 取第一条校验问题的话术。
- *
- * 导入失败时 `issues` 里第一条通常就是根因（后续是连锁），全塞进启动警告会变成
- * 一堵墙。完整清单在「规则」面板里能看到。
- */
-function firstIssue(issues: readonly { message: string }[]): string {
-  return issues[0]?.message ?? '格式校验未通过';
-}
-
-/**
- * 字节 → base64（契约的二进制写只收 base64）。
- *
- * 分块拼接再 `btoa`：`String.fromCharCode(...bytes)` 一次性展开在几 MB 的 PNG 上
- * 会超参数个数上限（Chrome 约 12 万）抛 `RangeError: Maximum call stack size exceeded`，
- * 而报错点与"图片太大"之间的关系没人能一眼看出来。
- */
-function bytesToBase64(bytes: Uint8Array): string {
-  const chunk = 0x8000;
-  let binary = '';
-  for (let offset = 0; offset < bytes.length; offset += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
-  }
-  return btoa(binary);
-}
 
 // ── 启动 ────────────────────────────────────────────────────
+
+/**
+ * 功能：判断键盘事件的焦点是否落在可编辑元素上，用于决定 Ctrl+A 该不该放行。
+ * 注意事项：CodeMirror 的输入区是 contenteditable，靠 isContentEditable 命中；
+ *   普通 input/textarea/select 按标签名判断。按钮、下拉容器、审计面板都不算。
+ * 踩过的坑：无。
+ */
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
+/**
+ * 桌面壳的浏览器行为收口（v0.2.3，2026-11-27 用户要求）。
+ *
+ * 功能：屏蔽 WebView 自带右键菜单（返回/刷新/另存为/打印/QR/朗读/翻译/截图/
+ *   发送到设备/查看源码/检查），并拦下 Ctrl+P 与非编辑区的 Ctrl+A。
+ * 注意事项：只挂在桌面入口（index.html 加载 editor/app.ts）；移动端
+ *   mobile.html 走另一个入口，不受影响。这里不拦 F5/Ctrl+R：用户列的是
+ *   右键菜单里的项，刷新快捷键仍可用。
+ * 踩过的坑：Ctrl+A 以前没拦，焦点在按钮/面板上按下去会把整个界面文字选蓝
+ *   （截图里整页高亮）；拦的时候必须放行输入框与 CodeMirror，否则编辑器里
+ *   没法全选。
+ */
+function installDesktopShellGuards(): void {
+  document.addEventListener('contextmenu', (event) => event.preventDefault(), true);
+  window.addEventListener(
+    'keydown',
+    (event) => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      const key = event.key.toLowerCase();
+      if (key === 'p') {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      if (key === 'a' && !isEditableTarget(event.target)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    },
+    true,
+  );
+}
+
 async function boot(): Promise<void> {
+  installDesktopShellGuards();
   const params = new URLSearchParams(location.search);
 
   /**
@@ -5845,6 +3686,16 @@ async function boot(): Promise<void> {
   let card: UnifiedCard | null = null;
   if (params.get('sample') === '1') {
     try {
+      /*
+       * ★ 动态 import（2026-11-24）：样例卡来自 `test/fixtures/`，属于测试夹具。
+       *
+       * 以前是顶层静态 import，于是**每个用户的包里都打进了这份夹具**
+       * （报告 P2-2 的"生产包含测试夹具"）。改成动态后它成为一个独立 chunk，
+       * 不带 `?sample=1` 的启动永远不会下载它。
+       *
+       * `?sample=1` 的语义完全不变 —— 端到端测试与截图脚本照旧可用。
+       */
+      const { default: sampleCardJson } = await import('../../../test/fixtures/sample-card.json');
       // 样本卡同样要按当前预设渲染世界书（缺陷一那条静态断言盯着所有调用点）
       card = parseStCard(sampleCardJson as unknown, {
         worldbookFormat: DEFAULT_WORLDBOOK_PRESET.format,
@@ -5865,88 +3716,19 @@ async function boot(): Promise<void> {
 
   await app.start();
 
-  // 调试/截图入口：?demo=lenient 用「只有基本信息」的 TXT 走一次**真实的宽松导入**，
-  // 用于验证/展示「原文缺失」标记。走的是 shared 的 applyCardText，不伪造状态。
-  if (params.get('demo') === 'lenient') {
-    app.applyDemoLenientText();
-  }
-
-  // T10.27：三种样本的真实导入（0 命中 / 混合 / 全部标准），用于截图与端到端。
-  //   ?import=zero|mixed|clean   走真实导入流程（会确认）
-  //   ?importPreview=zero|mixed  只打开导入对话框（截"导入前"）
-  const importSample = params.get('import');
-  if (importSample !== null) await app.importSampleForDemo(importSample);
-  const importPreview = params.get('importPreview');
-  if (importPreview !== null) await app.previewSampleForDemo(importPreview);
-
-  // T10.26：注入一个真实渲染层异常（走全局 error 钩子）
-  if (params.get('crashInject') === '1') app.injectCrashForDemo();
-
   /*
-   * v0.1.3 追加项二：只展开某一个板块并填入演示文本（三板块高亮截图）。
+   * 调试/截图入口（2026-11-24 搬到 `debug-params.ts`）。
    *
-   * `?highlightDemo=worldbook|initial-scene|chat-examples`
+   * 那段约 80 行只在带调试参数时用得上，以前躺在 boot() 里 ⇒ 每个用户下载的
+   * 包里都带着它（报告 P2-2）。现在按需动态加载：没带调试参数时这个模块
+   * **根本不会被下载**。
    *
-   * 放在这里是因为它只依赖会话与规则（`start()` 尾部已全部就绪），
-   * 不依赖任何面板。而 `?rulesSection=` 不在这里 —— 它依赖**面板已打开**，
-   * 见下方 `rules=1` 之后的位置（这条错位本仓库已经踩过三次）。
+   * ★ 18 个截图/验收脚本拼的 URL 一个字都没改 —— 参数语义与处理顺序原样保留。
+   *   判断清单在 `debug-keys.ts`（零依赖，主 chunk 只多几百字节）。
    */
-  const highlightDemo = params.get('highlightDemo');
-  if (highlightDemo !== null) app.demoHighlightBlock(highlightDemo);
-
-  // T10.29：改名提示的两态（show = 未点过 / hide = 已点过）
-  const hintParam = params.get('nameHint');
-  if (hintParam === 'show' || hintParam === 'hide') app.setNameHintForDemo(hintParam);
-
-  // 调试/截图入口（T6.2/T6.3）：
-  //   ?rules=1&preset=divider     打开规则面板并把预设选为 divider（不重排）
-  //   ?rules=1&applyPreset=divider 直接执行「应用预设」（会重排，走同一套 plan→apply）
-  //   ?platform=janitorai         切到指定平台规则（触发重检）
-  //   ?highlight=dark             切到指定高亮方案
-  const presetParam = params.get('preset');
-  if (presetParam) app.selectPresetForDemo(presetParam);
-  const applyParam = params.get('applyPreset');
-  if (applyParam) app.applyPresetForDemo(applyParam);
-  const platformParam = params.get('platform');
-  if (platformParam) app.switchPlatformForDemo(platformParam);
-  const highlightParam = params.get('highlight');
-  if (highlightParam) app.switchHighlightForDemo(highlightParam);
-  if (params.get('rules') === '1') app.openRulesDialogForDemo();
-  /*
-   * `?rules=1&rulesSection=greeting|example` —— 打开面板并滚到对应的新预设区块。
-   *
-   * **必须写在 `openRulesDialogForDemo()` 之后**（v0.1.3 第三次踩同一个坑）：
-   * 第一版写在这之前，`querySelector('[data-role="greeting-preset-section"]')`
-   * 拿到 null，函数静默 return —— 于是两张截图字节完全相同（204323），
-   * 看起来像"两新区长得一模一样"。同类错此前有过两次（`?preview=` 与 `?login=`
-   * 都曾写在 `wireSettings()` 里，那时的依赖对象还没构造）。
-   */
-  const rulesSection = params.get('rulesSection');
-  if (rulesSection === 'greeting' || rulesSection === 'example') {
-    app.demoRulesSection(rulesSection);
-  }
-  // T10.34：自定义路径演示（截图用）——custom=rules 开面板，custom=audit 看审计
-  const customParam = params.get('custom');
-  if (customParam === 'rules' || customParam === 'audit' || customParam === 'warn') {
-    app.applyCustomTrackDemo(customParam);
-  }
-  if (params.get('badImport') === '1') app.importBadRuleForDemo();
-  // ?export=1           打开导出面板（正常路径）
-  // ?export=1&forceError=1  先注入一个 error 级问题，用于展示拦截弹窗
-  if (params.get('forceError') === '1') app.injectErrorForDemo();
-  // v0.1.3 / 6c：让两个新板块各出一条真实审计问题（见 injectNewBlockIssuesForDemo）
-  if (params.get('newBlockIssues') === '1') app.injectNewBlockIssuesForDemo();
-  if (params.get('export') === '1') app.openExportForDemo();
-  const syncUrl = params.get('syncUrl');
-  const syncToken = params.get('syncToken');
-  if (syncUrl && syncToken) {
-    void (async () => {
-      await app.connectForDemo(syncUrl, syncToken);
-      if (params.get('sync') === '1') app.openSyncForDemo();
-      // ?syncCard=card-xxxx 预选某张卡，便于截图展示版本历史
-      const preselect = params.get('syncCard');
-      if (preselect) app.preselectSyncCardForDemo(preselect);
-    })();
+  if (hasDebugParams(params)) {
+    const { applyDebugParams } = await import('./debug-params');
+    await applyDebugParams(app, params);
   }
 
   // 便于性能脚本与调试访问（只挂载在 window 上，不参与业务逻辑）
@@ -5955,23 +3737,3 @@ async function boot(): Promise<void> {
 
 void boot();
 
-/**
- * 从卡 JSON 里取 `extensions.tcs.cardId`，取不到返回**空串**。
- *
- * 为什么返回空串而不是 null：调用方（`decideFaceDrop`）把"空串"当作
- * "没有身份"处理，与 null 同义；而顶层用 string 能少一层 ?? 判断。
- *
- * 为什么不直接用卡模型的类型：`parsePngCard` 返回的是 `unknown`
- * （它刻意不做 schema 校验，见 `shared/src/png-card.ts`），这里只是
- * 取一个**标识**，不该为此跑一遍完整校验 —— 一个损坏的卡也要能读出
- * 它属于谁，否则用户就会在"这份文件坏了"之外再收到"不知道它是谁的"。
- */
-function readCardIdFromCardJson(json: unknown): string {
-  if (typeof json !== 'object' || json === null) return '';
-  const extensions = (json as { extensions?: unknown }).extensions;
-  if (typeof extensions !== 'object' || extensions === null) return '';
-  const tcs = (extensions as { tcs?: unknown }).tcs;
-  if (typeof tcs !== 'object' || tcs === null) return '';
-  const cardId = (tcs as { cardId?: unknown }).cardId;
-  return typeof cardId === 'string' ? cardId : '';
-}

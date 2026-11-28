@@ -9,6 +9,12 @@
  * 所以这里的调用失败不一定是 bug，可能只是当前用的是仓库令牌。
  */
 
+import {
+  createFetchTransport,
+  defaultTransport,
+  type HttpTransport,
+} from '../net/http-transport.ts';
+
 export interface RepoSummary {
   id: string;
   name: string;
@@ -69,7 +75,10 @@ export interface RepoClientConfig {
 
 export interface RepoRequestOptions {
   timeoutMs?: number;
+  /** 老测试注入点：给了它就按 fetch 语义发请求（不走原生通道） */
   fetchImpl?: typeof fetch;
+  /** 显式指定传输层（优先级最高） */
+  transport?: HttpTransport;
 }
 
 const DEFAULT_TIMEOUT_MS = 15000;
@@ -81,48 +90,64 @@ async function request(
   options: RepoRequestOptions = {},
 ): Promise<unknown> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const fetchImpl = options.fetchImpl ?? fetch;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  /*
+   * ★ 走**传输层**，不是裸 fetch（2026-11-24）。
+   *
+   * 原来是 `options.fetchImpl ?? fetch`。在桌面壳里 `fetch` 是 WebView 的，
+   * 它**无法配置证书校验**，于是自签证书服务端上出现：
+   *
+   * ```text
+   *   卡片同步正常（走的是 server_http_request 原生命令）
+   *   仓库面板报"无法连接服务端"（走的是这里的 fetch）
+   * ```
+   *
+   * 同一个服务端、同一套配置、两种结论 —— 用户没法理解，也没法自查。
+   * `server-sync.ts` 早在 2026-11-17 就改成走传输层了，这里漏了。
+   *
+   * 顺序与它保持一致：显式 transport > fetchImpl（老测试注入）> 按环境自动选。
+   */
+  const transport =
+    options.transport ??
+    (options.fetchImpl === undefined ? defaultTransport() : createFetchTransport(options.fetchImpl));
 
-  let response: Response;
-  try {
-    response = await fetchImpl(`${config.serverUrl.replace(/\/+$/, '')}${path}`, {
-      ...init,
-      signal: controller.signal,
-      headers: {
-        Accept: 'application/json',
-        ...(config.accessToken.trim() === '' ? {} : { Authorization: `Bearer ${config.accessToken.trim()}` }),
-        ...(init.headers ?? {}),
-      },
-    });
-  } catch (error) {
-    const aborted = error instanceof Error && error.name === 'AbortError';
-    /*
-     * ★ `{ cause: error }` 不可省（2026-11-04）。
-     *
-     * 原来这里把任何底层失败都压成一句「无法连接服务端」，
-     * **丢掉了可操作的信息**。真机实测的后果：
-     *
-     * ```text
-     *   自签证书失败 → 原生侧说"证书校验失败，确认风险后可继续"
-     *                → 这里改写成"无法连接服务端"
-     *                → 上层认不出是证书问题 ⇒ 那个确认框永远不弹
-     *                → 用户只看到"连不上"，不知道有出路
-     * ```
-     *
-     * 加 `cause` 保留原始错误链（标准 Error cause 机制），
-     * **对外文案与错误码完全不变** —— 只是让上层能"看穿"这一层。
-     */
-    const wrapped = new RepoClientError(
-      aborted ? 'TIMEOUT' : 'NETWORK',
-      aborted ? `请求超时（${timeoutMs} ms）` : '无法连接服务端',
-    );
-    (wrapped as Error & { cause?: unknown }).cause = error;
-    throw wrapped;
-  } finally {
-    clearTimeout(timer);
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    ...(config.accessToken.trim() === '' ? {} : { Authorization: `Bearer ${config.accessToken.trim()}` }),
+  };
+  const extra = init.headers;
+  if (extra !== undefined) {
+    for (const [key, value] of Object.entries(extra as Record<string, string>)) headers[key] = value;
   }
+
+  const outcome = await transport({
+    url: `${config.serverUrl.replace(/\/+$/, '')}${path}`,
+    method: typeof init.method === 'string' ? init.method : 'GET',
+    headers,
+    ...(typeof init.body === 'string' ? { body: init.body } : {}),
+    timeoutMs,
+  });
+
+  if (outcome.status === null) {
+    /*
+     * `{ cause }` 不可省（2026-11-04 的教训）：把底层原因带上，
+     * 否则上层认不出"这是证书问题"，那个"确认风险后继续"的出口永远不弹。
+     */
+    const code = outcome.errorKind === 'timeout' ? 'TIMEOUT' : 'NETWORK';
+    const wrapped = new RepoClientError(code, outcome.error ?? '无法连接服务端');
+    (wrapped as Error & { cause?: unknown }).cause = {
+      kind: outcome.errorKind,
+      message: outcome.error,
+    };
+    (wrapped as Error & { certUntrusted?: boolean }).certUntrusted = outcome.errorKind === 'cert';
+    throw wrapped;
+  }
+
+  // 造一个真的 Response 交回去：下面十几处 `response.json()` / `.ok` / `.status`
+  // 都不用动，行为与原来完全一致（与 server-sync.ts 同一手法）。
+  const response = new Response(outcome.text ?? '', {
+    status: outcome.status,
+    headers: outcome.contentType === '' ? {} : { 'Content-Type': outcome.contentType },
+  });
 
   let body: Record<string, unknown> | null = null;
   try {
@@ -199,6 +224,164 @@ export async function listRepos(
   const body = (await request(config, '/api/repos', { method: 'GET' }, options)) as Record<string, unknown>;
   const items = Array.isArray(body['items']) ? body['items'] : [];
   return items.map(toRepo);
+}
+
+/**
+ * 当前账户的 uid / username（2026-11-25）。
+ *
+ * 为什么走这里而不是 `auth-client`：这条要**带 accessToken 发到
+ * `/api/auth/me`**，而这个模块已经有"带令牌请求 + 超时 + 原生传输层"
+ * 的全套封装（自签证书服务端也能连）。auth-client 那套是登录前的
+ * 免鉴权请求，两边的传输选型不同。
+ */
+export async function fetchAccountIdentity(
+  config: RepoClientConfig,
+  options: RepoRequestOptions = {},
+): Promise<{ uid: string; username: string }> {
+  const body = (await request(config, '/api/auth/me', { method: 'GET' }, options)) as Record<string, unknown>;
+  const user = body['user'];
+  const row = typeof user === 'object' && user !== null ? (user as Record<string, unknown>) : {};
+  return {
+    uid: typeof row['uid'] === 'string' ? row['uid'] : '',
+    username: typeof row['username'] === 'string' ? row['username'] : '',
+  };
+}
+
+/**
+ * 改用户名（2026-11-25）。需要当前密码，uid 不变。
+ */
+export async function changeAccountUsername(
+  config: RepoClientConfig,
+  input: { currentPassword: string; newUsername: string },
+  options: RepoRequestOptions = {},
+): Promise<{ username: string; uid: string }> {
+  const body = (await request(
+    config,
+    '/api/account/username',
+    { method: 'POST', body: JSON.stringify(input) },
+    options,
+  )) as Record<string, unknown>;
+  return {
+    username: typeof body['username'] === 'string' ? body['username'] : '',
+    uid: typeof body['uid'] === 'string' ? body['uid'] : '',
+  };
+}
+
+/**
+ * 改密码（2026-11-25）。成功后该账户**所有设备**（含本机）都要重新登录。
+ *
+ * `revoked` 是服务端实际吊销的会话数 —— 界面据此说"已让 N 台设备退出"。
+ */
+export async function changeAccountPassword(
+  config: RepoClientConfig,
+  input: { currentPassword: string; newPassword: string },
+  options: RepoRequestOptions = {},
+): Promise<{ revoked: number }> {
+  const body = (await request(
+    config,
+    '/api/account/password',
+    { method: 'POST', body: JSON.stringify(input) },
+    options,
+  )) as Record<string, unknown>;
+  return { revoked: typeof body['revoked'] === 'number' ? body['revoked'] : 0 };
+}
+
+/**
+ * 一条登录会话（2026-11-26，桌面端的「登录设备」）。
+ *
+ * 字段和 `server/src/http/account-routes.ts` 的 DTO 对得上。`current` 由服务端判定
+ * （`row.id === caller.sessionId`），客户端不重算：自己算就得再存一份 sessionId，
+ * 两边判定不一致时界面会互相打脸。
+ */
+export interface AccountSession {
+  id: string;
+  createdAt: string;
+  lastSeenAt: string;
+  expiresAt: string;
+  ip: string;
+  userAgent: string;
+  current: boolean;
+}
+
+function toAccountSession(value: unknown): AccountSession | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const row = value as Record<string, unknown>;
+  const id = typeof row['id'] === 'string' ? row['id'] : '';
+  if (id === '') return null;
+  const text = (key: string): string => (typeof row[key] === 'string' ? row[key] : '');
+  return {
+    id,
+    createdAt: text('createdAt'),
+    lastSeenAt: text('lastSeenAt'),
+    expiresAt: text('expiresAt'),
+    ip: text('ip'),
+    userAgent: text('userAgent'),
+    current: row['current'] === true,
+  };
+}
+
+/**
+ * 当前账户仍然有效的登录会话（2026-11-26）。
+ *
+ * 只返回未吊销、未过期的。已吊销的留给审计事件，不在这里出现。
+ */
+export async function fetchAccountSessions(
+  config: RepoClientConfig,
+  options: RepoRequestOptions = {},
+): Promise<AccountSession[]> {
+  const body = (await request(config, '/api/account/sessions', { method: 'GET' }, options)) as Record<
+    string,
+    unknown
+  >;
+  const items = Array.isArray(body['items']) ? body['items'] : [];
+  const sessions: AccountSession[] = [];
+  for (const item of items) {
+    const session = toAccountSession(item);
+    if (session !== null) sessions.push(session);
+  }
+  return sessions;
+}
+
+/**
+ * 登出一台指定设备（2026-11-26）。只能踢自己的会话。
+ *
+ * 返回 `self === true` 表示踢的是当前这台，调用方应当回登录页，而不是刷新列表。
+ * 服务端对「不存在」和「不是你的」都回 404，这里也不区分：区分了就能拿它枚举别人的会话。
+ */
+export async function revokeAccountSession(
+  config: RepoClientConfig,
+  sessionId: string,
+  options: RepoRequestOptions = {},
+): Promise<{ id: string; revoked: boolean; self: boolean }> {
+  const body = (await request(
+    config,
+    `/api/account/sessions/${encodeURIComponent(sessionId)}`,
+    { method: 'DELETE' },
+    options,
+  )) as Record<string, unknown>;
+  return {
+    id: typeof body['id'] === 'string' ? body['id'] : sessionId,
+    revoked: body['revoked'] === true,
+    self: body['self'] === true,
+  };
+}
+
+/**
+ * 退出其它设备，当前会话保留（2026-11-26）。
+ *
+ * 顺手把自己也踢掉的话，用户会以为操作失败，所以服务端明确排除当前会话。
+ */
+export async function revokeOtherSessions(
+  config: RepoClientConfig,
+  options: RepoRequestOptions = {},
+): Promise<{ revoked: number }> {
+  const body = (await request(
+    config,
+    '/api/account/sessions/revoke-all',
+    { method: 'POST' },
+    options,
+  )) as Record<string, unknown>;
+  return { revoked: typeof body['revoked'] === 'number' ? body['revoked'] : 0 };
 }
 
 export async function createRepo(

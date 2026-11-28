@@ -38,6 +38,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 import {
   createStreamState,
@@ -49,7 +50,7 @@ const ROOT = join(import.meta.dirname, '..');
 const strip = (t) => t.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
 const read = (rel) => readFileSync(join(ROOT, rel), 'utf8');
 const apiPage = strip(readFileSync(join(ROOT, 'client/src/chat/api-page.ts'), 'utf8'));
-const shell = strip(readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8'));
+const shell = strip(readShellImpl());
 const panel = strip(readFileSync(join(ROOT, 'client/src/chat/chat-panel.ts'), 'utf8'));
 const css = readFileSync(join(ROOT, 'client/src/chat/chat.css'), 'utf8');
 
@@ -163,7 +164,7 @@ test('★★★ 派生采样不许被 App 侧那份覆盖', () => {
    * ST 设置，而它曾经拿 `apiState.maxTokens` 盖上去 —— 于是 ST 里改的值
    * 看不见效果。
    */
-  const at = shell.indexOf('private deriveSampling');
+  const at = shell.indexOf('function deriveSampling(host: SettingsHost');
   assert.ok(at > 0, 'deriveSampling 要存在');
   const body = shell.slice(at, at + 900);
   assert.doesNotMatch(body, /apiState/, '不该再读 apiState');

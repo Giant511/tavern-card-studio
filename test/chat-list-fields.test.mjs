@@ -18,6 +18,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 import {
   chatFileCount,
@@ -167,7 +168,7 @@ test('★★★★★ 列表页必须调 chatFileCount，不许自己 parseInt(l
 });
 
 test('★★★★★ findLatestChat 必须调 chatFileLastAt，不许自己判 typeof number', () => {
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('private async findLatestChat');
   assert.ok(at > 0, '找不到 findLatestChat');
   const end = src.indexOf('\n  private ', at + 10);
@@ -199,7 +200,7 @@ test('★★★★★ "找最近"要优先有内容的文件（空壳的 mtime �
    * 返回 0 —— 若直接 `count > 0` 过滤，会把**所有文件**排除 ⇒ 空白。
    * 所以只在"确实读到了条数字段"时才认为它是空文件。
    */
-  const SHELL = read('client/src/chat/shell.ts');
+  const SHELL = readShellImpl();
   const at = SHELL.indexOf('private async findLatestChat');
   const end = SHELL.indexOf('\n  private ', at + 10);
   const body = SHELL.slice(at, end < 0 ? SHELL.length : end);

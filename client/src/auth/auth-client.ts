@@ -190,6 +190,8 @@ function failure(status: number, body: Record<string, unknown> | null): AuthClie
   const display = message.trim() !== '' ? message : neutral;
 
   if (status === 401) return new AuthClientError('BAD_CREDENTIALS', display, status);
+  /* 423 Locked：账户被登录限速锁住。服务端文案里带了解锁等待时间，直接显示它。 */
+  if (status === 423) return new AuthClientError('RATE_LIMITED', display, status);
   if (status === 429) return new AuthClientError('RATE_LIMITED', display, status);
   if (status === 403) {
     return code === 'REGISTRATION_CLOSED'
@@ -285,6 +287,43 @@ async function tokenRequest(
     throw new AuthClientError('SERVER', '服务端返回的令牌不完整（缺少 access 或 refresh）', response.status);
   }
   return bundle;
+}
+
+/**
+ * 用「UID + 临时密码」重置密码（2026-11-25，运维兜底）。
+ *
+ * ## 为什么不用 `tokenRequest`
+ *
+ * 那个函数断言"必须拿到 access + refresh"，而这条**故意不发令牌** ——
+ * 临时密码只能换密码，不能换来会话。拿它去 `tokenRequest` 会一直报
+ * "令牌不完整"。
+ *
+ * ## 为什么单独一个错误文案
+ *
+ * 这里的失败原因（uid 错 / 码错 / 过期 / 用过）服务端刻意合并成一句 ——
+ * 防止拿它当 uid 枚举探针。客户端原样转述那句话即可，不要自己拆。
+ */
+export async function resetPasswordWithTicket(
+  serverUrl: string,
+  input: { uid: string; code: string; newPassword: string },
+  options: AuthRequestOptions = {},
+): Promise<{ username: string; revoked: number }> {
+  const response = await send(
+    serverUrl,
+    '/api/auth/reset-password',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    },
+    options,
+  );
+  if (!response.ok) throw failure(response.status, response.body);
+  const body = response.body ?? {};
+  return {
+    username: typeof body['username'] === 'string' ? body['username'] : '',
+    revoked: typeof body['revoked'] === 'number' ? body['revoked'] : 0,
+  };
 }
 
 export async function login(

@@ -114,6 +114,40 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
 .muted { color: var(--text-2); }
 .hint { color: var(--text-3); font-size: 12px; margin: 10px 0 0; }
 
+/* 勾选框（「记住此设备」）：与 .field 同左边距，视觉上属于同一组表单 */
+.check {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 12px; font-size: 12.5px; color: var(--text-2);
+  cursor: pointer; user-select: none;
+}
+.check input[type='checkbox'] {
+  width: 15px; height: 15px; margin: 0; accent-color: var(--accent, #2f6fed); cursor: pointer;
+}
+.check:hover { color: var(--text-1, inherit); }
+
+.scope-note { margin: 0 0 12px; font-size: 12px; }
+
+/* 卡片头里的搜索框（账户过滤）：与按钮同高，宽度按内容不撑满 */
+.card-head .input-small {
+  padding: 5px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text-1, inherit);
+  font-size: 12.5px;
+  width: 200px;
+  min-width: 120px;
+}
+.card-head .input-small:focus {
+  outline: none;
+  border-color: var(--accent-2);
+  box-shadow: 0 0 0 3px rgba(43, 138, 126, 0.12);
+}
+/* 去掉 type=search 的原生清除按钮：我们给了独立的「清空」，
+   两个同时出现会让人不知道点哪个 */
+.card-head .input-small::-webkit-search-cancel-button { display: none; }
+.scope-note strong { color: var(--text-1, inherit); }
+
 .pill {
   display: inline-flex;
   align-items: center;
@@ -136,7 +170,9 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
 
 /* ── 卡片与网格 ───────────────────────────────── */
 .grid { display: grid; gap: 16px; }
-.cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+/* 统计卡：自适应列数。6 张卡在窄屏下按 4 列会剩两格空着，
+   用 auto-fit 让它们自己排 —— 加一张卡不用回来改这里。 */
+.cards { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 .two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .card {

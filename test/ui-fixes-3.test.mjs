@@ -23,6 +23,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const read = (rel) => readFileSync(join(REPO, rel), 'utf8');
@@ -73,7 +74,7 @@ test('★★★ 不支持项的文案只许是「暂不支持」，不写原因'
 });
 
 test('★★★ 菜单里的空状态页也只说「暂不支持」', () => {
-  const shell = read('client/src/chat/shell.ts');
+  const shell = readShellImpl();
   /*
    * ★ 2026-11-04：世界书已经不是空状态了（变成真页面），
    * 只剩「用户 UI 设置」这一项。判据跟着收窄 —— 但要求没放松。
@@ -95,7 +96,7 @@ test('★★★ 世界书已经是真页面（不再走空状态）', () => {
    * 这条判据守的是"别把它退回空状态" —— 那种回退很容易发生：
    * 重构菜单时顺手把两个 groupId 又合并回同一个分支。
    */
-  const shell = read('client/src/chat/shell.ts');
+  const shell = readShellImpl();
   assert.match(
     shell,
     /if \(groupId === 'worldbook'\) \{\s*this\.renderWorldbookPage\(\);/,
@@ -147,9 +148,9 @@ test('★★★ 聊天设置里不再有指向 persona 的入口', async () => {
 });
 
 test('★★★ persona 的真实入口在「卡片」Tab', () => {
-  const shell = read('client/src/chat/shell.ts');
+  const shell = readShellImpl();
   assert.match(shell, /entryRole: 'persona-entry'/, '卡片 Tab 要有用户设定入口');
-  assert.match(shell, /this\.renderPersonaPage\(\)/, '要能打开真的管理页');
+  assert.match(shell, /this\.renderPersonaPageAction\(\)/, '要能打开真的管理页');
 });
 
 /* ═══════════════════════════════════════════════════════════

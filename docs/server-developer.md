@@ -4,7 +4,7 @@
 > 本文自包含：不依赖仓库里任何未上传的开发文档，照本文就能把请求跑通。
 > 运维命令（装服务、建账户、换令牌、看日志）见 [`server-cmd.md`](server-cmd.md)。
 >
-> 适用版本：**v0.1.7**。文中标注 `v0.1.x 新增` 的部分在老服务端上不存在，见 §9 兼容性。
+> 适用版本：**v0.2.3**。文中标注 `v0.1.x 新增` 的部分在老服务端上不存在，见 §9 兼容性。
 
 ---
 
@@ -61,7 +61,12 @@ curl -s http://127.0.0.1:8730/api/health
 }
 ```
 
-`/api/health` 是**唯一默认免鉴权**的路径（`auth.publicPaths` 可配）。用它做存活探测。
+`/api/health` 是 `auth.publicPaths` 里**唯一默认**的路径。改这个配置只影响额外放行；
+登录、注册、刷新、取策略、仓库令牌校验、临时密码重置这几个入口写死在
+`server/src/http/app.ts` 的豁免分支里，不受 `auth.publicPaths` 控制。
+它们要么是发放凭证的入口，要么用另一种凭证自证（refresh、仓库令牌、一次性临时码）。
+`GET /api/token` 同样写死，另加"来源必须是回环"。
+做存活探测用 `/api/health`，别拿登录接口当探针。
 
 > **Windows 上的一个坑**：PowerShell 5.1 里 `curl` 是 `Invoke-WebRequest` 的别名，参数不兼容。
 > 本文所有示例都是 curl 语法，在 PowerShell 里请写 **`curl.exe`**，不要写 `curl`。
@@ -74,7 +79,7 @@ curl -s http://127.0.0.1:8730/api/health
 
 | 凭证 | 形态 | 带身份吗 | 权限范围 | 生命周期 | 怎么拿 |
 |---|---|---|---|---|---|
-| **全局令牌**（legacy） | 随机串（base64url） | 否 | **仅未归属卡片**（`owner_id = ''`） | 长期，`token rotate` 轮换 | `POST /api/token`（仅回环）／面板／`tcs-server token show` |
+| **全局令牌**（legacy） | 随机串（base64url） | 否 | 卡片数据仅未归属卡片（`owner_id = ''`）；管理接口按管理员放行 | 长期，`token rotate` 轮换 | `GET /api/token`（仅回环）／面板／`tcs-server token show` |
 | **access token** | JWT HS256 | 是（账户） | 该账户**全部仓库** | 2 小时 | `POST /api/auth/login` |
 | **refresh token** | opaque 串 | 会话 | 仅用于换新 access | 30 天，每次使用轮换 | 同 login 响应 |
 | **仓库令牌** | `tcr_` + 43 字符 | 是（账户 + 单仓库） | `read` / `write` / `rollback` 三档 | 可设过期，可吊销 | `POST /api/repos/:id/tokens` |
@@ -105,7 +110,7 @@ X-API-Token: <token>
 写 CI / 脚本，只上传不说别的      → 仓库令牌（read + write）
 写只读的展示页 / 备份工具          → 仓库令牌（read）
 做完整的第三方编辑器              → 账户登录拿 access + refresh
-运维脚本、修数据、看全站           → 全局令牌（但注意它只看未归属卡片）
+运维脚本、修数据、调管理接口    → 全局令牌（卡片数据只覆盖未归属卡片）
 ```
 
 **仓库令牌不能管理仓库或令牌本身**（否则一把泄露就能自我续期，吊销失去意义）。
@@ -188,10 +193,16 @@ curl.exe -s -X POST http://127.0.0.1:8730/api/auth/login \
 | 状态 | code | 说明 |
 |---|---|---|
 | `400` | `BAD_REQUEST` | 缺 `username` / `password` |
-| `401` | `INVALID_CREDENTIALS` | **用户不存在、密码错、账户锁定中，三者返回同一句话** |
+| `401` | `INVALID_CREDENTIALS` | **用户不存在与密码错返回同一句话**（不区分，避免枚举账户） |
+| `423` | `ACCOUNT_LOCKED` | 连续失败 5 次后锁定 10 分钟；带 `Retry-After`，期间密码正确也拒绝 |
 | `429` | `TOO_MANY_REQUESTS` | 鉴权失败次数过多（见 §6.2） |
 
-`INVALID_CREDENTIALS` 刻意不区分三种原因：分开就等于把账户存在性与锁定状态广播出去。
+`INVALID_CREDENTIALS` 刻意不区分用户不存在与密码错：分开就等于把账户存在性广播出去。
+锁定单独报 `423`（用户要求分清"锁了"与"密码错"），代价是锁定状态可观测。
+
+请求体可选 `"reuseDevice": true`：同一 IP + 同一 User-Agent 重新登录时，
+先把该设备的旧会话标记为 `replaced`。管理面板在未勾「记住」时每次刷新都会重新登录，
+靠这个参数保证「登录设备」只有一行；桌面端与移动端不传，重复登录保留多会话。
 
 ### 3.3 续期
 
@@ -354,17 +365,101 @@ POST /api/account/delete           { "password": "…" }      → { "ok": true }
 注销**不物理删除数据**：账户与其卡片进入注销审计，可在保留期内追溯。
 管理员可以用 `GET /api/audit/account-purges?limit=50` 查这份审计。
 
+### 3.5c2 登录设备（会话）
+
+```http
+GET    /api/account/sessions               → { "items": [
+                                               { "id": "…", "createdAt": "…", "lastSeenAt": "…",
+                                                 "ip": "…", "userAgent": "…", "current": true } ] }
+DELETE /api/account/sessions/:id           → { "id": "…", "revoked": true, "self": false }
+POST   /api/account/sessions/revoke-all    { }  → { "revoked": 3 }
+```
+
+**只能操作自己的会话。** 踢别人的会话回 `404 NOT_FOUND`（与"不存在"同一个响应，
+避免拿会话 id 做存在性探针）。
+
+`revoke-all` 保留当前这一个会话 —— 用户点这个按钮的诉求是"把别处的登录踢掉"，
+把自己也踢掉会让他以为操作失败。想连自己也退，用 `POST /api/auth/logout`。
+
+被踢掉的会话**立即**失效：access token 与 refresh token 都不能再用
+（access 校验会查库，不是纯无状态 JWT）。
+
+### 3.5c3 改用户名 / 改密码 / 临时密码找回（2026-11-25）
+
+```http
+POST /api/account/username    { "currentPassword": "…", "newUsername": "…" }
+                              → { "ok": true, "username": "…", "uid": "usr_…" }
+
+POST /api/account/password    { "currentPassword": "…", "newPassword": "…" }
+                              → { "ok": true, "revoked": 2 }
+
+POST /api/auth/reset-password { "uid": "usr_…", "code": "ABCD2345EFGH", "newPassword": "…" }
+                              → { "username": "…", "revoked": 1 }     ← 免鉴权
+```
+
+**`uid` 终身不变，用户名可改。** 这是整个设计的前提：工单、审计、运维定位都以
+`uid` 为准；用户改了自己的名字，历史记录仍然对得上。客户端「账户」里那句
+"请好好保存 UID —— 紧急情况下需要 UID 才能找回账号"就是这个原因。
+
+三条硬规矩：
+
+```text
+① 改密码 → 吊销该账户**全部**会话（含发起这次请求的那台设备）
+   不吊销的话，攻击者手里的 refresh token 还能续期 —— 改密码等于白改
+② 改用户名 → **不**吊销会话
+   用户名只用于登录时查表，已有会话绑的是 user_id；踢掉等于"只改个名字就被登出"
+③ 临时密码 → 不能登录、不能续期、用一次即废、30 分钟过期
+   它不在 users.password_hash 里，/api/auth/login 那条路根本不看它
+```
+
+**临时密码的运维流程**（用户忘了用户名或密码时）：
+
+```text
+运维：面板「全站治理 → 账户」搜到该账户（可按用户名或 uid 过滤）
+      → 点「临时密码」→ 拿到 UID + 12 位码 → 告诉用户
+用户：登录界面 → 「忘记密码？」→ 填 UID + 临时密码 + 自己设的新密码
+      → 用新密码正常登录
+```
+
+`/api/auth/reset-password` **免鉴权**（调用方正是登不上的人），所以：
+
+- 失败原因（uid 不存在 / 码错 / 过期 / 用过）**合并成同一句**，防止拿它枚举 uid；
+- 有独立限速维度 `reset-ip`（**不与登录共用 IP 桶** —— 共用会让"同事登录失败"
+  把正在重置密码的人一起锁掉，而他本来就是忘了密码的那个）；
+- 已加入 TokenGate 的免鉴权白名单（`server/src/http/app.ts`）。
+
 ### 3.5d 管理员：查看与注销他人账户
 
 ```http
-GET    /api/accounts/:id/summary   → 该账户的卡片数 / 仓库数 / 字节数
-DELETE /api/accounts/:id           → 注销该账户（软删，进审计）
+GET    /api/accounts/:id/summary           → 该账户的卡片数 / 仓库数 / 字节数
+DELETE /api/accounts/:id                   → 注销该账户（软删，进审计）
+POST   /api/accounts/:id/revoke-sessions   → { "revoked": 2 } 强制该账户全部下线
+POST   /api/accounts/:id/unlock-login      → { "cleared": 7, "clearedAccount": 1, "clearedIps": 6 } 解除登录锁定
 ```
 
-两条都要求 `role: "admin"`，否则 `403 ADMIN_ONLY`。
+三条都要求 `role: "admin"`，否则 `403 ADMIN_ONLY`。
 
 **最后一个管理员不可被删除** —— 否则这个实例就再没人能管了。
 用全局令牌（`via: "legacy"`）调用时按管理员处理。
+
+**强制下线**用于账户被盗：改密码不够，攻击者手里的 refresh token 还能续期，
+只有吊销全部会话才能立刻断掉。这条不排除任何会话（管理员踢自己也会被登出）。
+
+**解除登录锁定**一次清账户维度与**全部** IP 记录。登录限速同时记 IP 与账户
+两个维度（`check()` 是"任一被锁即拒"），五次失败会把两个都锁上；只清账户时
+用户从固定出口 IP 重试仍被拒，表现就是"管理员点了解除，用户还是登不上"。
+`login_attempts` 里 IP 与账户名没有关联字段，无法只清"这个账户失败过的 IP"，
+所以按管理员动作全清，被误放的地址下次失败会重新记账。响应里的
+`clearedAccount` / `clearedIps` 分别给出两个维度清掉的条数。
+
+如果**完全没有可用会话**（管理员自己被锁、且唯一设备也被同一个 IP 挡住），
+在服务端机器上跑：
+
+```bash
+tcs-server user unlock <用户名>
+```
+
+它把账户与 IP 两个维度一起清。
 
 ### 3.5e 重载 TLS 证书
 
@@ -395,7 +490,7 @@ curl.exe -s http://127.0.0.1:8730/api/token
 | `409` | `TOKEN_NOT_CONFIGURED` | 服务端根本没配令牌（配置被绕过规范化构造） |
 
 > 这两条的历史值得知道：v0.1.2 之前只看 `socket.remoteAddress`，同机反向代理下它对**所有公网请求**
-> 都是 `127.0.0.1`，于是任何人 `curl https://你的域名/api/token` 就能拿到全权令牌。
+> 都是 `127.0.0.1`，于是任何人 `curl https://你的域名/api/token` 就能拿到管理级令牌。
 > 如果你的部署在反向代理后面，**必须**按 §7.2 登记代理地址。
 
 ---
@@ -1003,7 +1098,7 @@ worker 在**下一个请求**就按新策略判定。最后一个管理员不可
 | `UNKNOWN_PRESET` | 400 | `preset` 不存在 |
 | `REGISTRATION_REJECTED` | 400 | 注册失败（用户名占用 / 格式或密码不合规，共用） |
 | `UNAUTHORIZED` | 401 | 缺少或无效凭证 |
-| `INVALID_CREDENTIALS` | 401 | 登录失败（用户不存在 / 密码错 / 锁定中，**同形**） |
+| `INVALID_CREDENTIALS` | 401 | 登录失败（用户不存在 / 密码错，**同形**） |
 | `INVALID_REFRESH_TOKEN` | 401 | refresh 失效（不存在 / 已吊销 / 已过期，同形） |
 | `FORBIDDEN` | 403 | 凭证范围不够 |
 | `ADMIN_ONLY` | 403 | 该操作仅管理员 |
@@ -1011,6 +1106,7 @@ worker 在**下一个请求**就按新策略判定。最后一个管理员不可
 | `REGISTRATION_CLOSED` | 403 | 服务端关闭了自助注册 |
 | `TOKEN_LOCAL_ONLY` | 403 | 取令牌接口的来源不是回环 |
 | `NOT_FOUND` | 404 | 不存在**或不属于你**（同形） |
+| `ACCOUNT_LOCKED` | 423 | 登录被锁定（`details.retryAfterSeconds`，响应带 `Retry-After`） |
 | `FACE_NOT_FOUND` | 404 | 卡存在但**没有封面**（正常状态，走默认封面兜底） |
 | `NOT_EMPTY` | 409 | 目标非空（删仓库没给 `transferTo`） |
 | `CARD_DELETED` | 409 | 该 ID 被一张软删的卡占着 |
@@ -1037,9 +1133,19 @@ worker 在**下一个请求**就按新策略判定。最后一个管理员不可
   （"每天错一次"的正常用户永远不会被锁）；
 - **锁定期间的失败不会延长锁定**。否则攻击者可以用持续尝试把别人的锁无限续期，
   变成针对合法用户的拒绝服务；
-- 锁定期间仍然会做一次**完整的密码哈希**，所以响应耗时不泄露"你已经触发锁定了"；
+- 锁定期间仍然会做一次**完整的密码哈希**：响应耗时与密码错同量级，不能靠"哪个快"
+  猜锁没锁。锁状态本身是明示的 —— 就是下面的 423；
 - 锁状态**落库**，重启不清（重启恰好是攻击者最想要的效果）；
-- 管理员着急可以手工解锁（`tcs-server` 的运维命令，见 `server-cmd.md`）。
+- 管理员着急可以手工解锁，两条路：
+  - **有可用会话时**：`POST /api/accounts/:id/unlock-login`（管理员 JWT，空 body）。
+    一次清掉账户维度与全部 IP 记录，与 CLI 同口径；响应给
+    `cleared` / `clearedAccount` / `clearedIps`。
+  - **完全没有可用会话时**（管理员自己被锁、且唯一设备也被同一个 IP 挡住）：
+    在服务端机器上跑 `tcs-server user unlock <用户名>`，同样是两个维度一起清。
+
+锁定期间登录返回 `423 ACCOUNT_LOCKED`，文案写明"账号已锁定，请 N 分钟后再试"，
+并带 `details.retryAfterSeconds` 与 `Retry-After` 头。这样用户能分清是密码错
+还是锁了；代价是锁定状态对外可观测（但足以拿到这个响应的人本来就在尝试登录）。
 
 **② 鉴权失败（IP 维度）**，同一 IP **5 分钟内 20 次无效凭证 → 阻断 5 分钟**，返回 `429`：
 
@@ -1107,7 +1213,7 @@ openssl s_client -connect 127.0.0.1:8443 -servername localhost < /dev/null 2>/de
 
 **为什么必须显式配**：服务端所有"按来源 IP 判定"的逻辑（`/api/token` 回环门禁、登录限速）
 都建立在 `socket.remoteAddress` 上。同机反代下，公网请求在业务侧看到的对端是**代理自己**
-（`127.0.0.1`），于是"只允许本机"对**所有公网请求**成立。任何人 curl 一下就能拿到全权令牌。
+（`127.0.0.1`），于是"只允许本机"对**所有公网请求**成立。任何人 curl 一下就能拿到管理级令牌。
 
 三条判定规则：
 
@@ -1256,6 +1362,15 @@ secondary_keys: 林晚照
 ---
 
 ## 9. 版本与兼容性
+
+### 9.0 v0.2.x 增补
+
+- 登录锁定与密码错分开：锁定返回 `423 ACCOUNT_LOCKED` + `Retry-After`（§3.2）。
+- 账户会话：`GET /api/account/sessions`、撤销单台/其它设备、管理员强制下线。
+- 忘记密码：临时密码（30 分钟、一次性）+ `POST /api/auth/reset-password`。
+- `POST /api/auth/login` 支持 `reuseDevice`，管理面板用它避免同一浏览器堆会话。
+
+这些端点都在 §5 的路由表里，参数见对应小节。
 
 ### 9.1 v0.1.1 → v0.1.2 变更点
 

@@ -29,6 +29,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { chatFingerprint, makeChatFileName, shouldSaveChat } from '@tcs/shared';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 
@@ -196,7 +197,7 @@ test('★★★ 面板必须在两个点通知外壳（否则快照与落库都�
 });
 
 test('★★★ 外壳必须真的接上，并且真的调用 saveChat', () => {
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  const shell = readShellImpl();
 
   assert.match(shell, /onChatChanged: \(messages\) => this\.handleChatChanged\(messages\)/, '要接线');
 
@@ -242,7 +243,7 @@ test('★★★ 保存并发时不许丢掉后一次（要排队，不是丢弃�
    * （这个 jsonl 最后一行没有结尾换行），实际一条都没丢。
    * 留着的理由是：丢弃并发保存的假设本身不成立，而排队的代价很小。
    */
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  const shell = readShellImpl();
   const at = shell.indexOf('private async persistChat');
   assert.ok(at > 0, '找不到 persistChat');
   const fn = shell.slice(at, at + 2600);
@@ -262,8 +263,19 @@ test('★★★ 保存并发时不许丢掉后一次（要排队，不是丢弃�
 });
 
 test('★ 保存失败不许打断对话（只提示，不抛）', () => {
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
-  const fn = shell.slice(shell.indexOf('private async persistChat'));
+  const shell = readShellImplNoComments();
+  const at = shell.indexOf('private async persistChat');
+  assert.ok(at > 0, '找不到 persistChat');
+
+  /*
+   * ★ 切片要收在方法体内（2026-11-24）。
+   *
+   * 原来写成 `shell.slice(at)` —— 一直切到文件尾。后面任何一个方法里有
+   * `throw error` 都会让 `doesNotMatch` 命中，报「不许把异常抛给调用方」，
+   * 而 persistChat 自己没问题。类里方法顺序一变就假红。
+   */
+  const end = shell.indexOf('\n  private ', at + 10);
+  const fn = shell.slice(at, end < 0 ? undefined : end);
 
   assert.match(fn, /catch \(error\)/, '要有 catch');
   assert.match(fn, /onNotify\?\.\(/, '失败要留痕迹');
@@ -298,7 +310,7 @@ test('★★★★★ 文件名只在没有时生成一次，且必须真的"该
    *   ② !shouldStartNewChatFile()  ⇒ 没有用户消息，不建
    * ```
    */
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  const shell = readShellImpl();
 
   /* 只有 null 时才可能建（这条保证"复用而非每次新造"） */
   assert.match(shell, /if \(this\.chatFileName === null && avatar !== null\) \{/, '只在 null 时考虑生成');
@@ -340,7 +352,7 @@ test('★★★ `onPickChat` 不许再硬编码返回 null（否则永远读不�
    *
    * 这比"数据丢了"更让人困惑：数据在磁盘上，用户却看不到。
    */
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  const shell = readShellImpl();
 
   assert.doesNotMatch(
     shell,
@@ -417,7 +429,7 @@ test('★★ 取最近一份历史必须用 `file_id`（无扩展名），不是
    * 而 `file_name` 在返回的 JSON 里**总是存在**（带扩展名），
    * 所以"随手取 file_name"是个很容易犯、且后果延迟的错。
    */
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  const shell = readShellImpl();
   const fn = shell.slice(
     shell.indexOf('private async findLatestChat'),
     shell.indexOf('private handleChatChanged'),
@@ -428,7 +440,7 @@ test('★★ 取最近一份历史必须用 `file_id`（无扩展名），不是
 });
 
 test('★ 按 last_mes 选最近的一份（不依赖服务端返回顺序）', () => {
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  const shell = readShellImpl();
   const fn = shell.slice(
     shell.indexOf('private async findLatestChat'),
     shell.indexOf('private handleChatChanged'),
@@ -438,7 +450,7 @@ test('★ 按 last_mes 选最近的一份（不依赖服务端返回顺序）', 
 });
 
 test('★ 读列表失败时返回 null（不卡界面、不弹错）', () => {
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  const shell = readShellImpl();
   const fn = shell.slice(
     shell.indexOf('private async findLatestChat'),
     shell.indexOf('private handleChatChanged'),
@@ -466,11 +478,26 @@ test('★★★ 会话身份必须落盘（否则切到别的 App 回来就空�
    *
    * 只靠内存变量修不了这一类，必须落盘。
    */
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  /*
+   * ★ 2026-11-24：`savedSession` / `onPersistSession` 是 `ShellOptions` 的字段，
+   *   而 `ShellOptions` 搬到了 `shell-contract.ts`（报告 P2-1 的第一刀）。
+   *   所以这里同时读契约文件与实现文件：
+   *
+   * ```text
+   *   字段在契约面   shell-contract.ts    ← 本次搬家后
+   *   落盘调用在实现 shell.ts / main.ts
+   * ```
+   *
+   * 两处都不能少：只读契约面会漏掉"字段声明了但没人调 onPersistSession"，
+   * 只读实现会连字段存在与否都判不了。
+   */
+  const shell = readShellImpl();
+  const contract = readFileSync(join(ROOT, 'client/src/chat/shell-contract.ts'), 'utf8');
   const main = readFileSync(join(ROOT, 'client/src/mobile/main.ts'), 'utf8');
 
-  assert.match(shell, /savedSession\?:/, '外壳要能接收上次的会话');
-  assert.match(shell, /onPersistSession\?:/, '外壳要能通知落盘');
+  assert.match(contract, /savedSession\?:/, '外壳要能接收上次的会话（ShellOptions 字段）');
+  assert.match(contract, /onPersistSession\?:/, '外壳要能通知落盘（ShellOptions 字段）');
+  assert.match(shell, /onPersistSession/, '实现里要用上那个回调 —— 只声明不调用等于没落盘');
   assert.match(main, /LS_CHAT_SESSION/, '要有存储 key');
 
   /*
@@ -506,7 +533,7 @@ test('★★ 构造函数要恢复会话身份（同步、不发请求）', () =
    * 合在一起做的后果：构造函数里发请求时 ST 引擎可能还没起，
    * 必然失败，而且失败后没有任何重试机会 —— 用户看到的永远是空聊天。
    */
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  const shell = readShellImpl();
   const ctorStart = shell.indexOf('constructor(options: ShellOptions)');
   /*
    * ★ 边界必须是 `mount(container: ElLike)` 这个**签名**，不能是 `mount(`。
@@ -531,7 +558,7 @@ test('★★ 恢复内容必须在 mount 之后（此时页面骨架才就位）
    * `restoreLatestChat` 仍然在 `switchTab` 之后。
    * 判据钉的是"顺序"，不是"多少字符之内"。
    */
-  const shell = stripComments(readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8'));
+  const shell = readShellImplNoComments();
   const mount = shell.slice(shell.indexOf('mount(container: ElLike)'), shell.indexOf('switchTab(id: TabId)'));
   assert.match(
     mount,
@@ -559,7 +586,7 @@ test('★★★ 恢复时优先用记下来的文件，不是"重新找最新的
    * 差别在用户行为上：他在聊天 A 里聊到一半切走了，回来应该回到 A，
    * 而不是跳到 A 之后新建的 B。只有没有记录（首次选角色）时才找最新的。
    */
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  const shell = readShellImpl();
   const fn = shell.slice(
     shell.indexOf('private async restoreLatestChat'),
     shell.indexOf('private persistSession'),
@@ -578,7 +605,7 @@ test('★ 换角色时要清掉旧的会话残留（文件名/快照/指纹）',
    *   restoreLatestChat 之后"的注释，那里面就含函数名。
    *   不剥的话 `indexOf` 命中注释，`head` 只到注释中间，断言必然红。
    */
-  const shell = stripComments(readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8'));
+  const shell = readShellImplNoComments();
   const onPick = shell.slice(shell.indexOf('onPick: (character: CharacterSummary)'));
   const head = onPick.slice(0, onPick.indexOf('restoreLatestChat'));
 
@@ -607,7 +634,7 @@ test('★★★ `restoreLatestChat` 设好 fileName 后必须再落一次盘', (
    * 修法：`restoreLatestChat` 在 `this.chatFileName = latest` 之后
    * 自己再 `persistSession()` 一次。
    */
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  const shell = readShellImpl();
   const fn = shell.slice(
     shell.indexOf('private async restoreLatestChat'),
     shell.indexOf('private persistSession'),
@@ -625,7 +652,7 @@ test('★★★ 重载后恢复不能要求 `chatFileName` 非空', () => {
    * 老版本存下的会话、或上面那个竞态，`fileName` 会是 null 但角色是确定的。
    * 那种情况应该"按这个角色找最近一份"，而不是当作"什么都没选"跳过。
    */
-  const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8');
+  const shell = readShellImpl();
   const mount = shell.slice(
     shell.indexOf('mount(container: ElLike)'),
     shell.indexOf('switchTab(id: TabId)'),

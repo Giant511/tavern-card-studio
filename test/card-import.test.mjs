@@ -22,6 +22,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { planCardImport, sanitizeAvatarBase } from '../shared/dist/repo/card-import.js';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const v2 = (name) => JSON.stringify({ spec: 'chara_card_v2', name, description: 'd' });
 const v3 = (name) => JSON.stringify({ spec: 'chara_card_v3', data: { name, description: 'd' } });
@@ -180,7 +181,7 @@ test('★★★ 导入必须走「允许新建」，否则新卡写不进去', a
    * 所以导入这条路径必须显式传 `allowCreate = true`。
    */
   const { readFileSync } = await import('node:fs');
-  const shell = readFileSync(new URL('../client/src/chat/shell.ts', import.meta.url), 'utf8');
+  const shell = readShellImpl();
   /*
    * ★ 2026-11-06：实现从 `onImportVersion` 回调**提成了方法**
    *   （`importRepoVersion`）—— 因为三级页面（卡片历史）也要调它，
@@ -206,7 +207,7 @@ test('★★★ 导入必须走「允许新建」，否则新卡写不进去', a
    * 结论：窗口大小一定会随代码增长而失效。改成"取整个函数体"，
    * 到下一个同缩进的 `private ` 或文件尾为止。
    */
-  const at = shell.indexOf('private async writeCardToLibrary(');
+  const at = shell.indexOf('function writeCardToLibrary(host: CardHost');
   assert.ok(at > 0, '找不到 writeCardToLibrary 方法');
   const nextPrivate = shell.indexOf('\n  private ', at + 10);
   const block = shell.slice(at, nextPrivate < 0 ? shell.length : nextPrivate);

@@ -19,6 +19,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { buildOpeningMessages } from '@tcs/shared';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 import {
   emptyGreetingDraft,
   emptyGreetingPageState,
@@ -348,10 +349,7 @@ test('★★★ 页面里要写出「怎么才算合规」的示例（对齐 ST 
    ③ 外壳接线（防"写了函数没调用"）
    ═══════════════════════════════════════════════════════════ */
 
-const shellSrc = readFileSync(
-  new URL('../client/src/chat/shell.ts', import.meta.url),
-  'utf8',
-);
+const shellSrc = readShellImpl();
 
 test('★★★ 卡片栏要有「开场与示例」入口，且真的渲染那一页', () => {
   assert.match(shellSrc, /entryRole: 'greeting-entry'/, '卡片栏要有入口');
@@ -370,10 +368,11 @@ test('★★★ 交互式重绘必须先清空 pageHost（否则每打一个字�
    * 这条缺陷单测抓不到（单测直接调渲染函数、没有 pageHost），
    * 所以只能静态钉住"渲染方法自己清"。
    */
-  const fn = shellSrc.slice(
-    shellSrc.indexOf('private renderGreeting(): void {'),
-    shellSrc.indexOf('private greetingChangeFlag'),
-  );
+  // 切片终点改为「下一个 export」（2026-11-24 搬家后：字段留壳，函数搬走了）
+  const fnStart = shellSrc.indexOf('function renderGreeting(host: GreetingHost): void {');
+  assert.ok(fnStart >= 0, '找不到 renderGreeting');
+  const fnEnd = shellSrc.indexOf('\nexport ', fnStart + 10);
+  const fn = shellSrc.slice(fnStart, fnEnd < 0 ? undefined : fnEnd);
   assert.ok(fn.includes('pageHost.replaceChildren()'), 'renderGreeting 里要先清空 pageHost');
 });
 
@@ -397,7 +396,7 @@ test('★★★ 选角色后要真的把卡读进 loadedCard（否则开场白�
    * 移动端入口一直传 `card: {}`，于是 `ctx.card` 里没有 `first_mes` ——
    * `buildOpeningMessages` 永远返回空数组，开场白插了个寂寞。
    */
-  assert.match(shellSrc, /private async loadCharacterCard\(/, '要有读卡的方法');
+  assert.match(shellSrc, /function loadCharacterCard\(host: CardHost/, '要有读卡的方法');
   /*
    * ★ 守性质：选角色后要读卡。不守写法（2026-11-11）。
    *

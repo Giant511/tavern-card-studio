@@ -33,7 +33,24 @@ export const DEFAULT_RATE_LIMIT: RateLimitPolicy = {
   windowMs: 15 * 60 * 1000,
 };
 
-export type LimitKind = 'ip' | 'account';
+/**
+ * 限速维度。
+ *
+ * `reset-ip` 是 2026-11-25 新增的第三类：临时密码重置（免鉴权端点）。
+ *
+ * ## 为什么不复用 `ip`
+ *
+ * 复用过一次，真机验证时立刻暴露两个问题：
+ *
+ *   1. **互相污染**：同事在同一出口 IP 上登录失败几次，正在重置密码的人
+ *      就被一起锁了 —— 而他本来就是"忘了密码"的那个，这下彻底进不去。
+ *   2. **失败计数被稀释**：登录失败与猜码失败混在一个桶里，两类攻击
+ *      都会更快打满阈值，正常用户被误伤的概率高得多。
+ *
+ * 独立一类之后：爆破登录不影响重置，爆破重置不影响登录，各自 5 次阈值。
+ * 表主键是 `(kind, key)`，`kind` 本来就是 TEXT，不需要迁移。
+ */
+export type LimitKind = 'ip' | 'account' | 'reset-ip';
 
 export interface LockState {
   locked: boolean;
@@ -157,11 +174,35 @@ export class LoginLimiter {
     if (keys.account) statement.run('account', keys.account);
   }
 
+  /**
+   * 清掉单个维度的记录（`reset-ip` 这类自成一套的用途）。
+   *
+   * 与 `clear` 的差别：那个固定清 ip + account 两行（登录语义），
+   * 而这个只动指定的那一行 —— 重置密码成功时**不该**顺手把登录的
+   * 失败计数也清了（那会让"爆破登录 + 成功重置"变成绕过限速的组合）。
+   */
+  clearKind(kind: LimitKind, key: string): void {
+    this.handle.prepare('DELETE FROM login_attempts WHERE kind = ? AND key = ?').run(kind, key);
+  }
+
   /** 手工解锁（运维用：用户被锁但等不及） */
   unlock(kind: LimitKind | 'all', key: string): number {
     if (kind === 'all') {
       return this.handle.prepare('DELETE FROM login_attempts WHERE key = ?').run(key).changes;
     }
     return this.handle.prepare('DELETE FROM login_attempts WHERE kind = ? AND key = ?').run(kind, key).changes;
+  }
+
+  /**
+   * 清掉某一维度的全部记录。
+   *
+   * 管理员点「解除锁定」时，IP 维度也走这里，和 CLI 同口径。IP 记录与账户名
+   * 之间没有关联字段，只能全清；这是管理员动作，普通用户碰不到。
+   *
+   * 踩过的坑：面板只清 account 维度时，同一出口 IP 仍被锁着，用户重试还是登不上，
+   * 表现就是「点了解除锁定没反应」。
+   */
+  unlockAllOfKind(kind: LimitKind): number {
+    return this.handle.prepare('DELETE FROM login_attempts WHERE kind = ?').run(kind).changes;
   }
 }

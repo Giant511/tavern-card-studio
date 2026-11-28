@@ -17,9 +17,15 @@
  */
 
 import { existsSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { join } from 'node:path';
 
 import { isLoopbackHost } from '../config.js';
+/*
+ * 路径口径搬到 `paths.ts`（2026-11-24）：运行时也要用同一个函数。
+ * 这里重新导出，保持既有 import（`supervisor.ts`）不变。
+ */
+import { resolveTlsPath } from './paths.js';
+export { resolveTlsPath };
 import {
   inspectCertificate,
   validateCustomCertificate,
@@ -28,12 +34,6 @@ import {
 import type { TlsMode } from './server.js';
 
 /** 相对路径按数据目录解析（与 `prepareTlsMaterial` 的口径一致） */
-export function resolveTlsPath(dataDir: string, path: string): string {
-  const trimmed = path.trim();
-  if (trimmed === '') return '';
-  return isAbsolute(trimmed) ? trimmed : join(dataDir, trimmed);
-}
-
 export type CheckLevel = 'ok' | 'warn' | 'bad';
 
 export interface TlsInputCheck {

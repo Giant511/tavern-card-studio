@@ -48,6 +48,13 @@ export interface ExportDialogCallbacks {
     preset: TxtPreset | null;
     /** 初始场景预设的分隔格式（v0.1.3 追加项一）；缺省 = 冻结默认 */
     greetingFormat?: GreetingFormatParams;
+    /**
+     * 对话示例预设的格式（2026-11-24 补）。
+     *
+     * 漏传的后果：导出/另存为/推 ST 的 JSON 里 `mes_example` 与上传到服务端的
+     * 那份排版不同 —— 同一张卡从不同出口出去长得不一样。**必传**。
+     */
+    chatExamplesFormat?: GreetingFormatParams;
     /** 世界书格式（v0.1.5 / G4）：闸门重解析必须与编辑器同一份口径，否则会误判 */
     worldbookFormat?: WorldbookFormatParams;
   };
@@ -390,6 +397,7 @@ export class ExportDialog {
         this.pendingFormat,
         state.greetingFormat,
         faceBytes,
+        state.chatExamplesFormat,
       );
 
       if (!isShellAvailable()) {

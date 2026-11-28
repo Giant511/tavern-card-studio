@@ -3401,6 +3401,25 @@ export class ChatPanel {
     this.memoryPage?.close();
     this.memoryPage = null;
     this.bridge.dispose();
+    /*
+     * ★★★ 在途生成必须**先中断**，再丢引用（2026-11-24）。
+     *
+     * 原来这里只有 `this.handle = null` —— 只是丢掉句柄，
+     * Rust 侧的流还在跑：上游继续生成、继续计费，而这里已经没有接收方，
+     * 于是这段回复既不进气泡也不落盘。用户切回来只看到"我发的问题没了答案"，
+     * 账单上却多了一次请求。
+     *
+     * 顺序：`abort()` 在 `handle = null` **之前**。abort 是 async，
+     * dispose 是同步的，所以不 await —— 面板马上销毁，等它没有意义；
+     * Rust 侧收到取消标志就会断连。
+     *
+     * 只在真的在生成时调：空闲时 abort 也会多发一条命令。
+     */
+    if (this.stream.phase === 'streaming' && this.handle !== null) {
+      void this.handle.abort().catch(() => {
+        /* 面板正在销毁，失败也无处可报；Rust 侧同样会因连接关闭而收尾 */
+      });
+    }
     this.handle = null;
     /*
      * ★★★ 必须**先 dispose 面板**再丢引用（2026-11-01 发布阻断级修复）。

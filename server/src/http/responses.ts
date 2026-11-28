@@ -42,7 +42,7 @@ export function sendError(res: ServerResponse, error: unknown): void {
 
 function errorHeaders(error: AppError): Record<string, string> {
   if (error.status === 401) return { 'WWW-Authenticate': 'Bearer realm="tavern-card-studio"' };
-  if (error.status === 429) {
+  if (error.status === 429 || error.status === 423) {
     const retry = (error.details as { retryAfterSeconds?: number } | undefined)?.retryAfterSeconds;
     return retry ? { 'Retry-After': String(retry) } : {};
   }

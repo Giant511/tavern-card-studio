@@ -41,11 +41,12 @@ import {
 } from '../shared/dist/chat/persona.js';
 import { assembleWithPrompts } from '../shared/dist/chat/prompt-assemble.js';
 import { parsePromptConfig } from '../shared/dist/chat/prompt-config.js';
+import { readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
 
-const shellSrc = () => readFileSync(join(CHAT_DIR, 'shell.ts'), 'utf8');
+const shellSrc = () => readShellImplNoComments();
 const pageSrc = () => readFileSync(join(CHAT_DIR, 'persona-page.ts'), 'utf8');
 
 /* ═══════════════════════════════════════════════════════════
@@ -297,7 +298,7 @@ test('★★★ 页面存在且带关键控件', () => {
 
 test('★★★ 外壳把 persona 推给聊天面板（不推就是"改了没生效"）', () => {
   const shell = shellSrc();
-  assert.match(shell, /private syncPersonaToChat/, '要有同步方法');
+  assert.match(shell, /function syncPersonaToChat\(host: PersonaHost\)/, '要有同步方法');
   assert.match(shell, /persona: this\.personaContext\(\)/, '创面板的 ctx 里要带 persona');
   assert.match(shell, /userName: this\.currentUserName\(\)/, 'userName 要用当前人设');
 });

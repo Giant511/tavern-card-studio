@@ -25,6 +25,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { revealFocusedInput, FOCUS_SCROLL_MARGIN } from '../client/src/chat/focus-scroll.ts';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
 
@@ -41,7 +42,7 @@ function stripComments(source) {
     .replace(/\n{3,}/g, '\n\n');
 }
 
-const shellSrc = stripComments(read('client/src/chat/shell.ts'));
+const shellSrc = readShellImplNoComments();
 const greetingSrc = stripComments(read('client/src/chat/greeting-page.ts'));
 const panelSrc = stripComments(read('client/src/chat/chat-panel.ts'));
 const cssSrc = read('client/src/chat/chat.css');
@@ -68,7 +69,7 @@ test('★★★★★ 保存后的通知必须在**重绘之后**发（否则被
    * 成功通知那一句。用行首锚点定位，避免命中注释
    * （已经剥过一遍注释，这里再加行首约束）。
    */
-  const at = shellSrc.indexOf('private async saveGreeting');
+  const at = shellSrc.indexOf('function saveGreeting(host: GreetingHost');
   assert.ok(at > 0, '找不到 saveGreeting');
   const body = shellSrc.slice(at, at + 6000);
 
@@ -90,7 +91,7 @@ test('★★★★★ 保存后的通知必须在**重绘之后**发（否则被
    *
    * 要钉的是"**最后一次**重绘在通知之前"，取全部匹配再拿最后一个。
    */
-  const redraws = [...body.matchAll(/^ {4}this\.renderGreeting\(\);$/gm)].map((m) => m.index ?? -1);
+  const redraws = [...body.matchAll(/^ {2}(?:this\.)?renderGreeting\(/gm)].map((m) => m.index ?? -1);
   const notify = body.search(/this\.options\.onNotify\?\.\('已保存到卡片'/);
 
   assert.ok(redraws.length >= 2, `saveGreeting 里应该有两处重绘，实际 ${String(redraws.length)}`);
@@ -127,7 +128,7 @@ test('★★★★ 保存成功要清掉上一轮的错误（否则永远不会�
    *
    * 两个后果叠在一起，表现又回到"保存了没反应"。
    */
-  const at = shellSrc.indexOf('private async saveGreeting');
+  const at = shellSrc.indexOf('function saveGreeting(host: GreetingHost');
   const body = shellSrc.slice(at, at + 4000);
   const success = body.indexOf('baseline: greetingFingerprint(fresh)');
   assert.ok(success > 0, '找不到成功分支');
@@ -375,7 +376,7 @@ test('★★★★★ 可选人设必须来自 personasForCharacter（不许自�
    * 那是"这个角色能用哪几套"的唯一判定（绑定关系 + 全局多绑定开关）。
    * 这里再过滤一遍必然分叉，表现为"管理页能看见、聊天页切不到"。
    */
-  const at = shellSrc.indexOf('private openPersonaSwitcher');
+  const at = shellSrc.indexOf('function openPersonaSwitcher(host: PersonaHost');
   assert.ok(at > 0, '找不到 openPersonaSwitcher');
   const body = shellSrc.slice(at, at + 2500);
   assert.match(body, /personasForCharacter\(this\.personaState/, '必须复用那个判定');
@@ -386,7 +387,7 @@ test('★★★★★ 可选人设必须来自 personasForCharacter（不许自�
 });
 
 test('★★★★ 切换人设不跳页（聊天不该被打断）', () => {
-  const at = shellSrc.indexOf('private openPersonaSwitcher');
+  const at = shellSrc.indexOf('function openPersonaSwitcher(host: PersonaHost');
   const body = shellSrc.slice(at, at + 2500);
   assert.ok(!/this\.renderPage\(\)/.test(body), '切人设不许 renderPage（会重建面板、断掉正在流的内容）');
   assert.match(body, /syncPersonaToChat/, '要推送新上下文');
@@ -397,7 +398,7 @@ test('★★★★ 切换后顶栏胶囊要跟着改名', () => {
    * `setContext` 只更新了 `userName`，胶囊文字是渲染期写死的 ——
    * 不显式刷一次，用户会看到"切了但名字没变"，那是"改了不生效"。
    */
-  const at = shellSrc.indexOf('private syncPersonaToChat');
+  const at = shellSrc.indexOf('function syncPersonaToChat(host: PersonaHost)');
   const body = shellSrc.slice(at, at + 900);
   assert.match(body, /personaLabel/, 'setContext 要带 personaLabel');
   assert.match(body, /syncPersonaChip/, '还要显式刷新胶囊文字');

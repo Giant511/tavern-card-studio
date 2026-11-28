@@ -35,6 +35,7 @@ import {
   writeField,
 } from '../shared/dist/chat/settings-schema.js';
 import { parseChatFileRows } from '../client/src/chat/chat-actions-page.ts';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const rawCss = readFileSync(join(ROOT, 'client/src/chat/chat.css'), 'utf8');
@@ -43,7 +44,7 @@ const tokensCss = readFileSync(join(ROOT, 'client/src/chat/nebula-tokens.css'), 
 const page = readFileSync(join(ROOT, 'client/src/chat/chat-actions-page.ts'), 'utf8')
   .replace(/\/\*[\s\S]*?\*\//g, '')
   .replace(/\/\/[^\n]*/g, '');
-const shell = readFileSync(join(ROOT, 'client/src/chat/shell.ts'), 'utf8')
+const shell = readShellImpl()
   .replace(/\/\*[\s\S]*?\*\//g, '')
   .replace(/\/\/[^\n]*/g, '');
 const panel = readFileSync(join(ROOT, 'client/src/chat/chat-panel.ts'), 'utf8')

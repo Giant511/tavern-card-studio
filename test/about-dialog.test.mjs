@@ -22,6 +22,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 import {
   androidAbout,
@@ -175,7 +176,7 @@ test('★★★ 桌面「关于」入口是蓝字、无背景、无边框', () =
    ═══════════════════════════════════════════════════════════ */
 
 test('★★★ 安卓「我的」页有关于入口，且用 androidAbout', () => {
-  const src = read('client/src/chat/shell.ts');
+  const src = readShellImpl();
   assert.match(src, /private renderAboutEntry\(\): ElLike/, 'renderAboutEntry 必须存在');
   assert.match(src, /androidAbout\(appVersion\(\)\)/, '安卓端必须用 androidAbout');
   assert.match(
@@ -191,7 +192,7 @@ test('★★★ 安卓「关于」不许用收纳结构（用户明确要求）'
    * 放在底部左边」。收纳项 = `.nb-section`（整宽点击行 + 折叠箭头 +
    * `renderAccordion`），视觉上像"又一个设置分组"，与"页脚"语义不符。
    */
-  const src = read('client/src/chat/shell.ts');
+  const src = readShellImpl();
   const start = src.indexOf('private renderAboutEntry(): ElLike {');
   assert.notEqual(start, -1);
   const body = src.slice(start, src.indexOf('private openAboutSheet(', start));
@@ -263,7 +264,7 @@ test('★★★ 安卓弹窗用真实存在的 nb-sheet 类（不许自造类名
    * 根本不存在。CSS 对未知类不报错，于是弹窗没有任何定位/遮罩/圆角 ——
    * 内容以裸流挤在页面底部，看起来像"点了没反应"。
    */
-  const src = read('client/src/chat/shell.ts');
+  const src = readShellImpl();
   const start = src.indexOf('private openAboutSheet(');
   const body = src.slice(start, start + 3000);
   const classes = [...body.matchAll(/'(nb-[a-z-]+)'/g)].map((m) => m[1]);

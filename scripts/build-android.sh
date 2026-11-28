@@ -564,8 +564,9 @@ fi
 # `tauri android build` 的 release 产物是 **unsigned** —— 它没有 signingConfig
 # 就直接出 `<name>-unsigned.apk`，而这个文件**装不上**（安装时被系统拒绝）。
 #
-# 所以 release 必须再走一步 apksigner。keystore 放在仓库外
-# `D:/tcs-release-keys/`（与 MSI 的客户端签名同一套材料），
+# 所以 release 必须再走一步 apksigner。keystore 放在仓库外，
+# 默认取仓库内已忽略的 `android/tcs-release-keys/keystore.properties`，
+# 也可以设 `TCS_KEYSTORE_PROPS` 指到别处（与 MSI 的客户端签名同一套材料）。
 # 密码从 `keystore.properties` 读，**不落进任何日志或仓库**。
 #
 # ★ v1（JAR signing）**必须开**，不是可选项。
@@ -583,7 +584,7 @@ fi
 # 代价很小（v1 只是多一个 META-INF 目录），兼容性收益很大 —— 开。
 # 三条一起开是 Android 生态里最稳的组合：老安装器认 v1、新系统用 v2/v3。
 if [ "$VARIANT" = "release" ]; then
-  KEYSTORE_PROPS="${TCS_KEYSTORE_PROPS:-D:/tcs-release-keys/keystore.properties}"
+  KEYSTORE_PROPS="${TCS_KEYSTORE_PROPS:-$REPO/android/tcs-release-keys/keystore.properties}"
   # ★ 用 `-f` 不用 `-x`：Windows 上 `apksigner.bat` 的权限位是 `-rw-r--r--`，
   # Git Bash 里 `[ -x ]` 对它判 **假** —— 于是脚本会打印
   # "[WARN] 找不到 apksigner" 并且**跳过签名**，产出一个 unsigned 的 release 包。

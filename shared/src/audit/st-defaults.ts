@@ -34,7 +34,19 @@ export const ST_DEFAULT_FIELDS: readonly StDefaultField[] = [
   { scope: 'card', path: 'extensions', label: '扩展字段', defaultValue: '{}' },
 
   // ---- 世界书根级 ----
-  { scope: 'book', path: 'scan_depth', label: '扫描深度', defaultValue: '依 SillyTavern 预设（默认 100）' },
+  /*
+   * ★ 这三个数值必须与 ST 源码同口径（2026-11-24 核对 1.19.0）：
+   *
+   * ```text
+   *   world-info.js:69    export let world_info_depth = 2;        扫描深度
+   *   world-info.js:96    export const DEFAULT_DEPTH = 4;         条目级插入位置（不是这个）
+   *   令牌预算默认 512 是 ST 的 context 默认值
+   * ```
+   *
+   * 原来这里写"默认 100" —— 那是把"上限/预设档位"当成了默认值。
+   * 审计报告是对用户解释"为什么这条没触发"的，数字错了会把人引到错方向。
+   */
+  { scope: 'book', path: 'scan_depth', label: '扫描深度', defaultValue: '依 SillyTavern 预设（默认 2 条）' },
   { scope: 'book', path: 'token_budget', label: '令牌预算', defaultValue: '依 SillyTavern 预设（默认 512）' },
   { scope: 'book', path: 'recursive_scanning', label: '递归扫描', defaultValue: 'false' },
   { scope: 'book', path: 'extensions', label: '扩展字段', defaultValue: '{}' },

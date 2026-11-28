@@ -251,6 +251,40 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   PRIMARY KEY (kind, key)
 );
 
+-- 一次性临时密码（2026-11-25，运维兜底）。
+--
+-- 场景：用户忘了密码，联系运维。运维在面板上给他生成一个临时密码，
+-- 用户拿「UID + 临时密码」在客户端**只能做一件事：改密码**。
+--
+-- ## 为什么不是"运维直接设一个新密码告诉他"
+--
+-- 那样运维就知道了用户的最终密码（等于运维能长期冒充用户），
+-- 而且用户往往不会再去改一次。临时密码的价值就在于**它会失效**：
+--
+-- --   登录 / 调 API    ✘ 不行（这张表不产生会话）
+--   改密码           ✔ 唯一用途
+--   用一次           ✘ 用完即废
+--   过期             ✘ 默认 30 分钟后失效
+-- --
+-- ## 存哈希不存原文
+--
+-- 与 refresh token 同一条纪律：库文件泄露时不能反推出可用的凭证。
+-- code_prefix 只用于面板上认"是哪一次生成的"，泄露它无法还原密码。
+CREATE TABLE IF NOT EXISTS password_tickets (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  uid TEXT NOT NULL,
+  code_hash TEXT NOT NULL,
+  code_prefix TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  created_by TEXT NOT NULL DEFAULT '',
+  created_ip TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_password_tickets_user ON password_tickets(user_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_password_tickets_hash ON password_tickets(code_hash);
+
 -- ── 仓库与仓库令牌（T10.6）──────────────────────────────
 -- 层级：账户 → 仓库（多）→ 卡片（不限）。
 -- 仓库名**在账户内唯一**（唯一索引建在 owner_id+name_key），
@@ -775,15 +809,38 @@ export class Db {
    * 账户 A 能从 /api/events 看到账户 B 的卡 id 与操作节奏 —— 与直接读卡片
    * 属于同一类泄露，只是绕了一层。这里用子查询限定到可见卡片集合。
    *
-   * 没有 `card_id` 的事件（token 轮换、服务启动等）属于运维事件，
-   * 与任何账户的卡片无关，保持可见。
+   * ## 没有 `card_id` 的事件要再分两类（2026-11-24）
+   *
+   * 原来一刀切"没有 card_id 就全体可见"，结果账户注销事件（`account.purge.*`）
+   * 也落进这条通路。它带的是**别人的用户名 / uid / 操作者 / 来源 IP / 原因**：
+   * 一个只有 `read` 权限的仓库令牌就能看到全站账户名录与治理动作。
+   *
+   * ```text
+   *   运维事件（token 轮换、服务启停）    与任何账户内容无关，保持全体可见
+   *   治理事件（account.*）              只给管理员，由调用方按身份传
+   *                                      options.includeAdminEvents
+   * ```
+   *
+   * 用 `action LIKE 'account.%'` 而不是逐个列 action：新增治理动作时
+   * 只要遵循 `account.` 前缀命名，就自动归入受限集合，不会漏。
    */
-  listEvents(limit = 50, scope: CardScope = ALL_CARDS): EventRow[] {
+  listEvents(
+    limit = 50,
+    scope: CardScope = ALL_CARDS,
+    options: { includeAdminEvents?: boolean } = {},
+  ): EventRow[] {
+    const adminFlag = options.includeAdminEvents === true ? 1 : 0;
     const scoped = scopeSql(scope);
     if (scoped.clause === '') {
       return this.handle
-        .prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?')
-        .all(limit) as EventRow[];
+        .prepare(
+          `SELECT * FROM events
+            WHERE card_id IS NOT NULL
+               OR (action NOT LIKE 'account.%')
+               OR @adminFlag = 1
+            ORDER BY id DESC LIMIT @limit`,
+        )
+        .all({ limit, adminFlag }) as EventRow[];
     }
 
     /*
@@ -791,9 +848,10 @@ export class Db {
      *   ① `owner_id` 直接匹配 —— 卡片已经被 purge 掉时仍然可见（purge 事件就是靠这条活着）；
      *   ② `owner_id IS NULL` 的老事件按卡片反查 —— 升级前的记录没有归属字段。
      *
-     * `card_id IS NULL` 的运维事件（轮换令牌、服务启停）不涉及任何账户内容，保持全体可见。
+     * `card_id IS NULL` 的运维事件（轮换令牌、服务启停）不涉及任何账户内容，保持全体可见；
+     * 但 `account.*` 治理事件仍只给管理员（见上面 listEvents 的说明）。
      */
-    const params: Record<string, unknown> = { limit, ...scoped.params };
+    const params: Record<string, unknown> = { limit, adminFlag, ...scoped.params };
     let ownerClause = '';
     if (scope.kind === 'unowned') {
       ownerClause = "owner_id = ''";
@@ -801,7 +859,7 @@ export class Db {
       ownerClause = 'owner_id = @scopeOwner';
     }
     const sql = `SELECT * FROM events
-      WHERE card_id IS NULL
+      WHERE (card_id IS NULL AND (action NOT LIKE 'account.%' OR @adminFlag = 1))
          OR ${ownerClause === '' ? '0' : ownerClause}
          OR (owner_id IS NULL AND card_id IN (SELECT id FROM cards WHERE ${scoped.clause}))
       ORDER BY id DESC LIMIT @limit`;

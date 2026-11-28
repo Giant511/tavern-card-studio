@@ -27,6 +27,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
 
@@ -34,7 +35,7 @@ function stripComments(source) {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/[^\n]*$/gm, '');
 }
 
-const shellSrc = stripComments(read('client/src/chat/shell.ts'));
+const shellSrc = readShellImplNoComments();
 const level1 = stripComments(read('client/src/chat/repo-page.ts'));
 const level2 = stripComments(read('client/src/chat/repo-cards-page.ts'));
 const level3 = stripComments(read('client/src/chat/repo-card-page.ts'));
@@ -95,18 +96,18 @@ test('★★★★★ 三级都走 renderPage（否则没有转场）', () => {
    * 判据：三级各自有一个 `renderXxxPage()` 私人方法，且调度处
    * 按 cardId → repoId → 一级 的顺序分派。
    */
-  assert.match(shellSrc, /private renderRepoPage\(\): void/, '一级渲染方法');
-  assert.match(shellSrc, /private renderRepoCardsPage\(\): void/, '二级渲染方法');
-  assert.match(shellSrc, /private renderRepoCardPage\(\): void/, '三级渲染方法');
+  assert.match(shellSrc, /function renderRepoPage\(host: RepoHost\): void/, '一级渲染方法');
+  assert.match(shellSrc, /function renderRepoCardsPage\(host: RepoHost\): void/, '二级渲染方法');
+  assert.match(shellSrc, /function renderRepoCardPage\(host: RepoHost\): void/, '三级渲染方法');
 
   /* 调度顺序：先判最深的，否则会渲染成上一级 */
   /*
    * 用 `renderRepoCardPage()` 的调用位置当锚点 —— 不依赖缩进/换行。
    * 然后看三个渲染方法的调用顺序。
    */
-  const cardCall = shellSrc.indexOf('this.renderRepoCardPage();');
-  const cardsCall = shellSrc.indexOf('this.renderRepoCardsPage();');
-  const pageCall = shellSrc.lastIndexOf('this.renderRepoPage();');
+  const cardCall = shellSrc.indexOf('this.renderRepoCardPageAction();');
+  const cardsCall = shellSrc.indexOf('this.renderRepoCardsPageAction();');
+  const pageCall = shellSrc.lastIndexOf('this.renderRepoPageAction();');
   assert.ok(cardCall > 0 && cardsCall > 0 && pageCall > 0, '三级渲染方法都要被调度到');
   assert.ok(
     cardCall < cardsCall && cardsCall < pageCall,

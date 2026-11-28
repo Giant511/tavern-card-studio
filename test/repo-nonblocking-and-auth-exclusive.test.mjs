@@ -35,6 +35,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
 
@@ -45,7 +46,7 @@ function stripComments(source) {
 
 const nativeFetchSrc = stripComments(read('client/src/chat/native-fetch.ts'));
 const repoStoreSrc = stripComments(read('client/src/chat/repo-store.ts'));
-const shellSrc = stripComments(read('client/src/chat/shell.ts'));
+const shellSrc = readShellImplNoComments();
 const repoPageSrc = stripComments(read('client/src/chat/repo-page.ts'));
 const bridgeKt = read(
   'client/src-tauri/gen/android/app/src/main/java/com/taverncardstudio/client/stengine/StBridge.kt',
@@ -300,7 +301,7 @@ test('★★★★ 登录任一处就清掉其它 origin（不许同时在线）
 });
 
 test('★★★★ 切换仓库类型 = 登出旧服务端，并且要说一声', () => {
-  const at = shellSrc.indexOf('private async saveRepoConfig');
+  const at = shellSrc.indexOf('function saveRepoConfig(host: RepoHost');
   assert.ok(at > 0, '找不到 saveRepoConfig');
   const body = shellSrc.slice(at, at + 4200);
 

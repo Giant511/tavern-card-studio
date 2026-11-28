@@ -88,6 +88,14 @@ export interface AuthSessionDeps {
   onPhaseChange?: (phase: AuthPhase, user: AuthUser | null) => void;
   /** 只给测试注入；生产用默认实现 */
   api?: AuthApi;
+  /**
+   * 是否把 refresh token 写进配置文件（默认 **false**，2026-11-24）。
+   *
+   * 打开后重启不用重登，但那个令牌**明文**躺在 `client-config.json` 里，
+   * 同机任意进程都能读走并永久续期。默认关掉是为了安全；
+   * 只在确认"这台机器只有我自己用"时才建议打开。
+   */
+  saveRefreshToken?: boolean;
 }
 
 const DEFAULT_SKEW_MS = 5 * 60 * 1000;
@@ -511,8 +519,54 @@ export class AuthSession {
 
   private async persist(patch: Partial<PersistedAuth>): Promise<void> {
     this.state = { ...this.state, ...patch };
+    /*
+     * ★ refreshToken 默认**不落盘**（2026-11-24）。
+     *
+     * ## 为什么
+     *
+     * 客户端的凭证与配置一起明文写在 `client-config.json`（Tauri plugin-store，
+     * 无 DPAPI / keyring）。同机任意进程都能读走 —— 而 refresh token 是
+     * **可无限续期的长期凭证**，比 2 小时的 access token 危险得多。
+     *
+     * ## 取舍
+     *
+     * ```text
+     *   accessToken  落盘   2 小时就过期，重启后大概率已失效，收益 > 风险
+     *   refreshToken 不落盘 只在内存；重启后需要重新登录
+     *   repoToken    落盘   用户每天要用的仓库凭证；但界面明确标注"明文存放"
+     * ```
+     *
+     * 代价是"重启要重新登录" —— 这是真实的不便，但比"任何本机进程都能
+     * 永久接管你的账户"轻。要恢复旧行为可以显式打开（见 `saveRefreshToken`）。
+     *
+     * ## 为什么不直接上 DPAPI
+     *
+     * 需要引入 `windows` crate 并把存储层改成"加密后再写"。本轮没有真机条件
+     * 验证"重启后能解密"，做半套比不做更危险（用户会以为已经加密了）。
+     * 所以先消除最危险的那一条，把 DPAPI 记为后续项。
+     */
+    const toSave = { ...patch };
+    /*
+     * ★ 只跳过"写新令牌"，不跳过"清空"（2026-11-24）。
+     *
+     * ```text
+     *   登录 / 续期 → refreshToken = 'eyJ…'   ⇒ 默认不写（长期凭证不进明文配置）
+     *   登出 / 注销 → refreshToken = ''        ⇒ 照常写（必须覆盖历史遗留）
+     * ```
+     *
+     * 第二条不能省：老版本把 refresh token 写进过配置文件，升级后那份**还在盘上**。
+     * 注销时若不写空串覆盖，它就一直留着 —— 用户以为"注销了"，实际凭证没清。
+     * 所以判断题是"要写的是不是非空值"，而不是"有没有这个字段"。
+     */
+    if (
+      toSave.refreshToken !== undefined &&
+      toSave.refreshToken !== '' &&
+      this.deps.saveRefreshToken !== true
+    ) {
+      delete toSave.refreshToken;
+    }
     try {
-      await this.deps.save(patch);
+      await this.deps.save(toSave);
     } catch {
       // 浏览器模式（无 C5 能力）写入会失败：内存态继续可用，
       // 但重启即丢失。这里不抛，否则一次配置写失败会让登录流程整个中断。

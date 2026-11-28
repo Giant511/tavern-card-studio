@@ -32,8 +32,29 @@ import type { StWorldbookEntry } from '../model/sillytavern.js';
  */
 const DEFAULT_ENABLED = true;
 const DEFAULT_CONSTANT = false;
-/** ST 的 scan_depth 缺省值 */
-export const DEFAULT_SCAN_DEPTH = 4;
+/**
+ * ST 的 `scan_depth` 缺省值 = **2**（2026-11-24 核对源码后修正）。
+ *
+ * ## 原来写的 4 是另一个字段
+ *
+ * 4 是 SillyTavern 里**条目级**的 `DEFAULT_DEPTH`（`world-info.js:96`），
+ * 表示"这条条目插到聊天历史的倒数第几条"。而 `scan_depth` 是**全局**设置
+ * （`world-info.js:69` `world_info_depth = 2`），表示"扫描最近多少条消息判定触发"。
+ *
+ * 两个字段单位相同（都是消息条数），语义完全不同：
+ *
+ * ```text
+ *   scan_depth  = 2   扫描最近 2 条，判断条目里的关键词是否出现 → 决定是否激活
+ *   entry.depth = 4   激活后插到倒数第 4 条位置 → 决定插在哪
+ * ```
+ *
+ * 混用之后，`scanDepth` 缺省比 ST 多扫一倍消息 ⇒ 本不该触发的条目被激活，
+ * 表现是"我们这边的上下文比 ST 里长一截"，而任何一侧都不会报错。
+ *
+ * 同一口径的另外两处：`chat/worldbook.ts` 的 `DEFAULT_GLOBAL_SETTINGS.scanDepth`
+ * 与 `audit/st-defaults.ts` 的展示文案。
+ */
+export const DEFAULT_SCAN_DEPTH = 2;
 
 export interface ActivationOptions {
   /**

@@ -167,6 +167,22 @@ test('★★★ 两个产出方都要维护 aria-expanded（CSS 靠它选状态�
    * 为什么不另加 `data-open`：同一状态两个属性必然分叉（§106.14 的
    * `fieldRow` 两份实现就是这种形状）。`aria-expanded` 本来就存在且同源。
    */
+  /*
+   * ★ 这里是**显式清单**，不用 `SHELL_IMPL_FILES`（2026-11-24）。
+   *
+   * 两者是不同的集合：
+   *
+   * ```text
+   *   SHELL_IMPL_FILES   组成壳实现的所有文件（含只有类型的契约面）
+   *   本清单              真的会**渲染收纳项**的文件
+   * ```
+   *
+   * 第一版拿 `SHELL_IMPL_FILES` 套进来，于是 `shell-contract.ts`（只有 interface）
+   * 与 `files-callbacks.ts`（聊天文件页回调，不渲染收纳项）都被要求"维护
+   * aria-expanded"，必然红 —— 判据的前提错了，不是代码错了。
+   *
+   * 拆 `shell.ts` 时若把**渲染收纳项**的代码搬走，记得把新文件加进这里。
+   */
   for (const file of ['client/src/chat/shell.ts', 'client/src/chat/api-page.ts']) {
     const src = stripComments(read(file));
     assert.match(

@@ -25,6 +25,7 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import test from 'node:test';
+import { readEditorImplNoComments } from './lib/editor-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 
@@ -371,21 +372,30 @@ test('所有 parseStCard 调用点都传了 worldbookFormat（少传一处就是
 });
 
 test('到达规范化的两个落地入口都调了 arriveCard（三条路径共用）', () => {
-  const source = readFileSync(join(ROOT, 'client', 'src', 'editor', 'app.ts'), 'utf8');
+  const source = readEditorImplNoComments();
   const replaceBody = /private replaceCard\(card: UnifiedCard\): void \{([\s\S]*?)\n  \}/.exec(source);
   assert.notEqual(replaceBody, null, '找不到 replaceCard');
-  assert.match(replaceBody[1], /this\.arriveCard\(/, 'replaceCard 必须过到达规范化');
+  /* 2026-11-24：arriveCard 搬到 landing.ts，调用变成 arriveCard(this.landingHost(), card)
+   （normalizeReceiver 只归一位移符，不拆参数） */
+  assert.match(replaceBody[1], /arriveCard\((?:this|host)\.landingHost\(\)|this\.arriveCard\(/, 'replaceCard 必须过到达规范化');
 
   const createBody = /private createSessionWithCard\(card: UnifiedCard, cardId: string\): string \{([\s\S]*?)\n  \}/.exec(source);
   assert.notEqual(createBody, null, '找不到 createSessionWithCard');
-  assert.match(createBody[1], /this\.arriveCard\(/, '零标签取回/打开也必须过到达规范化');
+  assert.match(createBody[1], /arriveCard\((?:this|host)\.landingHost\(\)|this\.arriveCard\(/, '零标签取回/打开也必须过到达规范化');
 
   /*
    * 第三条路：TXT 导入。它**不经过** replaceCard（那条会 markSaved，而导入是
    * "改当前卡"），所以必须显式调一次 arriveCard —— 漏了就等于"用自定义世界书
    * 预设导入标准写法的 TXT 仍然报 no-entry-marker"，也就是缺陷一没修完。
    */
-  const importBody = /private async importCardTextFile\(([\s\S]*?)\n  \}/.exec(source);
+  /*
+   * 2026-11-24：importCardTextFile 搬到 open-actions.ts，形态是
+   * `function importCardTextFile(host, ...)`，结束是 0 缩进的 `}`。
+   * 两种形态都认 —— 判据钉的是"它调了 arriveCard"，不是"住在哪个文件"。
+   */
+  const importBody =
+    /private async importCardTextFile\(([\s\S]*?)\n  \}/.exec(source) ??
+    /function importCardTextFile\(([\s\S]*?)\n\}/.exec(source);
   assert.notEqual(importBody, null, '找不到 importCardTextFile');
   assert.match(
     importBody[1],

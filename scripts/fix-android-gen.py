@@ -4,11 +4,33 @@
 
 ## 为什么需要这个脚本
 
-`client/src-tauri/gen/` 整个在 `.gitignore` 里（第 24 行），所以它对每个
-开发者、每台机器、每次重新 `tauri android init` 都是**重新生成的**。
-而生成出来的东西在这台机器上有三处跑不动，且三处都会报出**指向别处**的错误。
+`client/src-tauri/gen/android` 的 **Gradle 工程部分不入库**（2026-11-24 修正本文）：
+它会随 `tauri android init` 重新生成，而生成物里有一批路径是本机绝对路径，
+入库既会冲突也会误导。所以它对每个开发者、每台机器、每次重新 init
+都是**重新生成的**。
 
-脚本每次都从当前 gen/ 现状出发做幂等修补，所以：
+★ 但 `gen/android` 里有 **15 个文件是入库的**，那些是"我们写的东西"：
+
+```text
+  app/src/main/AndroidManifest.xml            竖屏锁定 + 任务保留（必须入库）
+  app/src/main/java/.../*.kt                  6 个手写 Kotlin（含 1056 行 MainActivity）
+  app/src/main/res/{values,values-night}/*.xml 窗口底色（必须入库）
+  buildSrc/src/main/java/.../{BuildTask,RustPlugin}.kt
+  app/jniLibs/.gitignore
+  docs/android-user-guide.md                  用户手册
+```
+
+**`tauri android init --force` 会覆盖/清空这些**。跑之前先确认：
+
+```bash
+git status --short client/src-tauri/gen/android   # 必须是干净的
+```
+
+它们已经入库，所以覆盖后 `git checkout -- client/src-tauri/gen/android` 能拿回来 ——
+这也是"手写代码必须入库"的理由（早期它们不入库，一次 --force 就没了）。
+
+Gradle 工程（`build.gradle.kts` / `settings.gradle.kts` / `gradle/`）由
+`tauri android init` 生成，本脚本在其后做幂等修补，所以：
   · 可反复跑，不漂移；
   · 别人 clone 后跑一次 `bash scripts/build-android.sh` 就够（它会调本脚本）；
   · 修了什么、为什么修，都留在输出里。
@@ -180,17 +202,44 @@ def patch_build_task(check_only: bool) -> list[str]:
         text = new_text
         out.append(f"[修] BuildTask.kt executable → {node_exe}")
 
-    # ② args 首位换成 CLI 的 JS 入口，并去掉 "tauri"
+    # ② args 首位换成"按仓库根相对算"的 CLI JS 路径
+    #
+    # 三种形态都要认（2026-11-26 修）：
+    #   ① tauri init 原始生成：`listOf("tauri", ...)`
+    #   ② 旧机器留下的绝对路径：`listOf("""D:/Claw/.../tauri.js""", ...)`
+    #      这条原来没被判据覆盖，换机后只在 gradle 阶段炸，最难查
+    #   ③ 已修好的相对形态：`val cliJs = File(File(projectDir, rootDirRel), ...)`
+    relative_form = (
+        'val cliJs = File(File(projectDir, rootDirRel), '
+        '"../../node_modules/@tauri-apps/cli/tauri.js").canonicalPath'
+    )
+    relative_args = 'val args = listOf(cliJs, "android", "android-studio-script");'
     cli_js = CLI_JS.as_posix()
-    old_args = 'val args = listOf("tauri", "android", "android-studio-script")'
-    new_args = f'val args = listOf("""{cli_js}""", "android", "android-studio-script")'
-    if old_args in text:
-        text = text.replace(old_args, new_args, 1)
-        out.append(f"[修] BuildTask.kt args[0] → {cli_js}（去掉会误导 node 的 'tauri'）")
-    elif cli_js in text:
-        pass  # 已经是修过的形态
+    abs_args = re.compile(
+        r'val args = listOf\("""[^"]*tauri\.js""", "android", "android-studio-script"\);'
+    )
+    if relative_form in text:
+        out.append("[OK] BuildTask.kt 已按仓库根相对定位 CLI")
+    elif abs_args.search(text):
+        text = abs_args.sub(
+            f"{relative_form}\n        {relative_args}",
+            text,
+            count=1,
+        )
+        out.append("[修] BuildTask.kt 的绝对路径 → 仓库根相对（原来的写死路径换机即失效）")
     else:
-        out.append("[警告] 找不到 args 那一行，请人工核对 BuildTask.kt")
+        old_args = 'val args = listOf("tauri", "android", "android-studio-script")'
+        if old_args in text:
+            text = text.replace(
+                old_args,
+                f"{relative_form}\n        {relative_args}",
+                1,
+            )
+            out.append("[修] BuildTask.kt args[0] → 仓库根相对的 tauri.js")
+        elif cli_js in text:
+            pass  # 已经是修过的形态
+        else:
+            out.append("[警告] 找不到 args 那一行，请人工核对 BuildTask.kt")
 
     if not out:
         return ["[OK] BuildTask.kt 无需修改"]
@@ -292,11 +341,14 @@ def patch_signing_config(check_only: bool) -> list[str]:
      */
     signingConfigs {
         create("release") {
-            val propFile = file("D:/tcs-release-keys/keystore.properties")
+            val propPath = System.getenv("TCS_KEYSTORE_PROPS")
+                ?: rootProject.file("../../../../android/tcs-release-keys/keystore.properties").absolutePath
+            val propFile = file(propPath)
             if (propFile.exists()) {
                 val props = Properties()
                 propFile.inputStream().use { props.load(it) }
-                storeFile = file(props.getProperty("storeFile"))
+                val ks = props.getProperty("storeFile")
+                storeFile = if (ks != null && ks.isNotBlank()) file(ks) else propFile.parentFile.resolve("tcs-release.jks")
                 storePassword = props.getProperty("storePassword")
                 keyAlias = props.getProperty("keyAlias")
                 keyPassword = props.getProperty("keyPassword")

@@ -48,6 +48,7 @@ import { test } from 'node:test';
  * `npm test` 会先 `build:shared`，所以这里 import 的是刚编译的 dist。
  */
 import { turnDirection } from '../shared/dist/chat/nav.js';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 /** Tab 从左到右的顺序（与 `shell.ts` 的 `TABS` 一致，判据里有守卫核对） */
 const TAB_ORDER = ['chat', 'cards', 'repo', 'me'];
@@ -61,7 +62,7 @@ function stripComments(source) {
 
 const css = stripComments(read('client/src/chat/chat.css'));
 const focusSrc = stripComments(read('client/src/chat/focus-scroll.ts'));
-const shellSrc = stripComments(read('client/src/chat/shell.ts'));
+const shellSrc = readShellImplNoComments();
 /** 方向规则的**实现**（纯函数，已挪出 shell 以便真跑） */
 const navSrc = stripComments(read('shared/src/chat/nav.ts'));
 
@@ -488,16 +489,24 @@ test('★★★ 同级切 Tab 的方向按左右顺序（往右点=内容往右�
   }
 
   /*
-   * ★ 顺手核一遍：判据里的 Tab 顺序必须与 `shell.ts` 的 `TABS` 一致。
+   * ★ 顺手核一遍：判据里的 Tab 顺序必须与契约面的 `TABS` 一致。
    *
    * 不一致的话上面那十组断言就全在验一份假的顺序（而且照样绿）。
+   *
+   * ★ 2026-11-24：`TABS` 与 `TabId` 搬到了 `shell-contract.ts`（报告 P2-1 的第一刀：
+   *   把契约面从 1 万行的 shell.ts 里独立出来）。所以这里改成读契约文件 ——
+   *   **判据强度不变**，只是跟随搬家的位置。读 shell.ts 会抠到空数组，
+   *   而空数组与 TAB_ORDER 比对必然报"不一致"，看起来像顺序真的错了。
    */
-  const tabsBlock = shellSrc.slice(
-    shellSrc.indexOf('const TABS: readonly TabDef[] = ['),
-    shellSrc.indexOf('];', shellSrc.indexOf('const TABS: readonly TabDef[] = [')) + 2,
+  const contractSrc = read('client/src/chat/shell-contract.ts');
+  const marker = 'const TABS: readonly TabDef[] = [';
+  const tabsBlock = contractSrc.slice(
+    contractSrc.indexOf(marker),
+    contractSrc.indexOf('];', contractSrc.indexOf(marker)) + 2,
   );
   const inShell = [...tabsBlock.matchAll(/id: '([a-z]+)'/g)].map((one) => one[1]);
-  assert.deepEqual(inShell, TAB_ORDER, '判据里的 Tab 顺序要与 shell.ts 的 TABS 一致');
+  assert.ok(inShell.length === 4, `契约面里只抠到 ${String(inShell.length)} 个 Tab —— 判据的正则可能失效了`);
+  assert.deepEqual(inShell, TAB_ORDER, '判据里的 Tab 顺序要与 shell-contract.ts 的 TABS 一致');
 });
 
 test('★★★ 角色编辑页必须走 renderPage（否则整页不换层，没有动画）', () => {
@@ -511,9 +520,9 @@ test('★★★ 角色编辑页必须走 renderPage（否则整页不换层，�
    * 它在**当前层里**清空重绘（`pageHost.replaceChildren()`），
    * 不新建层 ⇒ `finishPageTurn()` 没被调用 ⇒ 一层都没换 ⇒ 没有转场。
    */
-  const at = shellSrc.indexOf('private async openGreetingCard');
+  const at = shellSrc.indexOf('function openGreetingCard(host: GreetingHost');
   assert.ok(at > 0, '找不到 openGreetingCard');
-  const block = shellSrc.slice(at, shellSrc.indexOf('private async saveGreeting', at));
+  const block = shellSrc.slice(at, shellSrc.indexOf('function saveGreeting(host: GreetingHost', at));
 
   const renderPageCalls = [...block.matchAll(/this\.renderPage\(\)/g)].length;
   assert.ok(renderPageCalls >= 2, `进入与加载完成都要走 renderPage，实际 ${String(renderPageCalls)} 处`);

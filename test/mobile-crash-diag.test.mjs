@@ -34,6 +34,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 
@@ -284,7 +285,7 @@ test('★★★★★ 引擎连不上要记，但只在状态变化时记', () =
    * 但 `ensureConnected` 在重试循环里每 2 秒调一次 —— 每次都记的话，
    * 100 条的环形日志几十秒就被它占满，真正有用的崩溃记录反而被挤掉。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   const at = src.indexOf('private async ensureConnected');
   assert.ok(at > 0, '找不到 ensureConnected');
@@ -306,16 +307,16 @@ test('★★★★★ 「我的」页要有诊断入口，且副标题就说结�
    * 另外副标题必须直接写"上次异常结束" —— 用户不会为了看结论先展开面板，
    * 而这一条恰恰是他能对上"对，就是它崩了"的唯一信息。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   assert.match(src, /this\.renderDiagSection\(\)/, '要真的挂到「我的」页上');
-  assert.match(src, /private renderDiagSection/, '要有这个方法');
+  assert.match(src, /function renderDiagSection/, '要有这个方法');
 
   /*
    * ★ 取整个方法体，不用固定字符窗口（今天第六次因为窗口误红）。
    *   面板里加了"日志在哪"和"导出"之后，`diag-copy` 被推到了 2600 字符以外。
    */
-  const at = src.indexOf('private renderDiagSection');
+  const at = src.indexOf('function renderDiagSection(host: SettingsHost)');
   assert.ok(at > 0, '找不到 renderDiagSection');
   const endA = src.indexOf('\n  private ', at + 10);
   const body = src.slice(at, endA < 0 ? src.length : endA);
@@ -342,7 +343,7 @@ test('★★★★ 复制失败不许装作成功', () => {
    * 那时如果仍然弹"已复制"，用户会去粘贴一个空剪贴板 ——
    * 比明确失败更浪费时间。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   /*
    * ★ 分两处查，不要用"diag-copy 之后 N 字符"的窗口 ——
@@ -357,7 +358,7 @@ test('★★★★ 复制失败不许装作成功', () => {
   assert.match(copyBlock, /selectDiagText/, '复制失败要退到"选中文本"');
 
   /* 而"长按"这句在兜底方法里 */
-  const selAt = src.indexOf('private selectDiagText');
+  const selAt = src.indexOf('function selectDiagText(host: SettingsHost');
   assert.ok(selAt > 0, '要有 selectDiagText');
   const selBody = src.slice(selAt, selAt + 1600);
   assert.match(selBody, /长按/, '要告诉用户接下来怎么做');
@@ -710,7 +711,7 @@ test('★★★★★ 日志路径必须独立成块（不许内联进说明文�
    *
    * 附带好处：路径能长按复制了。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   assert.match(src, /'nb-diag-path'/, '路径要独立成块');
   assert.match(src, /pathEl\.textContent = status\.dir/, '路径要写进那个块');
@@ -919,7 +920,7 @@ test('★★★★★ @ts-ignore 那个全局必须有写入方（否则永远�
    *   DOM 判据整体崩在 `ERR_IMPORT_ATTRIBUTE_MISSING`。
    */
   const diag = stripComments(read('client/src/diagnostics/mobile-diag.ts'));
-  const shell = stripComments(read('client/src/chat/shell.ts'));
+  const shell = readShellImplNoComments();
 
   if (!diag.includes('__TCS_VERSION__')) return; // 将来改成别的方案就不约束了
 

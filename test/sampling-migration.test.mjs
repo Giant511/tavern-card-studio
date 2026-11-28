@@ -41,6 +41,7 @@ import {
   samplingFromSettings,
 } from '../shared/dist/chat/sampling-bridge.js';
 import { SAMPLING_SECTION, writeField } from '../shared/dist/chat/settings-schema.js';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const CHAT_DIR = join(REPO, 'client', 'src', 'chat');
@@ -480,7 +481,7 @@ test('★★ b4. 连接页保存后，外壳不许把 sampling 写回默认值',
    * 采样迁走后若这一行还在（且读的是已不存在的 `state.sampling`），
    * 就会把默认值写进去 —— 用户改个模型名，温度回默认。
    */
-  const src = read('client/src/chat/shell.ts');
+  const src = readShellImpl();
   /*
    * ★ 用正则找签名，不钉字面 `onSave: async (state) =>`。
    *
@@ -561,8 +562,14 @@ test('★★ c1. 采样保存走 ST 设置（mutateSettings），不写 localSto
    * ★ 取证发现：**改动前它其实存在 localStorage**（不是 ST 设置）。
    * 所以这次实际上是"把它真正落到 ST 设置"。这条断言守的是迁移后的状态。
    */
-  const src = read('client/src/chat/shell.ts');
-  const fn = src.slice(src.indexOf('saveFields: async (fields)'), src.indexOf('onNotify: this.options.onNotify'));
+  const src = readShellImpl();
+  /*
+   * 终点要带 fromIndex（2026-11-24）。`onNotify: this.options.onNotify` 在
+   * 别的回调对象里也出现过，不带起点找会命中**前面**那一处，slice 得到空串。
+   */
+  const fnAt = src.indexOf('saveFields: async (fields)');
+  assert.ok(fnAt >= 0, '找不到 saveFields');
+  const fn = src.slice(fnAt, src.indexOf('onNotify: this.options.onNotify', fnAt));
 
   assert.match(fn, /mutateSettings\(/, '采样保存必须走 mutateSettings（ST 设置）');
   /*
@@ -603,7 +610,7 @@ test('★★ c2. localStorage 读取必须收窄（旧版留下的 sampling 不�
 });
 
 test('★ c3. 进聊天页时从 ST 设置播种（否则重启丢值）', () => {
-  const src = read('client/src/chat/shell.ts');
+  const src = readShellImpl();
 
   assert.match(src, /void this\.seedSampling\(\)/, 'renderChat 末尾必须播种');
   assert.match(src, /private async seedSampling/, '要有 seedSampling 实现');

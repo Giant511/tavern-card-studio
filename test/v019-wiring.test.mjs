@@ -18,6 +18,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const read = (p) => readFileSync(join(ROOT, p), 'utf8');
@@ -129,7 +130,7 @@ test('★★★★★ 导出按钮真的接在聊天文件行上', () => {
 });
 
 test('★★★★★ shell 真的实现了 onExport（不是留个空壳）', () => {
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
 
   assert.match(src, /onExport: async \(id, name\)/, '要有实现');
 
@@ -155,7 +156,7 @@ test('★★★★★ shareText 必须直接调，不许先赋给变量', () => 
    *
    * 现象是"所有导出都失败"，而错误信息完全指不到这里。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   assert.doesNotMatch(
     src,
     /=\s*[^.\n]*\.shareText\s*;/,
@@ -175,7 +176,7 @@ test('★★★★ 读不出来和空聊天要分开说', () => {
    *
    * 一句"导出成功"盖住两种情况，会让文件损坏的用户以为记录已经导好了。
    */
-  const src = stripComments(read('client/src/chat/shell.ts'));
+  const src = readShellImplNoComments();
   const at = src.indexOf('onExport: async');
   const end = src.indexOf('\n      },\n', at);
   const body = src.slice(at, end < 0 ? at + 3000 : end);

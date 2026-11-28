@@ -35,6 +35,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
 
@@ -59,7 +60,7 @@ function stripComments(source) {
   );
 }
 
-const shellSrc = stripComments(read('client/src/chat/shell.ts'));
+const shellSrc = readShellImplNoComments();
 const repoPageSrc = stripComments(read('client/src/chat/repo-page.ts'));
 const authSrc = stripComments(read('client/src/auth/auth-client.ts'));
 
@@ -94,7 +95,7 @@ test('★★★★★ 续期后必须把**新的 refresh token** 也落盘', () 
    *
    * 所以 `this.repoAuth = {...}` 里四个字段都要有，且随后 `writeRepoAuth`。
    */
-  const at = shellSrc.indexOf('private async refreshRepoAuth');
+  const at = shellSrc.indexOf('function refreshRepoAuth(host: RepoHost)');
   assert.ok(at > 0, '找不到 refreshRepoAuth');
   const body = shellSrc.slice(at, at + 3200);
 
@@ -130,11 +131,11 @@ test('★★★★★ 续期必须单飞（并发只刷一次）', () => {
    */
   assert.match(
     shellSrc,
-    /private repoRefreshInFlight: Promise<boolean> \| null = null/,
+    /^  refreshInFlight: Promise<boolean> \| null;$/m,
     '要有 in-flight 字段',
   );
 
-  const at = shellSrc.indexOf('private async refreshRepoAuth');
+  const at = shellSrc.indexOf('function refreshRepoAuth(host: RepoHost)');
   const body = shellSrc.slice(at, at + 3200);
 
   /* 先判 in-flight，再决定要不要发请求 */
@@ -155,7 +156,7 @@ test('★★★★ 续期失败时不许弹通知（否则一次 401 弹三条�
    *
    * 提示统一由 `repoExpiredError()` 发一次（它只在最后一次抛出时调用）。
    */
-  const at = shellSrc.indexOf('private async refreshRepoAuth');
+  const at = shellSrc.indexOf('function refreshRepoAuth(host: RepoHost)');
   const body = shellSrc.slice(at, at + 3200);
   assert.ok(!/onNotify/.test(body), 'refreshRepoAuth 内部不许弹通知');
 });
@@ -172,7 +173,7 @@ test('★★★★★ 401 重试时必须读**新** token（值拷贝会拿旧�
    *
    * 所以重试路径必须**重新调** `repoSyncConfig()`。
    */
-  const at = shellSrc.indexOf('private async runRepoRequest');
+  const at = shellSrc.indexOf('function runRepoRequest<');
   assert.ok(at > 0, '找不到 runRepoRequest');
   const body = shellSrc.slice(at, at + 1400);
 
@@ -181,7 +182,7 @@ test('★★★★★ 401 重试时必须读**新** token（值拷贝会拿旧�
 });
 
 test('★★★★ 401 → 续期 → 重试，且只重试一次（不许递归）', () => {
-  const at = shellSrc.indexOf('private async repoFetchWithRefresh');
+  const at = shellSrc.indexOf('function repoFetchWithRefresh<T>(host: RepoHost');
   assert.ok(at > 0);
   const body = shellSrc.slice(at, at + 1200);
 
@@ -210,7 +211,7 @@ test('★★★★ 续期也失败时，给用户看的文案必须指向"重新
    *   · 只描述现象，不说下一步
    *   · 与界面上「已登录：Gez」并列时自相矛盾
    */
-  const at = shellSrc.indexOf('private repoExpiredError');
+  const at = shellSrc.indexOf('function repoExpiredError(host: RepoHost)');
   assert.ok(at > 0, '找不到 repoExpiredError');
   const body = shellSrc.slice(at, at + 800);
   assert.match(body, /重新登录/, '文案要指出下一步');
@@ -312,7 +313,7 @@ test('★★★ `expired` 只认"真的续期失败"，不按本地时钟推测'
    *   前缀照样匹配，`<` 又不是 `>`，两条**全过**。变异验证当场抓到了
    *   这个假绿（本日第五次"判据取错对象"）。
    */
-  const at = shellSrc.indexOf('private repoStatus()');
+  const at = shellSrc.indexOf('function repoStatus(host: RepoHost)');
   assert.ok(at > 0);
   const body = shellSrc.slice(at, at + 1400);
 
@@ -404,7 +405,7 @@ test('★★★★★ 换页时要主动关闭下拉面板（它挂在 body，�
 });
 
 test('★★★ closeActiveSelectPopover 必须真的被 import（不是同名巧合）', () => {
-  const importSrc = read('client/src/chat/shell.ts');
+  const importSrc = readShellImpl();
   assert.match(
     importSrc,
     /import \{[^}]*closeActiveSelectPopover[^}]*\} from '\.\/select-popover\.ts'/,

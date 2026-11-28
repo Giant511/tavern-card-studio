@@ -44,6 +44,20 @@ const PROXY_HEADERS = ['x-forwarded-for', 'forwarded', 'x-real-ip', 'x-forwarded
 /** 唯一用来取真实客户端地址的头。其它头一律不解析，避免"两个头各说一套"的差分解析。 */
 const ADDRESS_HEADER = 'x-forwarded-for';
 
+/**
+ * 控制面转发标记（2026-11-24）。
+ *
+ * supervisor 代理 `/api/*` 时注入它，用来告诉 worker"这一跳是本机控制面"。
+ * 为什么不用"信任 127.0.0.1"来替代：worker 也可能被别人从本机直连
+ * （任何本机进程都等价于本机用户），只靠地址分不出"来自面板"还是"来自本机任意程序"。
+ * 标记头 + 回环 socket 两条同时成立，才说明是 supervisor 打的。
+ *
+ * ★ 外部客户端伪造这个头没有收益：`resolve()` 还要求 socket 是回环；
+ *   而 supervisor 代理时会**先删掉**客户端带来的同名头再写自己的值。
+ */
+export const CONTROL_HOP_HEADER = 'x-tcs-control-hop';
+export const CONTROL_HOP_VALUE = 'supervisor';
+
 export interface TrustProxyParseResult {
   /** 规范化后的条目（如 `127.0.0.0/8`、`::1/128`） */
   entries: string[];
@@ -281,10 +295,55 @@ export class TrustProxyResolver {
   resolve(req: IncomingMessage): ResolvedClientAddress {
     const rawSocket = req.socket.remoteAddress;
     const socketAddress = normalizeAddress(rawSocket ?? '') ?? rawSocket ?? 'unknown';
-    const fromTrustedProxy = this.isTrusted(rawSocket === undefined ? undefined : socketAddress);
 
-    const proxied = PROXY_HEADERS.some((name) => req.headers[name] !== undefined);
+    /*
+     * ★ 控制面（supervisor）转发的请求要单独认（2026-11-24）。
+     *
+     * ## 原来的洞
+     *
+     * `supervisor` 代理 `/api/*` 时只重写 `host`，**不加任何来源标注**。
+     * worker 看到的对端永远是 `127.0.0.1`、且没有代理头 ⇒
+     * `resolve()` 返回"本机直连" ⇒ `/api/token` 的门禁通过 ⇒
+     * 返回全局令牌。而全局令牌同时是控制面凭证。
+     *
+     * 于是：面板一旦监听在局域网地址（配置允许，注释说是为远程运维），
+     * `curl http://<LAN-IP>:8731/api/token` 无凭证即可拿全权令牌。
+     *
+     * ## 现在的判定
+     *
+     * supervisor 注入两个头：内部标记 + 真实来源。这里在三项同时成立时
+     * 才把"真实来源"当真：
+     *
+     * ```text
+     *   ① 标记头等于预期值       —— 挡掉"外部客户端随手加个头"
+     *   ② socket 是回环           —— supervisor 与 worker 同机，非回环不可能是它
+     *   ③ 来源头可解析           —— 解析失败走 malformed 分支，门禁会拒
+     * ```
+     *
+     * ②是关键：外部请求的 socket 不是回环，无论加什么头都进不来这条分支。
+     * 所以"局域网访问 8731 端口"会被还原成真实 LAN 地址 → 门禁判非回环 → 拒。
+     */
+    const controlHop = readHeader(req, CONTROL_HOP_HEADER);
+    const fromControlPlane = controlHop === CONTROL_HOP_VALUE && isLoopbackAddress(socketAddress);
+
+    const proxiedByHeader = PROXY_HEADERS.some((name) => req.headers[name] !== undefined);
     const headerRaw = readHeader(req, ADDRESS_HEADER);
+
+    /*
+     * 控制面来了但**没带来源头** ⇒ 视为不可信代理（fail-closed）。
+     *
+     * 正常形态下 supervisor 一定同时写 `X-Forwarded-For`。这里防的是
+     * "将来有人改 supervisor 时漏了注入"—— 那种情况下若仍按本机直连放行，
+     * 洞会静默回来。宁可让 `/api/token` 报 403（客户端会提示手动复制令牌），
+     * 也不要无凭证发令牌。
+     */
+    const controlPlaneWithoutSource = fromControlPlane && headerRaw === '';
+
+    const fromTrustedProxy =
+      (fromControlPlane && !controlPlaneWithoutSource) ||
+      this.isTrusted(rawSocket === undefined ? undefined : socketAddress);
+
+    const proxied = proxiedByHeader || controlPlaneWithoutSource;
 
     if (!fromTrustedProxy) {
       // 未登记的对端：完全忽略代理头。伪造 XFF 在这一层没有任何收益，

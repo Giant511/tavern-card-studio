@@ -165,7 +165,7 @@ ufw allow 80/tcp && ufw allow 443/tcp && ufw enable
 cards.example.com {
     encode zstd gzip
 
-    # 全权令牌不得出本机。服务端自己也会按来源 IP 拒（配好 trustProxy 之后），
+    # 管理级令牌不得出本机。服务端自己也会按来源 IP 拒（配好 trustProxy 之后），
     # 这里再挡一道是纵深防御：万一 trustProxy 配错也不至于把令牌暴露到公网。
     @token path /api/token
     respond @token 403
@@ -203,7 +203,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/cards.example.com/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
-    # 全权令牌不得出本机（第二道闸，见 §3.2）
+    # 管理级令牌不得出本机（第二道闸，见 §3.2）
     location = /api/token { return 403; }
 
     client_max_body_size 40m;      # nginx 默认只有 1m，不改则任何真实角色卡都 413
@@ -283,7 +283,7 @@ Windows 版 Apache 用 `LoadModule` 同样五条，`httpd.conf` 里改完 `httpd
     SSLHonorCipherOrder   off
     SSLSessionTickets     off
 
-    # ── 全权令牌不得出本机（第二道闸，见 §3.2 事故二）──────
+    # ── 管理级令牌不得出本机（第二道闸，见 §3.2 事故二）──────
     # 用 Require all denied 而不是 RewriteRule …[F]：前者不受后续 rewrite 顺序影响，
     # 也不会因为漏了 [L] 而被后面的 ProxyPass 接走。
     <Location "/api/token">
@@ -373,12 +373,12 @@ systemctl reload apache2
 - **判据**：日志里每条请求的来源都是 `127.0.0.1`；面板「总览 → 可信代理」的"已生效代理数"是 0。
 - **修复**：`trustProxy: ["127.0.0.1"]`，保存即生效，无需重启。
 
-#### 事故二：全权令牌从公网被取走（安全问题，不只是体验问题）
+#### 事故二：管理级令牌从公网被取走（安全问题，不只是体验问题）
 
 - **症状**：在任意一台外网机器上执行
   `curl https://cards.example.com/api/token` —— 期望 403，实际拿到 **200 + 令牌原文**。
 - **机制**：`/api/token` 的判据是「有效来源必须是回环地址」，它发放的是 legacy
-  **全权令牌**（能改配置、能看所有未归属卡片）。`trustProxy` 为空时，来自公网的请求
+  **管理级令牌**（能改配置、能看所有未归属卡片）。`trustProxy` 为空时，来自公网的请求
   经过同机反代后，TCP 对端是 `127.0.0.1` → 服务端**判定为"本机访问"** → 把令牌交出去。
 - **后果**：拿到令牌等于拿到服务器管理权，且不会留下"异常登录"的痕迹（它不走登录）。
 - **修复（两层，都要做）**：
@@ -499,7 +499,7 @@ systemctl reload apache2
 | 现象 | 先查这里 |
 |---|---|
 | 客户端"一键连接"失败 | 正常：反代场景不可用，改用账户登录（§5） |
-| 登录说密码错，但密码是对的 | `trustProxy` 漏配 → 限速全局化（§3.2 事故一） |
+| 登录提示"账号已锁定"或"尝试过于频繁"，但密码是对的 | `trustProxy` 漏配 → 限速全局化（§3.2 事故一）；锁定 10 分钟，可先由管理员解除 |
 | `/api/token` 返回 200（外网） | 严重：`trustProxy` 漏配（§3.2 事故二），立即补配 + 代理层 deny |
 | 上传 413 / 502 / 504 | 代理的请求体上限与超时（§2.3.4、§2.2 注） |
 | 面板显示"明文传输"但已用 HTTPS 访问 | 反代拓扑下的已知文案问题（§4） |

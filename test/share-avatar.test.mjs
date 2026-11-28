@@ -20,6 +20,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { bytesToBase64, shareFileName } from '../client/src/chat/share-card.ts';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
 
@@ -119,7 +120,7 @@ test('★★★ 分享必须走 FileProvider + NEW_TASK（Kotlin）', () => {
 });
 
 test('★★★ 分享前必须预取（onShare 是同步的，读 PNG 是异步的）', () => {
-  const shell = read('client/src/chat/shell.ts');
+  const shell = readShellImpl();
   assert.match(shell, /shareCache/, '要有字节缓存');
   assert.match(shell, /prefetchForShare/, '要有预取');
   /*

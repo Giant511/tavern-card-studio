@@ -318,6 +318,13 @@ export interface MergeWorldbookResult {
   removed: number[];
   /** 机器字段（extensions / 未知键）按 id 挂回成功的条目 id */
   preserved: number[];
+  /**
+   * TXT 里**重复出现**的 id（2026-11-24 新增）。
+   *
+   * 合并策略是 first-wins：保留第一条，后面的同 id 条目丢弃。
+   * 把重复的 id 报出来让调用方提示用户 —— 静默丢掉一条会让人以为"TXT 改了没生效"。
+   */
+  duplicates: number[];
 }
 
 // ---------------------------------------------------------------- 工具
@@ -1286,12 +1293,28 @@ export function mergeWorldbookEntries(
   const added: number[] = [];
   const removed: number[] = [];
   const preserved: number[] = [];
+  const duplicates: number[] = [];
   const seen = new Set<number>();
 
   for (const parsedEntry of parsed) {
     const id = parsedEntry.id;
     if (typeof id !== 'number' || !Number.isFinite(id)) {
       result.push({ ...parsedEntry });
+      continue;
+    }
+    /*
+     * ★ 重复 id 必须拦下来（2026-11-24）。
+     *
+     * 原来只 `seen.add(id)` 而不检查，于是 TXT 里同一个 id 出现两次时
+     * result 会被 push 两条同 id 条目 —— 写回 ST JSON 后就是一个
+     * "两条记录抢同一个 id"的世界书，编辑器与 ST 的行为都不确定
+     * （哪条生效取决于遍历顺序）。
+     *
+     * 策略 first-wins：保留第一条，后面的丢弃，并把 id 报给调用方提示用户。
+     * 不选"后者覆盖"是因为那会让"我改了第二条"看起来没生效。
+     */
+    if (seen.has(id)) {
+      duplicates.push(id);
       continue;
     }
     seen.add(id);
@@ -1328,5 +1351,5 @@ export function mergeWorldbookEntries(
     );
   }
 
-  return { entries: result, added, removed, preserved };
+  return { entries: result, added, removed, preserved, duplicates };
 }

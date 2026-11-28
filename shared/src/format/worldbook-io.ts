@@ -27,7 +27,7 @@
  */
 
 import type { StCharacterBook, StWorldbookEntry } from '../model/sillytavern.js';
-import { offsetToLineColumn } from '../text/count.js';
+import { createLineIndex, offsetToLineColumn } from '../text/count.js';
 import { parseWorldbookTextWith, renderWorldbookTextWith, withStEntryComments } from './worldbook.js';
 import { DEFAULT_WORLDBOOK_FORMAT, type WorldbookFormatParams } from './worldbook-preset.js';
 
@@ -593,9 +593,19 @@ export function parseWorldbookJson(text: string): ParseWorldbookJsonResult {
 
   const list = entriesRaw as unknown[];
   const entries: StWorldbookEntry[] = [];
+  /*
+   * ★ 行号索引只建一次（2026-11-24）。
+   *
+   * 原来循环里每条都调 `offsetToLineColumn(text, offset)`，而它从 0 扫到 offset ——
+   * 总复杂度 O(条目数 × 文本长度)。实测 10k 条要 13.1 秒，界面直接卡死，
+   * 用户以为程序挂了（报告 P1-3）。
+   *
+   * 现在一次扫描建索引，每条约 14 次二分比较。语义逐字相同（同一个换行逻辑）。
+   */
+  const lineIndex = createLineIndex(text);
   for (let index = 0; index < list.length; index += 1) {
     const offset = entryOffsets[index];
-    const location: Location = offset === undefined ? {} : offsetToLineColumn(text, offset);
+    const location: Location = offset === undefined ? {} : lineIndex.at(offset);
     const entry = normalizeEntry(list[index], index, location, issues);
     if (entry !== null) entries.push(entry);
   }

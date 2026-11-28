@@ -398,13 +398,42 @@ export function tokenizeHighlight(text: string, compiled: CompiledHighlightRule,
 
 /** 把样式定义转成 CSS 声明（编辑器与 HTML 预览共用） */
 export function scopeCss(scope: HighlightScope): string {
-  const parts: string[] = [`color:${scope.color}`];
-  if (scope.backgroundColor) parts.push(`background-color:${scope.backgroundColor}`);
+  const parts: string[] = [`color:${safeColorValue(scope.color, 'inherit')}`];
+  if (scope.backgroundColor) {
+    parts.push(`background-color:${safeColorValue(scope.backgroundColor, 'transparent')}`);
+  }
   if (scope.bold) parts.push('font-weight:600');
   if (scope.italic) parts.push('font-style:italic');
   if (scope.underline) parts.push('text-decoration:underline');
   if (scope.strikethrough) parts.push('text-decoration:line-through');
   return parts.join(';');
+}
+
+/**
+ * 颜色值的第二道白名单（2026-11-24）。
+ *
+ * 解析层（`COLOR_PATTERN`）已经收紧了字符集，这里是**兜底**：
+ * `scopeCss` 的返回值会被原样拼进 `style` 属性，只要有一个字符能逃出
+ * 属性引号，导入一份恶意高亮方案就等于拿到 DOM 注入原语。
+ *
+ * 所以不依赖单一防线 —— 两道都过才输出，否则回落到安全值。
+ * 判据见 `test/highlight-color-injection.test.mjs`。
+ */
+export function safeColorValue(value: string, fallback: string): string {
+  const trimmed = value.trim();
+  if (trimmed === '') return fallback;
+  // 只允许十六进制 / 命名色 / 数值型函数调用；出现引号、分号、反斜杠、
+  // 尖括号、花括号一律视为不合法（这些都能改变属性边界或语句边界）
+  if (/["';\\<>{}]/.test(trimmed)) return fallback;
+  if (/^(#[0-9a-fA-F]{3,8}|[a-zA-Z]{3,20}|(?:rgb|rgba|hsl|hsla)\(\s*[0-9.%,\s/+-degra]+\s*\))$/.test(trimmed)) {
+    return trimmed;
+  }
+  return fallback;
+}
+
+/** 属性值转义：用于 `style="…"`，防止颜色值里的引号截断属性 */
+function escapeAttr(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function escapeHtml(text: string): string {
@@ -439,10 +468,10 @@ export function renderInlineHtml(
     }
     const scope = compiled.scopes[segment.scope];
     const style = scope ? scopeCss(scope) : '';
-    html += `<span class="tcs-hl tcs-hl-${escapeHtml(segment.scope)}" data-rule="${escapeHtml(segment.ruleId ?? '')}"${style ? ` style="${style}"` : ''}>${body}</span>`;
+    html += `<span class="tcs-hl tcs-hl-${escapeHtml(segment.scope)}" data-rule="${escapeHtml(segment.ruleId ?? '')}"${style ? ` style="${escapeAttr(style)}"` : ''}>${body}</span>`;
   }
   if (options.withWrapper === false) return html;
   const theme = compiled.theme;
-  const wrapper = `color:${theme.foreground};background:${theme.background}`;
-  return `<div class="tcs-highlight" data-scheme="${escapeHtml(compiled.id)}" style="${wrapper}">${html}</div>`;
+  const wrapper = `color:${safeColorValue(theme.foreground, 'inherit')};background:${safeColorValue(theme.background, 'transparent')}`;
+  return `<div class="tcs-highlight" data-scheme="${escapeHtml(compiled.id)}" style="${escapeAttr(wrapper)}">${html}</div>`;
 }

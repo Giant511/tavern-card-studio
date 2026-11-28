@@ -106,14 +106,32 @@ const baseTheme = EditorView.theme({
   '.cm-cursor': { borderLeftWidth: '2px' },
 });
 
-export interface BlockEditorOptions {
+export interface BlockEditorBase {
   parent: HTMLElement;
-  text: string;
   blockId: BlockId;
   compiled: CompiledHighlightRule | null;
   /** 文档变化（已去掉装饰影响） */
   onChange: (text: string) => void;
 }
+
+/**
+ * 功能
+ * 构造参数：`text`（新建）与 `state`（复用）二选一。
+ *
+ * 注意事项
+ * 用联合类型而不是"两个都可选"，是为了让"两个都给"在编译期就不可能 ——
+ * 同时给时 CodeMirror 会**静默忽略** extensions（`EditorViewConfig` 的文档
+ * 明写：只有没给 state 时才用 doc/extensions 创建），
+ * 于是新注册的 onChange 不会生效，症状是"打字没反应"。
+ *
+ * 踩过的坑
+ * 无。
+ */
+export type BlockEditorOptions = BlockEditorBase &
+  (
+    | { text: string; state?: undefined }
+    | { state: EditorState; text?: undefined }
+  );
 
 export class BlockEditor {
   readonly view: EditorView;
@@ -121,6 +139,22 @@ export class BlockEditor {
 
   constructor(options: BlockEditorOptions) {
     this.compiled = options.compiled;
+
+    /*
+     * 复用路径（P1-10）：折叠时存下的 state 直接给 view。
+     *
+     * 它自带的 extensions 里有一个 `updateListener`，闭包指向**上一次**
+     * 创建时的 `options.onChange`（也就是旧的 host 对象）。这在本项目里无害：
+     * host 的每个成员都是 getter / 转发到同一个 EditorApp 实例，
+     * 旧 host 与新 host 的行为完全一致。
+     *
+     * 如果哪天 host 变成"带快照的状态对象"，这条就成立不了了 ——
+     * 那时要改成"用一个稳定的 ref 转发 onChange"。
+     */
+    if (options.state !== undefined) {
+      this.view = new EditorView({ parent: options.parent, state: options.state });
+      return;
+    }
 
     const extensions: Extension[] = [
       history(),
@@ -144,6 +178,25 @@ export class BlockEditor {
 
   getText(): string {
     return this.view.state.doc.toString();
+  }
+
+  /**
+   * 功能
+   * 取当前完整 state（含撤销栈），供折叠时保存。
+   *
+   * 注意事项
+   * 必须在 `destroy()` **之前**调用。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  snapshotState(): EditorState {
+    return this.view.state;
+  }
+
+  /** 当前高亮规则（折叠时一并记下，切换过就不复用旧 state） */
+  get highlight(): CompiledHighlightRule | null {
+    return this.compiled;
   }
 
   /** 更新问题标记（重新校验后调用；传空数组即全部清除） */

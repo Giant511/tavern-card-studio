@@ -29,6 +29,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
+import { readEditorImplNoComments } from './lib/editor-source.mjs';
+
 import { parseStCard, stringifyStCard } from '../shared/dist/format/sillytavern-io.js';
 import { renderChatExamples, parseChatExamples } from '../shared/dist/format/chat-examples-format.js';
 
@@ -164,7 +166,12 @@ test('★★★★★ 导入与导出都必须拿到 chatExamplesFormat（漏了
    * 为什么单独钉：它不像类型错误会编译失败（参数是可选的），
    * 漏了只是**静默不生效**，而表现是"用户配了预设但界面没变"。
    */
-  const app = read('client/src/editor/app.ts');
+  /*
+   * 2026-11-24：改用共享入口。parseStCard 的调用点分散在 app.ts /
+   * open-actions.ts / st-push.ts 三处，只读 app.ts 会漏掉后两处 ——
+   * 而这条判据问的正是"每个调用点都接线了吗"。
+   */
+  const app = readEditorImplNoComments();
 
   /*
    * ## 两次写错这条判据，都因为"按行看"

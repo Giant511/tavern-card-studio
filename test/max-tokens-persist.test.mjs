@@ -42,6 +42,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readShellImpl, readShellImplNoComments } from './lib/shell-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const read = (rel) => readFileSync(join(ROOT, rel), 'utf8');
@@ -119,8 +120,8 @@ test('★★★ 派生采样只认 ST，不许被 App 侧覆盖', () => {
    * `apiState.maxTokens`，就算 UI 删了，旧 localStorage 里的值仍会在
    * 下一次启动时把 ST 的值盖掉。
    */
-  const shell = strip(read('client/src/chat/shell.ts'));
-  const at = shell.indexOf('private deriveSampling');
+  const shell = strip(readShellImpl());
+  const at = shell.indexOf('function deriveSampling(host: SettingsHost');
   assert.ok(at > 0, 'deriveSampling 要存在');
   const body = shell.slice(at, at + 900);
 
@@ -134,7 +135,7 @@ test('★★★ 外壳里不许再有写 maxTokens 的旁路方法', () => {
    * `writeMaxTokens` 是当年为"API 页那一格"造的第二条写 ST 的路径。
    * 留着它，将来任何一个入口都能绕过「AI 响应配置」改这个键。
    */
-  const shell = strip(read('client/src/chat/shell.ts'));
+  const shell = strip(readShellImpl());
   assert.doesNotMatch(shell, /writeMaxTokens/, '这个方法应已删除');
 });
 

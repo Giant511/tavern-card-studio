@@ -294,16 +294,61 @@ async fn send_once(
 /// 拒绝任意 host 会让这个功能不可用。与 `probe_tcp` 的白名单不是一回事 ——
 /// 那条限制是因为"探针接受任意 host 就变成端口扫描器"，而这里的用途
 /// 本来就是"连我指定的那台服务器"，用户填什么就连什么。
+/// 检查 URL 方案与明显危险的目标。只放行 http / https。
+///
+/// ## 为什么不校验 host
+///
+/// 同步服务端本来就是用户**自己填的**地址（可以是内网 10.x，也可以是公网域名），
+/// 仓库面板与 ST 包下载还会连任意第三方站点。拒绝任意 host 会让这些功能不可用。
+/// 与 `probe_tcp` 的白名单不是一回事 —— 那条限制是因为"探针接受任意 host
+/// 就变成端口扫描器"，而这里的用途本来就是"连我指定的那台服务器"。
+///
+/// ## 那注入风险靠什么挡
+///
+/// 靠**注入源**侧：高亮规则的颜色值曾经能逃出 `style` 属性（已修，
+/// 见 `test/highlight-color-injection.test.mjs`）。渲染层拿不到执行能力，
+/// 就没有"用这个命令去打内网"的入口。
+///
+/// 这里只做零功能损失的一层加固：拒绝云元数据地址。那些地址不是任何用户会
+/// 主动填的服务器，但它们能拿到实例凭据 —— 属于"即便被利用也不该连通"的目标。
 fn check_scheme(url: &str) -> ShellResult<()> {
     let lower = url.trim().to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        return Ok(());
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(ShellError::NetRequestFailed {
+            kind: "other".to_string(),
+            message: format!("只支持 http 与 https 地址：{url}"),
+            insecure_would_work: false,
+        });
     }
-    Err(ShellError::NetRequestFailed {
-        kind: "other".to_string(),
-        message: format!("只支持 http 与 https 地址：{url}"),
-        insecure_would_work: false,
-    })
+
+    // 取 host 部分（去掉 scheme、userinfo、path、port）
+    let after_scheme = lower.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = if host_port.starts_with('[') {
+        host_port.split(']').next().unwrap_or("").trim_start_matches('[')
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+
+    const BLOCKED: [&str; 4] = [
+        "169.254.169.254",          // AWS / GCP / Azure / 阿里云 通用元数据地址
+        "metadata.google.internal", // GCP 别名
+        "metadata",                 // 部分云厂商的短名
+        "100.100.100.200",          // 阿里云元数据
+    ];
+    if BLOCKED.contains(&host) {
+        return Err(ShellError::NetRequestFailed {
+            kind: "other".to_string(),
+            message: format!("拒绝访问云元数据地址：{host}"),
+            insecure_would_work: false,
+        });
+    }
+
+    Ok(())
 }
 
 /// 发一次 HTTP 请求（桌面端同步 / 探测用）。
@@ -484,5 +529,53 @@ mod tests {
             .await
             .expect_err("file:// 必须被拒");
         assert!(matches!(failure, ShellError::NetRequestFailed { .. }));
+    }
+
+    /*
+     * 云元数据地址必须拒（2026-11-24）。
+     *
+     * 这些地址不是任何用户会主动填的服务器，但它们能拿到实例凭据。
+     * 即便渲染层被注入，也不该有"用这个命令去打元数据服务"的入口。
+     */
+    /*
+     * 云元数据地址必须拒（2026-11-24）。
+     *
+     * 这些地址不是任何用户会主动填的服务器，但它们能拿到实例凭据。
+     * 即便渲染层被注入，也不该有"用这个命令去打元数据服务"的入口。
+     *
+     * ★ 直接测 `check_scheme` 这个纯函数，不走 `server_http_request` ——
+     *   后者会真的建连接，对 169.254 要等到超时，既慢又依赖网络环境。
+     */
+    #[test]
+    fn rejects_cloud_metadata_hosts() {
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "https://169.254.169.254/computeMetadata/v1/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://user:pass@169.254.169.254/x",
+            "http://169.254.169.254:80/x",
+        ] {
+            let err = check_scheme(url);
+            assert!(err.is_err(), "元数据地址必须被拒：{url}");
+        }
+    }
+
+    #[test]
+    fn allows_normal_hosts_and_loopback() {
+        /*
+         * 收窄不能把正常用途打死：用户填内网地址、公网域名、
+         * 回环代理（ST 内嵌面板）都必须照旧可用。
+         */
+        for url in [
+            "http://127.0.0.1:8730/api/health",
+            "http://localhost:8000/",
+            "https://github.com/Giant511/tavern-card-studio/releases/x.zip",
+            "http://192.168.1.50:8731/api/stats",
+            "https://my-server.example.com/api/auth/me",
+            "https://169.254.169.254.evil.com/x",
+        ] {
+            assert!(check_scheme(url).is_ok(), "正常地址被误拒：{url}");
+        }
     }
 }

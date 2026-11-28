@@ -233,8 +233,6 @@ import {
  */
 import { convertToPng } from '../export/face-convert.ts';
 
-export type TabId = 'chat' | 'cards' | 'repo' | 'me';
-
 /**
  * 「我的」页一级收纳项的规格（2026-10-31 第三批）。
  *
@@ -264,18 +262,6 @@ interface AccordionSpec {
   buildBody: () => ElLike;
 }
 
-/**
- * API 连接的副标题。
- *
- * 只说用户关心的两件事：**连哪个后端、用哪个模型**。
- * 不显示 key（有也不显示 —— 屏幕上出现密钥片段是事故），
- * 不显示采样参数（那是展开后的事）。
- */
-function apiSummary(state: ApiPageState): string {
-  const label = CHAT_SOURCE_LABELS[state.source]?.label ?? '自定义';
-  const model = state.model.trim();
-  return model === '' ? `当前：${label}（还没填模型名）` : `当前：${label} · ${model}`;
-}
 
 /**
  * 沿 `cause` 链判断这个错误是不是"证书不受信任"。
@@ -324,221 +310,82 @@ function voiceSummary(settings: VoiceSettings): string {
   return `当前：${name}${settings.confirmBeforeSend ? ' · 发送前需确认' : ''}`;
 }
 
-interface TabDef {
-  id: TabId;
-  label: string;
-  icon: string;
-}
-
-/**
- * 一次"把卡写进角色库"的结果（2026-11-09）。
+/*
+ * 契约面搬到了 `shell-contract.ts`（2026-11-24）。
  *
- * 只为一件事：**世界书到底进没进来，要能如实告诉用户**。
+ * 这里原样转出，所以既有 import 路径不变 —— `mobile/main.ts` 那句
+ * `import { AppShell, type SavedChatSession } from '../chat/shell.ts'` 不用改。
  *
- * ## 为什么必须区分 `none` 与 `failed`
- *
- * `persistEmbeddedWorldbook` 返回 `null` 同时覆盖两种情况，而它们的
- * 处置完全相反：
- *
- * ```text
- *   none    卡里本来就没有 character_book ⇒ 什么都不该说
- *   failed  卡里带了书但没落地           ⇒ 必须说，否则用户以为卡没带书
- * ```
- *
- * 把两者混成一句"世界书未导入"，会让**本来就没有书**的卡也弹提示 ——
- * 那是拿噪音换消息，用户很快就不看了。
+ * 为什么拆：`AppShell` 有 1 万行，而它的对外契约（22 个字段的 ShellOptions）
+ * 混在文件中部，任何改契约的人都要先滚过半个文件（报告 P2-1）。
  */
-interface CardWriteResult {
-  /** `ok` = 落地成功；`none` = 卡里没有内嵌书；`failed` = 有书但失败 */
-  worldbook: 'ok' | 'none' | 'failed';
-  /** 落地后的书名（`worldbook === 'ok'` 时才有） */
-  worldbookName?: string;
-  /** 失败原因（`worldbook === 'failed'` 时才有） */
-  worldbookFailure?: string;
-}
 
-/** Tab 顺序即从左到右（聊天是第一页 —— 它是这个 App 的主用途） */
-const TABS: readonly TabDef[] = [
-  { id: 'chat', label: '聊天', icon: '💬' },
-  { id: 'cards', label: '卡片', icon: '🗂' },
-  { id: 'repo', label: '仓库', icon: '☁️' },
-  { id: 'me', label: '我的', icon: '⚙️' },
-];
-
-export interface ShellOptions {
-  doc: DocLike;
-  /**
-   * ST 的地址。**外壳会用它在首次需要时调 `connect()`**。
-   *
-   * 2026-10-31 第五批修：这个字段此前**只被赋值、从未被读**
-   * （`grep stBaseUrl shell.ts` 只有声明那一行）。
-   * 而 `StChatBridge.connect()` 全库零调用 ⇒ Rust 侧 `StChatState.api`
-   * 恒为 None ⇒ 所有 ST 命令都返回 `StUnavailable`。
-   * 用户看到的「保存失败: [object Object]」和「读不到当前的聊天设置」
-   * 都是这一个断点的两种表现。
-   */
-  stBaseUrl: string;
-  /**
-   * 读引擎真实状态（Android 侧注入的 JS 桥）。
-   *
-   * 不传 = 这个平台没有这项能力（桌面端 / 浏览器）。
-   * **不许在拿不到时假装 `{ready:false}`** —— 那会让 UI 说
-   * "引擎没起来"，而我们其实只是没有信息源。
-   */
-  readEngineStatus?: () => EngineStatus | null;
-  userName: string;
-  /** 卡片数据（聊天上下文用） */
-  card: Record<string, unknown>;
-  /** 本机已保存的 API 偏好 */
-  apiState?: ApiPageState;
-  /**
-   * 本机已保存的用户设定（2026-11-04 第三十批）。
-   *
-   * 存在 App 自己这里而不是引擎里 —— 详见 `shared/chat/persona.ts`。
-   */
-  personaState?: PersonaState;
-  /** 保存用户设定（外壳负责落盘） */
-  onPersistPersona?: (state: PersonaState) => Promise<void>;
-  /** 保存 API 偏好（外壳负责落盘） */
-  onPersistApi?: (state: ApiPageState) => Promise<void>;
-  /**
-   * 哪些源**已经配置过 key**（2026-11-02 用户要求）。
-   *
-   * ## 为什么需要它
-   *
-   * 用户原话：「秘钥也改一下，改成可见的一串星号（给一个变量专门指示是否
-   * 填写了秘钥…），这样用户才知道自己有没有配置」。
-   *
-   * 聊天 API 的 key 写进 SillyTavern 后**读不回来**（契约 §3.5 掩码），
-   * 所以"配过没有"只能由**知道写入这件事的那一方**记一份标记。
-   * 写入发生在本壳里（`renderApiPage` 的保存流程），所以标记也放这里。
-   *
-   * ## 为什么是「按源」而不是一个全局布尔
-   *
-   * 用户可能给 OpenAI 配了、没给 DeepSeek 配。全局布尔会让切到 DeepSeek
-   * 也显示"已配置" —— 比不显示更糟：他以为能用，然后发消息失败。
-   */
-  apiKeySources?: readonly StChatSource[];
-  /**
-   * 某个源刚写入了新 key（外壳落盘标记）。
-   *
-   * 与 `onPersistApi` 分开：那是"页面状态"（源/模型/地址），这是
-   * "秘钥是否存在"的标记，两者的存储介质与失败影响都不同。
-   */
-  onApiKeyWritten?: (source: StChatSource) => void;
-  /** 本机已保存的语音设置 */
-  voiceSettings?: VoiceSettings;
-  /** 保存语音设置（外壳负责落盘 + 写 key） */
-  onPersistVoice?: (settings: VoiceSettings, apiKey: string | null) => Promise<void>;
-  /**
-   * 读「显示完整思考链」开关（2026-11-05）。
-   *
-   * 与 `onPersistVoice` 同一个模式：外壳不知道存储介质，
-   * 只负责把它传给设置页与聊天面板。
-   *
-   * 不传 = 关（默认不显示完整思考链，见 `mobile/main.ts` 里那段理由）。
-   */
-  readShowReasoning?: () => boolean;
-  /** 写这个开关。不传则开关只在本次进程内有效 */
-  onPersistShowReasoning?: (next: boolean) => void;
-  /**
-   * 读/写思考模式的本机偏好（2026-11-07，P0 第三步）。
-   *
-   * 落盘方式与平台相关（移动端是 localStorage），所以由入口负责，
-   * 外壳只持有内存值 —— 与 `readShowReasoning` 同一条纪律。
-   */
-  readThinking?: () => { intent: ThinkingIntent; budget?: number | string; family?: ParamFamily };
-  onPersistThinking?: (next: { intent: ThinkingIntent; budget?: number | string; family?: ParamFamily }) => void;
-  /**
-   * 读本机已存的 ASR key（为空串表示没存过）。
-   *
-   * 为什么要一个"读 key"的回调，而不是让外壳自己也存一份：
-   * key 的落盘方式与平台相关（Android 走 localStorage / 桌面以后可能走
-   * 系统凭据库），外壳不该知道这些。它只要能**在需要转写的那一刻拿到**。
-   *
-   * 注意：这**不是**"把 key 放进聊天请求"。ASR 请求直连用户配的服务，
-   * TCS 服务端零接触（需求 §五 第 6 条）。
-   */
-  readVoiceKey?: () => string;
-  onNotify?: (message: string, kind?: 'info' | 'ok' | 'warn' | 'danger') => void;
-
-  /**
-   * 冷启动的**会话恢复**已经落定（无论成功 / 没历史 / 失败）（2026-11-06）。
-   *
-   * ## 为什么需要这个回调
-   *
-   * 用户：
-   *
-   * > 在已经存在聊天记录的时候，再次打开 APP，开屏动画之后会短暂显示
-   * > 还没有聊天的那个界面，干脆再把开屏动画弄长一点，聊天记录页面
-   * > 加载完成后再显示。
-   *
-   * 真因：`mount()` 里的恢复是 `void` 异步（**故意不 await**，否则首屏
-   * 迟迟不出现），于是：
-   *
-   * ```text
-   *   splash 消失 → shell 挂上 → 渲染"还没有对话"（快照还是 null）
-   *   → 后台读完历史 → 再渲染 → 消息出现
-   * ```
-   *
-   * 中间那一帧就是用户看到的"短暂显示空界面"。
-   *
-   * 有了这个回调，`main.ts` 可以：
-   *
-   * ```text
-   *   splash 保持显示 → shell.mount() → 等这个回调（或 3 秒上限）→ 淡出
-   * ```
-   *
-   * 于是用户看到的是"开屏久一点，然后直接有聊天记录"。
-   *
-   * ★ 调用时机是 `finally`（成功失败都调）—— 失败时也必须放行，
-   *   否则引擎起不来会把用户永久关在开屏里。
-   */
-  onSessionSettled?: () => void;
-
-  /**
-   * 上次退出时正在聊的会话（2026-11-01 第八批问题二第二轮）。
-   *
-   * ## 为什么必须有
-   *
-   * 真机实测：内部 Tab 往返没问题（`chatSnapshot` 在内存里），但
-   * **切到别的 App / 按 Home 再回来**（Android 会回收 WebView）之后，
-   * 整个 JS 堆没了 —— `selectedCharacter` 与 `chatSnapshot` 双双归零，
-   * 界面回到「未选择聊天」。用户说"切走再回来消息全没了"就是这个。
-   *
-   * 实测证据（`.verify/verify-switch-scenarios.mjs`）：
-   * ```text
-   * A. 内部 Tab 往返   3 → -1 → 3        PASS
-   * B. 页面重载(等价回收) 3 → count=1     FAIL
-   * ```
-   *
-   * 所以会话身份（哪个角色、哪个聊天文件）必须**落盘**。
-   * 消息本身不用存 —— 它们在 ST 的 jsonl 里，按文件名能读回来。
-   */
-  savedSession?: SavedChatSession | null;
-  /**
-   * 会话身份变化时落盘。
-   *
-   * 与 `onPersistVoice` 同一个模式：外壳不知道存储介质
-   * （Android 是 localStorage / 桌面以后可能是别的），只负责"什么时候该存"。
-   */
-  onPersistSession?: (session: SavedChatSession) => void;
-}
-
-/**
- * 需要跨进程存活的会话身份。
- *
- * **不存 messages**：消息在 ST 的 jsonl 里，是唯一事实来源。
- * 在这里存一份会导致"两份历史不一致"，而合并策略是新的复杂度来源。
- */
-export interface SavedChatSession {
-  /** 角色头像文件名（ST 用它定位目录） */
-  avatar: string;
-  /** 角色显示名 */
-  name: string;
-  /** 聊天文件名（**不带扩展名**，`get`/`save` 要的那个） */
-  fileName: string | null;
-}
+export type { CardWriteResult, ShellOptions, SavedChatSession, TabId } from './shell-contract.ts';
+import { makeFilesCallbacks } from './files-callbacks';
+import { makeActionsCallbacks } from './actions-callbacks';
+import { createRepoState, type RepoState } from './repo-state';
+import {
+  applyPersonaForCharacter,
+  currentUserName,
+  openPersonaSwitcher,
+  personaContext,
+  renderPersonaPage as renderPersonaPageAction,
+  syncPersonaToChat,
+  type PersonaHost,
+} from './persona-actions';
+import {
+  deletePromptById,
+  mutatePromptPreset,
+  rebuildPromptConfig,
+  refreshPromptTriggers,
+  restoreCharacterPrompts,
+  saveCharacterPromptDraft,
+  saveCharacterPrompts,
+  savePromptDraft,
+  savePromptToggle,
+  type PromptHost,
+} from './prompt-actions';
+import {
+  apiSummary,
+  deriveSampling,
+  makePresetCallbacks,
+  makeSettingsCallbacks,
+  refreshKeyPresence,
+  renderApiSection,
+  renderDiagSection,
+  writeApiConnectionToSt,
+  type SettingsHost,
+} from './settings-sections';
+import {
+  loadGreetingCharacters,
+  renderGreeting,
+  type GreetingHost,
+} from './greeting-actions';
+import {
+  adoptLoadedCard,
+  chatAvatar,
+  importLocalCard,
+  loadCharacterCard,
+  loadCharacterCardWithRetry,
+  resolveCardPlacement,
+  writeCardPng,
+  writeCardToLibrary,
+  type CardHost,
+} from './card-actions';
+import {
+  fetchRepoCards,
+  loadRepoListQuietly,
+  renderRepoCardPage as renderRepoCardPageAction,
+  renderRepoCardsPage as renderRepoCardsPageAction,
+  renderRepoPage as renderRepoPageAction,
+  repoOrigin,
+  type RepoHost,
+} from './repo-actions';
+import type { FilesHost } from './files-callbacks';
+import type { ActionsHost } from './actions-callbacks';
+import type { ChatSessionState } from './chat-session-state';
+import { TABS } from './shell-contract.ts';
+import type { CardWriteResult, ShellOptions, SavedChatSession, TabId } from './shell-contract.ts';
 
 export class AppShell {
   private readonly doc: DocLike;
@@ -846,124 +693,25 @@ export class AppShell {
   /* ═══ 仓库（2026-11-04，T15.2 阶段 A）═══ */
 
   /**
-   * 服务端地址策略（内置云仓库 / 自定义）。
+   * 功能
+   * 仓库页的全部可变状态（配置 / 登录态 / 连通性 / 三层列表缓存）。
    *
-   * 启动时从 localStorage 读回 —— 用户要求"杀 App 重进后仓库配置保持"。
+   * 注意事项
+   * 19 个字段收进一个对象，不要再拆回散字段。
+   * 把它整体传给 repo-actions.ts 的函数，那里会直接改 `cards` / `versions`
+   * 这类数组字段 —— 所以在外部缓存子字段的引用会读到过期值。
+   *
+   * 踩过的坑
+   * 这些字段原来散在本类 600–790 行之间，中间夹着卡片页与聊天页的字段。
+   * 读一段仓库代码要上下翻几百行才知道共有几个状态，漏看一个就会把
+   * 「这个标志位谁在写」判断错，进而改错刷新时机。
+   * 详细逐字段说明见 repo-state.ts。
    */
-  private repoConfig: RepoConfigState = readRepoConfig();
+  private repo: RepoState = createRepoState({
+    config: readRepoConfig(),
+    auth: { ...EMPTY_REPO_AUTH },
+  });
 
-  /** 登录态（令牌 + 用户名）。与配置分两个键存，切地址时能独立清掉 */
-  /**
-   * 登录态。**按 origin 各一份**（2026-11-05）。
-   *
-   * 初始化时要先有 `repoConfig` 才能算 origin —— 所以放在构造函数里
-   * （`repoConfig` 是字段初始化器，先于这个字段？不一定，显式赋值更稳）。
-   */
-  private repoAuth: MobileRepoAuth = { ...EMPTY_REPO_AUTH };
-
-  /**
-   * 与服务端的连通状态（2026-11-06）。
-   *
-   * ## 为什么必须挂在外壳上，不能放页面闭包里
-   *
-   * 页面每次切 Tab 都会重建（转场架构如此）。状态放页面里 ⇒
-   * 切回来就变回 `unknown` ⇒ 又要探测一次 ⇒ 用户看到的就是
-   * "每次切回来都在重连"。
-   *
-   * 用户明确要求：
-   *
-   * > 切到其他地方不丢失连接，切回来不需要重新连接服务器。
-   *
-   * 外壳在整个 App 生命周期内只有一个，所以放这里才叫"不丢失"。
-   */
-  private repoLink: RepoLinkState = 'unknown';
-  private repoLinkDetail = '';
-  private repoLinkCheckedAt = 0;
-
-  /**
-   * 上次拉到的卡片列表（2026-11-06）。
-   *
-   * ## 为什么要缓存
-   *
-   * 同上：页面重建时如果只能"先转圈再拉"，切回来那一下就是一次重新连接。
-   * 有缓存就能**立刻有内容**，再后台静默刷新。
-   *
-   * ## 为什么要带 origin
-   *
-   * 切了服务端，旧服务端的列表必须作废 —— 否则会在新服务端下面
-   * 显示另一台机器的卡片，点进去 404。用 origin 当缓存键最直接。
-   */
-  private repoCardsCache: RepoCardRow[] = [];
-  private repoCardsCacheOrigin = '';
-
-  /*
-   * ═══════════════════════════════════════════════════════════
-     仓库的三级导航状态（2026-11-06）
-     ═══════════════════════════════════════════════════════════
-
-     用户要求：
-
-     > 登录后按照仓库列表做展示（多仓库的情况下），点击对应仓库可进入
-     > 卡查看界面 … 点击对应卡片进入卡片历史界面
-
-     所以仓库 Tab 变成三级：
-
-     ```text
-       null / null                 → 一级：服务端配置 + 登录 + 仓库列表
-       repoId 有值 / cardId 为 null → 二级：该仓库的卡片列表
-       repoId 有值 / cardId 有值    → 三级：某张卡的历史
-     ```
-
-     ★ 这两个字段同时决定 `pageKey()` 的段数（1 → 2 → 3），
-       于是转场方向由 `turnDirection()` 自动推导 —— 不需要为每一级
-       单独写动画。这是第 4 点"复用转场"的实现方式。
-     */
-  private repoRepoId: string | null = null;
-  private repoRepoName = '';
-  private repoCardId: string | null = null;
-  private repoCardTitle = '';
-
-  /*
-   * 二级、三级的加载状态。
-   *
-   * `null` = 还没拉到（渲染"正在读取…"）；空数组 = 拉到了但是空的。
-   * 两者必须区分：都当空数组的话，页面会先显示"没有卡片"再变成列表，
-   * 那一下闪烁比多一次渲染更刺眼。
-   */
-  private repoCardsState: RepoCardRow[] | null = null;
-  private repoCardsError = '';
-  private repoVersionsState: RepoVersionRow[] | null = null;
-  private repoVersionsError = '';
-
-  /** 一级的仓库列表缓存（切回一级时先有内容可看） */
-  private repoReposCache: RepoRow[] = [];
-
-  /**
-   * 正在进行的续期请求（单飞去重，2026-11-07）。
-   *
-   * 服务端的 refresh 是**轮换**语义：刷一次就把 refresh token 换掉。
-   * 仓库页进入时会并发发好几个请求，若每个 401 都各自去刷，
-   * 后到的那次必然用已被作废的旧 token 而失败 ⇒ 误判"登录过期"。
-   * 详见 `refreshRepoAuth()` 的注释。
-   */
-  private repoRefreshInFlight: Promise<boolean> | null = null;
-
-  /**
-   * 令牌彻底续不上了（refresh token 也过期/被吊销）。
-   *
-   * 与 `repoStatus().expired` 的区别：那个是"按本地时钟判断 access 过期"，
-   * 只是**推测**；这个是我**真的试过续期并失败**，是事实。
-   * 页面上要显示的是后者 —— 推测过期时自动续期就能解决，不该吓用户。
-   */
-  private repoAuthExpired = false;
-
-  /**
-   * 「显示完整思考链」的**当前值**（2026-11-05）。
-   *
-   * 为什么在外壳存一份而不是每次问 `options.readShowReasoning()`：
-   * 聊天面板的流式回调是**每帧**跑的，每帧读一次 localStorage 是浪费；
-   * 而且用户翻开关时面板已经存在，得有个地方能让它"看到新值"。
-   */
   private showReasoning = false;
   /**
    * 思考模式的本机偏好（2026-11-07，P0 第三步）。
@@ -1171,12 +919,12 @@ export class AppShell {
      * · `trustedCertOrigins` —— 用户确认过证书的自签服务器（可多个，持久化）
      */
     setInsecureOrigins([
-      ...(this.repoConfig.ackedPlainOrigin === '' ? [] : [this.repoConfig.ackedPlainOrigin]),
-      ...this.repoConfig.trustedCertOrigins,
+      ...(this.repo.config.ackedPlainOrigin === '' ? [] : [this.repo.config.ackedPlainOrigin]),
+      ...this.repo.config.trustedCertOrigins,
     ]);
     this.insecureOrigins = [
-      ...(this.repoConfig.ackedPlainOrigin === '' ? [] : [this.repoConfig.ackedPlainOrigin]),
-      ...this.repoConfig.trustedCertOrigins,
+      ...(this.repo.config.ackedPlainOrigin === '' ? [] : [this.repo.config.ackedPlainOrigin]),
+      ...this.repo.config.trustedCertOrigins,
     ];
     /*
      * 初始"已配 key"集合由调用方给（它从持久化标记里读）。
@@ -1198,9 +946,9 @@ export class AppShell {
      * 登录态按 origin 恢复（2026-11-05）。
      *
      * 必须在这里（而不是字段初始化器）读：`repoOrigin()` 依赖
-     * `this.repoConfig`，而字段初始化顺序不保证它已经就位。
+     * `this.repo.config`，而字段初始化顺序不保证它已经就位。
      */
-    this.repoAuth = readRepoAuthFor(this.repoOrigin() ?? '');
+    this.repo.auth = readRepoAuthFor(repoOrigin(this.repoHost()) ?? '');
     /* 思考链开关：默认关，用户存过就按存的 */
     this.showReasoning = options.readShowReasoning?.() ?? false;
     /* 思考模式：默认「自动」（不干预厂商默认），用户存过就按存的 */
@@ -1220,7 +968,7 @@ export class AppShell {
        * 而当前恢复出来的角色有自己的人设。不对齐的话，用户重进 App
        * 看到的就是"上一个人设"。
        */
-      this.applyPersonaForCharacter(saved.avatar);
+      applyPersonaForCharacter(this.personaHost(), saved.avatar);
     }
   }
 
@@ -1314,7 +1062,7 @@ export class AppShell {
            * 原来读一次失败就置空 ⇒ 开场白永久缺失，只有"进去保存一下"
            * 才会被 `refreshOpeningAfterEdit` 救回来。
            */
-          const gotCard = await this.loadCharacterCardWithRetry(avatar);
+          const gotCard = await loadCharacterCardWithRetry(this.cardHost(), avatar);
           /*
            * 卡一到就重绘 —— **不等历史**。
            *
@@ -1649,7 +1397,7 @@ export class AppShell {
           this.greetingState = emptyGreetingPageState();
           this.renderPage();
           /* 打开页面后异步读角色列表（`onToggle` 是同步的，不能 await） */
-          void this.loadGreetingCharacters();
+          void loadGreetingCharacters(this.greetingHost());
           return true;
         },
         buildBody: () => el(this.doc, 'p', 'nb-note'),
@@ -1725,7 +1473,7 @@ export class AppShell {
     button.setAttribute('data-state', 'idle');
     button.textContent = '从手机导入卡片';
     button.addEventListener('click', () => {
-      void this.importLocalCard(button);
+      void importLocalCard(this.cardHost(), button);
     });
 
     const note = el(this.doc, 'p', 'nb-note');
@@ -1798,12 +1546,12 @@ export class AppShell {
         setInsecureOrigins(this.insecureOrigins);
 
         const nextConfig: RepoConfigState = {
-          ...this.repoConfig,
-          trustedCertOrigins: [...this.repoConfig.trustedCertOrigins, origin],
+          ...this.repo.config,
+          trustedCertOrigins: [...this.repo.config.trustedCertOrigins, origin],
         };
         try {
           await writeRepoConfig(nextConfig);
-          this.repoConfig = nextConfig;
+          this.repo.config = nextConfig;
         } catch {
           /*
            * 存不住也继续 —— 这一次会话内仍然信任（用户已经点过确认）。
@@ -1817,31 +1565,13 @@ export class AppShell {
     }
   }
   /** 当前仓库 origin；未配置/地址非法时 null */
-  private repoOrigin(): string | null {
-    const resolved = resolveRepoOrigin(this.repoConfig);
-    return resolved.ok ? resolved.address.origin : null;
-  }
+
 
   /** 前端仓库请求：遇到 401 自动用 refresh token 续期并重试一次 */
-  private async repoFetchWithRefresh<T>(origin: string, work: () => Promise<T>): Promise<T> {
-    try {
-      return await work();
-    } catch (error) {
-      if (!this.isUnauthorized(error)) throw error;
-      const renewed = await this.refreshRepoAuth();
-      if (!renewed) throw this.repoExpiredError();
-      return await work();
-    }
-  }
+
 
   /** 这个错误是不是"令牌不被接受"（401） */
-  private isUnauthorized(error: unknown): boolean {
-    return (
-      error !== null &&
-      typeof error === 'object' &&
-      (error as { code?: unknown }).code === 'UNAUTHORIZED'
-    );
-  }
+
 
   /**
    * 令牌真的续不了（refresh token 也过期 / 被吊销）时给用户看的错误。
@@ -1852,13 +1582,7 @@ export class AppShell {
    *
    *   用户读到的必须是**下一步能做什么**。
    */
-  private repoExpiredError(): Error {
-    this.repoAuthExpired = true;
-    this.options.onNotify?.('登录已过期，请重新登录', 'warn');
-    /* 让页面刷一次：这会把它从「已登录」切到「需要重新登录」的形态 */
-    this.renderPage();
-    return new Error('登录已过期，请点「重新登录」');
-  }
+
 
   /**
    * 用 refresh token 换一对新令牌（2026-11-07）。
@@ -1895,91 +1619,10 @@ export class AppShell {
    *
    * @returns 是否续期成功（false = refresh token 也不行了，需要重新登录）
    */
-  private async refreshRepoAuth(): Promise<boolean> {
-    /* 已经在刷 ⇒ 等同一个结果，不要各刷各的 */
-    if (this.repoRefreshInFlight !== null) return await this.repoRefreshInFlight;
 
-    const origin = this.repoOrigin();
-    if (origin === null || this.repoAuth.refreshToken === '') return false;
-
-    const task = (async (): Promise<boolean> => {
-      try {
-        const bundle = await this.withCertTrust(origin, () =>
-          apiRefresh(origin, this.repoAuth.refreshToken, { fetchImpl: pickFetch() }),
-        );
-        /*
-         * ★ refresh token 也换了（轮换），必须**立刻**把新的存下来。
-         *
-         * 不存的话：这次续期能成功，但下次（2 小时后）拿的还是旧 refresh
-         * token，而它早已被服务端作废 ⇒ 那时就真的只能重新登录了。
-         */
-        this.repoAuth = {
-          accessToken: bundle.accessToken,
-          refreshToken: bundle.refreshToken,
-          accessExpiresAt: bundle.accessExpiresAt,
-          userId: bundle.user.userId,
-          username: bundle.user.username,
-        };
-        await writeRepoAuth(origin, this.repoAuth);
-        this.repoAuthExpired = false;
-        return true;
-      } catch {
-        /*
-         * 静默返回 false，由调用方统一提示。
-         *
-         * 这里不 `onNotify`：续期失败时可能有多个请求同时走到，
-         * 弹三条"登录已过期"比一条更糟（用户会以为出了三个错）。
-         */
-        return false;
-      }
-    })();
-
-    this.repoRefreshInFlight = task;
-    try {
-      return await task;
-    } finally {
-      this.repoRefreshInFlight = null;
-    }
-  }
 
   /** 给页面用的状态摘要 */
-  private repoStatus(): RepoStatus {
-    return {
-      config: this.repoConfig,
-      username: this.repoAuth.accessToken === '' ? null : this.repoAuth.username,
-      /*
-       * ★★★ 只认「真的续期失败」这一个事实（2026-11-07 修正）。
-       *
-       * 第一版这里按**本地时钟**判断 `accessExpiresAt < now`，于是问题变成：
-       *
-       * ```text
-       *   隔天打开 App
-       *     ⇒ access 一定过期（只有 2 小时）
-       *     ⇒ 页面直接写"登录已过期，请重新登录"
-       *     ⇒ 而其实 refresh token 还有 30 天，完全能自动续上
-       * ```
-       *
-       * 那等于把"用户无感的自动续期"变成了"每次重启都吓用户一跳"，
-       * 还逼他重新输密码 —— 比原来的 bug 更糟。
-       *
-       * 所以本地时钟**不再参与**这个判断。流程改成：
-       *
-       * ```text
-       *   进仓库页（显示「已登录」）
-       *     → 发请求 → 401 → 自动 refresh → 成功 ⇒ 用户完全无感 ✓
-       *                                    → 失败 ⇒ 置 repoAuthExpired
-       *                                             UI 才知道要重新登录
-       * ```
-       *
-       * `repoAuthExpired` 是**我试过并失败**的事实，不是推测。
-       */
-      expired: this.repoAuthExpired,
-      repoTokenMode: false,
-      link: this.repoLink,
-      linkDetail: this.repoLinkDetail,
-      linkCheckedAt: this.repoLinkCheckedAt,
-    };
-  }
+
 
   /**
    * 探测一次与服务端的连通性（2026-11-06，常驻指示灯）。
@@ -2007,62 +1650,10 @@ export class AppShell {
    *
    * 探测必须轻。重请求会让"亮个灯"变成一次真实加载。
    */
-  private async probeRepoLink(): Promise<{ state: RepoLinkState; detail: string }> {
-    const settle = (state: RepoLinkState, detail: string): { state: RepoLinkState; detail: string } => {
-      this.repoLink = state;
-      this.repoLinkDetail = detail;
-      this.repoLinkCheckedAt = Date.now();
-      return { state, detail };
-    };
 
-    const origin = this.repoOrigin();
-    if (origin === null) {
-      /*
-       * 地址还没填好（切到自定义仓库但没写地址）。
-       *
-       * 这**不是离线** —— 是"还没配"。给 offline 会让用户去查网络，
-       * 而实际要做的是把地址填上。所以保留 unknown 并说明原因。
-       */
-      return settle('unknown', '还没填服务端地址');
-    }
-
-    try {
-      /*
-       * 直接打 `/version`，**不带 Authorization**。
-       *
-       * 带了反而不好：令牌过期会被服务端回 401，而我们本来就把 401 算在线，
-       * 所以不影响结论 —— 但不带能让这次请求更纯粹地"只测连通"，
-       * 也不会在服务端留下一次带凭据的访问记录。
-       */
-      const response = await this.withCertTrust(origin, () =>
-        pickFetch()(`${origin}/version`, { method: 'GET' }),
-      );
-
-      /*
-       * 任何 HTTP 响应都说明连上了。`response.status > 0` 是判据 ——
-       * 0 表示"没拿到状态码"（原生通道的失败路径会给 0）。
-       */
-      if (response.status > 0) {
-        const at = new Date();
-        const hhmm = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
-        return settle('online', `服务端有响应（HTTP ${String(response.status)}），${hhmm} 确认`);
-      }
-      return settle('offline', '服务端没有返回状态码');
-    } catch (error) {
-      /*
-       * 连不上。把**原始原因**带上（`cause` 里可能是证书问题），
-       * 否则用户只看到"连不上"，不知道该改地址还是换个网络。
-       */
-      return settle('offline', describeBridgeError(error).message);
-    }
-  }
 
   /** 同步层要的配置。未登录时 token 为空串（服务端会 401，由调用方转成人话） */
-  private repoSyncConfig(): { serverUrl: string; token: string } | null {
-    const origin = this.repoOrigin();
-    if (origin === null) return null;
-    return { serverUrl: origin, token: this.repoAuth.accessToken };
-  }
+
 
   /**
    * 跑一次仓库请求，**401 时自动续期并重试一次**（2026-11-07）。
@@ -2075,22 +1666,10 @@ export class AppShell {
    *
    * ## 为什么重试时**重新取** config
    *
-   * `token` 是值拷贝。续期后 `this.repoAuth` 换了新 token，但闭包里
+   * `token` 是值拷贝。续期后 `this.repo.auth` 换了新 token，但闭包里
    * 那份旧值不会变 —— 直接重试还是 401，等于没续。
    */
-  private async runRepoRequest<T>(
-    work: (config: { serverUrl: string; token: string }) => Promise<T>,
-  ): Promise<T> {
-    const first = this.repoSyncConfig();
-    if (first === null) throw new Error('还没配置服务端地址');
 
-    return await this.repoFetchWithRefresh(first.serverUrl, async () => {
-      /* ★ 每次执行都重新取：续期后这里拿到的才是新 token */
-      const config = this.repoSyncConfig();
-      if (config === null) throw new Error('还没配置服务端地址');
-      return await this.withCertTrust(config.serverUrl, () => work(config));
-    });
-  }
 
   /**
    * 保存一份服务端配置（2026-11-04：与服务端配置页合并后由页面直接触发）。
@@ -2113,98 +1692,7 @@ export class AppShell {
    *   调用方只在 true 时重画整页 —— 只有"从已登录翻回登录表单"需要重画，
    *   其余情况重画只会抹掉用户刚填的账号（见 `onConfigChange` 处）。
    */
-  private async saveRepoConfig(next: RepoConfigState): Promise<boolean> {
-    const beforeOrigin = this.repoOrigin();
-    const beforeKind = this.repoConfig.kind;
 
-    /* 合并证书信任：页面传上来的可能是旧副本 */
-    const merged: RepoConfigState = {
-      ...next,
-      trustedCertOrigins:
-        next.trustedCertOrigins.length >= this.repoConfig.trustedCertOrigins.length
-          ? next.trustedCertOrigins
-          : this.repoConfig.trustedCertOrigins,
-    };
-
-    await writeRepoConfig(merged);
-    this.repoConfig = merged;
-
-    this.insecureOrigins = [
-      ...(merged.ackedPlainOrigin === '' ? [] : [merged.ackedPlainOrigin]),
-      ...merged.trustedCertOrigins,
-    ];
-    setInsecureOrigins(this.insecureOrigins);
-
-    const afterOrigin = this.repoOrigin();
-    if (beforeOrigin !== afterOrigin || beforeKind !== merged.kind) {
-      const hadAuth = this.repoAuth.accessToken !== '';
-
-      /*
-       * ★★★ 切换服务端 = **登出旧服务端**，不再"换槽保留"（2026-11-05）。
-       *
-       * 上一版是"把当前登录态存进旧 origin 那一格，再从新 origin 那一格读"，
-       * 目的是让用户切回来不用重登。**那个设计被用户判为危险**：
-       *
-       * > 还有一个很危险的问题就是自定义和云仓库可以同时登录
-       *
-       * 真机录屏证实：内置云仓库「已登录：Gez」、自定义仓库「已登录：testuser」，
-       * 两套凭据并存，切过去还会拿错令牌（报「缺少或无效的访问令牌」）。
-       *
-       * 现在：**同一时间只允许一处登录**。切换即登出，
-       * 新服务端从"未登录"开始 —— 想用它就重新登录。
-       *
-       * `writeRepoAuth` 里也加了同样的互斥（登录任一处就清掉其它 origin），
-       * 两处是**同一条纪律的两个入口**：一个是切换离开，一个是登录进来。
-       *
-       * ★ 登出要**说一声**：莫名"掉登录"会让用户以为是 bug
-       * （上一版改动的起因正是这个），所以给一条明确的提示。
-       */
-      if (hadAuth) {
-        await clearRepoAuth(beforeOrigin ?? '');
-        this.options.onNotify?.(
-          beforeKind === merged.kind
-            ? '换了服务端地址，已退出原来的登录'
-            : '切换了仓库类型，已退出原来的登录',
-          'warn',
-        );
-      }
-
-      /*
-       * 新服务端**不再从槽里恢复** —— 那里现在是空的。
-       * 留这一句而不是直接置空，是为了让"同一 origin 只改了写法"的情况
-       * 仍然走读盘（`beforeOrigin === afterOrigin` 时根本不会进这个分支，
-       * 所以这里必定是空）。
-       */
-      this.repoAuth = readRepoAuthFor(afterOrigin ?? '');
-
-      /*
-       * ★★★ 换了服务端，**旧的连通结论必须作废**（2026-11-06）。
-       *
-       * 连通状态有 60 秒的"新鲜期"（见 `repo-link` 那段：短时间内切走再
-       * 切回来不重新探测）。但"切了服务端"是完全不同的事 —— 前一秒
-       * 还在 A 上测出 `online`，切到 B 之后如果沿用这个结论：
-       *
-       * ```text
-       *   A 通、B 不通  ⇒ 界面显示绿灯「已连接」，点上传却失败
-       *   A 不通、B 通  ⇒ 界面显示红灯「连不上」，其实 B 好好儿的
-       * ```
-       *
-       * 两种都会让用户去查错方向。所以这里把状态清回 `unknown`，
-       * 新页面进来会立刻重新探测（进页面时 `unknown` ⇒ 探测并显示「检测中」）。
-       *
-       * ★ 不用"只重置时间戳、保留状态"—— 保留旧状态仍然是错的结论。
-       */
-      this.repoLink = 'unknown';
-      this.repoLinkDetail = '';
-      this.repoLinkCheckedAt = 0;
-      /* 卡片缓存同理（`onCachedCards` 已有 origin 校验，这里显式清更明确） */
-      this.repoCardsCache = [];
-      this.repoCardsCacheOrigin = '';
-
-      return hadAuth || this.repoAuth.accessToken !== '';
-    }
-    return false;
-  }
 
   /**
    * 用一份**页面刚给出的**配置连接并登录。
@@ -2212,355 +1700,13 @@ export class AppShell {
    * 为什么要带 config：用户可能是"刚改完地址就点登录"，
    * 那时外壳手里还是上一次保存的地址。不带就会打到旧地址上。
    */
-  private async repoLoginWith(
-    config: RepoConfigState,
-    username: string,
-    password: string,
-  ): Promise<void> {
-    await this.saveRepoConfig(config);
 
-    const resolved = resolveRepoOrigin(this.repoConfig);
-    if (!resolved.ok) throw new Error(resolved.reason);
-    const origin = resolved.address.origin;
-
-    /*
-     * ★ 注入 `pickFetch()` 而不是默认的全局 fetch。
-     *
-     * 真机实测：这个 WebView 里 fetch 完全不可用（连 127.0.0.1 都
-     * `Failed to fetch`），而聊天走的是 invoke 到 Rust，从没经过它。
-     * 所以这里换成走 Android 原生 HTTP 通道。
-     */
-    const bundle = await this.withCertTrust(origin, () =>
-      apiLogin(origin, { username, password }, { fetchImpl: pickFetch() }),
-    );
-
-    this.repoAuth = {
-      accessToken: bundle.accessToken,
-      refreshToken: bundle.refreshToken,
-      accessExpiresAt: bundle.accessExpiresAt,
-      userId: bundle.user.userId,
-      username: bundle.user.username,
-    };
-    await writeRepoAuth(this.repoOrigin() ?? '', this.repoAuth);
-    this.options.onNotify?.(`已登录：${this.repoAuth.username}`, 'ok');
-    this.renderPage();
-  }
 
   /** 注册。成功后**自动登录**（用户要求） */
-  private async repoRegisterWith(
-    config: RepoConfigState,
-    username: string,
-    password: string,
-    inviteCode: string,
-  ): Promise<void> {
-    await this.saveRepoConfig(config);
 
-    const resolved = resolveRepoOrigin(this.repoConfig);
-    if (!resolved.ok) throw new Error(resolved.reason);
-    const origin = resolved.address.origin;
-
-    /*
-     * 邀请码**只在内置云仓库才传**。
-     *
-     * `auth-client.register` 的注释写明"无条件透传没影响"，但这里还是
-     * 按"内置才传"来做：让请求体与用户看到的东西一致（自定义模式下
-     * 界面上没有邀请码框，请求里也不该出现一个用户没填过的字段）。
-     */
-    const invite =
-      this.repoConfig.kind === 'cloud' && inviteCode !== '' ? inviteCode : undefined;
-
-    const outcome = await this.withCertTrust(origin, () =>
-      apiRegister(
-        origin,
-        { username, password, inviteCode: invite },
-        { fetchImpl: pickFetch() },
-      ),
-    );
-
-    /*
-     * `tokens === null` 表示服务端只建了号、没给会话
-     * （`admin-only` 模式下管理员替人建号的场景）。那种情况不能假装登录成功。
-     */
-    if (outcome.tokens === null) {
-      this.options.onNotify?.('账户已创建，请用新账号登录', 'ok');
-      this.renderPage();
-      return;
-    }
-
-    /* ★ 注册后自动登录（用户明确要求） */
-    this.repoAuth = {
-      accessToken: outcome.tokens.accessToken,
-      refreshToken: outcome.tokens.refreshToken,
-      accessExpiresAt: outcome.tokens.accessExpiresAt,
-      userId: outcome.user.userId,
-      username: outcome.user.username,
-    };
-    await writeRepoAuth(this.repoOrigin() ?? '', this.repoAuth);
-    this.options.onNotify?.(`已注册并登录：${this.repoAuth.username}`, 'ok');
-    this.renderPage();
-  }
 
   /** 仓库主页面（服务端配置 + 账户 + 卡片，一页到底） */
-  private renderRepoPage(): void {
-    if (this.pageHost === null) return;
 
-    const page = renderRepoPage(this.doc, this.repoStatus(), {
-      onConfigChange: async (next) => {
-        const authCleared = await this.saveRepoConfig(next);
-
-        /*
-         * ★★★ 只在「登录态被清掉」时重画整页。
-         *
-         * 2026-11-04 真机验收抓到的缺陷（③⑪⑫⑮ 一起红）：
-         *
-         * ```text
-         *   用户填了用户名 / 密码
-         *   → 点地址框（失焦触发 change）→ 地址存盘 → renderPage()
-         *   → 页面重建，用户名密码回到空（它们在 render 的闭包里）
-         *   → 再点「登录」→ 守卫报「用户名和密码都要填」
-         * ```
-         *
-         * 而且更糟：`change` 是在**点登录按钮导致失焦**时触发的，
-         * 于是用户点的正是那颗即将被移除的按钮 —— 表现为"点了没反应"。
-         *
-         * 地址变了但 origin 没变（同一个服务端换个写法）时，账户区
-         * 压根不需要变；`kind` 切换由页面自己的 `paint()` 收尾。
-         * 只有"换了服务端 ⇒ 令牌作废"这一件事必须整页重画，
-         * 因为要从「已登录」翻回登录表单。
-         */
-        if (authCleared) this.renderPage();
-      },
-
-      onLogin: async (config, username, password) => {
-        await this.repoLoginWith(config, username, password);
-      },
-
-      onRegister: async (config, username, password, inviteCode) => {
-        await this.repoRegisterWith(config, username, password, inviteCode);
-      },
-
-      onLogout: async () => {
-        const origin = this.repoOrigin();
-        if (origin !== null && this.repoAuth.accessToken !== '') {
-          /*
-           * 服务端吊销失败也照常清本地。
-           *
-           * 用户的诉求是"从这台机器上退出"，不该因为网络问题被困住。
-           */
-          try {
-            await apiLogout(origin, this.repoAuth.accessToken, { fetchImpl: pickFetch() });
-          } catch {
-            /* 忽略：本地照样清 */
-          }
-        }
-        await clearRepoAuth();
-        this.repoAuth = { accessToken: '', refreshToken: '', accessExpiresAt: 0, userId: '', username: '' };
-        this.options.onNotify?.('已登出', 'ok');
-        this.renderPage();
-      },
-
-      onProbeLink: () => this.probeRepoLink(),
-
-      /* ── 仓库列表（一级，2026-11-06）── */
-
-      /*
-       * 拉仓库列表。
-       *
-       * ★ 这是把"一页到底"改成三级的核心：服务端支持多仓库
-       *   （`/api/repos`，带 `cardCount`），所以列表直接用它。
-       */
-      onListRepos: async () => {
-        const items = await this.runRepoRequest((config) =>
-          /* 仓库列表接口只认账户令牌，所以要显式给 `accessToken` 字段名 */
-          repoListRepos(
-            { serverUrl: config.serverUrl, accessToken: config.token },
-            { fetchImpl: pickFetch() },
-          ),
-        );
-        const rows: RepoRow[] = items.map((one) => ({
-          id: one.id,
-          name: one.name,
-          description: one.description,
-          cardCount: one.cardCount,
-          isDefault: one.isDefault,
-        }));
-        this.repoReposCache = rows;
-        return rows;
-      },
-
-      onCachedRepos: () => this.repoReposCache,
-
-      /**
-       * 「刷新」按钮（2026-11-07，用户建议）。
-       *
-       * ## 它做三件事，顺序不能反
-       *
-       * ```text
-       *   ① 清掉"已过期"标记 —— 用户主动重试了，先给它一次干净机会
-       *   ② 重新拉仓库列表   —— 失败会抛出，由页面显示原因
-       *   ③ 重探连通性       —— 顶部指示灯要跟着更新
-       * ```
-       *
-       * ★ 先清标记再拉：如果先拉再清，那么"令牌已失效"的状态下
-       *   拉取会立刻因为标记而走失败分支，用户点了刷新还是看到过期提示 ——
-       *   等于这个按钮没用。
-       */
-      onRefresh: async () => {
-        this.repoAuthExpired = false;
-        /*
-         * 主动刷新时把缓存的"过期结论"也丢掉：这次要走真正的网络。
-         * 不清的话，`runRepoRequest` 里续期成功的路径是对的，但
-         * 假如下面 `onListRepos` 因为别的原因失败，缓存会让人以为
-         * 刷新没发生。
-         */
-        this.repoReposCache = [];
-
-        /* 这一步失败就抛给页面，别吞 —— 用户点了按钮就是要一个结果 */
-        const rows = await this.runRepoRequest((config) =>
-          repoListRepos(
-            { serverUrl: config.serverUrl, accessToken: config.token },
-            { fetchImpl: pickFetch() },
-          ),
-        );
-        this.repoReposCache = rows.map((one) => ({
-          id: one.id,
-          name: one.name,
-          description: one.description,
-          cardCount: one.cardCount,
-          isDefault: one.isDefault,
-        }));
-
-        /*
-         * 点亮顶部指示灯。单独的 catch：探测失败不该让"刷新列表"这个动作
-         * 显示成失败（列表可能已经成功了）。
-         *
-         * ★ 不用 `this.repoLink = result.state` —— `probeRepoLink()` 内部
-         *   已经在 `settle()` 里写过这些字段了，外面再赋一次是重复。
-         *   重复写同一件事，将来改了其中一处就会分叉。
-         */
-        void this.probeRepoLink().catch(() => {
-          /* 探测是附加信息，失败就保持原样 */
-        });
-
-        this.options.onNotify?.('已刷新', 'ok');
-        this.renderPage();
-      },
-
-      onOpenRepo: (repoId, repoName) => {
-        this.repoRepoId = repoId;
-        this.repoRepoName = repoName;
-        this.repoCardId = null;
-        this.repoCardTitle = '';
-        /* 进二级：清掉上次的列表状态，避免先显示别的仓库的卡 */
-        this.repoCardsState = null;
-        this.repoCardsError = '';
-        this.renderPage();
-        void this.loadRepoCards(repoId);
-      },
-
-      /* 上传列表里的圆形头像（与角色选择器同一个取图实现） */
-      onThumbnail: (avatar: string) => loadThumbnail(avatar),
-
-      onPickLocalCard: async () => {
-        const raw = await this.withConnection(() => this.bridge.listCharactersRaw());
-        const parsed = parseCharacterList(raw);
-        if (!parsed.ok) throw new Error(parsed.reason);
-        return parsed.items.map((one) => ({ avatar: one.avatar, name: one.name }));
-      },
-
-      onUpload: async (avatar) => {
-        /*
-         * 从 ST 引擎读出这张卡，解出卡 JSON 原文。
-         *
-         * 走 PNG 而不是 `/api/characters/get`：后者返回的是 ST 加工过的视图，
-         * 拿它上传会把加工痕迹一起传进仓库（`chat_size` / `date_last_chat` 之类）。
-         * PNG 里那份才是用户创作的内容。
-         */
-        const pngBytes = await this.withConnection(() => this.bridge.characterPng(avatar));
-        const parsed = parsePngCard(new Uint8Array(pngBytes));
-        /*
-         * `kind === 'bare'` = 这张 PNG 里没有卡数据块。
-         * 那不是"没卡可传"，而是这张卡的数据只在 .json 里（或文件损坏）——
-         * 两种情况都不该悄悄传一张空卡上去，所以直接报错让用户看到。
-         */
-        if (parsed.kind !== 'card') {
-          throw new Error(`这张卡没有内嵌设定数据（${parsed.note}）`);
-        }
-
-        /*
-         * 不加 cardId：让服务端按内容/标题判定新建还是追加版本。
-         *
-         * ★ 这里**没有**做"本地查映射再决定 cardId"—— 桌面端有一整套
-         * `st-push-name` 处理这件事，那套依赖"卡文件里存了 cardId"。
-         * 手机端读的卡来自 ST 目录，里面通常没有 `extensions.tcs.cardId`，
-         * 所以退化成"按标题 upsert"是当前唯一正确的行为。
-         */
-        const result = await this.runRepoRequest((config) =>
-          repoUploadCard(config, { text: parsed.jsonText }, { fetchImpl: pickFetch() }),
-        );
-        return { created: result.created, seq: result.seq };
-      },
-
-      onLoadVersions: async (cardId) => {
-        const items = await this.runRepoRequest((config) =>
-          repoListVersions(config, cardId, { fetchImpl: pickFetch() }),
-        );
-        return items.map((one) => ({
-          seq: one.seq,
-          commit: one.commit,
-          createdAt: one.commit,
-          sha256: one.sha256,
-          message: one.message ?? '',
-        }));
-      },
-
-      onRollback: async (cardId, seq) => {
-        await this.runRepoRequest((config) =>
-          repoRollbackCard(config, cardId, seq, { fetchImpl: pickFetch() }),
-        );
-      },
-
-      onDeleteCard: async (cardId) => {
-        await this.runRepoRequest((config) =>
-          repoDeleteCard(config, cardId, { fetchImpl: pickFetch() }),
-        );
-      },
-
-      /**
-       * 把仓库里某一版**下载成一张本地角色卡**（2026-11-04，用户要求）。
-       *
-       * ## 没有「ST」字样
-       *
-       * 用户明令：这里是对用户可见的流程，必须说"角色库 / 卡片"，
-       * 不能说内部引擎的名字。所有文案都在 `repo-page.ts` 与这里，
-       * `test/no-internal-terms.test.mjs` 会扫。
-       *
-       * ## 四步，每步都可能单独失败
-       *
-       * ```text
-       *   ① 拉那一版的 JSON 原文        → 网络/权限失败
-       *   ② 算出文件名与块类型           → 纯函数（planCardImport）
-       *   ③ 拿一张 PNG 当容器            → 内置兜底卡面（桌面端同一张）
-       *   ④ buildPngCard + 原子写文件     → 写盘失败
-       * ```
-       */
-      onImportVersion: (cardId, seq) => this.importRepoVersion(cardId, seq),
-
-      onNotify: (message, kind) => this.options.onNotify?.(message, kind),
-    });
-
-    /*
-     * 把"下载某一版"暴露给三级页面（2026-11-06）。
-     *
-     * 那段逻辑就跑在上面的 `onImportVersion` 闭包里，三级页面是另一个
-     * 函数拿不到它。这里留一个引用，等于"页面一渲染就绪就可用"。
-     * 没就绪时（理论上进不到三级）三级页面会给一句人话。
-     */
-    this.repoImportVersion = (cardId, seq) =>
-      this.importRepoVersion(cardId, seq);
-
-    this.pageHost.append(page);
-  }
 
   /* ═══════════════════════════════════════════════════════════
      仓库：二级（某仓库的卡片列表）与三级（某张卡的历史）
@@ -2574,34 +1720,7 @@ export class AppShell {
    * > 点击对应仓库可进入卡查看界面，也是相同的按照卡列表的方式进行展示，
    * > 并且可以展示缩略图头像
    */
-  private renderRepoCardsPage(): void {
-    if (this.pageHost === null) return;
 
-    const page = renderRepoCardsPage(
-      this.doc,
-      {
-        repoName: this.repoRepoName,
-        cards: this.repoCardsState,
-        error: this.repoCardsError,
-      },
-      {
-        onLoadCards: async () => this.fetchRepoCards(),
-        onFace: async (cardId) => this.loadCardFace(cardId),
-        onOpenCard: (cardId, title) => {
-          this.repoCardId = cardId;
-          this.repoCardTitle = title;
-          this.repoVersionsState = null;
-          this.repoVersionsError = '';
-          this.renderPage();
-          void this.loadRepoVersions(cardId);
-        },
-        onBack: () => this.goBackOneLevel(),
-        onNotify: (message, kind) => this.options.onNotify?.(message, kind),
-      },
-    );
-
-    this.pageHost.append(page);
-  }
 
   /**
    * 三级：某张卡的历史与操作。
@@ -2611,101 +1730,13 @@ export class AppShell {
    * > 点击对应卡片进入卡片历史界面，可以看到卡片的详情，下载、设为最新、
    * > 编辑（做按键入口但是文字变灰不生效，这是下个版本的内容）、删除、设为最新
    */
-  private renderRepoCardPage(): void {
-    if (this.pageHost === null) return;
-    const cardId = this.repoCardId;
-    if (cardId === null) return;
 
-    const page = renderRepoCardPage(
-      this.doc,
-      {
-        cardTitle: this.repoCardTitle,
-        repoName: this.repoRepoName,
-        versions: this.repoVersionsState,
-        error: this.repoVersionsError,
-      },
-      {
-        onLoadVersions: async () => this.fetchRepoVersions(cardId),
-        /*
-         * 下载：把这一版导入成手机上的一张新卡。
-         *
-         * ★ 复用原来 `onImportVersion` 的整条逻辑（取文本 → 规划文件名 →
-         *   拼 PNG → 写盘）。它已经被真机验证过，不要在这里重写一份。
-         */
-        onDownload: async (seq) => {
-          const action = this.repoImportVersion;
-          if (action === null) throw new Error('下载入口没有就绪，切一下页面再试');
-          await action(cardId, seq);
-        },
-        /* 设为最新 = 服务端的 rollback（以旧版新建一个提交） */
-        onSetLatest: async (seq) => {
-          await this.runRepoRequest((config) =>
-            repoRollbackCard(config, cardId, seq, { fetchImpl: pickFetch() }),
-          );
-          /* 回滚会产生新版本 ⇒ 重新拉一遍，否则列表还是旧的 */
-          this.repoVersionsState = null;
-          this.renderPage();
-          void this.loadRepoVersions(cardId);
-        },
-        onDeleteCard: async () => {
-          await this.runRepoRequest((config) =>
-            repoDeleteCard(config, cardId, { fetchImpl: pickFetch() }),
-          );
-          /*
-           * 删完要让二级重新拉 —— 否则返回后那张卡还在列表里，
-           * 点进去必然 404。
-           */
-          this.repoCardsState = null;
-          this.repoReposCache = [];
-        },
-        onBack: () => this.goBackOneLevel(),
-        onNotify: (message, kind) => this.options.onNotify?.(message, kind),
-      },
-    );
-
-    this.pageHost.append(page);
-  }
 
   /** 拉二级的卡片（按 repoId 过滤） */
-  private async fetchRepoCards(): Promise<RepoCardRow[]> {
-    const repoId = this.repoRepoId;
 
-    const items = await this.runRepoRequest((config) =>
-      repoListCards(config, { fetchImpl: pickFetch(), limit: 200 }),
-    );
-
-    /*
-     * ★ 按 repoId 过滤在**客户端**做，因为 `/api/cards` 不支持按仓库过滤
-     *   （它返回全部，每条带 `repoId`）。服务端加了过滤参数时这里可以简化，
-     *   但现在不能假装它有。
-     */
-    return items
-      .filter((one: SyncCardSummary) => repoId === null || one.repoId === repoId)
-      .map((one: SyncCardSummary) => ({
-        id: one.cardId,
-        title: one.name === '' ? one.cardId : one.name,
-        seq: one.latestSeq,
-        versionCount: one.versionCount,
-        updatedAt: one.updatedAt,
-        hasFace: one.face !== null,
-        /* 卡面内容指纹：缩略图缓存靠它判断"图换了没有"（2026-11-11） */
-        faceSha256: one.face?.sha256 ?? null,
-      }));
-  }
 
   /** 拉三级的版本列表 */
-  private async fetchRepoVersions(cardId: string): Promise<RepoVersionRow[]> {
-    const items = await this.runRepoRequest((config) =>
-      repoListVersions(config, cardId, { fetchImpl: pickFetch() }),
-    );
-    return items.map((one) => ({
-      seq: one.seq,
-      commit: one.commit,
-      createdAt: one.createdAt,
-      sha256: one.sha256,
-      message: one.message ?? '',
-    }));
-  }
+
 
   /**
    * 取一张卡的缩略图，返回 data URL。
@@ -2721,48 +1752,10 @@ export class AppShell {
    * 服务端没有卡面（404）**不是错误** —— 调用方退回兜底首字头像。
    * 抛异常只发生在真的取不到（网络/证书），而那时上层也只是保留兜底。
    */
-  private async loadCardFace(cardId: string): Promise<string | null> {
-    let fetched: Awaited<ReturnType<typeof repoFetchFace>>;
-    try {
-      fetched = await this.runRepoRequest((config) =>
-        repoFetchFace(config, cardId, { fetchImpl: pickFetch() }),
-      );
-    } catch {
-      /* 缩略图是装饰：任何失败都退回兜底头像，不弹通知 */
-      return null;
-    }
-    if (fetched === null) return null;
 
-    /* 字节 → base64：分块转，避免 `String.fromCharCode(...bytes)` 爆栈 */
-    let binary = '';
-    const chunk = 0x8000;
-    for (let i = 0; i < fetched.bytes.length; i += chunk) {
-      binary += String.fromCharCode(...fetched.bytes.subarray(i, i + chunk));
-    }
-    const base64 = globalThis.btoa(binary);
-    /*
-     * ★ `mime` 用服务端给的 Content-Type，不要写死 `image/png` ——
-     *   卡面可能是 webp，写错标签部分 WebView 会拒绝渲染。
-     */
-    const mime = fetched.mime === '' ? 'image/png' : fetched.mime;
-    return `data:${mime};base64,${base64}`;
-  }
 
   /** 二级：进页面时拉卡片 */
-  private async loadRepoCards(repoId: string): Promise<void> {
-    try {
-      const rows = await this.fetchRepoCards();
-      /* 用户可能已经退回去了：别把结果写进别的页面 */
-      if (this.repoRepoId !== repoId) return;
-      this.repoCardsState = rows;
-      this.repoCardsError = '';
-    } catch (error) {
-      if (this.repoRepoId !== repoId) return;
-      this.repoCardsState = [];
-      this.repoCardsError = describeBridgeError(error).message;
-    }
-    this.renderPage();
-  }
+
 
   /**
    * 静默刷新二级（退回到列表时用）。
@@ -2772,9 +1765,9 @@ export class AppShell {
    */
   private async refreshCardsQuietly(repoId: string): Promise<void> {
     try {
-      const rows = await this.fetchRepoCards();
-      if (this.repoRepoId !== repoId || this.repoCardId !== null) return;
-      this.repoCardsState = rows;
+      const rows = await fetchRepoCards(this.repoHost());
+      if (this.repo.repoId !== repoId || this.repo.cardId !== null) return;
+      this.repo.cardsState = rows;
       this.renderPage();
     } catch {
       /* 静默：保留当前列表 */
@@ -2782,43 +1775,10 @@ export class AppShell {
   }
 
   /** 静默刷新一级的仓库列表（卡数会变） */
-  private async loadRepoListQuietly(): Promise<void> {
-    if (this.repoSyncConfig() === null) return;
-    try {
-      const items = await this.runRepoRequest((config) =>
-        repoListRepos(
-          { serverUrl: config.serverUrl, accessToken: config.token },
-          { fetchImpl: pickFetch() },
-        ),
-      );
-      if (this.repoRepoId !== null) return;
-      this.repoReposCache = items.map((one) => ({
-        id: one.id,
-        name: one.name,
-        description: one.description,
-        cardCount: one.cardCount,
-        isDefault: one.isDefault,
-      }));
-      this.renderPage();
-    } catch {
-      /* 静默：保留当前列表 */
-    }
-  }
+
 
   /** 三级：进页面时拉版本 */
-  private async loadRepoVersions(cardId: string): Promise<void> {
-    try {
-      const rows = await this.fetchRepoVersions(cardId);
-      if (this.repoCardId !== cardId) return;
-      this.repoVersionsState = rows;
-      this.repoVersionsError = '';
-    } catch (error) {
-      if (this.repoCardId !== cardId) return;
-      this.repoVersionsState = [];
-      this.repoVersionsError = describeBridgeError(error).message;
-    }
-    this.renderPage();
-  }
+
 
   /**
    * 把卡里内嵌的 `character_book` 落成 ST 的世界书文件（2026-11-06）。
@@ -2847,83 +1807,7 @@ export class AppShell {
    *
    * @returns 落地后的世界书名；没有世界书 / 落地失败时 `null`
    */
-  private async persistEmbeddedWorldbook(
-    jsonText: string,
-    cardName: string,
-  ): Promise<string | null> {
-    let parsed: unknown = null;
-    try {
-      parsed = JSON.parse(jsonText) as unknown;
-    } catch {
-      /* 卡 JSON 不合法：那不是这里要处理的（`planCardImport` 已校验过） */
-      return null;
-    }
 
-    let plan: ReturnType<typeof convertEmbeddedWorldbook> = null;
-    try {
-      plan = convertEmbeddedWorldbook(parsed, { cardName });
-    } catch {
-      return null;
-    }
-    if (plan === null) return null;
-
-    try {
-      /*
-       * 先查重：ST 的 import 同名覆盖，不能撞掉别人的书。
-       *
-       * 上限 50 与 `uniqueAvatar` 同一套思路：极端情况下不死循环。
-       *
-       * ★ `null` ≠ `[]`（2026-11-06 修）：读失败与"确实一本都没有"是两件事。
-       *   读失败时若当成空表，同名就会**静默覆盖用户已有的书** —— 那比不落地
-       *   世界书严重得多（丢的是别人一整套设定，且不可逆）。所以读失败就
-       *   整个跳过：卡已经写好了，少一本书是可重试的，覆盖是不可逆的。
-       */
-      const existing = await this.listWorldbookNames();
-      if (existing === null) return null;
-      let name = plan.name;
-      if (existing.includes(name)) {
-        /*
-         * 已有同名。名字本身带 ` (n)` 说明它当初就是被加过序号的，
-         * 那几乎肯定是我们为同一张卡建的 ⇒ 覆盖是对的。
-         * 否则保守加序号。
-         */
-        if (!/ \(\d+\)$/.test(name)) {
-          for (let index = 2; index <= 50; index += 1) {
-            const candidate = `${plan.name} (${String(index)})`;
-            if (!existing.includes(candidate)) {
-              name = candidate;
-              break;
-            }
-          }
-        }
-      }
-
-      await this.withConnection(() =>
-        this.bridge.importWorldbook(name, JSON.stringify(plan.entries)),
-      );
-      return name;
-    } catch (error) {
-      /*
-       * ★★★ 失败不能再静默（2026-11-09 用户报「导入卡片后却没有导入角色的世界书」）。
-       *
-       * 原来这里是一个空 catch，只 `return null`。后果是：
-       *
-       * ```text
-       *   卡面写好了 → 用户能用角色 → 但世界书没进来
-       *   而界面上一个字的提示都没有 → 用户以为"这张卡本来就没世界书"
-       * ```
-       *
-       * 真实原因可能是：ST 的 worldinfo/import 被拒、名字撞了加序号后
-       * 仍失败、引擎连接在半路断了……**每一种处置都不同**，
-       * 静默等于把这四种都压成"没有"。
-       *
-       * 现在记下原因，由调用方在**导入成功之后**补一条 warn（不是 danger：
-       * 角色确实可用了，不该让用户以为整个导入失败）。
-       */
-      this.lastWorldbookFailure = describeBridgeError(error).message;
-      return null;
-    }
-  }
 
   /**
    * 上一次世界书落地失败的原因（空串 = 没失败 / 没尝试）。
@@ -2940,27 +1824,7 @@ export class AppShell {
    * ★ 三态：`string[]` = 读到了（可能是空表）；`null` = **读失败**。
    *   调用方必须区分 —— 把失败当空表会静默覆盖别人的书（见调用处注释）。
    */
-  private async listWorldbookNames(): Promise<string[] | null> {
-    try {
-      const raw = await this.withConnection(() => this.bridge.listWorldbooksRaw());
-      const parsed: unknown = JSON.parse(raw === '' ? '[]' : raw);
-      if (!Array.isArray(parsed)) return null;
-      const out: string[] = [];
-      for (const one of parsed) {
-        if (one === null || typeof one !== 'object') continue;
-        const obj = one as Record<string, unknown>;
-        /* ST 列表里 `file_id` 才是文件名主干；`name` 可能是显示名 */
-        const fileId = typeof obj['file_id'] === 'string' ? obj['file_id'] : '';
-        const name = typeof obj['name'] === 'string' ? obj['name'] : '';
-        const value = fileId !== '' ? fileId : name;
-        if (value !== '') out.push(value);
-      }
-      return out;
-    } catch (error) {
-      this.lastWorldbookFailure = describeBridgeError(error).message;
-      return null;
-    }
-  }
+
 
   /**
    * 下载某一版（把"导入成新卡"那条既有逻辑暴露给三级页面）。
@@ -2969,7 +1833,6 @@ export class AppShell {
    * 那段逻辑在 `renderRepoPage` 的回调闭包里，而三级页面是另一个函数。
    * 用字段引用等于"它跟着页面渲染就绪" —— 没就绪时给一句人话。
    */
-  private repoImportVersion: ((cardId: string, seq: number) => Promise<void>) | null = null;
 
   /**
    * 把仓库里的某一版下载成手机上的一张新卡（2026-11-06 从回调提成方法）。
@@ -2997,134 +1860,9 @@ export class AppShell {
    * 失败/没有卡面一律返回 `null`：**没有背景是正常状态**（不是所有卡都配了图），
    * 不该抛错让下载整体失败。
    */
-  private async fetchRepoFaceForImport(
-    cardId: string,
-  ): Promise<{ bytes: Uint8Array; mime: string } | null> {
-    try {
-      const fetched = await this.runRepoRequest((config) =>
-        repoFetchFace(config, cardId, { fetchImpl: pickFetch() }),
-      );
-      if (fetched === null) return null;
-      return { bytes: fetched.bytes, mime: fetched.mime };
-    } catch {
-      return null;
-    }
-  }
 
-  private async importRepoVersion(cardId: string, seq: number): Promise<void> {
-    const jsonText = await this.runRepoRequest((config) =>
-      repoFetchVersionText(config, cardId, seq, { fetchImpl: pickFetch() }),
-    );
 
-    /* 仓库是权威版本，覆盖本地同名卡是预期行为，不弹确认 */
-    const plan = await this.resolveCardPlacement({ jsonText, cardId, confirmOverwrite: false });
-    if (plan === null) return;
 
-    /*
-     * ★★★ 用**仓库里的卡面**当底图（2026-11-11，用户报的）
-     *
-     * > 仓库有背景的时候下载没有把仓库的背景下载下来并合并成一张 PNG
-     *
-     * ## 原来为什么是一张首字封面
-     *
-     * v0.1.8 时传的是 `base: null`，理由是"仓库卡面是 webp，而
-     * `buildPngCard` 只认 PNG —— 转码要 canvas，这条路径只想让内容进来"。
-     *
-     * 那个理由在当时成立，但**同一个仓库里已经有 `convertToPng` 了**
-     * （桌面端导出用的就是它），只是没接到这条路上。于是：
-     *
-     * ```text
-     *   仓库里明明有精心画的卡面
-     *   下载下来却是一张"西"字封面
-     *   ⇒ 选角色列表里认不出哪张是哪张（正是 v0.1.8 当初想解决的）
-     * ```
-     *
-     * 转念一想，`base: null` 解决的正是它自己想避免的问题：所有卡长得一样。
-     *
-     * ## 三种情况
-     *
-     * ```text
-     *   ① 仓库有卡面且已是 PNG   → 直接当底图
-     *   ② 仓库有卡面但是 webp    → convertToPng 转一张再当底图
-     *   ③ 仓库没有卡面           → 首字封面 + 提示用户去配背景
-     * ```
-     *
-     * ③ 按用户要求："如果无背景提示用户选背景或者生成背景"。
-     */
-    const face = await this.fetchRepoFaceForImport(cardId);
-    let base: Uint8Array | null = null;
-    /* 背景没合并进去的**真实原因**，下载完要说给用户听 */
-    let faceProblem: string | null = null;
-    if (face !== null) {
-      if (isPngBytes(face.bytes)) {
-        base = face.bytes;
-      } else {
-        try {
-          /*
-           * 长边限 1024：卡面只用于列表/顶栏，几百 px 就够。
-           * 4096 的 canvas 在手机 WebView 上是 64MB —— 那正是它失败的地方。
-           */
-          base = (
-            await convertToPng(
-              face.bytes,
-              `face.${face.mime.includes('webp') ? 'webp' : 'jpg'}`,
-              1024,
-            )
-          ).bytes;
-        } catch (error) {
-          /*
-           * ★★★ 转码失败**不许静默**（2026-11-11）。
-           *
-           * 原来这里是 `catch { base = null }` —— 静默退回首字封面。
-           * 真机后果：仓库卡面下载花了 13 秒（说明图确实拉下来了），
-           * 最终却仍是一个字，而**用户看不到任何解释**，只能报"问题未解决"。
-           *
-           * 吞掉失败比失败本身更坏：失败还能查，静默只能猜。
-           */
-          faceProblem =
-            error instanceof Error ? error.message : String(error);
-          console.warn('[repo-import] 卡面转 PNG 失败', faceProblem);
-          base = null;
-        }
-      }
-    }
-
-    const written = await this.writeCardToLibrary({ plan, jsonText, base });
-    /*
-     * 没有背景图 ⇒ 说清楚"这张卡现在只有首字封面，可以去配一张"。
-     *
-     * 为什么值得单独提示：用户以为下载下来的卡就是仓库里看到的那张，
-     * 结果头像是个字 —— 会当成"下载坏了"。而实际上仓库里那张卡本来
-     * 就没有配图，需要有人补一张。
-     */
-    if (face === null) {
-      this.options.onNotify?.(
-        '这张卡在仓库里没有背景图，已用首字封面代替。想要头像的话，可以在同步页给它上传一张背景。',
-        'warn',
-      );
-    } else if (faceProblem !== null) {
-      /*
-       * 有背景但没转成 PNG —— 与"没有背景"是两件事，提示必须分开：
-       *
-       * ```text
-       *   没有背景      → 用户去配一张就好
-       *   有背景但转不了 → 是我们的问题，得说清是哪一步失败的
-       * ```
-       */
-      this.options.onNotify?.(
-        `这张卡有背景，但没能合并进卡里（${faceProblem}），暂时用首字封面。`,
-        'warn',
-      );
-    }
-
-    /* 书没落地要说一声（角色可用了，所以是 warn 不是 danger） */
-    if (written.worldbook === 'failed') {
-      this.options.onNotify?.(
-        `卡已导入，但内嵌世界书没进来：${written.worldbookFailure ?? '未知原因'}`,
-        'warn',
-      );
-    }
-  }
 
   /**
    * 决定这张卡落到哪个文件名、要不要覆盖（v0.1.8 从 `importRepoVersion` 抽出）。
@@ -3138,47 +1876,7 @@ export class AppShell {
    *
    * @returns `null` = 用户在覆盖确认里取消
    */
-  private async resolveCardPlacement(input: {
-    jsonText: string;
-    cardId: string;
-    confirmOverwrite: boolean;
-  }): Promise<ImportPlan | null> {
-    /*
-     * 现有文件名要**现取**，不能用页面进页面时那份：
-     * 用户可能刚导入过一张，再导同名的那张就该变 ` (2)`。
-     */
-    const rawList = await this.withConnection(() => this.bridge.listCharactersRaw());
-    const listed = parseCharacterList(rawList);
-    if (!listed.ok) throw new Error(listed.reason);
 
-    const planned = planCardImport({
-      jsonText: input.jsonText,
-      cardId: input.cardId,
-      existingAvatars: listed.items.map((one) => one.avatar),
-      /*
-       * ★ 名字也要传（2026-11-06，用户报「同一个角色出现多个」）。
-       *
-       * 只给文件名判断不出"同一个角色"：`西奥.png` 与 `西奥 (2).png`
-       * 是两个不同的字符串，但它们是同一个角色。必须按**卡名**比。
-       */
-      existingNames: listed.items.map((one) => one.name),
-    });
-    if (!planned.ok) throw new Error(planned.reason);
-
-    /*
-     * 覆盖不可逆，而本地导入没有服务端那份兜底：从别人那里收到一张同名卡，
-     * 就会顶掉用户自己那张。所以这条路必须先问。
-     *
-     * 仓库下载不弹（`confirmOverwrite: false`）—— 那份是权威版本，
-     * 用户点"下载"就是要把本地刷成它。
-     */
-    if (planned.plan.overwrite && input.confirmOverwrite) {
-      const go = await this.confirmOverwriteCard(planned.plan.displayName);
-      if (!go) return null;
-    }
-
-    return planned.plan;
-  }
 
   /**
    * 把规划好的卡真正写进角色库（世界书 → 建 PNG → 原子落盘）。
@@ -3186,142 +1884,7 @@ export class AppShell {
    * 顺序不能换：卡里要写 `extensions.world = <书名>`，书名得先定下来。
    * 反过来（先写卡再写世界书）中途失败会留下"卡指向不存在的书"的坏状态。
    */
-  private async writeCardToLibrary(input: {
-    plan: ImportPlan;
-    jsonText: string;
-    /**
-     * 当底图的 PNG 字节。
-     *
-     * `null` = 没有图 ⇒ 按卡名生成一张首字封面。
-     * 用 `null` 而不是空数组：空数组是合法值，混用分不清「没图」和「图是空的」。
-     */
-    base: Uint8Array | null;
-  }): Promise<CardWriteResult> {
-    const { plan, jsonText } = input;
 
-    /*
-     * 内嵌世界书**先**落地。
-     * 失败**不阻断导入** —— 卡本身能用；阻断会让用户连卡都拿不到，
-     * 那比"世界书没进来"更糟。
-     */
-    /* 先清掉上一次的失败痕迹，否则这一次"没有书"会被上一次的失败原因污染 */
-    this.lastWorldbookFailure = '';
-
-    const worldName = await this.persistEmbeddedWorldbook(jsonText, plan.displayName);
-    const cardText = worldName === null ? jsonText : JSON.stringify(
-      attachWorldToCard(JSON.parse(jsonText) as unknown, worldName),
-    );
-
-    /*
-     * ★ 卡里到底有没有书，与"落地成没成"是**两件事**（2026-11-09）。
-     *
-     * `persistEmbeddedWorldbook` 返回 `null` 同时覆盖两种情况，
-     * 所以这里再问一次源头，才能给出对的话：
-     *
-     * ```text
-     *   卡里没有 character_book  → 本来就没有，"缺书"不是问题，不该提示
-     *   有书但落地失败          → 必须告诉用户，否则他会以为卡没带书
-     * ```
-     */
-    const worldbook: CardWriteResult['worldbook'] = (() => {
-      if (worldName !== null) return 'ok';
-      if (this.lastWorldbookFailure !== '') return 'failed';
-      /* 没失败但也没书名 ⇒ 卡里没有内嵌书 */
-      let hasBook = false;
-      try {
-        hasBook = readEmbeddedWorldbook(JSON.parse(jsonText) as unknown) !== null;
-      } catch {
-        hasBook = false;
-      }
-      return hasBook ? 'failed' : 'none';
-    })();
-
-    /*
-     * 没有底图就按卡名画一张（v0.1.8，用户口径）。
-     *
-     * 为什么不塞一张统一的默认卡面：选角色列表**显示头像**，
-     * 所有没有封面的卡长得一模一样，用户只能靠名字分辨 ——
-     * 那等于把"有没有封面"变成了"能不能认出自己的卡"。
-     *
-     * 失败不阻断：画不出来就退回内置卡面；内置也没有才抛（那是打包问题）。
-     */
-    let base = input.base;
-    if (base === null) {
-      try {
-        base = await faceFromName(this.doc as unknown as CanvasDoc, plan.displayName);
-      } catch {
-        base = await readDefaultFaceBytes();
-      }
-    }
-
-    const png = buildPngCard(base, cardText, plan.spec);
-
-    const status = this.readEngineStatus();
-    const charactersDir = status?.charactersDir ?? '';
-    if (charactersDir === '') throw new Error('拿不到角色库目录，无法保存');
-
-    /*
-     * ★★★ 写卡之后必须让**头像缩略图**失效（2026-11-11）。
-     *
-     * ## 用户两次报同一件事
-     *
-     * ```text
-     *   ① 下载后威廉的角色头像还是原来的那个兜底的
-     *   ② 现在连直接导入 PNG 卡，缩略图还是会显示兜底
-     * ```
-     *
-     * 第 ② 次说明第一版只修了仓库下载那条路 —— 而本地导入走的是同一个
-     * `writeCardToLibrary`。**修在调用方就是会漏，修在这里才对。**
-     *
-     * ## 真因（直连 ST 读字节取证）
-     *
-     * ```text
-     *   原图   /characters/威廉.png      PNG  683×1024（691 KB） ← 已经是新卡面
-     *   缩略图 /thumbnail?type=avatar    JPEG  96×144（5 KB）    ← 还是绿「威」字
-     * ```
-     *
-     * ST 靠 `originalStat.mtimeMs > cachedStat.ctimeMs` 判断原图变没变
-     * （`thumbnails.js`）。而我们是**直接写文件**（tmp + rename），绕过了
-     * 它的 API —— 那条路上它没有机会知道"图换了"，于是永远回旧缩略图。
-     *
-     * ## 两层都要清
-     *
-     * ```text
-     *   ST  磁盘缩略图  ← invalidateThumbnail（删文件，下次请求自动重建）
-     *   App 内存 cache  ← clearThumbnailCacheFor
-     * ```
-     *
-     * 只清一层不够：ST 那层不清，App 重新请求拿到的还是旧字节；
-     * App 那层不清，这一会话里根本不会重新请求。
-     *
-     * 失败**不阻断导入**：卡的内容已经落地了，头像只是观感。
-     */
-    try {
-      await this.withConnection(() => this.bridge.invalidateThumbnail(plan.avatar, charactersDir));
-    } catch {
-      /* 清不掉就让 ST 继续用旧缩略图 —— 不影响卡内容 */
-    }
-    clearThumbnailCacheFor(plan.avatar);
-
-    /*
-     * `allowCreate` 跟着 `overwrite` 走 —— 两个语义**必须成对**：
-     *
-     * ```text
-     *   新卡（overwrite=false） ⇒ allowCreate=true   要求同名不存在
-     *   覆盖（overwrite=true）  ⇒ allowCreate=false  要求文件已存在
-     * ```
-     *
-     * 反着传会直接报错（Rust 侧两个方向都校验），这正是我们要的：
-     * "该新建却去覆盖" / "该覆盖却去新建" 立刻暴露，而不是静默走错。
-     */
-    await this.writeCardPng(plan.avatar, charactersDir, png, !plan.overwrite);
-
-    return {
-      worldbook,
-      ...(worldName === null ? {} : { worldbookName: worldName }),
-      ...(this.lastWorldbookFailure === '' ? {} : { worldbookFailure: this.lastWorldbookFailure }),
-    };
-  }
 
   /**
    * 从手机里选一个文件导入成卡片（v0.1.8）。
@@ -3332,98 +1895,7 @@ export class AppShell {
    * 按钮状态刻意分两段：选文件与覆盖确认期间按钮**保持空闲**
    * （用户在答对话框，不是在等按钮）；只有真正写盘那段才进忙碌态。
    */
-  private async importLocalCard(button: ElLike): Promise<void> {
-    const picked = await this.pickFileBytes('image/png,application/json,.png,.json');
-    if (picked === null) return;
 
-    const parsed = readLocalCardFile(picked.name, picked.bytes);
-    if (parsed.kind === 'reject') {
-      /* 不是卡就是不是卡，不能进忙碌态装作在处理 */
-      this.options.onNotify?.(parsed.reason, 'warn');
-      return;
-    }
-
-    /*
-     * PNG 卡用**它自己那张图**当底图 —— 本地导入的卡应该保留它自己的封面。
-     *
-     * JSON 卡本身没有图，所以这里**问一句**（v0.1.8 用户口径）：
-     * 从相册选一张，或者让它按卡名生成。
-     *
-     * 为什么不直接塞默认图：选角色列表是显示头像的，所有没有封面的卡
-     * 长得一模一样，用户只能靠名字分辨。而 JSON 卡的封面一旦定下，
-     * 手机端**没有任何地方能改**（卡面编辑只在桌面端有），
-     * 所以选择必须发生在导入这一刻。
-     */
-    let base = parsed.base;
-    if (base === null) {
-      const choice = await this.askCardFace();
-      if (choice === 'cancel') return;
-
-      if (choice === 'pick') {
-        const pickedFace = await this.pickFaceImage();
-        /* 选图框取消了就当作用户放弃这次导入，不偷偷退回默认图 */
-        if (pickedFace === null) return;
-        base = pickedFace;
-      }
-      /* choice === 'default' ⇒ base 保持 null，写入时按卡名生成 */
-    }
-
-    const cardId = localCardId(parsed.jsonText, picked.name);
-
-    let plan: ImportPlan | null = null;
-    try {
-      plan = await this.resolveCardPlacement({
-        jsonText: parsed.jsonText,
-        cardId,
-        confirmOverwrite: true,
-      });
-    } catch (error) {
-      const text = error instanceof Error ? error.message : String(error);
-      this.options.onNotify?.(text, 'danger');
-      return;
-    }
-    if (plan === null) return; /* 用户取消覆盖 */
-
-    const target = plan;
-    let written: CardWriteResult | null = null;
-    await runBusy(
-      button,
-      { idle: '从手机导入卡片', busy: '导入中…', done: '已导入 ✓', retry: '重试' },
-      async () => {
-        written = await this.writeCardToLibrary({ plan: target, jsonText: parsed.jsonText, base });
-      },
-      { doneKind: 'ok' },
-    ).then(() => {
-      /*
-       * 成功后才通知，且**这时候不会重绘**（卡片页不列卡片），
-       * 所以挂 topbar 的通知不会被删掉。
-       */
-      const done = target.overwrite
-        ? `已覆盖「${target.displayName}」`
-        : `已导入「${target.displayName}」`;
-      /*
-       * ★ 世界书那半句必须单独说（2026-11-09）。
-       *
-       * 卡写成功但书没进来时，只说"已导入"就是在撒谎 ——
-       * 用户以为设定齐了，实际角色会在聊天里"忘事"，而且找不到原因。
-       */
-      const result = written as CardWriteResult | null;
-      if (result !== null && result.worldbook === 'failed') {
-        this.options.onNotify?.(
-          `${done}，但内嵌世界书没进来：${result.worldbookFailure ?? '未知原因'}`,
-          'warn',
-        );
-        return;
-      }
-      const extra = result !== null && result.worldbook === 'ok'
-        ? `，含世界书「${result.worldbookName ?? ''}」`
-        : '';
-      this.options.onNotify?.(`${done}${extra}`, 'ok');
-    }).catch((error: unknown) => {
-      const text = error instanceof Error ? error.message : String(error);
-      this.options.onNotify?.(`导入失败：${text}`, 'danger');
-    });
-  }
 
   /**
    * 弹一个选文件框，读成字节（v0.1.8）。
@@ -3444,56 +1916,7 @@ export class AppShell {
    *
    * @returns `null` = 用户取消（含 60 秒无操作）
    */
-  private async pickFileBytes(
-    accept: string,
-  ): Promise<{ name: string; bytes: Uint8Array } | null> {
-    const input = this.doc.createElement('input');
-    input.setAttribute('type', 'file');
-    /* 扩展名与 MIME 都写：不同 ROM 的选文件器认其中一种 */
-    input.setAttribute('accept', accept);
-    input.setAttribute('style', 'position:fixed;left:-9999px;top:0;opacity:0;');
-    const body = (this.doc as unknown as { body?: ElLike }).body;
-    if (body === undefined) return null;
-    body.append(input);
 
-    try {
-      return await new Promise<{ name: string; bytes: Uint8Array } | null>((resolve) => {
-        let settled = false;
-        const finish = (value: { name: string; bytes: Uint8Array } | null): void => {
-          if (settled) return;
-          settled = true;
-          resolve(value);
-        };
-        input.addEventListener('change', () => {
-          const file = (input as unknown as HTMLInputElement).files?.[0];
-          if (file === undefined) {
-            finish(null);
-            return;
-          }
-          const reader = new FileReader();
-          reader.onload = () => {
-            const result = reader.result;
-            /*
-             * 必须是 ArrayBuffer。用 `readAsText` 读 PNG 会把二进制掰成文本，
-             * 那份字节再写进角色目录就是一个坏文件 —— 而且看起来像"导入成功"。
-             */
-            if (result instanceof ArrayBuffer) {
-              finish({ name: file.name, bytes: new Uint8Array(result) });
-              return;
-            }
-            finish(null);
-          };
-          reader.onerror = () => finish(null);
-          reader.readAsArrayBuffer(file);
-        });
-        input.addEventListener('cancel', () => finish(null));
-        globalThis.setTimeout(() => finish(null), 60_000);
-        (input as unknown as HTMLInputElement).click();
-      });
-    } finally {
-      input.remove();
-    }
-  }
 
   /**
    * 问一句「要不要给这张卡配封面」（v0.1.8）。
@@ -3511,65 +1934,7 @@ export class AppShell {
    * 「取消」必须显式给一个按钮，不能只靠点遮罩：
    * 用户在思考"要不要配图"时误触遮罩，会以为导入已经开始了。
    */
-  private async askCardFace(): Promise<'pick' | 'default' | 'cancel'> {
-    const host = this.root;
-    if (host === null) return 'default';
 
-    return await new Promise<'pick' | 'default' | 'cancel'>((resolve) => {
-      const overlay = el(this.doc, 'div', 'nb-exit-overlay');
-      overlay.setAttribute('data-role', 'card-face-ask');
-
-      const card = el(this.doc, 'div', 'nb-exit-card');
-      card.setAttribute('role', 'dialog');
-      card.setAttribute('aria-modal', 'true');
-
-      const title = el(this.doc, 'p', 'nb-exit-title');
-      title.textContent = '给这张卡配一张封面？';
-      const sub = el(this.doc, 'p', 'nb-exit-subtitle');
-      sub.textContent = '这张卡文件里没有图。可以选一张，或者用卡名生成一张。';
-
-      const actions = el(this.doc, 'div', 'nb-exit-actions');
-
-      const pick = el(this.doc, 'button', 'nb-exit-leave');
-      pick.setAttribute('type', 'button');
-      pick.setAttribute('data-role', 'card-face-pick');
-      pick.textContent = '选一张图';
-      pick.addEventListener('click', () => {
-        overlay.remove();
-        resolve('pick');
-      });
-
-      const fallback = el(this.doc, 'button', 'nb-exit-stay');
-      fallback.setAttribute('type', 'button');
-      fallback.setAttribute('data-role', 'card-face-default');
-      fallback.textContent = '用卡名生成';
-      fallback.addEventListener('click', () => {
-        overlay.remove();
-        resolve('default');
-      });
-
-      const cancel = el(this.doc, 'button', 'nb-exit-stay');
-      cancel.setAttribute('type', 'button');
-      cancel.setAttribute('data-role', 'card-face-cancel');
-      cancel.textContent = '不导了';
-      cancel.addEventListener('click', () => {
-        overlay.remove();
-        resolve('cancel');
-      });
-
-      actions.append(pick, fallback, cancel);
-      card.append(title, sub, actions);
-      overlay.append(card);
-      /* 点遮罩 = 按卡名生成：既不臆断用户要走，也不让他卡在一个必答问题上 */
-      overlay.addEventListener('click', (event) => {
-        if ((event as { target?: unknown }).target !== overlay) return;
-        overlay.remove();
-        resolve('default');
-      });
-
-      host.append(overlay);
-    });
-  }
 
   /**
    * 选一张图当封面，缩到 512×512（v0.1.8）。
@@ -3579,18 +1944,7 @@ export class AppShell {
    *
    * @returns `null` = 用户取消选图，或这张图读不出来（已提示）
    */
-  private async pickFaceImage(): Promise<Uint8Array | null> {
-    const picked = await this.pickFileBytes('image/*');
-    if (picked === null) return null;
 
-    try {
-      return await faceFromImage(this.doc as unknown as CanvasDoc, picked.bytes);
-    } catch (error) {
-      const text = error instanceof Error ? error.message : String(error);
-      this.options.onNotify?.(text, 'warn');
-      return null;
-    }
-  }
 
   /**
    * 覆盖前确认（v0.1.8）。
@@ -3599,243 +1953,16 @@ export class AppShell {
    * 挂在页面层里会被层的 `transform` 变成"相对层定位"（§121 同一个坑），
    * 而且换页时会被连带删掉 —— 那样这个 Promise 永远不 resolve，导入就卡死。
    */
-  private async confirmOverwriteCard(name: string): Promise<boolean> {
-    const host = this.root;
-    if (host === null) return false;
 
-    return await new Promise<boolean>((resolve) => {
-      const overlay = el(this.doc, 'div', 'nb-exit-overlay');
-      overlay.setAttribute('data-role', 'card-import-confirm');
 
-      const card = el(this.doc, 'div', 'nb-exit-card');
-      card.setAttribute('role', 'dialog');
-      card.setAttribute('aria-modal', 'true');
 
-      const title = el(this.doc, 'p', 'nb-exit-title');
-      title.textContent = `本地已有「${name}」`;
-      const sub = el(this.doc, 'p', 'nb-exit-subtitle');
-      sub.textContent = '覆盖会替换这张卡的内容，不能恢复。';
-
-      const actions = el(this.doc, 'div', 'nb-exit-actions');
-
-      const confirm = el(this.doc, 'button', 'nb-exit-leave');
-      confirm.setAttribute('type', 'button');
-      confirm.setAttribute('data-role', 'card-import-confirm-ok');
-      confirm.textContent = '覆盖';
-      confirm.addEventListener('click', () => {
-        overlay.remove();
-        resolve(true);
-      });
-
-      const cancel = el(this.doc, 'button', 'nb-exit-stay');
-      cancel.setAttribute('type', 'button');
-      cancel.setAttribute('data-role', 'card-import-confirm-cancel');
-      cancel.textContent = '取消';
-      cancel.addEventListener('click', () => {
-        overlay.remove();
-        resolve(false);
-      });
-
-      actions.append(confirm, cancel);
-      card.append(title, sub, actions);
-      overlay.append(card);
-      /* 点遮罩等同取消：覆盖是危险动作，误触不该前进 */
-      overlay.addEventListener('click', (event) => {
-        if ((event as { target?: unknown }).target !== overlay) return;
-        overlay.remove();
-        resolve(false);
-      });
-
-      host.append(overlay);
-    });
-  }
-
-  private renderPersonaPage(): void {
-    if (this.pageHost === null) return;
-
-    const page = renderPersonaPage(this.doc, this.personaState, {
-      /*
-       * 返回**统一走 `goBackOneLevel()`**（2026-11-04）。
-       *
-       * 那里已经有 `personaOpen` 分支。自己写一份 `personaOpen = false;
-       * renderPage()` 看起来一样，但那是"层级有两个定义"的开始 ——
-       * 判据 `back-navigation.test.mjs` 就是为了防这件事。
-       */
-      onBack: () => {
-        this.goBackOneLevel();
-      },
-      onChange: (next) => {
-        this.personaState = next;
-        void this.options.onPersistPersona?.(next);
-        this.syncPersonaToChat();
-      },
-      onNotify: (message, kind) => {
-        this.options.onNotify?.(message, kind);
-      },
-      /*
-       * 人设头像上传（2026-11-04）。
-       *
-       * 选图与缩放都在 `avatar-upload.ts`（用 `<input type="file">` +
-       * canvas，这个壳的 WebChromeClient 已实现 `onShowFileChooser`）。
-       * 这里只负责把结果写回状态并落盘。
-       */
-      onPickAvatar: (personaId: string) => {
-        void (async () => {
-          let dataUrl: string | null = null;
-          try {
-            dataUrl = await pickAvatarDataUrl();
-          } catch (error) {
-            this.options.onNotify?.(
-              error instanceof Error ? error.message : '这张图读不了，换一张试试',
-              'danger',
-            );
-            return;
-          }
-          /* 用户取消：什么都不做，不要弹提示（他什么都没做错） */
-          if (dataUrl === null) return;
-
-          this.personaState = updatePersona(this.personaState, personaId, { avatar: dataUrl });
-          void this.options.onPersistPersona?.(this.personaState);
-          /* 头像只影响这一页的显示，不推给聊天面板（它不显示人设图） */
-          this.renderPage();
-        })();
-      },
-      onRelabelMessages: async (name) => {
-        const panel = this.chatPanel;
-        if (panel === null) return 0;
-
-        const messages = panel.getMessages();
-        const userCount = messages.filter((one) => one.is_user).length;
-        if (userCount === 0) return 0;
-
-        /*
-         * 记下滚动位置再改：`setMessages` 会重绘列表把它归零。
-         * 批量改名后把位置还回去，用户不会"被弹回顶部"。
-         */
-        const keepScroll = panel.getScrollTop();
-        const next = relabelUserMessages(messages, name);
-        panel.setMessages(next, this.chatFileName ?? undefined, this.selectedCharacter?.avatar);
-        panel.restoreScroll(keepScroll);
-
-        if (this.chatSnapshot !== null) {
-          this.chatSnapshot = { ...this.chatSnapshot, messages: next.slice() };
-        }
-        await this.persistChat(next, this.selectedCharacter?.avatar ?? null);
-        return userCount;
-      },
-      listWorldbooks: async () => {
-        try {
-          const raw = await this.withConnection(() => this.bridge.listWorldbooksRaw());
-          const parsed: unknown = JSON.parse(raw === '' ? '[]' : raw);
-          if (!Array.isArray(parsed)) return [];
-          return parsed
-            .map((one) => {
-              const item = one as Record<string, unknown>;
-              const name = item['name'];
-              return typeof name === 'string' ? name : '';
-            })
-            .filter((name) => name !== '');
-        } catch {
-          /* 读不到就给空列表：下拉里只剩「不关联」，不阻塞页面 */
-          return [];
-        }
-      },
-      listCharacters: async () => {
-        try {
-          const raw = await this.withConnection(() => this.bridge.listCharactersRaw());
-          const parsed = parseCharacterList(raw);
-          if (!parsed.ok) return [];
-          return parsed.items.map((one) => ({ avatar: one.avatar, name: one.name }));
-        } catch {
-          return [];
-        }
-      },
-    });
-
-    this.pageHost.append(page);
-  }
 
   /* ═══════════════════════════════════════════════════════════
      开场与示例（2026-11-05，用户决定 1 + 2 + 5）
      ═══════════════════════════════════════════════════════════ */
 
   /** 渲染这一页（数据全在 `this.greetingState`，页面是纯视图） */
-  private renderGreeting(): void {
-    if (this.pageHost === null) return;
 
-    /*
-     * ★★★ 必须先清空（2026-11-05 真机抓到的）。
-     *
-     * 交互式重绘（打字、加一条备用开场）调的是 `renderGreeting()`，
-     * **不经过 `renderPage()`** —— 而 `renderPage()` 里那句
-     * `pageHost.replaceChildren()` 是唯一的清空点。
-     *
-     * 不清的后果：每打一个字就**再叠一页**。真机上的表现是
-     * "改了内容，保存按钮还是「没有改动」" —— 因为 `querySelector`
-     * 拿到的是**第一页那个旧按钮**，新那一页在后面。
-     *
-     * 这类缺陷在单测里抓不到（单测直接调渲染函数、没有 pageHost）。
-     */
-    this.pageHost.replaceChildren();
-
-    const page = renderGreetingPage(this.doc, this.greetingState, {
-      /*
-       * 返回**统一走 `goBackOneLevel()`**（与 persona 页同一条纪律）：
-       * 层级只在一个地方定义，否则"返回去哪"迟早两处不一致。
-       */
-      onBack: () => {
-        this.goBackOneLevel();
-      },
-      onSelect: (avatar) => {
-        void this.openGreetingCard(avatar);
-      },
-      onChange: (patch) => {
-        /*
-         * 合并而不是替换：`onChange` 每次只带改的那一段，
-         * 替换会把其它三段清空（用户打一个字，另外三段全没了）。
-         */
-        this.greetingState = {
-          ...this.greetingState,
-          draft: { ...this.greetingState.draft, ...patch },
-        };
-        /*
-         * 就地重绘整页 —— 因为保存按钮的文案与禁用态依赖"有没有改动"。
-         *
-         * 代价是每敲一个字都重建 DOM，输入框会失焦。所以只在
-         * **改动状态翻转时**才重绘（下面这一行判断），平时不重绘。
-         */
-        if (this.greetingChangeFlag !== hasGreetingChanges(this.greetingState)) {
-          this.greetingChangeFlag = hasGreetingChanges(this.greetingState);
-          this.renderGreeting();
-        }
-      },
-      onAddAlternate: () => {
-        this.greetingState = {
-          ...this.greetingState,
-          draft: {
-            ...this.greetingState.draft,
-            alternateGreetings: [...this.greetingState.draft.alternateGreetings, ''],
-          },
-        };
-        this.renderGreeting();
-      },
-      onRemoveAlternate: (index) => {
-        const next = this.greetingState.draft.alternateGreetings.filter(
-          (_, i) => i !== index,
-        );
-        this.greetingState = {
-          ...this.greetingState,
-          draft: { ...this.greetingState.draft, alternateGreetings: next },
-        };
-        this.renderGreeting();
-      },
-      onSave: () => {
-        void this.saveGreeting();
-      },
-    });
-
-    this.pageHost.append(page);
-  }
 
   /**
    * 「改动状态」的上一帧快照。
@@ -3885,35 +2012,7 @@ export class AppShell {
   }
 
   /** 载入角色列表（这一页的第一步） */
-  private async loadGreetingCharacters(): Promise<void> {
-    this.greetingState = { ...this.greetingState, loading: true, error: '' };
-    this.renderGreeting();
 
-    try {
-      const raw = await this.withConnection(() => this.bridge.listCharactersRaw());
-      const parsed = parseCharacterList(raw);
-      if (!parsed.ok) {
-        this.greetingState = {
-          ...this.greetingState,
-          loading: false,
-          error: `读不到角色列表：${parsed.reason}`,
-        };
-      } else {
-        this.greetingState = {
-          ...this.greetingState,
-          loading: false,
-          characters: parsed.items.map((one) => ({ avatar: one.avatar, name: one.name })),
-        };
-      }
-    } catch (error) {
-      this.greetingState = {
-        ...this.greetingState,
-        loading: false,
-        error: describeBridgeError(error).message,
-      };
-    }
-    this.renderGreeting();
-  }
 
   /**
    * 打开一个角色的开场与示例。
@@ -3931,110 +2030,7 @@ export class AppShell {
    * 目录里的 `.json` 只是副产物，很多卡根本没有（真机查过）。
    * 读 `.json` 会拿到过期副本，或者读不到。
    */
-  private async openGreetingCard(avatar: string): Promise<void> {
-    this.greetingState = { ...this.greetingState, loading: true, error: '', selected: avatar };
-    /*
-     * ★★★ 这里必须是 `renderPage()`，不是 `renderGreeting()`（2026-11-05 修）。
-     *
-     * 用户：
-     *
-     * > 你遗漏了卡片中的开场与示例中的角色界面，点击进入退出对应角色界面
-     * > 的时候没有动画（注意如果后续角色多起来后应该如何实现，即不能写死
-     * > 现有的角色，后续陆续加进来的也要有动画才行）
-     *
-     * 真因：`renderGreeting()` 是在**当前层里**清空重绘
-     * （`this.pageHost.replaceChildren()`），不新建层 ⇒ `finishPageTurn()`
-     * 根本没被调用 ⇒ 一层都没换 ⇒ 没有转场。
-     *
-     * 而"列表 → 编辑"本来就是换页：`pageKey()` 从 `cards/greeting`
-     * 变成 `cards/greeting/edit`，段数 2 → 3 ⇒ 自动 push。
-     * 退出（`goBackOneLevel()` 里 `selected = null`）走的是 `renderPage()`，
-     * 段数 3 → 2 ⇒ 自动 back。
-     *
-     * ## 为什么这样对"角色变多"也成立
-     *
-     * `pageKey()` 只区分**列表**与**编辑**两种形态，**不枚举角色** ——
-     * 它不看 avatar 是谁、也不看列表里有几个。所以两个角色和两百个角色
-     * 走的是同一条路径、同一套动画，新增角色**不需要改任何动画代码**。
-     *
-     * 要改的只是"这条入口用哪个渲染函数"，而入口只有这一个
-     * （`onSelect` → `openGreetingCard`）。
-     */
-    this.renderPage();
 
-    try {
-      const pngBytes = await this.withConnection(() => this.bridge.characterPng(avatar));
-      const png = new Uint8Array(pngBytes);
-      const parsed = parsePngCard(png);
-      if (parsed.kind !== 'card') {
-        this.greetingState = {
-          ...this.greetingState,
-          loading: false,
-          selected: null,
-          error: `这张卡没有内嵌设定数据（${parsed.note}）`,
-        };
-        /*
-         * 退回列表也是换页（`cards/greeting/edit` → `cards/greeting`），
-         * 同样要走 `renderPage()` —— 否则"打开失败"时页面会硬切回去，
-         * 而成功时是滑回去的，同一件事两种观感。
-         */
-        this.renderPage();
-        return;
-      }
-
-      const card = parseStCardText(parsed.jsonText);
-      const draft: GreetingDraft = {
-        scenario: card.card.residual.scenario,
-        firstMes: card.card.residual.firstMes,
-        alternateGreetings: [...card.card.residual.alternateGreetings],
-        mesExample: card.card.residual.mesExample,
-      };
-
-      /* 原文留着：保存时在它上面改，其余字段一个字节都不碰 */
-      this.greetingJson = parsed.jsonText;
-      this.greetingPng = png;
-      this.greetingChangeFlag = false;
-
-      this.greetingState = {
-        ...this.greetingState,
-        loading: false,
-        error: '',
-        draft,
-        baseline: greetingFingerprint(draft),
-      };
-
-      /*
-       * 解析有问题要**说出来**，但不能拦着不让改。
-       *
-       * 最常见的是"旧格式卡"（没有这两个板块）。用户能打开、能补内容，
-       * 只是要知到这里为什么是空的。
-       */
-      if (card.issues.length > 0) {
-        const first = card.issues[0];
-        this.options.onNotify?.(first?.message ?? '这张卡有几处格式问题，已按原样载入', 'warn');
-      }
-    } catch (error) {
-      this.greetingState = {
-        ...this.greetingState,
-        loading: false,
-        selected: null,
-        error: describeBridgeError(error).message,
-      };
-    }
-
-    /*
-     * 尾部这次要按 `pageKey()` 分两种情况，所以必须走 `renderPage()`：
-     *
-     * ```text
-     *   加载成功   selected 还是那个角色 ⇒ key 不变 ⇒ 同一页重绘，不播
-     *   加载失败   selected 被清成 null   ⇒ key 退回列表 ⇒ 播 back
-     * ```
-     *
-     * 用 `renderGreeting()` 的话第二种情况会硬切回去 ——
-     * 同一件事（从编辑页回列表）两种观感。
-     */
-    this.renderPage();
-  }
 
   /**
    * 保存：改 `residual` → 按**当前**规则序列化 → 嵌回原 PNG → 原子写回。
@@ -4054,170 +2050,10 @@ export class AppShell {
    * `postHistoryInstructions` / `passthrough` / 世界书…）原样带着走 ——
    * 它们不在这一页的职责里，动了就是越权。
    */
-  private async saveGreeting(): Promise<void> {
-    const avatar = this.greetingState.selected;
-    if (avatar === null || this.greetingJson === null || this.greetingPng === null) return;
 
-    this.greetingState = { ...this.greetingState, loading: true, error: '' };
-    this.renderGreeting();
-
-    try {
-      const parsed = parseStCardText(this.greetingJson);
-      const draft = this.greetingState.draft;
-
-      /*
-       * 空行清掉：用户在备用开场白里点"加一条"之后没写就走，
-       * 留下一个空字符串会变成一条**空白开场白** —— 用户换到它时
-       * 聊天是空的，而界面上"有一条备用开场"，对不上。
-       */
-      const alternates = draft.alternateGreetings
-        .map((one) => one.trim())
-        .filter((one) => one !== '');
-
-      const next = {
-        ...parsed.card,
-        residual: {
-          ...parsed.card.residual,
-          scenario: draft.scenario,
-          firstMes: draft.firstMes,
-          alternateGreetings: alternates,
-          mesExample: draft.mesExample,
-        },
-      };
-
-      /*
-       * `entryTitleToComment: true` —— 与桌面端「导出 JSON」同一个选项。
-       *
-       * 不传的话世界书条目标题只写 `name`，ST 的面板读 `comment` ⇒ 导进 ST
-       * 每条标题都是空白。这个选项的存在意义就是"这份文件是给 ST 用的"，
-       * 而写到 ST 角色目录里的文件当然属于这一类。
-       */
-      const jsonText = stringifyStCard(next, { indent: 2, entryTitleToComment: true });
-
-      /*
-       * 用**原 PNG** 当容器：`buildPngCard` 只替换卡数据块，
-       * 头像图与其它块逐字节保留 —— 重新生成一张会让卡面变掉。
-       */
-      /*
-       * PNG 的 `spec` 是 `'v2' | 'v3'`（不是 keyword 本身）——
-       * 由 `PNG_KEYWORD_FOR_SPEC` 映射到 `chara` / `ccv3`。
-       * 传错会在 `undefined` 关键字上写出一块 ST 读不到的 tEXt。
-       */
-      const spec = parsed.card.meta.spec === 'v3' ? 'v3' : 'v2';
-      const png = buildPngCard(this.greetingPng, jsonText, spec);
-
-      const status = this.readEngineStatus();
-      const charactersDir = status?.charactersDir ?? '';
-      if (charactersDir === '') throw new Error('拿不到角色库目录，无法保存');
-
-      await this.writeCardPng(avatar, charactersDir, png, false);
-
-      /* 写成功后把内存里的旧副本换掉：否则再点一次保存会基于旧 JSON 重算 */
-      this.greetingJson = jsonText;
-      this.greetingPng = png;
-
-      const fresh: GreetingDraft = {
-        scenario: draft.scenario,
-        firstMes: draft.firstMes,
-        alternateGreetings: [...alternates],
-        mesExample: draft.mesExample,
-      };
-      this.greetingChangeFlag = false;
-      this.greetingState = {
-        ...this.greetingState,
-        loading: false,
-        /*
-         * 清掉上一轮的错误：保存成功后页面不该还挂着上次的失败提示
-         * （否则下面那句"成功才发通知"永远不成立，用户又看不到反馈）。
-         */
-        error: '',
-        draft: fresh,
-        baseline: greetingFingerprint(fresh),
-        /*
-         * ★ 点亮按钮上的"已保存 ✓"（2026-11-06，用户问题①）。
-         *
-         * 不靠顶栏通知的原因见 `GreetingPageState.savedFlash` 的注释：
-         * 这一页保存后会整页重绘，topbar 连同里面的通知一起被删。
-         */
-        savedFlash: true,
-      };
-      this.savedFlashTimer = this.clearSavedFlashTimer();
-      /*
-       * 2 秒后回落成「没有改动」。这个时长选在"用户一定能看见、
-       * 又不至于一直占着主按钮位置"之间；与下载按钮的三态同规格。
-       *
-       * ★★★ 回落**不许重绘整页**（2026-11-06 真机抓到的）。
-       *
-       * 第一版这里调的是 `renderGreeting()`，探针看到的是：
-       *
-       * ```text
-       *   .nb-scroll scrollTop: 648 → 0     ← 滚动位置被清零
-       *   activeElement: BODY               ← 焦点丢了
-       *   --nb-kb-inset-native: 0           ← 键盘被收起
-       * ```
-       *
-       * 对用户意味着：保存成功 2 秒后，如果他正在改下一个字段，
-       * 输入框会被换掉、键盘收起、页面跳回顶部。**为了撤掉一句
-       * "已保存 ✓" 而打断用户**，代价远大于收益。
-       *
-       * 所以这里只改那一个按钮的文字与状态。
-       */
-      this.savedFlashTimer = globalThis.setTimeout(() => {
-        this.savedFlashTimer = null;
-        this.greetingState = { ...this.greetingState, savedFlash: false };
-        this.paintSavedFlashOff();
-      }, 2000) as unknown as number;
-
-      /*
-       * 如果改的正是**当前正在聊的那个角色**，让它重读开场白 ——
-       * 否则用户改完开场白去聊天，看到的还是旧的那条（因为面板里
-       * 已经建好了一条聊天空记录）。
-       *
-       * 只在"没有历史消息"时重载：有历史说明已经聊过了，
-       * 这时换开场白会把用户已有的对话顶掉。
-       */
-      if (this.chatAvatar() === avatar) {
-        void this.refreshOpeningAfterEdit();
-      }
-    } catch (error) {
-      this.greetingState = {
-        ...this.greetingState,
-        loading: false,
-        error: describeBridgeError(error).message,
-        savedFlash: false,
-      };
-    }
-
-    /*
-     * ★★★ 重绘必须在**发通知之前**（2026-11-06 真机取证）。
-     *
-     * 原来这两句是反的：
-     *
-     * ```text
-     *   onNotify('已保存到卡片')   ← 通知挂进 .nb-topbar
-     *   renderGreeting()          ← pageHost.replaceChildren()
-     *                                 把 .nb-greeting 整个删掉
-     *                                 ⇒ topbar 没了 ⇒ 通知也没了
-     * ```
-     *
-     * 用户看到的就是"点保存，什么反应都没有"。而代码里明明有提示 ——
-     * 这类"写了但看不见"的缺陷比没写更难查。
-     */
-    this.renderGreeting();
-
-    /*
-     * 通知放最后，挂在新渲染出来的 topbar 里。
-     * 成功的文案说"已保存"，不再补一句"到哪里" —— 按钮上已经写了。
-     */
-    if (this.greetingState.error === '') {
-      this.options.onNotify?.('已保存到卡片', 'ok');
-    }
-  }
 
   /** 当前正在聊的角色（avatar）；没有就是 null */
-  private chatAvatar(): string | null {
-    return this.selectedCharacter?.avatar ?? null;
-  }
+
 
   /**
    * 读一张卡的 `data` 段，存进 `this.loadedCard`。
@@ -4235,30 +2071,7 @@ export class AppShell {
    * 读不到卡不能让聊天用不了 —— 用户还能打字、还能拿到回复，
    * 只是模型不知道在扮演谁。报错中断整页比"降级"更糟。
    */
-  private async loadCharacterCard(avatar: string): Promise<boolean> {
-    try {
-      const pngBytes = await this.withConnection(() => this.bridge.characterPng(avatar));
-      const parsed = parsePngCard(new Uint8Array(pngBytes));
-      if (parsed.kind !== 'card') {
-        this.adoptLoadedCard({});
-        return false;
-      }
-      const json = JSON.parse(parsed.jsonText) as unknown;
-      if (json === null || typeof json !== 'object') {
-        this.adoptLoadedCard({});
-        return false;
-      }
-      const root = json as Record<string, unknown>;
-      const data = root['data'];
-      this.adoptLoadedCard(
-        data !== null && typeof data === 'object' ? (data as Record<string, unknown>) : root,
-      );
-      return true;
-    } catch {
-      this.adoptLoadedCard({});
-      return false;
-    }
-  }
+
 
   /**
    * 收下一张卡的 `data` 段 —— **并且连带解析它带的角色级提示词**。
@@ -4279,15 +2092,7 @@ export class AppShell {
    * 用户只会觉得"模型怎么怪怪的"。所以把"收卡"与"清提示词"绑成一件事，
    * 让漏掉其中一半在结构上不可能。
    */
-  private adoptLoadedCard(card: Record<string, unknown>): void {
-    this.loadedCard = card;
-    /*
-     * `extensions` 是 V2/V3 规范里放应用私有数据的唯一位置。
-     * 取不到（V1 卡 / 没配过）就是 `null` —— 面板据此完全走全局。
-     */
-    this.characterPrompts = parseCharacterPrompts(card['extensions']);
-    this.rebuildPromptConfig();
-  }
+
 
   /**
    * 重算"最终生效"的提示词配置，并推给面板。**唯一写 `promptConfig` 的地方**。
@@ -4306,11 +2111,7 @@ export class AppShell {
    * 正是本项目最反复的缺陷类型（实现存在、接在错的函数里）。
    * `setContext` 是浅合并语义，只推 `promptConfig` 不会清掉其它字段。
    */
-  private rebuildPromptConfig(): void {
-    const merged = combineGlobalAndCharacter(this.globalPromptConfig, this.characterPrompts);
-    this.promptConfig = merged;
-    this.chatPanel?.setContext({ promptConfig: merged });
-  }
+
 
   /* ═══════════════════════════════════════════════════════════
      角色级提示词：写回卡片（v0.2.0 第 2 步）
@@ -4346,106 +2147,7 @@ export class AppShell {
    *
    * @param mutate 拿到当前配置返回新配置。传空配置 = 从零开始
    */
-  private async saveCharacterPrompts(
-    mutate: (config: CharacterPromptConfig) => CharacterPromptConfig,
-  ): Promise<{ ok: boolean; reason?: string }> {
-    const avatar = this.chatAvatar();
-    if (avatar === null) return { ok: false, reason: '还没选角色，不知道该存到哪张卡。' };
 
-    const next = mutate(this.characterPrompts ?? emptyCharacterPrompts());
-
-    /*
-     * 上限校验。**先校验后写盘** —— 反过来的话卡已经被改坏了才发现超限，
-     * 那时只能再写一次去修，而两次写之间用户可能已经杀掉 App。
-     */
-    const violations = validateCharacterPrompts(next);
-    if (violations.length > 0) {
-      return { ok: false, reason: violations.map((one) => one.message).join(' ') };
-    }
-
-    try {
-      const pngBytes = await this.withConnection(() => this.bridge.characterPng(avatar));
-      const bytes = new Uint8Array(pngBytes);
-      const parsedPng = parsePngCard(bytes);
-      if (parsedPng.kind !== 'card') {
-        return { ok: false, reason: '这个角色不是 PNG 卡，存不了角色级提示词。' };
-      }
-
-      const parsedCard = parseStCardText(parsedPng.jsonText);
-      const card = parsedCard.card;
-
-      /*
-       * `extensions` 在 `passthrough.data` 这个**原样桶**里。
-       *
-       * `writeCharacterPrompts` 只动 `tcs.prompts`，其余键（别的工具放的
-       * `depth_prompt` / `world` / `fav`，以及我们自己的 `tcs.cardId`）
-       * 逐个保留 —— V2 规范 MUST NOT destroy unknown key-value pairs。
-       */
-      const prevExtensions = card.passthrough.data['extensions'];
-      const extensions = writeCharacterPrompts(
-        prevExtensions !== null && typeof prevExtensions === 'object' && !Array.isArray(prevExtensions)
-          ? (prevExtensions as Record<string, unknown>)
-          : null,
-        next,
-      );
-
-      const updated = {
-        ...card,
-        passthrough: {
-          ...card.passthrough,
-          data: {
-            ...card.passthrough.data,
-            /*
-             * 强转的理由：`writeCharacterPrompts` 的输出**自证是 JSON-safe** ——
-             * 它只写我们从卡片 JSON 里读出来的值（string / boolean / number /
-             * 数组 / 普通对象），没有 Date / Map / undefined。
-             *
-             * 而它的返回类型故意是 `Record<string, unknown>`：那个文件在
-             * `shared/src/chat/` 下，不该为了一个类型去依赖 format 层的
-             * `JsonObject`（否则改 format 会牵动 chat）。所以边界处转一次，
-             * 且只在这一个位置转。
-             */
-            extensions: extensions as unknown as (typeof card.passthrough.data)[string],
-          },
-        },
-      };
-
-      const jsonText = stringifyStCard(updated, { indent: 2, entryTitleToComment: true });
-      /*
-       * `spec` 要跟原卡走：v3 卡写 `ccv3`、v2 卡写 `chara`。
-       * 传错会在 ST 读不到的关键字上写一块 —— 表现是"改完 ST 里没变化"。
-       */
-      const spec = card.meta.spec === 'v3' ? 'v3' : 'v2';
-      const png = buildPngCard(bytes, jsonText, spec);
-
-      const status = this.readEngineStatus();
-      const charactersDir = status?.charactersDir ?? '';
-      if (charactersDir === '') return { ok: false, reason: '拿不到角色库目录，无法保存。' };
-
-      await this.writeCardPng(avatar, charactersDir, png, false);
-
-      /*
-       * 写成功后更新内存并重算。顺序不能反：先重算再写盘的话，
-       * 写盘失败时内存里已经是"已保存"的状态，界面会骗人。
-       */
-      this.characterPrompts = isCharacterPromptsEmpty(next) ? null : next;
-      this.rebuildPromptConfig();
-
-      /*
-       * 记下"这几个数"。排查"改了没生效"时：
-       * 日志里有这行而卡里没有 ⇒ 写盘或序列化出的问题；
-       * 日志里没有这行 ⇒ 根本没走到保存（前端状态没更新）。
-       */
-      diagNote(
-        'note',
-        `[提示词] 写回 avatar=${avatar} own=${String(next.own.length)} override=${String(Object.keys(next.overrideOrder).length)} 字节=${String(png.length)}`,
-      );
-
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, reason: describeBridgeError(error).message };
-    }
-  }
 
   /**
    * 「恢复卡片默认」：把这个角色的提示词配置整个清空。
@@ -4459,13 +2161,7 @@ export class AppShell {
    *
    * 这里不再问第二遍：确认属于 UI 的职责，重复问只会让人烦。
    */
-  private async restoreCharacterPrompts(): Promise<{ ok: boolean; reason?: string }> {
-    const result = await this.saveCharacterPrompts(() => emptyCharacterPrompts());
-    if (!result.ok) return result;
-    this.renderPage();
-    this.options.onNotify?.('已恢复到卡片原本的提示词设置', 'ok');
-    return { ok: true };
-  }
+
 
   /**
    * 读角色卡，**读不到就重试**。
@@ -4498,22 +2194,7 @@ export class AppShell {
    * 抛错会让每个调用点都写 try/catch，而这里失败**不是异常情况** ——
    * 引擎还没起是正常时序。
    */
-  private async loadCharacterCardWithRetry(avatar: string): Promise<boolean> {
-    const deadline = Date.now() + CARD_LOAD_TIMEOUT_MS;
-    for (;;) {
-      /*
-       * 用户可能在这期间换了角色 —— 立刻放弃，别把别人的卡读到这个槽里。
-       * 与 `restoreLatestChat` 里那条判断同源。
-       */
-      if (this.selectedCharacter !== null && this.selectedCharacter.avatar !== avatar) return false;
 
-      await this.ensureConnected();
-      if (await this.loadCharacterCard(avatar)) return true;
-
-      if (Date.now() >= deadline) return false;
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-    }
-  }
 
   /**
    * 改完开场白之后，让**当前这条还没开聊的对话**跟上。
@@ -4526,43 +2207,10 @@ export class AppShell {
    * 判据是"没有一条 `is_user`"，不是"只有一条消息"：用户可能连点两次
    * 重新生成了开场白，条数会变，但"没说过话"这条性质不变。
    */
-  private async refreshOpeningAfterEdit(): Promise<void> {
-    const panel = this.chatPanel;
-    const avatar = this.chatAvatar();
-    if (panel === null || avatar === null) return;
 
-    /*
-     * 先把新卡读进 `loadedCard`：`refreshOpeningAfterEdit` 是在**保存之后**
-     * 调的，此时磁盘上已经是新卡，重读一次就拿得到新的 `first_mes`。
-     */
-    await this.loadCharacterCard(avatar);
-
-    const messages = panel.getMessages();
-    if (messages.some((one) => one.is_user === true)) return;
-
-    const opening = buildOpeningMessages(this.loadedCard);
-    if (opening.length === 0) return;
-
-    /*
-     * `setMessages` 而不是 `newChat`：`newChat` 会把 `fileName` 置空、
-     * 换一个聊天文件 —— 用户只是改了开场白，不该多出一条聊天记录。
-     */
-    panel.setMessages(opening, this.chatFileName ?? undefined, avatar);
-    /*
-     * 快照的形状是 `{ fileName, messages }`，**不是** `messages` 本身。
-     * 写成 `= opening` 会让下一次 `renderChat()` 读到 `snapshot.messages`
-     * 得 `undefined` ⇒ 面板一片空白（而磁盘上有内容）。
-     */
-    if (this.chatFileName !== null) {
-      this.chatSnapshot = { fileName: this.chatFileName, messages: opening.slice() };
-    }
-    this.handleChatChanged(opening);
-  }
 
   /** 当前该用的用户名：选中的人设优先，否则用外部传入的默认名 */
-  private currentUserName(): string {
-    return activePersona(this.personaState)?.name ?? this.options.userName;
-  }
+
 
   /**
    * 把当前人设对齐到"这个角色该用的那套"并落盘。
@@ -4570,12 +2218,7 @@ export class AppShell {
    * 抽成一个方法而不是在两处各写一遍：切角色与冷启动恢复必须走同一套规则，
    * 各写一遍必然分叉（而分叉的表现就是"切角色生效、重进 App 不生效"这种）。
    */
-  private applyPersonaForCharacter(avatar: string): void {
-    const next = syncPersonaToCharacter(this.personaState, avatar);
-    if (next === this.personaState) return;
-    this.personaState = next;
-    void this.options.onPersistPersona?.(next);
-  }
+
 
   /**
    * 把人设的当前状态推给聊天面板。
@@ -4593,39 +2236,9 @@ export class AppShell {
    * 各写一遍必然分叉，而分叉的表现是"重启后生效、改完不生效"这类
    * 只在特定路径出现的怪现象。
    */
-  private personaContext():
-    | undefined
-    | {
-        name: string;
-        description: string;
-        position: 'in_prompt' | 'top_an' | 'bottom_an' | 'at_depth' | 'none';
-        depth: number;
-        role: 'system' | 'user' | 'assistant';
-      } {
-    const active = activePersona(this.personaState);
-    if (active === null) return undefined;
-    return {
-      name: active.name,
-      description: active.description,
-      position: active.position,
-      depth: active.depth,
-      role: active.role,
-    };
-  }
 
-  private syncPersonaToChat(): void {
-    /*
-     * 标签一起更新（2026-11-06）：顶栏胶囊也跟着换名字。
-     * 只推 `userName` 的话，胶囊会停在旧人设名上 —— 而用户刚点的就是它。
-     */
-    const label = activePersona(this.personaState)?.name ?? '';
-    this.chatPanel?.setContext({
-      userName: this.currentUserName(),
-      persona: this.personaContext(),
-      personaLabel: label,
-    });
-    this.chatPanel?.syncPersonaChip(label);
-  }
+
+
 
   /**
    * 聊天页顶栏的人设胶囊被点：弹出可切换的列表（2026-11-06）。
@@ -4647,57 +2260,7 @@ export class AppShell {
    * 那是很重的动作。`selectPersona(state, null)` 本来就支持，
    * 只是一直没有入口。
    */
-  private openPersonaSwitcher(anchor: unknown): void {
-    const avatar = this.chatAvatar();
-    const available = avatar === null ? this.personaState.personas : personasForCharacter(this.personaState, avatar);
 
-    if (available.length === 0) {
-      this.options.onNotify?.('还没有用户设定，去「卡片 → 用户设定管理」加一套', 'info');
-      return;
-    }
-
-    const currentId = this.personaState.selectedId ?? '';
-    /*
-     * 末位「默认人设」= 不绑定任何一套，用默认名。
-     *
-     * ★ 文案从「不设人设（用默认名）」缩到这里（2026-11-07，用户要求）：
-     *
-     * > 默认人设这个列表里面你就写默认或者默认人设就行
-     *
-     * 原来那 10 个字是全列表最长的一条，逼着面板按它算宽度、
-     * 在窄屏上还要换行。短文案让面板能小一点、也更像"一个选项"
-     * 而不是"一句解释"。
-     */
-    const options = [
-      ...available.map((one) => ({ value: one.id, label: one.name })),
-      ...(currentId === '' ? [] : [{ value: '', label: '默认人设' }]),
-    ];
-
-    openSelectPopover(this.doc, {
-      options,
-      current: currentId,
-      anchorEl: anchor,
-      onPick: (value) => {
-        const next = selectPersona(this.personaState, value === '' ? null : value);
-        this.personaState = next;
-
-        /* 先推送再落盘：界面上立刻生效，落盘失败也不会让操作看起来没反应 */
-        this.syncPersonaToChat();
-        void this.options.onPersistPersona?.(next).catch(() => {
-          this.options.onNotify?.('人设切换已生效，但没能存下来（重启后会复原）', 'warn');
-        });
-
-        /*
-         * 提示只在用户开了那个全局开关时给（ST 的「切换用户设定时显示提示」）。
-         * 默认值是开的，但用户可能关掉 —— 关掉就安静切换。
-         */
-        if (next.notifyOnSwitch) {
-          const name = activePersona(next)?.name ?? this.currentUserName();
-          this.options.onNotify?.(`已切换到：${name}`, 'ok');
-        }
-      },
-    });
-  }
 
   /* ═══════════════════════════════════════════════════════════
      聊天设置（聊天 Tab 的二级页，2026-10-31 第三批问题二）
@@ -4783,7 +2346,7 @@ export class AppShell {
          * `syncPersonaToCharacter` 按"绑定优先、默认兜底"重新对齐 ——
          * 用户不用再每次手动点「使用」。
          */
-        this.applyPersonaForCharacter(character.avatar);
+        applyPersonaForCharacter(this.personaHost(), character.avatar);
 
         /*
          * ★★★ 跳转必须**立刻**发生，不能等读完历史（2026-11-06）。
@@ -4884,7 +2447,7 @@ export class AppShell {
          *   上一个角色留在 `characterPrompts` 里的覆盖必须一起清掉。
          *   否则"点角色 B → 卡还没到 → 发一条消息"会按 A 的提示词发。
          */
-        this.adoptLoadedCard({});
+        adoptLoadedCard(this.cardHost(), {});
 
         /* ① 立即跳（不 await） */
         this.renderPage();
@@ -4900,7 +2463,7 @@ export class AppShell {
              * 首启时引擎要 7–57 秒才就绪，而原来读卡只试一次、失败即空，
              * 再也没人重读 —— 直到用户进「开场与示例」保存了一次。
              */
-            const gotCard = await this.loadCharacterCardWithRetry(character.avatar);
+            const gotCard = await loadCharacterCardWithRetry(this.cardHost(), character.avatar);
             if (gotCard && this.selectedCharacter?.avatar === character.avatar) {
               this.renderPage();
             }
@@ -5059,23 +2622,7 @@ export class AppShell {
    * `bridge.writeCharacterPng`，谁也没想到要清缓存。收口之后，
    * **新增第四处写卡也不可能漏** —— 这比"记得在每个地方补一行"可靠。
    */
-  private async writeCardPng(
-    avatar: string,
-    charactersDir: string,
-    png: Uint8Array,
-    allowCreate: boolean,
-  ): Promise<void> {
-    await this.withConnection(() =>
-      this.bridge.writeCharacterPng(avatar, charactersDir, png, allowCreate),
-    );
-    /*
-     * 写成功就作废这张卡的分享缓存。顺序不能反：先清再写的话，
-     * 写失败时缓存已经没了 —— 下次导出会重新读（也能读到旧的），
-     * 但白丢一次预取。
-     */
-    this.shareCache.delete(avatar);
-    diagNote('note', `[卡] 已写回 avatar=${avatar} 缓存已作废`);
-  }
+
 
   /**
    * 预取一张卡的 PNG 字节到分享缓存（失败就清掉，下次重试）。
@@ -5122,7 +2669,7 @@ export class AppShell {
   private renderChatSettingsMenu(): void {
     if (this.pageHost === null) return;
 
-    const page = renderChatSettingsMenu(this.doc, this.makeSettingsCallbacks());
+    const page = renderChatSettingsMenu(this.doc, makeSettingsCallbacks(this.settingsHost()));
     this.pageHost.append(page);
   }
 
@@ -5161,7 +2708,7 @@ export class AppShell {
       return;
     }
 
-    const page = renderFieldSection(this.doc, groupId, this.makeSettingsCallbacks());
+    const page = renderFieldSection(this.doc, groupId, makeSettingsCallbacks(this.settingsHost()));
     this.pageHost.append(page);
   }
 
@@ -5490,9 +3037,7 @@ export class AppShell {
    *
    * 现在该键只由「AI 响应配置」读写，派生值就是唯一真相。
    */
-  private deriveSampling(settings: Record<string, unknown>): DerivedSampling {
-    return samplingFromSettings(settings);
-  }
+
 
   /**
    * 把「最大回复长度」写进 ST 设置（`oai_settings.openai_max_tokens`）。
@@ -5538,169 +3083,7 @@ export class AppShell {
    *
    * @returns 成功返回 `null`；失败返回给用户看的原因（可能多条）
    */
-  private async writeApiConnectionToSt(
-    state: ApiPageState,
-    apiKey: string | null,
-  ): Promise<string[] | null> {
-    const problems: string[] = [];
 
-    /*
-     * ── ① 秘钥：核对引擎里这个源**到底有没有**可用 key ──
-     *
-     * ★★★ 这里原来有个致命的条件：只有"这次填了新 key"才核对。
-     *
-     * ```ts
-     *   if (apiKey !== null && apiKey.trim() !== '') { …核对… }
-     * ```
-     *
-     * ## 它造成的完整事故链（2026-11-12 真机取证）
-     *
-     * 用户报「填了秘钥，还是 401」并说"点保存后提示已保存"。
-     * 直连他手机的 ST 读 `/api/secrets/read`：**52 个槽位全是 null**。
-     * 也就是说 key 一个字节都没进去，而界面一路说成功。
-     *
-     * ```text
-     *   ① api-page 拿到的 rawKey 是 null（原因待查，见下面的日志）
-     *   ② 这一步因为 apiKey === null 直接跳过核对
-     *   ③ problems 为空 ⇒ stOk = true
-     *   ④ 界面显示「已保存（已同步到服务）」
-     *   ⑤ 发消息 → Bearer 为空 → 上游 401
-     * ```
-     *
-     * ## 修法：不管这次填没填，都问引擎"有没有"
-     *
-     * 「不改 key」不等于「不需要 key」。用户点了保存，就该知道
-     * 这个接口现在到底能不能用。
-     *
-     * ## 为什么是 warn 而不是 error
-     *
-     * 有些源**本来就不需要 key**（本地跑的 ollama / koboldcpp / vLLM，
-     * 地址是回环或局域网）。对它们硬报错会让用户没法保存。
-     *
-     * 所以：`custom` 源 + 回环地址 ⇒ 不要求 key（它就是本地服务）；
-     * 其余情况没有 key ⇒ 明确提示"发消息会失败"，但不阻断保存。
-     */
-    let keyWritten = false;
-    {
-      const secretKey = secretKeyOf(state.source);
-      try {
-        /*
-         * ★★★ 这里**不再写 key**，只回读确认（2026-11-09）。
-         *
-         * ## 为什么把写入让给 api-page
-         *
-         * 两处都写会让 ST 的 secrets.json 每次保存多出一条
-         * （`writeSecret` 是追加语义）。api-page 是用户点"保存"的直接处理者，
-         * 由它写最自然；这一层负责**核实**。
-         *
-         * ## 为什么要核实（这是本轮修的核心）
-         *
-         * 用户报：
-         *
-         * > 我明明填了秘钥……报 Key 错误：Key 填错、过期或未设置 Bearer
-         *
-         * 真机取证（直连 ST 的 `/api/secrets/read`）：整张表**全是 null**，
-         * 包括 `api_key_custom`。也就是 key 一个字节都没进去，而界面说成功。
-         * 于是请求带 `Authorization: Bearer `（空），上游回"未设置 Bearer"。
-         *
-         * `writeSecret` 返回 200 只说明 ST **收下了请求**，不代表 secrets.json
-         * 里真有一条 `active: true`。而 ST 的 `readSecret()` 只认 active 那条：
-         *
-         * ```js
-         *   const activeSecret = secretArray.find(s => id ? s.id === id : s.active);
-         *   return activeSecret?.value || '';      // 没有 active ⇒ 空串
-         * ```
-         *
-         * 所以判据要用 ST 自己的口径：**`secretPresent()` 里有没有这个名字**。
-         * 那个函数已改成与 `readSecret` 完全一致（只认 active:true）。
-         */
-        const present = await this.withConnection(() => this.bridge.secretPresent());
-        if (present.includes(secretKey)) {
-          keyWritten = true;
-        } else if (apiKey !== null && apiKey.trim() !== '') {
-          /* 这次填了，引擎里却没有 ⇒ 写入本身失败了，这是硬错误 */
-          problems.push(
-            `秘钥没在引擎里生效（${secretKey} 找不到 active 记录）。` +
-              '再点一次保存；还不行就说明引擎没连上。',
-          );
-        } else if (!isLocalEndpoint(state.baseUrl)) {
-          /*
-           * 这次没填、引擎里也没有 ⇒ 用户以为配好了，实际必然失败。
-           *
-           * 这是本次修复的核心：原来这种情况**什么都不说**，界面还显示
-           * "已保存（已同步到服务）"。用户只能等到发消息看到 401 才知道。
-           *
-           * 文案要说清两件事：现在什么状态、下一步做什么。
-           */
-          problems.push(
-            `这个接口还没有可用的秘钥 —— 现在发消息会失败。` +
-              '把 key 粘贴到上面的输入框，再点一次保存。',
-          );
-        }
-        /* 没填 + 本地服务 ⇒ 不需要 key，不报 */
-      } catch (error) {
-        /*
-         * 写不进去**必须报**：只改源和模型而不写 key，等于把用户
-         * 从"能聊"改成"必然 401"，而且表面上一切正常。
-         */
-        problems.push(
-          `秘钥没写进引擎：${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
-
-    /* ── ② settings：source / model / custom_url ── */
-    const patch = buildStConnectionPatch(state);
-    let saved: Record<string, unknown> | null = null;
-    try {
-      const result = await mutateSettings(
-        {
-          getRaw: () => this.withConnection(() => this.bridge.settingsGetRaw()),
-          save: (settings) => this.withConnection(() => this.bridge.settingsSave(settings)),
-        },
-        (current) => {
-          const oai = current['oai_settings'];
-          const base = oai !== null && typeof oai === 'object' ? (oai as Record<string, unknown>) : {};
-          return { ...current, oai_settings: { ...base, ...patch } };
-        },
-      );
-      if (!result.ok) {
-        problems.push(`连接配置没写进引擎：${result.reason}`);
-      } else {
-        saved = result.settings;
-      }
-    } catch (error) {
-      problems.push(
-        `连接配置没写进引擎：${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-
-    /* ── ③ 回读校验：不信"写成功"，只信"读回来一致" ── */
-    if (saved !== null) {
-      try {
-        const raw = await this.withConnection(() => this.bridge.settingsGetRaw());
-        const envelope: unknown = JSON.parse(raw === '' ? '{}' : raw);
-        const parsed = parseSettingsEnvelope(envelope);
-        if (!parsed.ok) {
-          problems.push(`保存后核对不一致：${parsed.reason}`);
-        } else {
-          const verdict = verifyConnectionPersisted(parsed.settings, {
-            source: state.source,
-            model: state.model,
-            baseUrl: state.baseUrl,
-            keyWritten,
-          });
-          if (!verdict.ok) problems.push(...verdict.problems);
-        }
-      } catch (error) {
-        problems.push(
-          `保存后核对不一致：${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
-
-    return problems.length === 0 ? null : problems;
-  }
 
 
   /**
@@ -5731,41 +3114,7 @@ export class AppShell {
    * ST 是真相。它说有的未必在本地标记里（这就要补上），
    * 它说没有的一定没有（本地标记多出来的就是过期数据）。
    */
-  private async refreshKeyPresence(): Promise<void> {
-    let names: string[];
-    try {
-      names = await this.withConnection(() => this.bridge.secretPresent());
-    } catch {
-      /* 连不上 / 解析失败：保持现有显示（"不知道"不等于"都没有"） */
-      return;
-    }
 
-    /*
-     * ST 的 secret key 命名是 `api_key_<source>`（见 ST 的 `SECRET_KEYS`）。
-     * 直接按前缀剥，比维护一张映射表稳 —— ST 加新源时自动跟着走，
-     * 剥出来的名字若不在我们的支持列表里，`isSupportedChatSource` 会挡掉。
-     */
-    const fromSt = new Set<StChatSource>();
-    for (const name of names) {
-      if (!name.startsWith('api_key_')) continue;
-      const candidate = name.slice('api_key_'.length);
-      if (isSupportedChatSource(candidate)) fromSt.add(candidate);
-    }
-
-    /*
-     * 没变化就不重绘 —— 否则每次进 API 页都会闪一下
-     * （重绘会收起已展开的收纳项，用户正在填的输入框也会被换掉）。
-     */
-    const same =
-      fromSt.size === this.apiKeyPresent.size &&
-      [...fromSt].every((one) => this.apiKeyPresent.has(one));
-    if (same) return;
-
-    this.apiKeyPresent = fromSt;
-
-    /* 只有用户正看着 API 那一块时才重绘，别打扰别的页面 */
-    if (this.apiExpanded) this.renderPage();
-  }
 
   private async withConnection<T>(run: () => Promise<T>): Promise<T> {    const gate = await this.ensureConnected();
     if (!gate.ok) throw gate.error;
@@ -5913,14 +3262,14 @@ export class AppShell {
          */
         this.globalPromptConfig = null;
         this.promptFormats = {};
-        this.rebuildPromptConfig();
+        rebuildPromptConfig(this.promptHost());
         this.chatPanel?.setContext({ promptFormats: {} });
         return;
       }
 
       const config = parsePromptConfig(body);
       this.globalPromptConfig = config.prompts.length > 0 ? config : null;
-      this.rebuildPromptConfig();
+      rebuildPromptConfig(this.promptHost());
 
       /*
        * 格式串与示例分隔提示：一律**照抄用户的配置**，缺省即空串。
@@ -5995,7 +3344,7 @@ export class AppShell {
       if (!parsed.ok) return; // 读不懂就沿用原值，见方法注释
       if (generation !== this.samplingGeneration) return; // 已有更新的播种在路上
 
-      this.sampling = this.deriveSampling(parsed.settings);
+      this.sampling = deriveSampling(this.settingsHost(), parsed.settings);
       this.chatPanel?.setContext({ sampling: { ...this.sampling } });
 
       /*
@@ -6025,14 +3374,14 @@ export class AppShell {
 
   private renderChatActions(): void {
     if (this.pageHost === null) return;
-    const page = renderChatActionsPage(this.doc, this.makeActionsCallbacks());
+    const page = renderChatActionsPage(this.doc, makeActionsCallbacks(this.actionsHost()));
     /* `renderPage()` 已经 `pageHost.replaceChildren()` 过，这里只 append */
     this.pageHost.append(page);
   }
 
   private renderChatFiles(): void {
     if (this.pageHost === null) return;
-    const page = renderChatFilesPage(this.doc, this.makeFilesCallbacks());
+    const page = renderChatFilesPage(this.doc, makeFilesCallbacks(this.filesHost()));
     this.pageHost.append(page);
   }
 
@@ -6192,11 +3541,11 @@ export class AppShell {
        *   当成同一页（不播转场），而一张卡改了名会莫名播一次转场。
        *   这与角色编辑页的做法一致（那里也没写角色 id）。
        */
-      if (this.repoCardId !== null) {
-        return `repo/${this.repoRepoId ?? '-'}/${encodeURIComponent(this.repoCardId)}`;
+      if (this.repo.cardId !== null) {
+        return `repo/${this.repo.repoId ?? '-'}/${encodeURIComponent(this.repo.cardId)}`;
       }
-      if (this.repoRepoId !== null) {
-        return `repo/${encodeURIComponent(this.repoRepoId)}`;
+      if (this.repo.repoId !== null) {
+        return `repo/${encodeURIComponent(this.repo.repoId)}`;
       }
       return 'repo';
     }
@@ -6292,11 +3641,11 @@ export class AppShell {
      */
     if (this.active === 'cards') {
       if (this.personaOpen) {
-        this.renderPersonaPage();
+        renderPersonaPageAction(this.personaHost());
         return;
       }
       if (this.greetingOpen) {
-        this.renderGreeting();
+        renderGreeting(this.greetingHost());
         return;
       }
       this.renderCardsTab();
@@ -6316,15 +3665,15 @@ export class AppShell {
      *   （1 → 2 → 3），不需要为每一级单独写动画。这就是用户第 4 点
      *   "复用转场"的实现方式。
      */
-    if (this.repoCardId !== null) {
-      this.renderRepoCardPage();
+    if (this.repo.cardId !== null) {
+      renderRepoCardPageAction(this.repoHost());
       return;
     }
-    if (this.repoRepoId !== null) {
-      this.renderRepoCardsPage();
+    if (this.repo.repoId !== null) {
+      renderRepoCardsPageAction(this.repoHost());
       return;
     }
-    this.renderRepoPage();
+    renderRepoPageAction(this.repoHost());
   }
 
   /**
@@ -6476,29 +3825,29 @@ export class AppShell {
      *   会在新卡的历史页上先闪一下上一张卡的版本列表。
      */
     if (this.active === 'repo') {
-      if (this.repoCardId !== null) {
-        this.repoCardId = null;
-        this.repoCardTitle = '';
-        this.repoVersionsState = null;
-        this.repoVersionsError = '';
+      if (this.repo.cardId !== null) {
+        this.repo.cardId = null;
+        this.repo.cardTitle = '';
+        this.repo.versionsState = null;
+        this.repo.versionsError = '';
         this.renderPage();
         /*
          * 退回到列表时**重拉一次**：在三级里可能删过卡、回滚过（版本数会变）。
          * 不重拉的话列表还显示着已经不存在的那张卡，点进去必然 404。
          * 用 `quiet` 是因为列表已经画出来了，别闪成"正在读取"。
          */
-        const repoId = this.repoRepoId;
+        const repoId = this.repo.repoId;
         if (repoId !== null) void this.refreshCardsQuietly(repoId);
         return true;
       }
-      if (this.repoRepoId !== null) {
-        this.repoRepoId = null;
-        this.repoRepoName = '';
-        this.repoCardsState = null;
-        this.repoCardsError = '';
+      if (this.repo.repoId !== null) {
+        this.repo.repoId = null;
+        this.repo.repoName = '';
+        this.repo.cardsState = null;
+        this.repo.cardsError = '';
         this.renderPage();
         /* 同上：卡数可能变了 */
-        void this.loadRepoListQuietly();
+        void loadRepoListQuietly(this.repoHost());
         return true;
       }
     }
@@ -6645,48 +3994,7 @@ export class AppShell {
    * 反过来（失败就填个"仅续写"之类）会让用户以为自己的提示词不发送，
    * 那是凭空造出来的告警。
    */
-  private async refreshPromptTriggers(): Promise<void> {
-    const config = this.promptConfig;
-    if (config === null) return;
-    try {
-      const raw = await this.withConnection(() => this.bridge.settingsGetRaw());
-      const envelope: unknown = JSON.parse(raw === '' ? '{}' : raw);
-      const bodies = presetBodiesByName(envelope);
 
-      const settings = (envelope as Record<string, unknown>)['settings'];
-      const resolved =
-        typeof settings === 'string'
-          ? ((): unknown => {
-              try {
-                return JSON.parse(settings);
-              } catch {
-                return null;
-              }
-            })()
-          : settings;
-      const presetName = currentPresetName(resolved);
-      const body = presetName === '' ? undefined : bodies[presetName];
-      /*
-       * `undefined`（没这份预设）与 `null`（这份预设读不出对象）都跳过。
-       * 都不当"没有触发器"—— 那是两回事，见上面那段说明。
-       */
-      if (body === undefined || body === null) return;
-
-      const next = new Map<string, readonly string[]>();
-      for (const prompt of config.prompts) {
-        next.set(prompt.identifier, readInjectionTrigger(body, prompt.identifier));
-      }
-      this.promptTriggers = next;
-      /*
-       * 已经在这一页上就重绘一次，让只读值显示出来。
-       *
-       * 只在编辑页时重绘 —— 在列表页重绘会让用户刚滑到一半的位置跳回顶部。
-       */
-      if (this.chatSettingsRoute === 'promptEdit') this.renderPage();
-    } catch {
-      /* 读不到就保持"所有类型"，见上面那段说明 */
-    }
-  }
 
   /**
    * 提示词页（v0.2.0 起有两种作用域）。
@@ -6713,7 +4021,7 @@ export class AppShell {
      * 同时把 scope 落回全局 —— 否则下次进来还挂着 `'character'`
      * 却画不出切换条，界面状态与字段值对不上。
      */
-    const canUseCharacter = this.chatAvatar() !== null && characterName !== '';
+    const canUseCharacter = chatAvatar(this.cardHost()) !== null && characterName !== '';
     const scope = canUseCharacter ? this.promptScope : 'global';
     const config = scope === 'character' ? this.promptConfig : this.globalPromptConfig;
 
@@ -6743,13 +4051,13 @@ export class AppShell {
                 this.renderPage();
               },
               onRestoreOne: (identifier: string) =>
-                this.saveCharacterPrompts((current) => clearOverride(current, identifier)).then(
+                saveCharacterPrompts(this.promptHost(), (current) => clearOverride(current, identifier)).then(
                   (result) => {
                     if (result.ok) this.renderPage();
                     return result;
                   },
                 ),
-              onRestoreAll: () => this.restoreCharacterPrompts(),
+              onRestoreAll: () => restoreCharacterPrompts(this.promptHost()),
             },
           }
         : {}),
@@ -6761,7 +4069,7 @@ export class AppShell {
        */
       togglePrompt: (identifier, enabled) =>
         scope === 'character'
-          ? this.saveCharacterPrompts((current) => {
+          ? saveCharacterPrompts(this.promptHost(), (current) => {
               /*
                * 需要"全局这一条现在是什么状态"才能判断"要不要留下覆盖"：
                * 与全局相同就删掉覆盖项（否则 `overrideOrder` 里会攒一堆
@@ -6785,7 +4093,7 @@ export class AppShell {
               }
               return setCharacterPromptEnabled(current, identifier, enabled, globalEnabled);
             })
-          : this.savePromptToggle(identifier, enabled),
+          : savePromptToggle(this.promptHost(), identifier, enabled),
       /*
        * ★ 这里**不能**直接把这个回调赋成 `this.options` 里那一个。
        *
@@ -6828,7 +4136,7 @@ export class AppShell {
          * ★ 不 await：await 会让"点一下要等一次 HTTP"变成可感知的卡顿，
          *   而那一栏是只读信息，晚 200ms 出现完全可以接受。
          */
-        void this.refreshPromptTriggers();
+        void refreshPromptTriggers(this.promptHost());
         this.renderPage();
       },
     });
@@ -6887,7 +4195,7 @@ export class AppShell {
      * 判据是"当前作用域 + 这条不在角色的 own 里"。新建（`id === null`）
      * 不受影响 —— 那时建的是角色特有项，所有字段都有效。
      */
-    const inCharacterScope = this.promptScope === 'character' && this.chatAvatar() !== null;
+    const inCharacterScope = this.promptScope === 'character' && chatAvatar(this.cardHost()) !== null;
     const editingOwnPrompt =
       id !== null &&
       (this.characterPrompts?.own.some((one) => ownIdentifierOf(one) === id) ?? false);
@@ -6923,10 +4231,10 @@ export class AppShell {
         this.promptEditId = null;
         this.goBackOneLevel();
       },
-      onSave: (draft) => this.savePromptDraft(target.identifier, draft),
+      onSave: (draft) => savePromptDraft(this.promptHost(), target.identifier, draft),
       ...(target.identifier === null
         ? {}
-        : { onDelete: () => this.deletePromptById(target.identifier as string) }),
+        : { onDelete: () => deletePromptById(this.promptHost(), target.identifier as string) }),
       onNotify: (message, kind) => this.options.onNotify?.(message, kind),
     });
     this.pageHost.append(page);
@@ -6946,37 +4254,7 @@ export class AppShell {
    * 存到哪。而"存到哪"如果由页面判断，将来加第三种作用域就要改页面，
    * 且两处判断必然分叉。
    */
-  private async savePromptDraft(
-    identifier: string | null,
-    draft: PromptDraft,
-  ): Promise<{ ok: boolean; reason?: string }> {
-    const problem = validateDraft(draft);
-    if (problem !== null) return { ok: false, reason: problem };
 
-    if (this.promptScope === 'character' && this.chatAvatar() !== null) {
-      return this.saveCharacterPromptDraft(identifier, draft);
-    }
-
-    const isCreate = identifier === null;
-    const newId = isCreate ? newPromptIdentifier() : identifier;
-
-    const result = await this.mutatePromptPreset((body, config) =>
-      isCreate ? createPrompt(body, draft, newId) : updatePrompt(body, identifier, draft),
-    );
-    if (!result.ok) return result;
-
-    /*
-     * 新建成功后**停在编辑页**并显示这条的真正 id？
-     *
-     * 不 —— 回到列表。用户新建完最想看的是"它进列表了吗、开着吗"，
-     * 而列表正好回答这两个问题（末尾一条、开关是开）。
-     */
-    this.promptEditId = null;
-    this.chatSettingsRoute = 'prompts';
-    this.renderPage();
-    this.options.onNotify?.(isCreate ? '已新建，默认是开启的' : '已保存', 'ok');
-    return { ok: true };
-  }
 
   /**
    * 「本角色」作用域下保存一条提示词（v0.2.0）。
@@ -7000,126 +4278,10 @@ export class AppShell {
    * 也应当只读（`kind: 'content-only'`）。这里若拿到不同的值，
    * 只取 content，其余静默忽略 —— 但要在返回的提示里说清楚。
    */
-  private async saveCharacterPromptDraft(
-    identifier: string | null,
-    draft: PromptDraft,
-  ): Promise<{ ok: boolean; reason?: string }> {
-    const global = this.globalPromptConfig;
-    const isCreate = identifier === null;
 
-    // ① 新建 → 角色特有项
-    if (isCreate) {
-      const result = await this.saveCharacterPrompts((current) => {
-        const own: OwnPrompt = {
-          id: nextOwnPromptId(current),
-          name: draft.name.trim() === '' ? '未命名' : draft.name.trim(),
-          content: draft.content,
-          role: draft.role,
-          enabled: true,
-          injection: {
-            position: draft.injectionPosition,
-            depth: draft.injectionDepth,
-            order: draft.injectionOrder,
-          },
-        };
-        return upsertOwnPrompt(current, own);
-      });
-      if (!result.ok) return result;
-      this.promptEditId = null;
-      this.chatSettingsRoute = 'prompts';
-      this.renderPage();
-      this.options.onNotify?.('已加到这个角色，默认是开启的', 'ok');
-      return { ok: true };
-    }
-
-    // ② 编辑角色特有项 → 按 id 覆盖
-    const own = this.characterPrompts?.own.find((one) => ownIdentifierOf(one) === identifier);
-    if (own !== undefined) {
-      const result = await this.saveCharacterPrompts((current) => {
-        const exists = current.own.some((one) => one.id === own.id);
-        if (!exists) return current;
-        return upsertOwnPrompt(current, {
-          ...own,
-          name: draft.name.trim() === '' ? own.name : draft.name.trim(),
-          content: draft.content,
-          role: draft.role,
-          injection: {
-            position: draft.injectionPosition,
-            depth: draft.injectionDepth,
-            order: draft.injectionOrder,
-          },
-        });
-      });
-      if (!result.ok) return result;
-      this.promptEditId = null;
-      this.chatSettingsRoute = 'prompts';
-      this.renderPage();
-      this.options.onNotify?.('已保存', 'ok');
-      return { ok: true };
-    }
-
-    // ③ 编辑全局条目 → 只覆盖正文
-    const globalPrompt = global?.prompts.find((one) => one.identifier === identifier);
-    if (globalPrompt === undefined) {
-      return { ok: false, reason: '这条提示词已经不在全局预设里了，先回列表刷新一下。' };
-    }
-    /*
-     * 标记位（`charDescription` / `chatHistory` …）的正文来自卡片与时序，
-     * 覆盖它语义不清 —— `setCharacterPromptContent` 会拒绝并给原因，
-     * 这里直接把它的话透出去（不自己再写一份判断，那样两处会分叉）。
-     */
-    const changed = setCharacterPromptContent(
-      this.characterPrompts ?? emptyCharacterPrompts(),
-      identifier,
-      draft.content,
-      globalPrompt.content,
-      globalPrompt.marker,
-    );
-    if (!changed.ok) return { ok: false, reason: changed.reason };
-
-    const result = await this.saveCharacterPrompts(() => changed.config);
-    if (!result.ok) return result;
-    this.promptEditId = null;
-    this.chatSettingsRoute = 'prompts';
-    this.renderPage();
-    this.options.onNotify?.('已保存，只影响这个角色', 'ok');
-    return { ok: true };
-  }
 
   /** 删除一条提示词 */
-  private async deletePromptById(identifier: string): Promise<{ ok: boolean; reason?: string }> {
-    /*
-     * 角色作用域下：角色特有项可以删；全局预设里的那条**不许删** ——
-     * 它属于预设，删掉会让所有角色都少一条。要让它不生效，只能关掉。
-     *
-     * 这两件事在前端看起来都是"删除"，但后果差一个数量级。
-     */
-    if (this.promptScope === 'character' && this.chatAvatar() !== null) {
-      const own = this.characterPrompts?.own.find((one) => ownIdentifierOf(one) === identifier);
-      if (own === undefined) {
-        return {
-          ok: false,
-          reason: '这条在全局预设里，删掉会影响所有角色。只想让它在这个角色下不生效的话，把它关掉。',
-        };
-      }
-      const result = await this.saveCharacterPrompts((current) => removeOwnPrompt(current, own.id));
-      if (!result.ok) return result;
-      this.promptEditId = null;
-      this.chatSettingsRoute = 'prompts';
-      this.renderPage();
-      this.options.onNotify?.('已删除', 'ok');
-      return { ok: true };
-    }
 
-    const result = await this.mutatePromptPreset((body) => deletePrompt(body, identifier));
-    if (!result.ok) return result;
-
-    this.promptEditId = null;
-    this.chatSettingsRoute = 'prompts';
-    this.renderPage();
-    this.options.onNotify?.('已删除', 'ok');
-    return { ok: true };
-  }
 
   /**
    * 对"当前预设"做一次修改并整份写回（2026-11-07 抽出）。
@@ -7135,79 +4297,7 @@ export class AppShell {
    *
    * @param apply 拿到（原始 body, 当前解析结果）返回新 body
    */
-  private async mutatePromptPreset(
-    apply: (
-      body: Record<string, unknown>,
-      config: ParsedPromptConfig,
-    ) =>
-      | { ok: true; body: Record<string, unknown>; changed: boolean }
-      | { ok: false; reason: string },
-  ): Promise<{ ok: boolean; reason?: string }> {
-    const config = this.promptConfig;
-    if (config === null) return { ok: false, reason: '还没读到提示词配置，请回上一页重新进入。' };
 
-    try {
-      const raw = await this.withConnection(() => this.bridge.settingsGetRaw());
-      const envelope: unknown = JSON.parse(raw === '' ? '{}' : raw);
-      const bodies = presetBodiesByName(envelope);
-
-      const settings = (envelope as Record<string, unknown>)['settings'];
-      const resolved =
-        typeof settings === 'string'
-          ? ((): unknown => {
-              try {
-                return JSON.parse(settings);
-              } catch {
-                return null;
-              }
-            })()
-          : settings;
-      const presetName = currentPresetName(resolved);
-      if (presetName === '') {
-        return { ok: false, reason: '不知道该写回哪一份预设（还没选预设）。' };
-      }
-
-      const body = bodies[presetName];
-      /*
-       * `undefined` = 没有这份预设；非对象 = 这份预设读坏了。
-       * 两种都要拦住 —— 把它当空对象传下去，保存时会用"只剩我们改的那几个键"
-       * 的内容覆盖整份预设，用户的采样参数会全丢。
-       */
-      if (body === undefined || body === null || typeof body !== 'object' || Array.isArray(body)) {
-        return { ok: false, reason: `找不到「${presetName}」这份预设的内容，可能刚被删掉。` };
-      }
-
-      const next = apply(body as Record<string, unknown>, config);
-      if (!next.ok) return { ok: false, reason: next.reason };
-      if (!next.changed) return { ok: true };
-
-      await this.withConnection(() =>
-        this.bridge.presetSave(presetName, JSON.stringify(next.body)),
-      );
-
-      /*
-       * 重新解析，让面板手上的配置与磁盘一致。
-       *
-       * 这一步不能省：不重新解析的话，聊天时用的还是旧内容/旧开关。
-       *
-       * ★ v0.2.0：写的是 `globalPromptConfig`（磁盘那份预设），再由
-       *   `rebuildPromptConfig()` 叠上当前角色的覆盖。直接写
-       *   `this.promptConfig` 会把角色覆盖冲掉 —— 表现是"我改完这条
-       *   开关，本角色的定制全没了"，而且只在**这个角色有定制**时才出现，
-       *   一般人测不到。
-       */
-      const fresh = parsePromptConfig(next.body);
-      this.globalPromptConfig = fresh.prompts.length > 0 ? fresh : null;
-      this.rebuildPromptConfig();
-      if (this.authorNote !== null) {
-        this.chatPanel?.setContext({ authorNote: this.authorNote });
-      }
-
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, reason: describeBridgeError(error).message };
-    }
-  }
 
   /**
    * 保存一个提示词开关：读当前预设体 → 改 → 整份写回。
@@ -7224,14 +4314,7 @@ export class AppShell {
    * 用户关掉一条、再去聊天，发出去的**还是**那一条 ——
    * 而界面上开关明明已经关了。这是"设了不生效"最典型的样子。
    */
-  private async savePromptToggle(
-    identifier: string,
-    enabled: boolean,
-  ): Promise<{ ok: boolean; reason?: string }> {
-    return this.mutatePromptPreset((body, config) =>
-      setPromptEnabled(body, config, identifier, enabled),
-    );
-  }
+
 
   /**
    * 打开指定的聊天文件。
@@ -7259,6 +4342,393 @@ export class AppShell {
    * 现在失败就不记名字（保持 null），让用户的下一条消息按"新对话"处理，
    * 由 `shouldStartNewChatFile` 那道闸决定什么时候真的建档。
    */
+  /**
+   * 「聊天文件」页回调的接入点（实现在 `files-callbacks.ts`）。
+   *
+   * 13 个成员，就是那个模块能碰的全部状态与动作 —— 读这一个方法就知道
+   * 「聊天文件」页依赖什么，不必翻 1 万行。
+   *
+   * 5 个字段用 get/set 成对转发（它们在回调里会被写：改名同步 fileName、
+   * 删档清空 snapshot、返回上级清路由）。其余是只读依赖与方法。
+   */
+  /**
+   * 功能
+   * 「开场与示例」页的接入点。实现在 `greeting-actions.ts`。
+   *
+   * 注意事项
+   * 四个 `greeting*` 字段双向转发：渲染改 state、保存后清 png/json、
+   * changeFlag 每次渲染前重算。少一个 setter 就成「改完看着没改」。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  private greetingHost(): GreetingHost {
+    const self = this;
+    return {
+      get doc() { return self.doc; },
+      get pageHost() { return self.pageHost; },
+      get bridge() { return self.bridge; },
+      get options() { return self.options; },
+      get chatPanel() { return self.chatPanel; },
+      get chatFileName() { return self.chatFileName; },
+      get chatSnapshot() { return self.chatSnapshot; },
+      set chatSnapshot(next) { self.chatSnapshot = next as typeof self.chatSnapshot; },
+      get loadedCard() { return self.loadedCard; },
+      get readEngineStatus() { return self.options.readEngineStatus; },
+      get greetingState() { return self.greetingState; },
+      set greetingState(next) { self.greetingState = next; },
+      get greetingPng() { return self.greetingPng; },
+      set greetingPng(next) { self.greetingPng = next; },
+      get greetingJson() { return self.greetingJson; },
+      set greetingJson(next) { self.greetingJson = next; },
+      get greetingChangeFlag() { return self.greetingChangeFlag; },
+      set greetingChangeFlag(next) { self.greetingChangeFlag = next; },
+      get savedFlashTimer() { return self.savedFlashTimer; },
+      set savedFlashTimer(next) { self.savedFlashTimer = next; },
+      renderPage: () => self.renderPage(),
+      goBackOneLevel: () => self.goBackOneLevel(),
+      withConnection: (run) => self.withConnection(run),
+      clearSavedFlashTimer: () => self.clearSavedFlashTimer(),
+      paintSavedFlashOff: () => self.paintSavedFlashOff(),
+      cardHost: () => self.cardHost(),
+      handleChatChanged: (messages) => self.handleChatChanged(messages),
+    };
+  }
+
+  /**
+   * 功能
+   * 设置页的接入点。实现在 `settings-sections.ts`。
+   *
+   * 注意事项
+   * 14 个字段 + 8 个动作。字段几乎都双向：`apiKeyPresent` 探测后整体替换、
+   * `pendingApiNotice` 显示完置 null、`lastSettingsFailure` 保存失败时写。
+   *
+   * 踩过的坑
+   * `pendingApiNotice` 与 `lastSettingsFailure` 的类型是 `string | null` 而不是
+   * `string`：空串会渲染出一个空提示框，用户看到一条没有内容的"错误"。
+   */
+  private settingsHost(): SettingsHost {
+    const self = this;
+    return {
+      ...this.chatSessionState(),
+      get doc() { return self.doc; },
+      get bridge() { return self.bridge; },
+      get options() { return self.options; },
+      get chatPanel() { return self.chatPanel; },
+      get apiExpanded() { return self.apiExpanded; },
+      set apiExpanded(next) { self.apiExpanded = next; },
+      get diagExpanded() { return self.diagExpanded; },
+      set diagExpanded(next) { self.diagExpanded = next; },
+      get apiState() { return self.apiState; },
+      set apiState(next) { self.apiState = next; },
+      get apiKeyPresent() { return self.apiKeyPresent; },
+      set apiKeyPresent(next) { self.apiKeyPresent = next; },
+      get pendingApiNotice() { return self.pendingApiNotice; },
+      set pendingApiNotice(next) { self.pendingApiNotice = next; },
+      get lastSettingsFailure() { return self.lastSettingsFailure; },
+      set lastSettingsFailure(next) { self.lastSettingsFailure = next; },
+      get sampling() { return self.sampling; },
+      set sampling(next) { self.sampling = next; },
+      get contextLimit() { return self.contextLimit; },
+      set contextLimit(next) { self.contextLimit = next; },
+      get responseLimit() { return self.responseLimit; },
+      set responseLimit(next) { self.responseLimit = next; },
+      get showReasoning() { return self.showReasoning; },
+      set showReasoning(next) { self.showReasoning = next; },
+      get thinkingBudget() { return self.thinkingBudget; },
+      set thinkingBudget(next) { self.thinkingBudget = next; },
+      get thinkingFamily() { return self.thinkingFamily; },
+      set thinkingFamily(next) { self.thinkingFamily = next; },
+      get thinkingIntent() { return self.thinkingIntent; },
+      set thinkingIntent(next) { self.thinkingIntent = next; },
+      get apiPageEl() { return self.apiPageEl; },
+      set apiPageEl(next) { self.apiPageEl = next; },
+      get globalPromptConfig() { return self.globalPromptConfig; },
+      set globalPromptConfig(next) { self.globalPromptConfig = next; },
+      get promptFormats() { return self.promptFormats; },
+      set promptFormats(next) { self.promptFormats = next; },
+      withConnection: (run) => self.withConnection(run),
+      renderPage: () => self.renderPage(),
+      goBackOneLevel: () => self.goBackOneLevel(),
+      renderAccordion: (spec) => self.renderAccordion(spec),
+      diagBoot: () => self.diagBoot(),
+      rebuildPromptConfig: () => rebuildPromptConfig(self.promptHost()),
+    };
+  }
+
+  /**
+   * 功能
+   * 「用户设定」的接入点。实现在 `persona-actions.ts`。
+   *
+   * 注意事项
+   * `personaState` 双向（切角色与保存后都改），其余只读。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  private personaHost(): PersonaHost {
+    const self = this;
+    return {
+      ...this.chatSessionState(),
+      get doc() { return self.doc; },
+      get pageHost() { return self.pageHost; },
+      get bridge() { return self.bridge; },
+      get options() { return self.options; },
+      get chatPanel() { return self.chatPanel; },
+      get personaState() { return self.personaState; },
+      set personaState(next) { self.personaState = next; },
+      withConnection: (run) => self.withConnection(run),
+      renderPage: () => self.renderPage(),
+      goBackOneLevel: () => self.goBackOneLevel(),
+      persistChat: (messages, avatar) => self.persistChat(messages, avatar),
+      cardHost: () => self.cardHost(),
+    };
+  }
+
+  /**
+   * 功能
+   * 提示词编辑的接入点。实现在 `prompt-actions.ts`。
+   *
+   * 注意事项
+   * 五个字段都是双向：改完要立刻生效（`promptConfig` 直接进请求体）。
+   * `promptScope` / `promptEditId` 是编辑器状态，切作用域时要重置。
+   *
+   * 踩过的坑
+   * `promptTriggers` 是 `Map` 不是数组 —— 按 identifier 查该条目的触发词。
+   */
+  private promptHost(): PromptHost {
+    const self = this;
+    return {
+      ...this.chatSessionState(),
+      get bridge() { return self.bridge; },
+      get options() { return self.options; },
+      get chatPanel() { return self.chatPanel; },
+      get globalPromptConfig() { return self.globalPromptConfig; },
+      set globalPromptConfig(next) { self.globalPromptConfig = next; },
+      get characterPrompts() { return self.characterPrompts; },
+      set characterPrompts(next) { self.characterPrompts = next; },
+      get promptConfig() { return self.promptConfig; },
+      set promptConfig(next) { self.promptConfig = next; },
+      get promptTriggers() { return self.promptTriggers; },
+      set promptTriggers(next) { self.promptTriggers = next; },
+      get promptScope() { return self.promptScope; },
+      set promptScope(next) { self.promptScope = next; },
+      get promptEditId() { return self.promptEditId; },
+      set promptEditId(next) { self.promptEditId = next; },
+      get authorNote() { return self.authorNote; },
+      set authorNote(next) { self.authorNote = next; },
+      get readEngineStatus() { return self.options.readEngineStatus; },
+      withConnection: (run) => self.withConnection(run),
+      renderPage: () => self.renderPage(),
+      cardHost: () => self.cardHost(),
+    };
+  }
+
+  /**
+   * 功能
+   * 卡片页接入点。实现在 `card-actions.ts`。
+   *
+   * 注意事项
+   * `lastWorldbookFailure` 与 `loadedCard` 用 get/set 双向转发 ——
+   * 它们在壳外（聊天页、提示词页）也有读写点，不能只读。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  private cardHost(): CardHost {
+    const self = this;
+    return {
+      get doc() {
+        return self.doc;
+      },
+      get root() {
+        return self.root;
+      },
+      get options() {
+        return self.options;
+      },
+      get bridge() {
+        return self.bridge;
+      },
+      get shareCache() {
+        return self.shareCache;
+      },
+      get characterPrompts() {
+        return self.characterPrompts;
+      },
+      set characterPrompts(next) {
+        self.characterPrompts = next as typeof self.characterPrompts;
+      },
+      get selectedCharacter() {
+        return self.selectedCharacter;
+      },
+      get readEngineStatus() {
+        return self.options.readEngineStatus;
+      },
+      get lastWorldbookFailure() {
+        return self.lastWorldbookFailure;
+      },
+      set lastWorldbookFailure(next) {
+        self.lastWorldbookFailure = next;
+      },
+      get loadedCard() {
+        return self.loadedCard;
+      },
+      set loadedCard(next) {
+        self.loadedCard = next;
+      },
+      ensureConnected: async () => {
+        await self.ensureConnected();
+      },
+      withConnection: (run) => self.withConnection(run),
+      rebuildPromptConfig: () => rebuildPromptConfig(self.promptHost()),
+    };
+  }
+
+  /**
+   * 功能
+   * 仓库页接入点。实现在 `repo-actions.ts`。
+   *
+   * 注意事项
+   * `state` 是同一个对象而非副本，模块直接改它。不要在外部缓存
+   * `state.cards` 这类子字段的引用 —— 模块会整体替换数组。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  private repoHost(): RepoHost {
+    const self = this;
+    return {
+      get state() {
+        return self.repo;
+      },
+      get doc() {
+        return self.doc;
+      },
+      get pageHost() {
+        return self.pageHost;
+      },
+      get bridge() {
+        return self.bridge;
+      },
+      get options() {
+        return self.options;
+      },
+      get insecureOrigins() {
+        return self.insecureOrigins;
+      },
+      set insecureOrigins(next) {
+        self.insecureOrigins = next;
+      },
+      withConnection: (run) => self.withConnection(run),
+      withCertTrust: (origin, action) => self.withCertTrust(origin, action),
+      renderPage: () => self.renderPage(),
+      goBackOneLevel: () => self.goBackOneLevel(),
+      resolveCardPlacement: (input) => resolveCardPlacement(self.cardHost(), input),
+      writeCardToLibrary: (input) => writeCardToLibrary(self.cardHost(), input),
+    };
+  }
+
+  /**
+   * 功能
+   * 把五个会话状态字段以 get/set 形式暴露出去，供各 `*Host` 展开复用。
+   *
+   * 注意事项
+   * 返回的对象要用 `...` 展开进各个 host，不要逐字段抄写。
+   * 字段本身仍由本类持有，这里只是转发，不要在外部缓存这个对象。
+   *
+   * 踩过的坑
+   * files-callbacks 与 actions-callbacks 需要同样这五个字段。第一版在两处各写了
+   * 一遍 get/set，共十组。漏一个 setter 不会报错：写入静默丢弃，症状是
+   * 「改名成功但下次保存写回旧名」，要隔着几层才看得出来。
+   */
+  private chatSessionState(): ChatSessionState {
+    const self = this;
+    return {
+      get selectedCharacter() {
+        return self.selectedCharacter;
+      },
+      set selectedCharacter(next) {
+        self.selectedCharacter = next;
+      },
+      get chatFileName() {
+        return self.chatFileName;
+      },
+      set chatFileName(next) {
+        self.chatFileName = next;
+      },
+      get chatSnapshot() {
+        return self.chatSnapshot;
+      },
+      set chatSnapshot(next) {
+        self.chatSnapshot = next;
+      },
+      get lastSavedFingerprint() {
+        return self.lastSavedFingerprint;
+      },
+      set lastSavedFingerprint(next) {
+        self.lastSavedFingerprint = next;
+      },
+      get chatSettingsRoute() {
+        return self.chatSettingsRoute;
+      },
+      set chatSettingsRoute(next) {
+        self.chatSettingsRoute = next;
+      },
+    };
+  }
+
+  /**
+   * 功能
+   * 「聊天操作」页回调的接入点。实现在 actions-callbacks.ts。
+   *
+   * 注意事项
+   * 不要在这里放同名薄包装方法转发。包装要静态 import 那个模块，
+   * 主 chunk 会把 206 行重新装回去。调用方直接拿这个 host 对象。
+   *
+   * 踩过的坑
+   * 无。
+   */
+  private actionsHost(): ActionsHost {
+    const self = this;
+    return {
+      ...this.chatSessionState(),
+      get bridge() {
+        return self.bridge;
+      },
+      get options() {
+        return self.options;
+      },
+      get chatPanel() {
+        return self.chatPanel;
+      },
+      hasOpenChat: () => self.hasOpenChat(),
+      withConnection: (run) => self.withConnection(run),
+      renderPage: () => self.renderPage(),
+      persistSession: () => self.persistSession(),
+      goBackOneLevel: () => self.goBackOneLevel(),
+    };
+  }
+
+  private filesHost(): FilesHost {
+    const self = this;
+    return {
+      ...this.chatSessionState(),
+      get bridge() {
+        return self.bridge;
+      },
+      get options() {
+        return self.options;
+      },
+      withConnection: (run) => self.withConnection(run),
+      openChatFile: (avatar, fileName) => self.openChatFile(avatar, fileName),
+      persistSession: () => self.persistSession(),
+      renderPage: () => self.renderPage(),
+      goBackOneLevel: () => self.goBackOneLevel(),
+      currentUserName: () => currentUserName(self.personaHost()),
+    };
+  }
+
   private async openChatFile(avatar: string, fileName: string): Promise<boolean> {
     const loaded = (await this.chatPanel?.loadChat(avatar, fileName)) ?? false;
     if (loaded) {
@@ -7294,718 +4764,11 @@ export class AppShell {
    * | AI 帮答 / 续写 | `generate` + 一条临时 system 指令 |
    * | 转群聊 | `groups/create`（真机实测 200） |
    */
-  private makeActionsCallbacks(): ChatActionsCallbacks {
-    const doc = this.options.doc;
-    void doc;
 
-    /*
-     * ★ 返回 `fileName` 而不是让调用方从 `detail` 文案里正则抠。
-     *
-     * 从人类可读的文案里解析机器要用的值，是最脆的耦合之一：
-     * 改一个字（加个书名号、换个词）就静默失效，而且失效方式取决于文案。
-     * 第一版就是这么写的，`/「(.+?)」/` 一改文案就抓不到。
-     */
-    const saveAs = async (
-      nameHint: string,
-      messages: readonly StChatMessage[],
-    ): Promise<ChatActionOutcome & { fileName?: string }> => {
-      const avatar = this.selectedCharacter?.avatar ?? null;
-      if (avatar === null) return { ok: false, detail: '先选一个角色。' };
-      /*
-       * ★★★ 空内容一律不建文件（2026-11-14）。
-       *
-       * `saveAs` 是唯一一个"用新文件名写盘"的入口，而新名字不覆盖任何东西
-       * —— 所以它**不会**造成数据丢失，只会造成垃圾：
-       *
-       * ```text
-       *   每调一次 ⇒ 角色目录里多一个 chat_items: 0 的空壳 jsonl
-       * ```
-       *
-       * 用户视频里那 8 个「2027 条」的同类就是这么攒出来的
-       * （另一个来源是 `onNewChat`，已改成完全不写）。
-       *
-       * 上游「保存检查点」本来也判了空，这里再判一次是因为
-       * **判据要钉在最靠近副作用的地方** —— 上游多一个调用点就漏一次。
-       */
-      if (messages.length === 0) {
-        return { ok: false, detail: '当前对话是空的，没有可保存的内容。' };
-      }
-      try {
-        /*
-         * 文件名必须**独一无二**：ST 的 `chats/save` 是整份覆盖，
-         * 撞名就会把已有聊天覆盖掉 —— 而"保存检查点"的语义恰恰是"别动原来的"。
-         * 所以带上时间戳到秒。
-         */
-        const stamp = new Date();
-        const pad = (n: number): string => String(n).padStart(2, '0');
-        const when =
-          `${String(stamp.getFullYear())}-${pad(stamp.getMonth() + 1)}-${pad(stamp.getDate())}` +
-          `@${pad(stamp.getHours())}h${pad(stamp.getMinutes())}m${pad(stamp.getSeconds())}s`;
-        const fileName = `${nameHint} - ${when}`;
 
-        await this.withConnection(() =>
-          this.bridge.saveChat(avatar, fileName, [...messages]),
-        );
-        this.options.onNotify?.(`已保存为「${fileName}」`, 'ok');
-        return {
-          ok: true,
-          detail: `已保存为「${fileName}」。可在「管理聊天文件」里打开。`,
-          fileName,
-        };
-      } catch (error) {
-        const text = describeBridgeError(error).message;
-        return { ok: false, detail: `保存失败：${text}` };
-      }
-    };
 
-    return {
-      /* 聊天操作页的上一级是设置菜单 —— 统一走层级表 */
-      onBack: () => {
-        this.goBackOneLevel();
-      },
-      onNotify: (message, kind) => this.options.onNotify?.(message, kind),
-      hasOpenChat: this.hasOpenChat(),
 
-      onSaveCheckpoint: async () => {
-        const messages = this.chatPanel?.getMessages() ?? [];
-        if (messages.length === 0) return { ok: false, detail: '当前对话是空的，没有可保存的内容。' };
-        const name = this.options.card['name'] === undefined
-          ? '检查点'
-          : `检查点 ${String(this.options.card['name'])}`;
-        return saveAs(name, messages);
-      },
 
-      /*
-       * 「开始新聊天」= **只清前端状态，不写文件**（2026-11-14 修）。
-       *
-       * ## 原来的做法与它的三个后果
-       *
-       * 原来调 `saveAs('新聊天', [])`，也就是立刻往 ST 写一个**空 jsonl**，
-       * 再 `openChatFile()` 把它读回来。真机日志（vivo）里留下的痕迹：
-       *
-       * ```text
-       *   File not found: …/威廉/新聊天 - 2026-11-14@19h57m46s.jsonl.
-       *     The chat does not exist or is empty.
-       *   Deleted file: …/威廉/新聊天 - 2026-11-14@19h57m46s.jsonl
-       * ```
-       *
-       * ```text
-       *   ① 每点一次「开始新聊天」就多一个空壳文件
-       *      —— 正是前两天用户截图里那 8 个「2027 条」垃圾的同类
-       *   ② 写完之后立刻读它，ST 把"空"报成"不存在" ⇒ 一条 W 级错误
-       *      用户看日志会以为记录丢了，实际是我们自己刚造的空文件
-       *   ③ 读完失败还会把 chatFileName 指过去（已在上游修掉）
-       * ```
-       *
-       * ## 现在：什么都不写，等第一句话
-       *
-       * `chatPanel.newChat()` 会清空消息、注入开场白、回调 `onChatChanged`；
-       * 而 `handleChatChanged` 里那道 `shouldStartNewChatFile` 闸
-       * 明确"只有开场白不建档"。⇒ **用户真的发出第一句话时才建文件**。
-       *
-       * 这也正是 ST 自己的行为（它的「Start new chat」只清 DOM）。
-       *
-       * ## 没说话就退出会怎样
-       *
-       * `chatFileName` 是 null，localStorage 里也是 null ⇒ 下次进 App
-       * `restoreLatestChat` 会找回上一段。**什么都没说，等于没开新段** ——
-       * 这比"留一个空文件等他回来发现是空的"合理得多。
-       */
-      onNewChat: async () => {
-        const avatar = this.selectedCharacter?.avatar ?? null;
-        if (avatar === null) return { ok: false, detail: '先选一个角色。' };
-
-        /*
-         * 先清指针，再让面板清消息 —— 顺序不能反。
-         *
-         * `newChat()` 会回调 `onChatChanged`，如果那一刻 `chatFileName`
-         * 还是旧值，保存就会写进**上一段**（把旧聊天覆盖成开场白）。
-         */
-        this.chatFileName = null;
-        this.chatSnapshot = null;
-        this.lastSavedFingerprint = null;
-
-        this.chatPanel?.newChat(avatar, this.selectedCharacter?.name);
-        this.persistSession();
-        this.renderPage();
-
-        return { ok: true, detail: '已开一段新对话，说第一句话就会保存成新文件。' };
-      },
-
-      onCloseChat: () => {
-        /*
-         * 关闭 = 清掉"当前打开哪一段"的指针。
-         *
-         * **不删文件**：用户在 ST 里还能看到它，下次也能从
-         * 「管理聊天文件」里重新打开。删文件是另一个动作。
-         */
-        this.selectedCharacter = null;
-        this.chatFileName = null;
-        this.chatSnapshot = null;
-        this.lastSavedFingerprint = null;
-        this.chatSettingsRoute = null;
-        this.renderPage();
-        /*
-         * ★ 不清 localStorage 里的会话指针也可以，但**必须重绘** ——
-         * 否则界面还停在那段对话上。这里靠 `renderPage()` 走空状态分支。
-         */
-        return { ok: true, detail: '已关闭当前对话。' };
-      },
-
-      onManageFiles: () => {
-        this.chatSettingsRoute = 'files';
-        this.renderPage();
-      },
-
-      onAiAssist: async () => {
-        if (!this.hasOpenChat()) return { ok: false, detail: '先打开一段对话。' };
-        await this.chatPanel?.runDirective(
-          '你现在是「旁白/编剧」而不是角色本人。请**不要**替代角色说话，' +
-            '而是让角色以简短的方式给用户 2-3 条接下来的走向建议（每条一句话）。',
-        );
-        return { ok: true, detail: '已请求建议，回复会出现在下面。' };
-      },
-
-      onContinueWriting: async () => {
-        if (!this.hasOpenChat()) return { ok: false, detail: '先打开一段对话。' };
-        await this.chatPanel?.runDirective(
-          '请自然地接着上文继续写下去，不要重复已经写过的内容，也不要重新开始一个话题。',
-        );
-        return { ok: true, detail: '已请求续写，回复会出现在下面。' };
-      },
-
-      onConvertToGroup: async () => {
-        const avatar = this.selectedCharacter?.avatar ?? null;
-        const name = this.selectedCharacter?.name ?? '';
-        if (avatar === null) return { ok: false, detail: '先选一个角色。' };
-        try {
-          /*
-           * ST 的群是**独立实体**，没有"把角色变成群"的接口
-           * （`group/convert` 实测 404）。所以这里用当前角色建一个单成员群 ——
-           * 语义上等价于"以这个角色为起点开了个群"，之后可在 ST 里加人。
-           */
-          const raw = await this.withConnection(() => this.bridge.createGroup(`${name} 的群聊`, [avatar]));
-          const parsed: unknown = JSON.parse(raw === '' ? '{}' : raw);
-          const groupName =
-            parsed !== null && typeof parsed === 'object' && typeof (parsed as Record<string, unknown>)['name'] === 'string'
-              ? String((parsed as Record<string, unknown>)['name'])
-              : `${name} 的群聊`;
-          this.options.onNotify?.(`已建群「${groupName}」`, 'ok');
-          return {
-            ok: true,
-            detail: `已建群「${groupName}」（成员：${name}）。要在群里加人请到群聊设置里操作。`,
-          };
-        } catch (error) {
-          return { ok: false, detail: `建群失败：${describeBridgeError(error).message}` };
-        }
-      },
-    };
-  }
-
-  private makeFilesCallbacks(): ChatFilesCallbacks {
-    return {
-      /* 同样统一走层级表：文件页的上一级是「聊天操作」 */
-      onBack: () => {
-        this.goBackOneLevel();
-      },
-      onNotify: (message, kind) => this.options.onNotify?.(message, kind),
-      loadFiles: async () => {
-        const avatar = this.selectedCharacter?.avatar ?? null;
-        if (avatar === null) return [];
-        try {
-          const raw = await this.withConnection(() => this.bridge.listChatsRaw(avatar));
-          return parseChatFileRows(raw, this.chatFileName ?? null);
-        } catch {
-          return null;
-        }
-      },
-      onOpen: async (id) => {
-        const avatar = this.selectedCharacter?.avatar ?? null;
-        if (avatar === null) return;
-        const loaded = await this.openChatFile(avatar, id);
-        /*
-         * 读不到就**留在文件列表页**（2026-11-14）。
-         *
-         * 原来不管成没成都跳回聊天页，于是用户看到一段空对话 +
-         * 一条顶部提示，而"哪一条没读出来"这个信息已经丢了 ——
-         * 他还得重新进列表才知道。
-         */
-        if (!loaded) return;
-        this.chatSettingsRoute = null;
-        this.renderPage();
-      },
-      onRename: async (id, newName) => {
-        const avatar = this.selectedCharacter?.avatar ?? null;
-        if (avatar === null) return { ok: false, detail: '先选一个角色。' };
-
-        /*
-         * 空名字直接拦掉（2026-11-15）。
-         *
-         * 空格子点保存 → `renamed_file = ".jsonl"` → ST 那边
-         * `path.parse('.jsonl').name = '.jsonl'`（点开头的隐藏文件）
-         * ⇒ 一个看不见的聊天文件。用户此后既找不到也删不掉。
-         */
-        const trimmed = newName.trim();
-        if (trimmed === '') return { ok: false, detail: '名字不能是空的。' };
-
-        /*
-         * ★★★ 先在本地查重，别让 ST 用 400 回我们（2026-11-15）。
-         *
-         * ST 的 `/rename` 在目标文件已存在时返回 **400**，而那个 400 与
-         * "源文件不存在"的 400 **是同一个状态码**（它只回 `{error:true}`）。
-         *
-         * ```js
-         *   if (!fs.existsSync(pathToOriginalFile) || fs.existsSync(pathToRenamedFile)) {
-         *       return response.status(400).send({ error: true });
-         *   }
-         * ```
-         *
-         * 用户看到的是「改名失败：/api/chats/rename 返回 HTTP 400」，
-         * 而他唯一能做的动作就是"再点一次"或"换个名字瞎试"。
-         *
-         * 列表就在手上，所以这里自己判：
-         *
-         * ```text
-         *   重名（且不是自己）⇒ "已经有同名的，换一个"     精准、可行动
-         *   其余 400        ⇒ 保留原始错误 + 提示可能是文件已被删
-         * ```
-         *
-         * 判重必须排除**自己**：把「A」改成「A」是不该报错的（用户可能只改了
-         * 首尾空格，trim 之后与原 id 相同）。
-         */
-        try {
-          const listRaw = await this.withConnection(() => this.bridge.listChatsRaw(avatar));
-          const rows = parseChatFileRows(listRaw, this.chatFileName ?? null);
-          const clash = rows.some((row) => row.id === trimmed && row.id !== id);
-          if (clash) {
-            return { ok: false, detail: `已经有叫「${trimmed}」的聊天文件了，换一个名字。` };
-          }
-        } catch {
-          /*
-           * 列表读不到就**不阻断改名** —— 它只是"提前给个好提示"的优化，
-           * 不是正确性的一部分。真重名时 ST 那边还会用 400 兜住。
-           */
-        }
-
-        try {
-          const raw = await this.withConnection(() => this.bridge.renameChat(avatar, id, trimmed));
-
-          /*
-           * ★★★ 用 ST 返回的名字，不是用户输入的名字（2026-11-15）。
-           *
-           * ST 那侧过了一遍 `sanitize()`（`sanitize-filename` 包）：
-           * 非法字符会被删掉、结尾的点和空格会被去掉、超长会截断。
-           * 然后它回一个 `sanitizedFileName`（**不带扩展名**）。
-           *
-           * ```text
-           *   用户输入  a/b:c   → 实际文件  abc.jsonl
-           *   记成 a/b:c 的话，下次按这个名字读 ⇒ 404 ⇒ 又"记录没了"
-           * ```
-           *
-           * 所以指针必须记**磁盘上真实的名字**。拿不到回退值时才用输入名，
-           * 并把这件事说给用户（`detail` 里带上实际名字，他就能对上）。
-           */
-          let sanitized = '';
-          try {
-            const parsed = JSON.parse(raw === '' ? '{}' : raw) as { sanitizedFileName?: unknown };
-            sanitized = typeof parsed.sanitizedFileName === 'string' ? parsed.sanitizedFileName.trim() : '';
-          } catch {
-            /* 返回不是 JSON ⇒ 当没有回传值，走下面的回退 */
-          }
-          const finalName = sanitized === '' ? trimmed : sanitized;
-
-          diagNote(
-            'note',
-            `[会话] 改名 ${id} → ${finalName}` +
-              `${sanitized === '' ? '（ST 未回传，用输入名）' : ''}` +
-              ` 指针原值=${this.chatFileName ?? 'null'}`,
-          );
-
-          /*
-           * ★★★★★ 改的是"当前这段"⇒ 必须按新名字**重新打开一次**（2026-11-15）。
-           *
-           * ## 为什么只是"把指针改成 finalName"不够
-           *
-           * 昨天的版本就只改了指针。用户操作是「改名 → 回聊天页 → 发一句话 →
-           * 杀进程重进」，结果记录没了。日志里的证据：
-           *
-           * ```text
-           *   engine：Successfully renamed chat file.        ← 改名确实成功
-           *   16:22 重进后的请求里第 4 条是**开场白**       ← 打开的是新的一段
-           *   15:45→16:22 之间没有任何 save / 删除错误
-           * ```
-           *
-           * 也就是说：改名成功了，但**重进时按某个名字读不到**，于是走了
-           * "空聊天 → 发一句话 → 建档"那条路，那段历史就被"新的 2 条"顶掉了。
-           *
-           * ## 改指针解决不了的那种情况
-           *
-           * ```text
-           *   改名时 this.chatFileName 是 null（上一次恢复就没成功）
-           *   ⇒ `chatFileName === id` 不成立 ⇒ 指针不更新 ⇒ localStorage 里
-           *      还是旧名字/空 ⇒ 重进按旧名字读 ⇒ 那个文件已被改名删掉 ⇒ 读不到
-           * ```
-           *
-           * 所以判断条件要放宽到"快照指向它"也算当前；而且改完之后
-           * **真的去读一次** —— 读成功才算这件事办完了。
-           *
-           * 这一步同时是**验证**：如果新名字读不回内容，说明 ST 的 sanitize
-           * 结果与回传值不一致（或文件没落地），必须当场告诉用户，
-           * 而不是等他第二天来报"记录没了"。
-           */
-          const wasCurrent = this.chatFileName === id || this.chatSnapshot?.fileName === id;
-
-          if (wasCurrent) {
-            this.chatFileName = finalName;
-            if (this.chatSnapshot !== null) {
-              this.chatSnapshot = { ...this.chatSnapshot, fileName: finalName };
-            }
-            this.persistSession();
-
-            const reopened = await this.openChatFile(avatar, finalName);
-            diagNote(
-              'note',
-              `[会话] 改名后重开 finalName=${finalName} 结果=${reopened ? 'ok' : 'miss'}`,
-            );
-            if (!reopened) {
-              /*
-               * 改名成功但读不回来 —— 这是**必须出声**的状态：
-               * 用户以为"改完了继续聊"，而下一句话会写进一个新文件、
-               * 把这段历史的连续性断掉。
-               */
-              return {
-                ok: true,
-                detail:
-                  `已改名为「${finalName}」，但按新名字读不回内容。` +
-                  '请在列表里点「打开」确认一下——如果打不开，说明这个名字没落地。',
-              };
-            }
-          }
-
-          /*
-           * 改的不是当前这段 ⇒ 只同步快照（如果它恰好指向它），不动指针。
-           * 面板不用管：用户切回去时会按快照重建。
-           */
-          if (!wasCurrent && this.chatSnapshot !== null && this.chatSnapshot.fileName === id) {
-            this.chatSnapshot = { ...this.chatSnapshot, fileName: finalName };
-          }
-
-          return {
-            ok: true,
-            detail:
-              finalName === trimmed
-                ? `已改名为「${finalName}」。`
-                : `已改名为「${finalName}」（原名字里有不能用的字符，已自动调整）。`,
-          };
-        } catch (error) {
-          return { ok: false, detail: `改名失败：${describeBridgeError(error).message}` };
-        }
-      },
-      onDelete: async (id) => {
-        const avatar = this.selectedCharacter?.avatar ?? null;
-        if (avatar === null) return { ok: false, detail: '先选一个角色。' };
-        try {
-          await this.withConnection(() => this.bridge.deleteChat(avatar, id));
-          /* 删的正是当前打开的那条 ⇒ 关掉会话，否则界面还指着一个不存在的文件 */
-          if (this.chatFileName === id) {
-            this.selectedCharacter = null;
-            this.chatFileName = null;
-            this.chatSnapshot = null;
-            this.lastSavedFingerprint = null;
-          }
-          return { ok: true, detail: '已删除。' };
-        } catch (error) {
-          return { ok: false, detail: `删除失败：${describeBridgeError(error).message}` };
-        }
-      },
-      /*
-       * 导出这段聊天为 TXT 并起分享面板（2026-11-14，v0.1.9）。
-       *
-       * ## 三步：读 → 转 → 分享
-       *
-       * 转那一步是纯函数（`shared/src/chat/chat-export.ts`），
-       * 五条容易做错的细节都在它的判据里（不是在这里）。
-       *
-       * ## 为什么不用 `panel.getMessages()`
-       *
-       * 面板手上的只是**当前打开的那一段**。用户在这一页可以导出任何一条
-       * 历史聊天，所以必须按 `id` 现读 —— 用面板的消息会把 A 段的内容
-       * 存成 B 段的文件名。
-       *
-       * ## 失败不抛，返回 `{ ok, detail }`
-       *
-       * 界面把 `detail` 直接显示在状态条上。抛异常会让每个调用点各写一遍捕获。
-       */
-      onExport: async (id, name) => {
-        const avatar = this.selectedCharacter?.avatar ?? null;
-        if (avatar === null) return { ok: false, detail: '先选一个角色。' };
-
-        let raw = '';
-        try {
-          raw = await this.withConnection(() => this.bridge.loadChatRaw(avatar, id));
-        } catch (error) {
-          return { ok: false, detail: `读不到这段聊天：${describeBridgeError(error).message}` };
-        }
-
-        let messages: StChatMessage[] = [];
-        try {
-          const parsed = parseChatResponse(JSON.parse(raw === '' ? '{}' : raw) as unknown);
-          if (parsed.kind !== 'chat') {
-            /*
-             * `missing` / `empty` / `malformed` 三种都不是"可以导出"的状态。
-             * 尤其是 `malformed`：导出一个空文件让用户以为记录丢了，
-             * 而实际是读取环节出了问题 —— 两者必须分开说。
-             */
-            return {
-              ok: false,
-              detail:
-                parsed.kind === 'missing'
-                  ? '这个聊天文件不在了（可能刚被删掉）。'
-                  : '这段聊天的内容读不出来，没法导出。',
-            };
-          }
-          messages = parsed.messages;
-        } catch {
-          return { ok: false, detail: '这段聊天的内容读不出来，没法导出。' };
-        }
-
-        const characterName = this.selectedCharacter?.name ?? '';
-        const exported = chatToText(messages, {
-          characterName,
-          userName: this.currentUserName(),
-        });
-
-        /*
-         * `shareText` 是原生方法，**必须直接调不能解引用**（§125）：
-         * `const f = bridge.shareText; f(...)` 会报 "non-injected object"。
-         */
-        const bridge = (globalThis as { __ST_ENGINE__?: { shareText?: (t: string, n: string) => string } })
-          .__ST_ENGINE__;
-        if (typeof bridge?.shareText !== 'function') {
-          return { ok: false, detail: '这台设备不支持导出。' };
-        }
-
-        let reply: { ok?: boolean; error?: string; bytes?: number } = {};
-        try {
-          reply = JSON.parse(
-            bridge.shareText(exported.text, chatExportFileName(characterName)),
-          ) as typeof reply;
-        } catch {
-          return { ok: false, detail: '导出失败（返回的不是有效数据）。' };
-        }
-
-        if (reply.ok !== true) return { ok: false, detail: reply.error ?? '导出失败。' };
-
-        /*
-         * 说清"导出了几条"而不是"已导出" ——
-         * 后者在空聊天时会骗人（那种情况也"导出成功"了，但一条都没有）。
-         */
-        return {
-          ok: true,
-          detail: exported.empty
-            ? '这段聊天还没有记录，已导出说明文本。'
-            : `已导出 ${String(exported.count)} 条，选择应用打开即可。`,
-        };
-      },
-    };
-  }
-
-  private makeSettingsCallbacks(): ChatSettingsCallbacks {
-    return {
-      /*
-       * 统一走层级表（2026-11-03 第二十三批）。
-       *
-       * 原来这里写的是 `route === 'menu' ? null : 'menu'` —— 对分组页正确，
-       * 但它把"上一级是谁"这件事**又实现了一遍**，与别处的写死目标分叉。
-       * 现在只有 `parentRouteOf()` 一个答案。
-       */
-      onBack: () => {
-        this.goBackOneLevel();
-      },
-      /*
-       * ★ 菜单项点进分组页。
-       *
-       * 这一行第一次**漏了** —— `chat-settings.ts` 里 `callbacks.onOpenGroup?.()`
-       * 是可选调用，没接线时它安静地什么也不做：菜单渲染得好好的、四项都在、
-       * 点下去毫无反应。截图里就是"点了还停在菜单"。
-       *
-       * 又是"实现存在但没接线"（本项目最反复的缺陷类型）。
-       * 所以 `test/chat-settings-ui.test.mjs` 里有一条断言专门守它：
-       * `makeSettingsCallbacks` 必须给 `onOpenGroup` 赋值。
-       */
-      onOpenGroup: (groupId) => {
-        this.chatSettingsRoute = groupId;
-        this.renderPage();
-      },
-      reasoning: {
-        get: () => this.showReasoning,
-        set: (next) => {
-          this.showReasoning = next;
-          this.options.onPersistShowReasoning?.(next);
-          /*
-           * 面板如果已经建好，要**立刻**把新值推过去 ——
-           * 否则用户翻完开关回到聊天，下一次生成还是旧行为。
-           */
-          this.chatPanel?.setShowReasoning(next);
-        },
-      },
-      /*
-       * 「思考」区块（2026-11-07，P0 第三步）。
-       *
-       * ## 这里的 `computePreview` 是**唯一**的判定入口
-       *
-       * 用户要求前端不许猜厂商。所以设置页每点一次三态，都回到这里
-       * 调一次 `previewReasoningPlan` —— 它和发送路径共用同一个实现
-       * （`buildGenerateRequest` 内部也调它），所以"界面显示"与"实际发出"
-       * 必然一致，不会分叉。
-       */
-      thinking: {
-        initialIntent: this.thinkingIntent,
-        initialBudget: this.thinkingBudget,
-        initialEffort: this.sampling['reasoningEffort'] as string | undefined,
-        ...(this.thinkingFamily === undefined ? {} : { initialFamily: this.thinkingFamily }),
-        computePreview: (intent, budget, family) =>
-          previewReasoningPlan({
-            source: this.apiState.source,
-            model: this.apiState.model,
-            customUrl: this.apiState.baseUrl,
-            intent,
-            budget,
-            ...(family === undefined ? {} : { manualFamily: family }),
-          }),
-        onChange: (state) => {
-          this.thinkingIntent = state.intent;
-          this.thinkingBudget = state.budget;
-          this.thinkingFamily = state.family;
-          this.options.onPersistThinking?.(state);
-          /*
-           * 推给聊天面板：下一次生成立刻用新值。
-           *
-           * 不走 `renderPage()` —— 那会把用户刚展开的折叠区收回去、
-           * 还会抢焦点（本页真机踩过 `activeElement: BODY`）。
-           */
-          this.chatPanel?.setThinking(state.intent, state.budget, state.family);
-        },
-      },
-      onOpenActions: () => {
-        this.chatSettingsRoute = 'actions';
-        this.renderPage();
-      },
-      /*
-       * 上下文预算（2026-11-03，第十九批 ④）。
-       *
-       * 用**回调**而不是传死值：用户在这一页改完「上下文长度」并保存后，
-       * 外壳手上的 `promptFormats` / 面板上的用量都变了 ——
-       * 传死值会让提示停留在旧数字上，而用户会以为自己没改成功。
-       *
-       * 预算为 0（ST 里没填上下文长度）时如实返回 0，
-       * 页面据此显示"不会裁剪"而不是"预算 0 token"。
-       */
-      /*
-       * 打开「提示词管理」（2026-11-03 第二十二批）。
-       *
-       * ★ 这一行漏了就是"入口不存在"——`callbacks.onOpenPrompts` 是可选调用，
-       * 不传时整块不渲染，界面上看不到、点了也没反应，而测试全绿。
-       * 本项目最反复的缺陷类型（memory §90.6 记过 6 次）。
-       */
-      onOpenPrompts: () => {
-        this.chatSettingsRoute = 'prompts';
-        this.renderPage();
-      },
-      budget: () => {
-        const contextLimit = this.contextLimit;
-        const responseLimit = this.responseLimit;
-        const usage = this.chatPanel?.tokenUsage() ?? null;
-        return {
-          budget: computeBudget(contextLimit, responseLimit),
-          contextLimit,
-          responseLimit,
-          lastUsed: usage === null ? null : usage.used,
-          lastTrimmed: usage === null ? 0 : usage.trimmed,
-          overBudget: usage !== null && usage.budget > 0 && usage.used > usage.budget,
-        };
-      },
-      loadSettings: async () => {
-        try {
-          const raw = await this.withConnection(() => this.bridge.settingsGetRaw());
-          const envelope: unknown = JSON.parse(raw === '' ? '{}' : raw);
-          const parsed = parseSettingsEnvelope(envelope);
-          if (!parsed.ok) {
-            // 读到了但解析不了 —— 要把原因带出去（见 loadFailure）
-            this.lastSettingsFailure = parsed.reason;
-            return null;
-          }
-          this.lastSettingsFailure = null;
-          return parsed.settings;
-        } catch (error) {
-          /*
-           * ★ 不能只 `return null` 就完事。
-           *
-           * 设置页要区分"引擎没起"与"引擎在跑但读失败" —— 那是两种不同的
-           * 下一步动作，而用户这次报的正是"引擎在跑、UI 却说没起来"。
-           * 所以把原始原因记下来，交给 `readSettingsFailure()` 归因。
-           */
-          this.lastSettingsFailure = describeBridgeError(error).message;
-          return null;
-        }
-      },
-      /*
-       * 设置读失败时给页面一份**如实**的归因。
-       *
-       * 页面自己没有能力判断引擎死活（它只拿到一个 null），
-       * 所以由外壳把"读失败原因 + 引擎真实状态"组合好再交出去。
-       */
-      describeReadFailure: () =>
-        describeSettingsFailure(this.options.readEngineStatus?.() ?? null, this.lastSettingsFailure ?? undefined),
-      saveFields: async (fields) => {
-        /*
-         * 走 `mutateSettings`：GET → 改 → 整份 POST，三道防线在那边。
-         * 这里**不许**直接调 `bridge.settingsSave` —— 那是整份覆盖，
-         * 少一个字段就把用户设置清空了。
-         */
-        const result = await mutateSettings(
-          {
-            // ★ 两个传输动作都过连接门 —— mutateSettings 内部就是 GET→改→POST
-            getRaw: () => this.withConnection(() => this.bridge.settingsGetRaw()),
-            save: (settings) => this.withConnection(() => this.bridge.settingsSave(settings)),
-          },
-          (current) => {
-            let next: StSettings = current;
-            for (const { field, value } of fields) {
-              next = writeField(next, field, value) as StSettings;
-            }
-            return next;
-          },
-        );
-
-        if (!result.ok) return { ok: false, reason: result.reason };
-
-        /*
-         * ★ 保存成功后**立刻**把新采样值推给聊天面板。
-         *
-         * 不推的后果：用户改完温度、回到聊天页，发现回复风格没变 ——
-         * 因为请求体里还是旧值。而这个问题**不会报错**，只能靠"再发一条
-         * 试试"才发现，很容易被当成"模型不听话"。
-         *
-         * 用保存后的 `result.settings` 重新派生（而不是从 `fields` 里挑），
-         * 保证运行时值与存储值来自同一份数据、同一个函数 ——
-         * 挑字段就等于在第二个地方实现一遍映射。
-         */
-        this.sampling = this.deriveSampling(result.settings);
-        this.chatPanel?.setContext({ sampling: { ...this.sampling } });
-
-        return { ok: true };
-      },
-      /*
-       * 预设（2026-11-03 / 任务 #259）。
-       *
-       * 只对「AI 响应配置」给 —— 那一组就是 ST 的 `OpenAI Settings` 预设。
-       * 其它组没有预设概念，渲染一个下拉只会让人困惑。
-       */
-      presets: this.makePresetCallbacks(),
-      onNotify: this.options.onNotify,
-    };
-  }
 
   /**
    * 预设：列出 / 切换 / 导入。
@@ -8025,156 +4788,7 @@ export class AppShell {
    * 所以必须把预设里的参数真的写进 `oai_settings`，否则就是
    * "下拉显示新预设、温度还是旧值"。
    */
-  private makePresetCallbacks(): {
-    list: () => Promise<{ presets: PresetSummary[]; current: string } | null>;
-    apply: (name: string) => Promise<{ ok: boolean; reason?: string; skipped?: number }>;
-    importFile: () => Promise<{ ok: boolean; name?: string; reason?: string }>;
-  } {
-    return {
-      list: async () => {
-        try {
-          const raw = await this.withConnection(() => this.bridge.settingsGetRaw());
-          const envelope: unknown = JSON.parse(raw === '' ? '{}' : raw);
-          if (envelope === null || typeof envelope !== 'object') return null;
-          const presets = parsePresetList(envelope);
-          const parsed = parseSettingsEnvelope(envelope);
-          const current = parsed.ok ? currentPresetName(parsed.settings) : '';
-          return { presets, current };
-        } catch {
-          /*
-           * 读不到列表**不等于**出错要报警：用户可能就是想调单个参数。
-           * 返回 null 让界面把提示换成"可以先用下面的单项设置"，
-           * 而不是弹一个红色错误挡住整个页面。
-           */
-          return null;
-        }
-      },
 
-      apply: async (name) => {
-        try {
-          /* 先拿到要切的那份预设体 */
-          const raw = await this.withConnection(() => this.bridge.settingsGetRaw());
-          const envelope: unknown = JSON.parse(raw === '' ? '{}' : raw);
-          if (envelope === null || typeof envelope !== 'object') {
-            return { ok: false, reason: '读不到预设列表' };
-          }
-          const bodies = presetBodiesByName(envelope);
-          const body = bodies[name];
-          if (body === undefined) {
-            return { ok: false, reason: `找不到名为「${name}」的预设（可能刚被删掉）` };
-          }
-
-          const plan = planApplyPreset(body, name);
-          if (Object.keys(plan.updates).length === 0) {
-            return { ok: false, reason: `「${name}」里没有可用的参数（文件是空的？）` };
-          }
-
-          /*
-           * 走 `mutateSettings`（GET → 改 → 整份 POST），
-           * 不是直接 `settingsSave` —— 那是整份覆盖，少一个字段就清空用户设置。
-           */
-          const result = await mutateSettings(
-            {
-              getRaw: () => this.withConnection(() => this.bridge.settingsGetRaw()),
-              save: (settings) => this.withConnection(() => this.bridge.settingsSave(settings)),
-            },
-            (current) => {
-              const oai = (current['oai_settings'] ?? {}) as Record<string, unknown>;
-              const merged = mergePresetIntoOai(oai, plan);
-              return { ...current, oai_settings: merged } as StSettings;
-            },
-          );
-
-          if (!result.ok) return { ok: false, reason: result.reason };
-
-          /* 立刻把新采样值推给聊天面板 —— 否则下一次生成还用旧值 */
-          this.sampling = this.deriveSampling(result.settings);
-          this.chatPanel?.setContext({ sampling: { ...this.sampling } });
-
-          /*
-           * 提示词配置也要跟着换（2026-11-03）。
-           *
-           * ★ 不重新播的话会出现**最难归因的一种**：用户切换了预设，
-           * 采样值变了（温度/长度立刻新值），但提示词还是上一份预设的 ——
-           * 表现是"换了预设，风格只变了一半"，而这看起来像模型不稳定。
-           *
-           * 这里直接传预设体（手上就有），不用再发一次请求。
-           *
-           * ★ v0.2.0：赋给 `globalPromptConfig` 再 `rebuildPromptConfig()`。
-           *   换预设不该改变"这个角色的定制"，所以角色覆盖要重新叠上去。
-           */
-          const nextConfig = parsePromptConfig(body);
-          this.globalPromptConfig = nextConfig.prompts.length > 0 ? nextConfig : null;
-          this.rebuildPromptConfig();
-          {
-            const readText = (key: string): string | undefined => {
-              const value = (body as Record<string, unknown>)[key];
-              return typeof value === 'string' && value !== '' ? value : undefined;
-            };
-            this.promptFormats = {
-              scenarioFormat: readText('scenario_format'),
-              personalityFormat: readText('personality_format'),
-              wiFormat: readText('wi_format'),
-              newExampleChatPrompt: readText('new_example_chat_prompt'),
-            };
-          }
-          this.chatPanel?.setContext({ promptFormats: this.promptFormats });
-
-          return { ok: true, skipped: plan.skipped.length };
-        } catch (error) {
-          return { ok: false, reason: describeBridgeError(error).message };
-        }
-      },
-
-      importFile: async () => {
-        try {
-          /* 1. 选文件（原生对话框在 Rust 侧，见 `pick_json_file`） */
-          const picked = await this.bridge.pickJsonFile();
-          /*
-           * 用户取消 ≠ 失败。取消时静默返回"没做成、也没出错"，
-           * 界面据此什么都不弹 —— 弹一条红色"导入失败"会让用户以为程序坏了。
-           */
-          if (!picked.ok) {
-            return picked.cancelled === true ? { ok: false, reason: '' } : { ok: false, reason: picked.reason };
-          }
-
-          /* 2. 解析 + 校验（导错文件在这里拦住，别等到"导入了却没用"） */
-          let body: unknown;
-          try {
-            body = JSON.parse(picked.text);
-          } catch {
-            return { ok: false, reason: `「${picked.fileName}」不是合法的 JSON 文件。` };
-          }
-
-          const verdict = validatePresetBody(body);
-          if (!verdict.ok) return { ok: false, reason: verdict.reason };
-
-          const name = presetNameFromFile(picked.fileName);
-          if (name === '') return { ok: false, reason: '文件名是空的，没法给预设起名。' };
-
-          /* 3. 写进 ST */
-          const saved = await this.withConnection(() =>
-            this.bridge.presetSave(name, JSON.stringify(body)),
-          );
-          const savedName = saved === '' ? name : saved;
-
-          /*
-           * 4. 导入完**直接切过去**。
-           *
-           * 用户导一份配置就是为了用它。导完还得再手动选一次，
-           * 中间那句"导入成功"会让人以为已经生效了。
-           */
-          const applied = await this.makePresetCallbacks().apply(savedName);
-          if (!applied.ok) {
-            return { ok: true, name: savedName, reason: `已导入，但切换失败：${applied.reason ?? ''}` };
-          }
-          return { ok: true, name: savedName };
-        } catch (error) {
-          return { ok: false, reason: describeBridgeError(error).message };
-        }
-      },
-    };
-  }
 
   private renderChat(): void {
     if (this.pageHost === null) return;
@@ -8266,7 +4880,7 @@ export class AppShell {
        * 正在看的对话打断。弹下拉、选完就回到对话。
        */
       onSwitchPersona: (anchor) => {
-        this.openPersonaSwitcher(anchor);
+        openPersonaSwitcher(this.personaHost(), anchor);
       },
     };
 
@@ -8280,7 +4894,7 @@ export class AppShell {
        */
       card: Object.keys(this.loadedCard).length > 0 ? this.loadedCard : this.options.card,
       /* 有选中的人设就用它的名字，否则退回外部传入的默认名（2026-11-04） */
-      userName: this.currentUserName(),
+      userName: currentUserName(this.personaHost()),
       /*
        * 顶栏胶囊显示的名字（2026-11-06）。
        *
@@ -8289,7 +4903,7 @@ export class AppShell {
        */
       personaLabel: activePersona(this.personaState)?.name ?? '',
       /* 描述与插入位置也一起带上 —— 只带名字的话人设描述永远进不了上下文 */
-      persona: this.personaContext(),
+      persona: personaContext(this.personaHost()),
       source: this.apiState.source,
       model: this.apiState.model,
       /*
@@ -9233,7 +5847,7 @@ export class AppShell {
      * 而这类分叉只在截图里看得出来（`chat.css` 那边已有过同类教训）。
      */
     scroller.append(
-      this.renderApiSection(),
+      renderApiSection(this.settingsHost()),
       this.renderVoiceSection(),
       /*
        * 诊断日志（2026-11-12）。
@@ -9242,7 +5856,7 @@ export class AppShell {
        * **拿不到任何日志** —— logcat 要数据线，用户做不到。
        * 有了这个入口，他闪退后重进 App 点一下就能把原因发回来。
        */
-      this.renderDiagSection(),
+      renderDiagSection(this.settingsHost()),
       /*
        * 「关于」（2026-11-18，合规要求）。
        *
@@ -9476,244 +6090,7 @@ export class AppShell {
    * "现有 API 与语音输入两个页面内部的抽屉式交互保持不变"。
    * 这一步只改**外层怎么摆**，不动里面怎么用。
    */
-  private renderApiSection(): ElLike {
-    /*
-     * 进这一块就先问一次 ST「哪些源真的配了 key」（2026-11-07）。
-     *
-     * ★ 为什么必须问 ST 而不是只用本地标记：
-     *
-     * 用户真机报「配了 API key，界面说没配」。本地标记会因换版本、
-     * 清缓存、在 ST 原始界面配过而丢失 —— 而 ST 的 `secrets.json`
-     * 才是真相。`/api/secrets/read` 返回的每一项要么是数组、要么是 `null`。
-     *
-     * 这里是"fire and forget"：同步渲染用当前已知状态，
-     * 拿到真相后如果需要再重绘一次（`refreshKeyPresence` 内部判断）。
-     */
-    void this.refreshKeyPresence();
 
-    return this.renderAccordion({
-      entryRole: 'api-entry',
-      panelRole: 'api-panel',
-      title: 'API 连接',
-      subtitle: apiSummary(this.apiState),
-      expanded: this.apiExpanded,
-      onToggle: () => {
-        this.apiExpanded = !this.apiExpanded;
-        return true;
-      },
-      buildBody: () => {
-        /*
-         * 传一个**包过连接门**的 writeSecret。
-         *
-         * 直接传 `this.bridge` 的话，第一次保存会撞上 "还没连上 SillyTavern"
-         * —— 而那一刻外壳其实有能力连上，只是没被要求连。
-         */
-        const writer = {
-          writeSecret: (key: string, value: string) =>
-            /*
-             * ★★★ 写入 + **自证成功**（2026-11-11）。
-             *
-             * ## 为什么必须在这里自证
-             *
-             * 用户报：
-             *
-             * > 我现在尝试了多次，无法更新秘钥
-             *
-             * 而界面每次都显示「已保存」。真机取证（直读 ST 的
-             * `/api/secrets/read`）：`api_key_custom` 里只有一条
-             * `label: "cli-test"` —— 那是**旧探针脚本**写的，
-             * `App 一次都没写进去过`。
-             *
-             * ## 为什么以前的校验看不出来
-             *
-             * 外壳的 `writeApiConnectionToSt()` 只核「`api_key_custom`
-             * 这个名字在不在」。旧的那条一直在 ⇒ **永远通过** ⇒ 显示"已保存"。
-             *
-             * ```text
-             *   写入失败（或压根没调用）
-             *     → secretPresent() 返回 ['api_key_custom']（旧值）
-             *     → 校验通过 → "已保存"
-             * ```
-             *
-             * ## 判据：写入前后比对 active 那条的 id
-             *
-             * key 的值读不回来（掩码），但 id 会变：
-             *
-             * ```text
-             *   ST.writeSecret → 旧的 active=false，push 新 uuid active=true
-             *   ⇒ id 不变 == 没写进去
-             * ```
-             *
-             * 这是唯一可靠的证据。失败就直接抛错 —— 抛了 api-page 才会
-             * 显示红条而不是"已保存"。
-             */
-            this.withConnection(async () => {
-              const before = await this.bridge.secretActiveId(key);
-              const written = await this.bridge.writeSecret(key, value);
-              const after = await this.bridge.secretActiveId(key);
-              if (after === null || after === before) {
-                /*
-                 * ★ 用户可见文案里不出现 "ST" 这种内部术语（项目文案红线）。
-                 * 说"聊天服务"就够了 —— 用户知道那指的是引擎。
-                 */
-                throw new Error(
-                  '新密钥没写进聊天服务：写入前后指向同一条记录。' +
-                    '先确认服务在运行，然后重新保存一次。',
-                );
-              }
-              return written;
-            }),
-        };
-
-        const page = renderApiPage(this.doc, writer, this.apiState, {
-          /*
-           * 收纳项的标题行已经写着「API 连接」，这一页自带顶栏会重复一次
-           * （2026-10-31 第三批截图里能直接看到两个「API 连接」）。
-           */
-          hideTopbar: true,
-          // 重绘前记下的提示（"已保存"）—— 显示一次就清
-          notice: this.pendingApiNotice ?? undefined,
-          /*
-           * 秘钥框的三态要问"这个源配过没有"（2026-11-02 用户要求）。
-           *
-           * 传函数而不是布尔：页面在**切换源**时会重建输入框，
-           * 那一刻要按新源重新判断。传快照的话切到另一个源仍显示旧状态。
-           */
-          hasKeyFor: (source) => this.apiKeyPresent.has(source),
-          onSave: async (state, apiKey) => {
-            /*
-             * ★★★ 第一步就是**真的写进 SillyTavern**（2026-11-04 第二十八批）。
-             *
-             * 取证结论：改之前这一页**只写 localStorage** ——
-             * ST 的 secrets 从未被调用（`SecretWriter` 定义了但零引用），
-             * ST 的 settings 只写过 `max_tokens`。
-             * 所以 ST 里一直是 `openai / gpt-4-turbo`，App 里是
-             * `custom / deepseek-v4-pro`，两边长期不一致。
-             *
-             * 放到最前面而不是最后：这一步是"保存"的**实质**，
-             * 它的成败决定后面能不能说"已保存"。
-             */
-            const stProblems = await this.writeApiConnectionToSt(state, apiKey);
-            const stOk = stProblems === null;
-
-            this.apiState = state;
-
-            /*
-             * 本地状态照写。
-             *
-             * 为什么 ST 失败也写本地：请求体用的是本地这份，写了才聊得动；
-             * 不写会让用户"连本机都存不了"。但**必须告诉他没同步进引擎** ——
-             * 只写本机而不说，就是改之前那种"看起来成功了、其实是假的"。
-             */
-            let localError: string | null = null;
-            try {
-              await this.options.onPersistApi?.(state);
-            } catch (error) {
-              localError = error instanceof Error ? error.message : String(error);
-            }
-
-            /*
-             * 这次写了新 key ⇒ 记下"这个源已配置"。
-             *
-             * ★ 只在**真的写进 ST** 时才认这个标记。改之前是无条件记的，
-             * 于是 UI 会显示"已配置秘钥"，而引擎里一个字节都没有 ——
-             * 用户发消息才发现 401。
-             */
-            if (apiKey !== null && stOk && localError === null) {
-              this.apiKeyPresent.add(state.source);
-              this.options.onApiKeyWritten?.(state.source);
-            }
-            /*
-             * 只同步连接类字段。
-             *
-             * 2026-10-31 第四批：采样参数已迁走，这里**不许**再碰
-             * `sampling` —— 一旦这里还写一遍，保存连接配置就会把
-             * 聊天页正在用的采样值覆盖成默认值（用户会看到"我只是改了
-             * 模型名，温度怎么回默认了"）。
-             */
-            this.chatPanel?.setContext({
-              source: state.source,
-              model: state.model,
-              // 地址也要同步 —— 否则填完地址要重启才生效
-              baseUrl: state.baseUrl,
-            });
-
-            /*
-             * ★★★ 「最大回复长度」不再在这里写（2026-11-21 用户决定）。
-             *
-             * ## 为什么删掉
-             *
-             * 它和「AI 响应配置」页的「最大回复长度（Token）」**是同一个东西**
-             * ——两处最终都落到 ST 的 `oai_settings.openai_max_tokens`。
-             * 而这一处是"按源"存（localStorage），保存时覆盖 ST 的值。
-             *
-             * 于是同一个数字有两个入口、两个存放位置，且这里的优先级更高。
-             * 用户实际遇到的是：
-             *
-             * ```text
-             *   在「自定义」页填 4096 → 保存 → 值确实进了 ST
-             *   下次再进这一页 → 输入框显示 2048（草稿没从 apiState 回填）
-             *   ⇒ 看起来"没保存"，再点一次保存就把 4096 覆盖成 2048
-             * ```
-             *
-             * 用户的判断是对的：**留一处更合理**。所以现在只保留
-             * 「AI 响应配置 → 最大回复长度（Token）」，它直接读写
-             * `openai_max_tokens`，是唯一入口、也是唯一真相。
-             *
-             * 保存连接配置时**刻意不碰**这个字段 —— 改模型名不该顺手改长度。
-             */
-
-            /*
-             * 记下"已保存"给重绘后的页面显示。
-             *
-             * 不记的话用户看不到任何成功反馈（真机实测：保存其实成功了，
-             * 但界面上一片空白）—— 见 `pendingApiNotice` 与
-             * `ApiPageCallbacks.notice` 的注释。
-             */
-            /*
-             * ★★★ 反馈只由**实际结果**决定（用户要求"回读验证后 UI 反馈才允许显示成功"）。
-             *
-             * 改之前无论 ST 写没写都显示"已保存" —— 那正是这个 bug 能潜伏
-             * 这么久的原因：界面一直在说成功。
-             */
-            if (stOk && localError === null) {
-              this.pendingApiNotice = '已保存（已同步到服务）';
-            } else if (stOk) {
-              this.pendingApiNotice = '引擎已同步，但本机没存住';
-            } else {
-              this.pendingApiNotice = '只保存到本机，没同步到服务';
-              this.options.onNotify?.(
-                `「${state.model}」没能同步到服务：${(stProblems ?? []).join('；')}`,
-                'danger',
-              );
-            }
-            if (localError !== null) {
-              this.options.onNotify?.(`本机配置没存住：${localError}`, 'danger');
-            }
-            /*
-             * 重绘后立刻清掉，保证"只显示一次"。
-             *
-             * 用微任务而不是同步清：`renderPage()` 是同步的，它在下面这行
-             * 之前执行，所以这次渲染能读到值；清空留到下一轮事件循环，
-             * 这样切 Tab 回来时不会又冒出"已保存"。
-             */
-            queueMicrotask(() => {
-              this.pendingApiNotice = null;
-            });
-            /*
-             * 副标题要跟着变（"当前：xxx 模型 yyy"）。
-             * 重绘整页是唯一可靠的办法：`renderAccordion` 每次重建标题行，
-             * 手工去改那个 span 会漏掉"另一个条目也被重建了"这件事。
-             */
-            this.renderPage();
-          },
-          onNotify: this.options.onNotify,
-        });
-        this.apiPageEl = page;
-        return page;
-      },
-    });
-  }
 
   /**
    * 「我的 → 语音输入配置」收纳项。
@@ -9806,212 +6183,7 @@ export class AppShell {
    * 不展开也能看到"上次是正常退出还是异常结束" —— 那是最关键的一条信息，
    * 藏进面板里等于没有（用户不会为了看结论先展开）。
    */
-  private renderDiagSection(): ElLike {
-    const boot = this.diagBoot();
-    const entries = readDiagEntries();
-    const errorCount = entries.filter(
-      (one) => one.kind === 'error' || one.kind === 'unhandledrejection',
-    ).length;
-    const status = nativeStatus();
 
-    /*
-     * 副标题只说**能被用户理解**的事：
-     *
-     * ```text
-     *   "上次异常结束"  → 他心里"对，就是它崩了"
-     *   "0x00000008"   → 无意义
-     * ```
-     */
-    /*
-     * 副标题要一眼回答两件事：**上次崩没崩**、**日志有多大**。
-     *
-     * 后者是用户要求的直接来源：
-     *
-     * > 日志需要能够让用户方便快速的找到并可以传输的方式
-     *
-     * 只说"已记录"没用 —— 他要知道该不该先导出（快满了就得先导）。
-     */
-    const sizeText =
-      status === null
-        ? ''
-        : ` · ${(status.totalBytes / 1024 / 1024).toFixed(1)}/${String(Math.round(status.limitBytes / 1024 / 1024))}MB`;
-    /*
-     * ★★★ 这里不许出现 markdown 强调语法（2026-11-13，用户截图报的）。
-     *
-     * 原来写的是 `上次**异常结束**` —— 那四个星号是我在**注释里**习惯用
-     * `**重点**` 的写法，直接漏进了用户可见文案。真机上副标题显示成：
-     *
-     * ```text
-     *   上次**异常结束** · 共 0 条 · 0.0/18MB
-     * ```
-     *
-     * `textContent` 不做 markdown 渲染，星号就是四个字符。
-     *
-     * 判断标准很简单：**用户看到的每一个字符都得是有意义的**。
-     * 要强调就靠措辞和位置，不靠星号 —— 这里本来也没有富文本能力。
-     */
-    const subtitle = boot.lastExitClean
-      ? `上次正常退出 · 共 ${String(entries.length)} 条${sizeText}`
-      : `上次异常结束${errorCount > 0 ? `（有 ${String(errorCount)} 条报错）` : ''} · 共 ${String(entries.length)} 条${sizeText}`;
-
-    return this.renderAccordion({
-      entryRole: 'diag-entry',
-      panelRole: 'diag-panel',
-      title: '诊断日志',
-      subtitle,
-      expanded: this.diagExpanded,
-      onToggle: () => {
-        this.diagExpanded = !this.diagExpanded;
-        return true;
-      },
-      buildBody: () => {
-        const body = el(this.doc, 'div', 'nb-diag-body');
-        body.setAttribute('data-role', 'diag-body');
-
-        const note = el(this.doc, 'p', 'nb-note');
-        note.textContent =
-          '闪退后重新打开 App，这里会显示上次是怎么结束的。把下面的内容复制出来发给开发者，就能定位问题。';
-        body.append(note);
-
-        /*
-         * 日志文件在哪 + 多大（2026-11-12 用户要求）。
-         *
-         * 用户原话：
-         *
-         * > 最好是放在用户无 root 时可以访问的目录，这样在应用反复崩溃时
-         * > 也可以拿到 APP 日志
-         *
-         * 所以这里要把路径明写出来 —— 他能照着去电脑上找。同时说明
-         * "导出到 Download"更省事（Android 11+ 文件管理器进不去 Android/data）。
-         */
-        if (status !== null) {
-          /*
-           * ★★★ 路径**单独成块**，不混在说明文字里（2026-11-13 第二次修）。
-           *
-           * ## 为什么
-           *
-           * 原来是一句话：`日志文件：${status.dir}（N 个文件，…）`。
-           * 而「中文 + 一条 80 字符、没有空格的绝对路径」在真机上会断错位置：
-           * 红米那台把**标题**拆成了「日志文 / 件：/storage/…」。
-           *
-           * 试过两轮 CSS（`overflow-wrap: anywhere` → `break-word`），
-           * 都没解决 —— 断行落点取决于 WebView 版本，**不可预测**。
-           *
-           * ⇒ 改结构：说明是说明，路径是路径。
-           *
-           * ```text
-           *   日志文件（1 个文件，0.0 MB，上限 18 MB）
-           *   ┌──────────────────────────────────────┐
-           *   │ /storage/emulated/0/Android/data/…   │  ← 等宽、可选中复制
-           *   └──────────────────────────────────────┘
-           * ```
-           *
-           * 顺带修好了另一个体验问题：路径现在**能长按复制**，
-           * 用户不必照着手打。
-           *
-           * ★ 文案里也不许出现 "Android 11+" 之外的内部细节 ——
-           *   "自带文件管理器进不去"是用户能理解的事实，保留。
-           */
-          const where = el(this.doc, 'p', 'nb-note');
-          where.setAttribute('data-role', 'diag-where');
-          where.textContent =
-            `日志文件（${String(status.fileCount)} 个文件，` +
-            `${(status.totalBytes / 1024 / 1024).toFixed(1)} MB，上限 ` +
-            `${String(Math.round(status.limitBytes / 1024 / 1024))} MB）：` +
-            '用数据线连电脑即可取。Android 11+ 的手机自带文件管理器进不去这个目录，' +
-            '请用下面的「导出到下载目录」。';
-
-          /*
-           * 路径块挂在同一个段落**后面**（不是段落里面）——
-           * 放进段落里会被段落的文字排版规则管住，又回到断错行的老问题。
-           */
-          const pathEl = el(this.doc, 'div', 'nb-diag-path');
-          pathEl.setAttribute('data-role', 'diag-path');
-          pathEl.textContent = status.dir;
-
-          body.append(where, pathEl);
-        } else {
-          const where = el(this.doc, 'p', 'nb-note');
-          where.setAttribute('data-role', 'diag-where');
-          where.textContent =
-            '当前拿不到原生日志（可能不在安卓上）。下面的内容只存在于本次会话，重启会丢。';
-          body.append(where);
-        }
-
-        const pre = el(this.doc, 'pre', 'nb-diag-pre');
-        pre.setAttribute('data-role', 'diag-text');
-        /*
-         * 只在展开时才拼整份报告：`buildDiagReport()` 要读 localStorage
-         * 并格式化上百行，每次重绘都算一遍是白花钱。
-         */
-        pre.textContent = buildDiagReport();
-        body.append(pre);
-
-        const row = el(this.doc, 'div', 'nb-tag-row');
-
-        /*
-         * 「导出到下载目录」放第一位（2026-11-12）。
-         *
-         * 理由：这是用户**真正用得上**的那一步 —— 复制文本适合一两条报错，
-         * 而闪退要的是完整日志。导出后是 `Download/tcs-log-<时间>.txt`，
-         * 任何文件管理器能开、能长按分享到微信/QQ。
-         */
-        if (status !== null) {
-          const exportBtn = el(this.doc, 'button', 'nb-btn');
-          exportBtn.setAttribute('type', 'button');
-          exportBtn.setAttribute('data-role', 'diag-export');
-          exportBtn.textContent = '导出到下载目录';
-          exportBtn.addEventListener('click', () => {
-            const name = exportNativeLog();
-            if (name === '') {
-              this.options.onNotify?.('导出失败，日志可能还是空的', 'warn');
-              return;
-            }
-            this.options.onNotify?.(`已导出：下载目录 / ${name}`, 'ok');
-          });
-          row.append(exportBtn);
-        }
-
-        const copy = el(this.doc, 'button', 'nb-btn');
-        copy.setAttribute('type', 'button');
-        copy.setAttribute('data-role', 'diag-copy');
-        copy.textContent = '复制全部';
-        copy.addEventListener('click', () => {
-          /*
-           * `navigator.clipboard` 在 WebView 里可能没有（或需要 https）。
-           * 失败不装作成功 —— 改成全选文本，用户手动长按复制，
-           * 并明说这一步（不能让他以为复制好了）。
-           */
-          const text = buildDiagReport();
-          const clipboard = (globalThis as { navigator?: { clipboard?: { writeText?: (t: string) => Promise<void> } } })
-            .navigator?.clipboard;
-          if (clipboard?.writeText !== undefined) {
-            void clipboard.writeText(text).then(
-              () => this.options.onNotify?.('已复制到剪贴板', 'ok'),
-              () => this.selectDiagText(pre),
-            );
-            return;
-          }
-          this.selectDiagText(pre);
-        });
-        row.append(copy);
-
-        const clear = el(this.doc, 'button', 'nb-btn');
-        clear.setAttribute('type', 'button');
-        clear.setAttribute('data-role', 'diag-clear');
-        clear.textContent = '清空日志';
-        clear.addEventListener('click', () => {
-          clearDiagLog();
-          this.options.onNotify?.('诊断日志已清空', 'ok');
-          this.renderPage();
-        });
-        row.append(clear);
-
-        body.append(row);
-        return body;
-      },
-    });
-  }
 
   /** 读"上次怎么退的" —— 读不到就当正常，别让诊断功能自己成为错误源 */
   private diagBoot(): { lastExitClean: boolean } {
@@ -10029,23 +6201,7 @@ export class AppShell {
    *   而这条路径只在真 WebView 里走 —— 桩环境里 `document` 不存在，
    *   直接跳过即可，不需要为它扩展 `DocLike`（那会让所有桩都变重）。
    */
-  private selectDiagText(pre: ElLike): void {
-    const doc = (globalThis as { document?: { createRange?: () => Range } }).document;
-    const selection = (globalThis as { getSelection?: () => Selection | null }).getSelection?.();
-    if (doc?.createRange === undefined || selection === null || selection === undefined) {
-      this.options.onNotify?.('复制失败，请长按文本手动选择', 'warn');
-      return;
-    }
-    try {
-      const range = doc.createRange();
-      range.selectNodeContents(pre as unknown as Node);
-      selection.removeAllRanges();
-      selection.addRange(range);
-      this.options.onNotify?.('已选中全部文本，长按复制', 'warn');
-    } catch {
-      this.options.onNotify?.('复制失败，请长按文本手动选择', 'warn');
-    }
-  }
+
 
   private renderVoiceSection(): ElLike {
     return this.renderAccordion({

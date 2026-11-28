@@ -16,9 +16,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readEditorImplNoComments } from './lib/editor-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
-const APP = readFileSync(join(ROOT, 'client/src/editor/app.ts'), 'utf8');
+const APP = readEditorImplNoComments();
 
 /** 六类预设的 kind 字面量（与 preset-store.ts 的 PresetKind 对应） */
 const KINDS = ['platform', 'highlight', 'txt', 'worldbook', 'greeting', 'chat-examples'];
@@ -35,8 +36,13 @@ const SELECTION_KEYS = [
 
 test('六类预设导入后都调了 rememberPreset（漏一类 = 那一类重启即丢）', () => {
   for (const kind of KINDS) {
+    /*
+     * 2026-11-24：函数搬到 import-actions.ts 并带上 host 首参，
+     * 调用形态变成 `rememberPreset(host, 'platform', ...)`。
+     * 两种形态都认，判据钉的是"这一类有没有调"。
+     */
     assert.ok(
-      APP.includes(`rememberPreset('${kind}'`),
+      APP.includes(`rememberPreset('${kind}'`) || APP.includes(`rememberPreset(host, '${kind}'`),
       `没有为 ${kind} 调用 rememberPreset —— 这一类导入后不会落盘`,
     );
   }
@@ -62,7 +68,12 @@ test('六类选中项启动时都能恢复（只存不读等于没存）', () =>
 
 test('启动顺序：预设库在 buildRuleset 之后加载（内置要先在，同 id 才能覆盖）', () => {
   const rulesAt = APP.indexOf('this.rules = await buildRuleset()');
-  const loadAt = APP.indexOf('await this.loadPresetLibrary()');
+/** 2026-11-24：loadPresetLibrary 搬到 library-actions.ts，
+   *  调用变成 `await loadPresetLibrary(this.libraryHost())`。两种都认。 */
+  const loadAt = Math.max(
+    APP.indexOf('await this.loadPresetLibrary()'),
+    APP.indexOf('await loadPresetLibrary(this.libraryHost())'),
+  );
   assert.notEqual(rulesAt, -1, 'start 里必须 buildRuleset');
   assert.notEqual(loadAt, -1, 'start 里必须 loadPresetLibrary');
   assert.ok(loadAt > rulesAt, 'loadPresetLibrary 必须排在 buildRuleset 之后');
@@ -70,16 +81,22 @@ test('启动顺序：预设库在 buildRuleset 之后加载（内置要先在，
 
 test('库未加载完时不写盘（否则会把磁盘上已有的预设覆盖成只有一条）', () => {
   assert.ok(
-    APP.includes('if (!this.presetStoreReady)'),
-    'rememberPreset 必须检查 presetStoreReady',
+    APP.includes('presetStoreReady'),
+    'rememberPreset 必须检查 presetStoreReady（搬家后是 host.presetStoreReady）',
   );
 });
 
 test('浏览器直开不做持久化，且不报错（那是预期场景，不该刷警告）', () => {
-  const loadBlock = APP.slice(
+  /*
+   * 2026-11-24：搬到 library-actions.ts，形态是
+   * `function loadPresetLibrary(host: LibraryHost)`。
+   */
+  const loadAt = Math.max(
     APP.indexOf('private async loadPresetLibrary()'),
-    APP.indexOf('private async loadPresetLibrary()') + 600,
+    APP.indexOf('function loadPresetLibrary(host: LibraryHost)'),
   );
+  assert.notEqual(loadAt, -1, '找不到 loadPresetLibrary');
+  const loadBlock = APP.slice(loadAt, loadAt + 600);
   assert.match(loadBlock, /if \(!isShellAvailable\(\)\)/, '无壳时要直接返回');
 
   const persistBlock = APP.slice(

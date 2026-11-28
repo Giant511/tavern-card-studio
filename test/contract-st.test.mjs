@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { readEditorImplNoComments } from './lib/editor-source.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const TYPES_TS = readFileSync(join(ROOT, 'client/src/contract/types.ts'), 'utf8');
@@ -196,7 +197,7 @@ test('新增两个错误码，两侧都有', () => {
 test('顶栏有 F15 的入口按钮，且在零标签时会被禁用', () => {
   assert.ok(HEX_HTML.includes('id="btn-st"'), 'index.html 里没有 ST 入口');
   assert.ok(HEX_HTML.includes('在 SillyTavern 中测试'), '按钮文案与需求不一致');
-  const app = readFileSync(join(ROOT, 'client/src/editor/app.ts'), 'utf8');
+  const app = readEditorImplNoComments();
   assert.ok(
     /for \(const id of \[[^\]]*'btn-st'[^\]]*\]/.test(app),
     'btn-st 没进 setCardActionEnabled 的清单 —— 零标签时点它会因为没有活动会话而抛错',
